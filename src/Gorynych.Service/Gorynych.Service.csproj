@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Gorynych.Service</RootNamespace>
+    <AssemblyName>Gorynych.Service</AssemblyName>
+    <IsAotCompatible>true</IsAotCompatible>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Gorynych.Acp\Gorynych.Acp.csproj" />
+    <ProjectReference Include="..\Gorynych.Adapters.Kimi\Gorynych.Adapters.Kimi.csproj" />
+    <ProjectReference Include="..\Gorynych.Adapters.Claude\Gorynych.Adapters.Claude.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Gorynych.Tests" />
+  </ItemGroup>
+</Project>
