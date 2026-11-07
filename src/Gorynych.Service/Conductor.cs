@@ -157,6 +157,8 @@ public sealed class Conductor : IAsyncDisposable
             var client = await feed.WaitForClientAsync(c => c.Accepts(request.Method), ct);
             try
             {
+                if (request.Method == AcpMethods.Client.ElicitationCreate && !client.Accepts(request.Method))
+                    return await FormFallback.AskAsync(client, request, ct);
                 return await client.Rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
             }
             catch (Exception e) when (e is IOException or TimeoutException || (e is OperationCanceledException && !ct.IsCancellationRequested))
@@ -168,11 +170,13 @@ public sealed class Conductor : IAsyncDisposable
 
     // ---------------------------------------------------------------- for clients
 
-    internal async Task<ListSessionsResponse> ListAsync(ListSessionsRequest request, CancellationToken ct)
+    /// <param name="agentScope">Only this adapter's sessions (a client scoped to one agent), or all.</param>
+    internal async Task<ListSessionsResponse> ListAsync(ListSessionsRequest request, CancellationToken ct, string? agentScope = null)
     {
         var found = new Dictionary<string, SessionInfo>(StringComparer.Ordinal);
         foreach (var host in agents.Values)
         {
+            if (agentScope is not null && host.Name != agentScope) continue;
             try
             {
                 var rpc = await host.GetAsync(ct);
@@ -205,6 +209,7 @@ public sealed class Conductor : IAsyncDisposable
         foreach (var r in store.All())
         {
             if (found.ContainsKey(r.SessionId)) continue;
+            if (agentScope is not null && r.Agent != agentScope) continue;
             if (request.Cwd is not null && !string.Equals(Path.GetFullPath(r.Cwd), Path.GetFullPath(request.Cwd), StringComparison.OrdinalIgnoreCase)) continue;
             if (agents.TryGetValue(r.Agent, out var host) && host.IsRunning && host.CanList) continue; // the agent no longer has it
             found[r.SessionId] = Describe(r, null);
@@ -233,7 +238,8 @@ public sealed class Conductor : IAsyncDisposable
 
     internal async Task<NewSessionResponse> NewSessionAsync(ClientConnection client, NewSessionRequest request, CancellationToken ct)
     {
-        var host = Agent((string?)request.Meta?[GorynychProtocol.MetaAgent]);
+        // An explicit choice in the request wins; otherwise the agent the connection is scoped to.
+        var host = Agent((string?)request.Meta?[GorynychProtocol.MetaAgent] ?? client.AgentScope);
         var rpc = await host.GetAsync(ct);
         var token = NewToken();
         request.McpServers = WithPeers(request.McpServers, token);

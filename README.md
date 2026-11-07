@@ -29,6 +29,9 @@ gorynych-test status | shutdown
 
 Approvals are asked on the console; `--approve allow|deny` answers them automatically.
 
+Any ACP client that starts agents over stdio, such as Zed, can use the service through
+`Gorynych.Service acp --agent claude|kimi`; see [external clients](docs/external-clients.md).
+
 Specifications: [service protocol](docs/service-protocol.md), [adapters](docs/adapters.md),
 [ACP types](docs/acp-types.md). Probe programs and what they proved:
 [research/probes](research/probes/README.md).

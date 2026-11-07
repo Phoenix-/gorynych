@@ -5,6 +5,7 @@
     <AssemblyName>Gorynych.Service</AssemblyName>
     <IsAotCompatible>true</IsAotCompatible>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Gorynych.Acp\Gorynych.Acp.csproj" />

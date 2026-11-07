@@ -188,6 +188,45 @@ public sealed class LiveSmokeTests
 
     [TestMethod]
     [Timeout(300_000, CooperativeCancellation = true)]
+    public async Task PlainClient_ThroughTheBridge_ClaudesQuestionBecomesAnApproval()
+    {
+        RequireLive();
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var root = RepoRoot();
+        var pipe = "gorynych-live-" + Guid.NewGuid().ToString("N")[..8];
+        await using var zed = new PlainClient("acp", "--agent", "claude", "--pipe", pipe, "--data", TestDirs.New(), "--claude-model", "haiku");
+        var init = await zed.InitializeAsync();
+        Assert.AreEqual("Gorynych: Claude Code", (string?)init!["agentInfo"]!["title"]);
+        try
+        {
+            var created = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew, new JsonObject { ["cwd"] = root, ["mcpServers"] = new JsonArray() });
+            var sessionId = (string)created!["sessionId"]!;
+            var result = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject
+            {
+                ["sessionId"] = sessionId,
+                ["prompt"] = new JsonArray(new JsonObject
+                {
+                    ["type"] = "text",
+                    ["text"] = "Use the AskUserQuestion tool to ask me one question: which color I prefer, with the options Red and Blue. " +
+                        "Then reply with exactly the color I chose.",
+                }),
+            });
+            Assert.AreEqual("end_turn", (string?)result!["stopReason"]);
+            var question = zed.Approvals.Single(a => a.Options.Any(o => o.Name.StartsWith("Blue", StringComparison.Ordinal)));
+            Assert.AreEqual("Skip", question.Options[^1].Name);
+            string text;
+            lock (zed.Updates)
+                text = string.Concat(zed.Updates.Where(u => (string?)u["sessionUpdate"] == "agent_message_chunk").Select(u => (string?)u["content"]?["text"]));
+            StringAssert.Contains(text, "Blue", "the plain client picked the second option, Blue");
+        }
+        finally
+        {
+            await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodShutdown, new JsonObject());
+        }
+    }
+
+    [TestMethod]
+    [Timeout(300_000, CooperativeCancellation = true)]
     public async Task Kimi_FirstPrompt()
     {
         RequireLive();

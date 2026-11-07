@@ -1,17 +1,26 @@
-using System.IO.Pipes;
-using System.Security.AccessControl;
-using System.Security.Principal;
 using System.Text.Json;
 using Gorynych.Acp.Hosting;
 using Gorynych.Adapters.Claude;
 using Gorynych.Adapters.Kimi;
 using Gorynych.Service;
 
-// Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi] [--claude-model <m>] [--no-channel] [--console]
+// Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi] [--claude-model <m>] [--no-channel] [--no-peers] [--console]
 // Gorynych.Service peers [--pipe <name> --token <t>] [--channel-url <url>]
 //   the gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel
 if (args.Length > 0 && args[0] == "peers")
     return await PeersServer.RunAsync(Arg(args, "--pipe"), Arg(args, "--token"), Arg(args, "--channel-url"));
+// Gorynych.Service acp --agent claude|kimi [--pipe <name>] [service options]
+//   the stdio entry point for external ACP clients (Zed); starts the service when needed
+if (args.Length > 0 && args[0] == "acp")
+{
+    var agent = Arg(args, "--agent") ?? throw new ArgumentException("--agent is required");
+    var forwarded = new List<string>();
+    foreach (var option in new[] { "--data", "--claude-model", "--default-agent" })
+        if (Arg(args, option) is { } value) forwarded.AddRange([option, value]);
+    foreach (var flag in new[] { "--no-channel", "--no-peers" })
+        if (args.Contains(flag)) forwarded.Add(flag);
+    return await AcpBridge.RunAsync(agent, Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName, forwarded);
+}
 
 var pipeName = Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName;
 var dataDirectory = Path.GetFullPath(Arg(args, "--data")

@@ -23,26 +23,29 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
 Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi]
 [--claude-model <model>] [--no-channel] [--no-peers] [--console]`. The same executable is
 also the `gorynych` MCP server agents start over stdio:
-`peers [--pipe … --token …] [--channel-url …]` (see Opinions below).
+`peers [--pipe … --token …] [--channel-url …]` (see Opinions below), and the stdio bridge
+for external ACP clients: `acp --agent claude|kimi` (see [external-clients.md](external-clients.md)).
 
 ## Standard methods
 
 | Method | What the service does |
 | --- | --- |
 | `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close`. |
-| `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`. |
-| `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (default: `--default-agent`, else the first), adds the peers MCP server to `mcpServers`, forwards, records the session, attaches the client. |
+| `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`. A connection scoped to one agent sees only that agent's sessions. |
+| `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers`, forwards, records the session, attaches the client. |
 | `session/load` | Opens the session in the agent (`session/resume`, or `session/load` with the agent's replay dropped), replays the service journal as `session/update`, then attaches the client. A session the journal has never seen is loaded from the agent instead, and journaled. |
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
 | `session/close`, anything else with a `sessionId` | Forwarded to the session's agent. |
 
-Agent → client requests go to the most recently attached client of the session that can
-take them: `session/request_permission` (an approval) to any client, `elicitation/create`
-(a form, such as Claude's questions) only to a client that declared
-`clientCapabilities.elicitation.form`. Toward its adapters the service declares form
-elicitation, since it relays them. If none is attached the request waits; if
+Agent → client requests go to the most recently attached client of the session:
+`session/request_permission` (an approval) to any client; `elicitation/create` (a form,
+such as Claude's questions) preferably to a client that declared
+`clientCapabilities.elicitation.form`. A client without forms gets each choice field as a
+`session/request_permission` with the answers as options plus `Skip`; a form with free text
+is declined for it. Toward its adapters the service declares form elicitation, since it
+relays or translates them. If none is attached the request waits; if
 the client disconnects before answering it goes to the next one. So an approval raised
 while the GUI is closed appears when the GUI loads the session again, right after the
 replay. When the agent withdraws the request (`$/cancel_request`), it is withdrawn from the
@@ -59,6 +62,7 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | Name | Where | Meaning |
 | --- | --- | --- |
 | `gorynych/agent` | `session/new` params, `SessionInfo._meta`, `session/new` result | the adapter that owns the session |
+| `gorynych/agent` | `initialize` params `_meta` | scopes the connection to one adapter: its default for `session/new` and the only one in `session/list` (the stdio bridge sets it for plain clients) |
 | `gorynych/serviceId` | `initialize` result `_meta` | the service's persistent ID; a GUI keys sessions as service/session |
 | `gorynych/agents` | `initialize` result `_meta` | the adapters this service offers (`name`, `displayName`) |
 | `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel) or `terminal` |

@@ -29,6 +29,12 @@ internal sealed class ClientConnection
     /// <summary>The client's <c>initialize</c> params.</summary>
     public InitializeRequest? Init { get; private set; }
 
+    /// <summary>
+    /// The agent this connection is scoped to by <c>initialize</c>'s <c>_meta["gorynych/agent"]</c>
+    /// (the stdio bridge sets it for plain ACP clients): new sessions use it, lists show only it.
+    /// </summary>
+    public string? AgentScope => (string?)Init?.Meta?[GorynychProtocol.MetaAgent];
+
     /// <summary>Whether this client can take <paramref name="method"/> requests from an agent.</summary>
     public bool Accepts(string method) => method switch
     {
@@ -42,12 +48,14 @@ internal sealed class ClientConnection
         {
             case AcpMethods.Agent.Initialize:
                 Init = request.ParamsAs<InitializeRequest>();
+                if (AgentScope is { } scope && !conductor.Agents.ContainsKey(scope))
+                    throw new JsonRpcException(JsonRpcException.InvalidParams, $"Unknown agent '{scope}'. Known: {string.Join(", ", conductor.Agents.Keys)}");
                 return AcpJson.ToNode(Initialize());
             case AcpMethods.Agent.Authenticate:
             case AcpMethods.Agent.Logout:
                 return new JsonObject();
             case AcpMethods.Agent.SessionList:
-                return AcpJson.ToNode(await conductor.ListAsync(request.ParamsAs<ListSessionsRequest>(), ct));
+                return AcpJson.ToNode(await conductor.ListAsync(request.ParamsAs<ListSessionsRequest>(), ct, AgentScope));
             case AcpMethods.Agent.SessionNew:
                 return AcpJson.ToNode(await conductor.NewSessionAsync(this, request.ParamsAs<NewSessionRequest>(), ct));
             case AcpMethods.Agent.SessionLoad:
@@ -89,7 +97,12 @@ internal sealed class ClientConnection
     InitializeResponse Initialize() => new()
     {
         ProtocolVersion = (ushort)Math.Min((int)(Init?.ProtocolVersion ?? AcpMethods.ProtocolVersion), AcpMethods.ProtocolVersion),
-        AgentInfo = new Implementation { Name = "gorynych", Title = "Gorynych", Version = AgentHost.Version },
+        AgentInfo = new Implementation
+        {
+            Name = "gorynych",
+            Title = AgentScope is { } scope && conductor.Agents.TryGetValue(scope, out var host) ? $"Gorynych: {host.DisplayName}" : "Gorynych",
+            Version = AgentHost.Version,
+        },
         AgentCapabilities = new AgentCapabilities
         {
             LoadSession = true,

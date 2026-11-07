@@ -100,10 +100,10 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     }
 
     /// <summary>
-    /// Returns the most recently attached client that <paramref name="accepts"/> the request,
-    /// waiting for one if none is attached.
+    /// Returns the most recently attached client, preferring one that <paramref name="prefer"/>s
+    /// the request, waiting for one if none is attached.
     /// </summary>
-    public async Task<ClientConnection> WaitForClientAsync(Func<ClientConnection, bool> accepts, CancellationToken ct)
+    public async Task<ClientConnection> WaitForClientAsync(Func<ClientConnection, bool> prefer, CancellationToken ct)
     {
         Interlocked.Increment(ref pendingRequests);
         try
@@ -113,7 +113,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
                 Task wait;
                 lock (clientsGate)
                 {
-                    var live = clients.LastOrDefault(c => !c.Rpc.IsClosed && accepts(c));
+                    var open = clients.Where(c => !c.Rpc.IsClosed).ToList();
+                    var live = open.LastOrDefault(prefer) ?? open.LastOrDefault();
                     if (live is not null) return live;
                     wait = clientAttached.Task;
                 }
