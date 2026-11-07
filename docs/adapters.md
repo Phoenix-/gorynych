@@ -16,9 +16,12 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
 - `session/new` returns config options (model, thinking, mode) and modes; the first
   prompt immediately yields `session_info_update` with the prompt as the title.
 - `session/list` returns titles and `updatedAt`.
-- On 7 November 2026 every model answered `session/prompt` with `-32000 Authentication
-  required: 403 Your current subscription does not have access to Kimi Code right now`.
-  The service relays that error to the client unchanged.
+- Approvals arrive as `session/request_permission` with Kimi's own options (approve once,
+  approve for this session, reject); tool calls stream their arguments as `tool_call_update`.
+- Verified live on 7 November 2026 after logging in: first prompt, a Write approval, the
+  title, replay through the service journal, and `ask_agent` to a Claude session. Before
+  the login every turn failed with `-32000 Authentication required: 403`, which the service
+  relays to the client unchanged.
 
 ## Claude Code
 
@@ -72,15 +75,16 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
 | `UserPromptSubmit` | nothing for the client's own prompt (ACP does not echo it); otherwise `user_message_chunk` with `_meta["gorynych/origin"]` = `channel` or `terminal` |
 | `PreToolUse` | `tool_call` (`pending`), `toolCallId` = `tool_use_id`, title and kind from the tool, locations from `file_path` |
 | `PermissionRequest` | `session/request_permission` with Allow / Deny; the hook replies `allow` or `deny`. A denial also marks the tool call `failed`. |
-| `PermissionRequest` for `AskUserQuestion` | one `session/request_permission` per question, its answers as options; the hook replies `allow` with `updatedInput.answers` |
+| `PermissionRequest` for `AskUserQuestion` | one `elicitation/create` form (scoped to the session and tool call) with a property `q1`, `q2`, … per question: a string with `oneOf` for a single choice, an array of titled items for `multiSelect`; an accepted form makes the hook reply `allow` with `updatedInput.answers` (`{question: label}`, several labels joined by ", "), anything else `deny` |
 | `PostToolUse` / `PostToolUseFailure` | `tool_call_update` `completed` / `failed`, `rawOutput`, Bash output as content |
 | `MessageDisplay` | `agent_message_chunk` (`messageId` = `message_id`) |
 | `Stop` | ends the turn; if no `MessageDisplay` came, `last_assistant_message` is sent as the answer |
 | transcript `ai-title` / `custom-title` | `session_info_update` with the title (a chosen name wins) |
 
-The transcript is only read, from the path the hooks report, for the title.
-`AskUserQuestion` would fit ACP `elicitation/create` better; the approval-shaped mapping
-works with every ACP client today.
+The transcript is only read, from the path the hooks report, for the title. Approvals
+and questions are kept apart: `session/request_permission` asks to allow an action,
+`elicitation/create` asks for information. If the client cannot show forms, the question
+is denied with a note so Claude asks in plain text.
 
 ### Channel (opinions from other agents)
 
@@ -92,6 +96,9 @@ for messages, pushes them as `notifications/claude/channel` with
 authorizes opinions from the user's agents and forbids actions on their behalf; the
 adapter's PermissionRequest hook allows the channel's own `reply` tool without asking.
 `_gorynych/opinion` on the service is the entry point.
+
+Claude does not get the peers MCP server yet (the adapter ignores `mcpServers`), so Claude
+can be asked but cannot ask.
 
 ### Not done yet
 

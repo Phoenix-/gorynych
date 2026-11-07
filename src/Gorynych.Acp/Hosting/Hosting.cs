@@ -49,6 +49,15 @@ public static class GorynychProtocol
     /// <summary>Who sent an agent-to-agent message.</summary>
     public const string MetaSender = "gorynych/sender";
 
+    /// <summary>Identifies the asking session in calls from the peers MCP server the service gave it.</summary>
+    public const string MetaPeerToken = "gorynych/peerToken";
+
+    /// <summary>Asks a session's agent for an opinion: <c>{sessionId, text, sender?}</c> → <c>{text}</c>.</summary>
+    public const string MethodOpinion = "_gorynych/opinion";
+
+    /// <summary>The sessions a peer can ask: <c>{token}</c> → <c>{sessions: [...]}</c>.</summary>
+    public const string MethodPeers = "_gorynych/peers";
+
     /// <summary>Returns service status: ID, process, adapters, sessions.</summary>
     public const string MethodStatus = "_gorynych/status";
 

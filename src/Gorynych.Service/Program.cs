@@ -11,6 +11,10 @@ using Gorynych.Service;
 // Gorynych.Service channel --url <url>      (the Claude channel server; Claude starts it over stdio)
 if (args.Length > 0 && args[0] == "channel")
     return await ChannelServer.RunAsync(Arg(args, "--url") ?? throw new ArgumentException("--url is required"));
+// Gorynych.Service peers --pipe <name> --token <t>   (the peers MCP server; agents start it over stdio)
+if (args.Length > 0 && args[0] == "peers")
+    return await PeersServer.RunAsync(Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName,
+        Arg(args, "--token") ?? throw new ArgumentException("--token is required"));
 
 var pipeName = Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName;
 var dataDirectory = Path.GetFullPath(Arg(args, "--data")
@@ -50,50 +54,16 @@ await using var conductor = new Conductor(new ConductorOptions
     DataDirectory = dataDirectory,
     ServiceId = state.ServiceId,
     DefaultAgent = Arg(args, "--default-agent"),
+    PeerServerCommand = args.Contains("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
 }, adapters);
 
 using var stop = CancellationTokenSource.CreateLinkedTokenSource(conductor.ShutdownRequested);
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; Stop(stop); };
 AppDomain.CurrentDomain.ProcessExit += (_, _) => Stop(stop);
 
-await Listen(conductor, pipeName, stop.Token);
+await PipeListener.RunAsync(conductor, pipeName, stop.Token);
 ServiceLog.Info("service stopping");
 return 0;
-
-static async Task Listen(Conductor conductor, string pipeName, CancellationToken ct)
-{
-    var count = 0;
-    while (!ct.IsCancellationRequested)
-    {
-        var server = CreatePipe(pipeName);
-        try
-        {
-            await server.WaitForConnectionAsync(ct);
-        }
-        catch (OperationCanceledException)
-        {
-            await server.DisposeAsync();
-            break;
-        }
-        var name = $"client{++count}";
-        _ = Task.Run(() => conductor.ServeClientAsync(server, server, name), CancellationToken.None);
-    }
-}
-
-// Only the current user may open the pipe; on Windows remote (network) clients are refused too.
-static NamedPipeServerStream CreatePipe(string name)
-{
-    const PipeOptions options = PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly;
-    if (!OperatingSystem.IsWindows())
-        return new NamedPipeServerStream(name, PipeDirection.InOut, NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte, options);
-    var security = new PipeSecurity();
-    using var identity = WindowsIdentity.GetCurrent();
-    security.SetOwner(identity.User!);
-    security.AddAccessRule(new PipeAccessRule(identity.User!, PipeAccessRights.FullControl, AccessControlType.Allow));
-    security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.NetworkSid, null), PipeAccessRights.FullControl, AccessControlType.Deny));
-    return NamedPipeServerStreamAcl.Create(name, PipeDirection.InOut, NamedPipeServerStream.MaxAllowedServerInstances,
-        PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, security);
-}
 
 static ServiceState LoadState(string path)
 {

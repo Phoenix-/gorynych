@@ -119,7 +119,7 @@ switch (options.Command)
     }
     case "opinion":
     {
-        var result = await client.Rpc.SendRequestAsync("_gorynych/opinion", new JsonObject
+        var result = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject
         {
             ["sessionId"] = options.To ?? throw new ArgumentException("--to is required"),
             ["sender"] = options.Sender ?? "peer_kimi",
@@ -269,6 +269,7 @@ sealed class FeedPrinter
 {
     readonly Lock gate = new();
     bool midLine;
+    string? stream;
     public int Count { get; private set; }
     public int TitleUpdates { get; private set; }
     public string? Title { get; private set; }
@@ -283,10 +284,10 @@ sealed class FeedPrinter
             switch (kind)
             {
                 case "agent_message_chunk":
-                    Write((string?)u["content"]?["text"] ?? "");
+                    Stream("message", "", (string?)u["content"]?["text"] ?? "");
                     break;
                 case "agent_thought_chunk":
-                    Line($"  (thinking) {(string?)u["content"]?["text"]}");
+                    Stream("thought", "  (thinking) ", (string?)u["content"]?["text"] ?? "");
                     break;
                 case "user_message_chunk":
                     var origin = (string?)u["_meta"]?[GorynychProtocol.MetaOrigin];
@@ -322,17 +323,30 @@ sealed class FeedPrinter
 
     public void EndLine()
     {
-        lock (gate) if (midLine) { Console.WriteLine(); midLine = false; }
+        lock (gate)
+        {
+            if (midLine) { Console.WriteLine(); midLine = false; }
+            stream = null;
+        }
     }
 
-    void Write(string s)
+    /// <summary>Streams text chunks inline; a new kind of stream starts on its own line.</summary>
+    void Stream(string kind, string prefix, string s)
     {
+        if (stream != kind)
+        {
+            if (midLine) Console.WriteLine();
+            Console.Write(prefix);
+            midLine = prefix.Length > 0;
+            stream = kind;
+        }
         Console.Write(s);
-        midLine = !s.EndsWith('\n');
+        if (s.Length > 0) midLine = !s.EndsWith('\n');
     }
 
     void Line(string s)
     {
+        stream = null;
         if (midLine) { Console.WriteLine(); midLine = false; }
         Console.WriteLine(s);
     }

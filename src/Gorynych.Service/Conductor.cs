@@ -15,6 +15,12 @@ public sealed class ConductorOptions
     public string? DefaultAgent { get; init; }
     public int JournalMaxEntries { get; init; } = 5000;
     public int ListPageSize { get; init; } = 50;
+
+    /// <summary>
+    /// The command that runs the peers MCP server (<see cref="PeersServer"/>), given to every
+    /// session in <c>mcpServers</c> with a token; null gives agents no peer tools.
+    /// </summary>
+    public IReadOnlyList<string>? PeerServerCommand { get; init; }
 }
 
 /// <summary>
@@ -32,6 +38,8 @@ public sealed class Conductor : IAsyncDisposable
     readonly ConcurrentDictionary<string, SessionFeed> feeds = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<ClientConnection, byte> clients = new();
     readonly CancellationTokenSource shutdown = new();
+    readonly ConcurrentDictionary<string, string> peerTokens = new(StringComparer.Ordinal);   // token -> session
+    readonly ConcurrentDictionary<string, string> sessionTokens = new(StringComparer.Ordinal); // session -> token
 
     public Conductor(ConductorOptions options, IEnumerable<IAgentAdapter> adapters)
     {
@@ -216,7 +224,10 @@ public sealed class Conductor : IAsyncDisposable
     {
         var host = Agent((string?)request.Meta?[GorynychProtocol.MetaAgent]);
         var rpc = await host.GetAsync(ct);
+        var token = NewToken();
+        request.McpServers = WithPeers(request.McpServers, token);
         var response = await rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, request, ct);
+        BindToken(token, response.SessionId);
         host.MarkLive(response.SessionId);
         store.Update(response.SessionId, host.Name, r => r.Cwd = request.Cwd);
         Feed(response.SessionId).Attach(client);
@@ -264,7 +275,7 @@ public sealed class Conductor : IAsyncDisposable
         if (host.CanResume)
         {
             opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionResume,
-                AcpJson.ToNode(new ResumeSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = [] }), ct);
+                AcpJson.ToNode(new ResumeSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId) }), ct);
         }
         else if (host.CanLoad)
         {
@@ -273,7 +284,7 @@ public sealed class Conductor : IAsyncDisposable
             try
             {
                 opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
-                    AcpJson.ToNode(new LoadSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = [] }), ct);
+                    AcpJson.ToNode(new LoadSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId) }), ct);
             }
             finally
             {
@@ -302,7 +313,7 @@ public sealed class Conductor : IAsyncDisposable
             {
                 feed.Attach(client);
                 opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
-                    AcpJson.ToNode(new LoadSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = [] }), ct) as JsonObject;
+                    AcpJson.ToNode(new LoadSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId) }), ct) as JsonObject;
                 host.MarkLive(record.SessionId);
                 return opened ?? [];
             }
@@ -400,6 +411,92 @@ public sealed class Conductor : IAsyncDisposable
         var result = await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
         host.MarkClosed(sessionId);
         return result;
+    }
+
+    // ---------------------------------------------------------------- opinions between agents
+
+    /// <summary>
+    /// <c>_gorynych/opinion</c>: asks the agent of <c>sessionId</c> for an opinion. A call from
+    /// the peers MCP server carries its token, which names the asking session and its agent.
+    /// </summary>
+    internal async Task<JsonNode?> OpinionAsync(JsonRpcRequest request, CancellationToken ct)
+    {
+        var target = (string?)request.Params?["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
+        var text = (string?)request.Params?["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
+        var sender = (string?)request.Params?["sender"];
+        string? from = null;
+        if ((string?)request.Params?["_meta"]?[GorynychProtocol.MetaPeerToken] is { } token)
+        {
+            from = peerTokens.TryGetValue(token, out var sid) ? sid : throw new JsonRpcException(JsonRpcException.InvalidRequest, "Unknown peer token");
+            if (from == target) throw new JsonRpcException(JsonRpcException.InvalidParams, "A session cannot ask itself.");
+            sender = $"peer_{store.Get(from)?.Agent ?? "agent"}";
+        }
+        var record = await FindAsync(target, ct);
+        var (rpc, _) = await EnsureLiveAsync(record, ct);
+        ServiceLog.Info($"opinion: {from ?? "client"} asks {record.Agent} {target}");
+        var forwarded = new JsonObject { ["sessionId"] = target, ["text"] = text, ["sender"] = sender ?? "peer_agent" };
+        if (from is not null) forwarded["fromSessionId"] = from;
+        try
+        {
+            return await rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, forwarded, ct);
+        }
+        catch (JsonRpcException e) when (e.Code == JsonRpcException.MethodNotFound)
+        {
+            throw new JsonRpcException(JsonRpcException.MethodNotFound, $"{record.Agent} sessions cannot be asked for opinions yet.");
+        }
+    }
+
+    /// <summary><c>_gorynych/peers</c>: the sessions the session behind <c>token</c> can ask.</summary>
+    internal JsonObject Peers(JsonRpcRequest request)
+    {
+        var token = (string?)request.Params?["token"];
+        var self = token is not null && peerTokens.TryGetValue(token, out var sid) ? sid : null;
+        var sessions = new JsonArray();
+        foreach (var r in store.All().Where(r => r.SessionId != self).OrderByDescending(r => r.UpdatedAt))
+        {
+            var live = agents.TryGetValue(r.Agent, out var host) && host.IsLive(r.SessionId);
+            sessions.Add((JsonNode)new JsonObject
+            {
+                ["session_id"] = r.SessionId,
+                ["agent"] = r.Agent,
+                ["title"] = r.Title,
+                ["cwd"] = r.Cwd,
+                ["open"] = live,
+                ["updated_at"] = r.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
+            });
+        }
+        return new JsonObject { ["sessions"] = sessions };
+    }
+
+    static string NewToken() => Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
+
+    void BindToken(string token, string sessionId)
+    {
+        peerTokens[token] = sessionId;
+        sessionTokens[sessionId] = token;
+    }
+
+    List<McpServer> PeersFor(string sessionId)
+    {
+        var token = sessionTokens.GetOrAdd(sessionId, _ => NewToken());
+        peerTokens[token] = sessionId;
+        return WithPeers([], token);
+    }
+
+    /// <summary>Adds the peers MCP server, unless the client already brought one with that name.</summary>
+    List<McpServer> WithPeers(List<McpServer>? servers, string token)
+    {
+        var list = servers is null ? [] : new List<McpServer>(servers);
+        if (options.PeerServerCommand is not { Count: > 0 } command) return list;
+        if (list.OfType<McpServerStdio>().Any(s => s.Name == PeersServer.ServerName)) return list;
+        list.Add(new McpServerStdio
+        {
+            Name = PeersServer.ServerName,
+            Command = command[0],
+            Args = [.. command.Skip(1), "--token", token],
+            Env = [],
+        });
+        return list;
     }
 
     internal JsonObject Status() => new()

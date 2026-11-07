@@ -97,6 +97,73 @@ public sealed class LiveSmokeTests
     }
 
     [TestMethod]
+    [Timeout(600_000, CooperativeCancellation = true)]
+    public async Task Kimi_AsksClaude_ForAnOpinion()
+    {
+        RequireLive();
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var root = RepoRoot();
+        var exe = ServiceExe(root);
+        var dir = TestDirs.New();
+        var pipe = "gorynych-live-" + Guid.NewGuid().ToString("N")[..8];
+        await using var conductor = new Gorynych.Service.Conductor(new Gorynych.Service.ConductorOptions
+        {
+            DataDirectory = dir,
+            ServiceId = "live",
+            PeerServerCommand = [exe, "peers", "--pipe", pipe],
+        }, [
+            new ClaudeAdapter(new ClaudeAdapterOptions { DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "channel"] }),
+            new KimiAdapter(new KimiAdapterOptions()),
+        ]);
+        using var stop = new CancellationTokenSource();
+        var listening = Gorynych.Service.PipeListener.RunAsync(conductor, pipe, stop.Token);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome
+        {
+            OptionId = r.Options.First(o => o.Kind.Value.StartsWith("allow", StringComparison.Ordinal)).OptionId,
+        });
+
+        var claude = (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+        {
+            Cwd = root, McpServers = [], Meta = new JsonObject { [GorynychProtocol.MetaAgent] = "claude" },
+        })).SessionId;
+        await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = claude, Prompt = [new TextContent { Text = "Reply with exactly READY." }] });
+
+        var kimi = (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+        {
+            Cwd = dir, McpServers = [], Meta = new JsonObject { [GorynychProtocol.MetaAgent] = "kimi" },
+        })).SessionId;
+        try
+        {
+            var before = client.Text().Length;
+            var result = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt, new PromptRequest
+            {
+                SessionId = kimi,
+                Prompt = [new TextContent { Text =
+                    $"Use the ask_agent tool (gorynych MCP server) to ask the agent session {claude} this question: " +
+                    "\"For a single-user desktop app, is SQLite or PostgreSQL the better local store? One sentence.\" " +
+                    "Then reply with ANSWER: followed by the answer you got." }],
+            });
+            Assert.AreEqual(StopReason.EndTurn, result.StopReason);
+            var kimiText = client.Text()[before..];
+            StringAssert.Contains(kimiText, "ANSWER");
+            Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call" && ((string?)u["title"] ?? "").Contains("ask_agent", StringComparison.OrdinalIgnoreCase)),
+                "Kimi called ask_agent");
+            Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "user_message_chunk"
+                && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == "channel" && ((string?)u["content"]?["text"] ?? "").Contains("peer_kimi")),
+                "the question reached Claude through the channel, from peer_kimi");
+        }
+        finally
+        {
+            try { await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = kimi }); }
+            catch (JsonRpcException) { }
+            stop.Cancel();
+            await listening;
+        }
+    }
+
+    [TestMethod]
     [Timeout(300_000, CooperativeCancellation = true)]
     public async Task Kimi_FirstPrompt()
     {

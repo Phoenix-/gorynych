@@ -152,7 +152,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 if (sessions.TryRemove(id, out var s)) await s.DisposeAsync();
                 return new JsonObject();
             }
-            case "_gorynych/opinion":
+            case GorynychProtocol.MethodOpinion:
                 return await OpinionAsync(request, ct);
             default:
                 throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {request.Method}");
