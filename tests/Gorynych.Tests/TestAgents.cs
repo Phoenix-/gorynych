@@ -93,6 +93,11 @@ sealed class TestClient : IAsyncDisposable
         return client;
     }
 
+    public JsonObject[] Snapshot()
+    {
+        lock (Updates) return Updates.ToArray();
+    }
+
     public string[] Kinds()
     {
         lock (Updates) return Updates.Select(u => (string)u["sessionUpdate"]!).ToArray();

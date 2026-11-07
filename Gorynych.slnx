@@ -6,6 +6,7 @@
     <Project Path="src/Gorynych.Service/Gorynych.Service.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Gorynych.FakeClaude/Gorynych.FakeClaude.csproj" />
     <Project Path="tests/Gorynych.Tests/Gorynych.Tests.csproj" />
   </Folder>
   <Folder Name="/tools/">

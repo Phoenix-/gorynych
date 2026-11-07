@@ -5,7 +5,33 @@ several AI coding agents (Claude Code, Codex, Kimi Code, DeepSeek Harness) in th
 native harnesses and bring their conversations, approvals and session lists into one
 place. The agents can also ask each other for opinions.
 
-Status: design done, MVP not started yet.
+Status: first MVP slice. The service runs Claude Code and Kimi Code sessions; a console
+test client stands in for the GUI.
+
+## Try it
+
+```
+dotnet build Gorynych.slnx
+dotnet test --project tests/Gorynych.Tests             # contract tests, no live agent
+GORYNYCH_LIVE=1 dotnet test --project tests/Gorynych.Tests   # also runs Claude (haiku) and Kimi
+```
+
+`tools/Gorynych.TestClient` (`gorynych-test`) starts the service if it is not running:
+
+```
+gorynych-test new --agent claude --cwd <folder> --wait-title 20 "first prompt"
+gorynych-test list
+gorynych-test prompt <session> "next prompt"
+gorynych-test load <session> [--follow]      # replays the history from the service journal
+gorynych-test opinion --to <claude session> "a question from another agent"
+gorynych-test status | shutdown
+```
+
+Approvals are asked on the console; `--approve allow|deny` answers them automatically.
+
+Specifications: [service protocol](docs/service-protocol.md), [adapters](docs/adapters.md),
+[ACP types](docs/acp-types.md). Probe programs and what they proved:
+[research/probes](research/probes/README.md).
 
 ## Shape
 

@@ -59,7 +59,7 @@ public sealed class ConductorTests
         Assert.AreEqual(JsonRpcException.AuthRequired, error.Code);
         StringAssert.Contains(error.Message, "403");
         // The service shows the shortened first prompt at once; Kimi's own title then replaces it.
-        var titles = client.Updates.Where(u => (string?)u["sessionUpdate"] == "session_info_update").Select(u => (string?)u["title"]).ToList();
+        var titles = client.Snapshot().Where(u => (string?)u["sessionUpdate"] == "session_info_update").Select(u => (string?)u["title"]).ToList();
         Assert.AreEqual(2, titles.Count);
         StringAssert.EndsWith(titles[0], "…");
         Assert.AreEqual("Create a file named hello.txt in the current directory containing the word hi, using your file writing tool. Then reply with exactly DONE.", titles[1]);

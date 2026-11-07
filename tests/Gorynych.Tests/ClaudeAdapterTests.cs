@@ -1,0 +1,75 @@
+using Gorynych.Acp;
+using Gorynych.Acp.JsonRpc;
+using Gorynych.Adapters.Claude;
+
+namespace Gorynych.Tests;
+
+/// <summary>
+/// The Claude adapter end to end — ConPTY launch, http hooks, approvals, paste after Stop,
+/// transcript title — against Gorynych.FakeClaude instead of the real binary.
+/// </summary>
+[TestClass]
+public sealed class ClaudeAdapterTests
+{
+    static string FakeClaude()
+    {
+        var config = AppContext.BaseDirectory.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}") ? "Release" : "Debug";
+        var tests = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
+        var exe = Path.Combine(tests, "Gorynych.FakeClaude", "bin", config, "net10.0", "Gorynych.FakeClaude.exe");
+        return File.Exists(exe) ? exe : throw new AssertInconclusiveException($"build Gorynych.FakeClaude first: {exe}");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task Session_FromFirstPrompt_Approval_Paste_AndTitle()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var dir = TestDirs.New();
+        var adapter = new ClaudeAdapter(new ClaudeAdapterOptions
+        {
+            DataDirectory = Path.Combine(dir, "claude"),
+            Executable = FakeClaude(),
+            StartupTimeoutSeconds = 30,
+            PasteEnterDelayMs = 200,
+        });
+        await using var conductor = TestDirs.Conductor(dir, adapter);
+        await using var client = await TestClient.ConnectAsync(conductor);
+
+        var created = await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+        {
+            Cwd = dir,
+            McpServers = [],
+            Meta = new System.Text.Json.Nodes.JsonObject { ["gorynych/agent"] = "claude" },
+        });
+
+        // First prompt: the launch argument. It asks for a Write approval.
+        var first = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = created.SessionId, Prompt = [new TextContent { Text = "please write a file" }] });
+        Assert.AreEqual(StopReason.EndTurn, first.StopReason);
+        Assert.AreEqual("Write fake.txt", client.Approvals.Single().ToolCall.Title);
+        Assert.AreEqual("wrote it", client.Text());
+        CollectionAssert.IsSubsetOf(new[] { "tool_call", "tool_call_update", "agent_message_chunk" }, client.Kinds());
+
+        // The generated title comes from the transcript a moment later.
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (DateTime.UtcNow < deadline && !client.Snapshot().Any(u => (string?)u["title"] == "Fake title")) await Task.Delay(200);
+        Assert.IsTrue(client.Snapshot().Any(u => (string?)u["title"] == "Fake title"), "ai-title from the transcript");
+
+        // Next prompt: a bracketed paste plus Enter into the running TUI, after Stop.
+        var second = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = created.SessionId, Prompt = [new TextContent { Text = "and now something\nmulti-line" }] });
+        Assert.AreEqual(StopReason.EndTurn, second.StopReason);
+        StringAssert.Contains(client.Text(), "echo: and now something");
+
+        // A denied approval reaches Claude as a deny decision and fails the tool call in the feed.
+        client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = ClaudeHooks.DenyOptionId });
+        await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = created.SessionId, Prompt = [new TextContent { Text = "write again" }] });
+        StringAssert.EndsWith(client.Text(), "not allowed");
+        Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call_update" && (string?)u["status"] == "failed"));
+
+        // The adapter lists the session with its title.
+        var list = await client.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
+        Assert.AreEqual("Fake title", list.Sessions.Single(s => s.SessionId == created.SessionId).Title);
+    }
+}

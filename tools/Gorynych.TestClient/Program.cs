@@ -13,6 +13,7 @@ using Gorynych.Acp.JsonRpc;
 //     prompt <sessionId> <prompt…>
 //     load <sessionId> [--follow]          replay the history, then optionally keep watching
 //     opinion --to <sessionId> [--sender <name>] <question…>
+Console.OutputEncoding = System.Text.Encoding.UTF8;
 var options = Options.Parse(args);
 if (options.Command is null)
 {
