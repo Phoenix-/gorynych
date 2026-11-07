@@ -293,23 +293,7 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
     /// <summary>Claude asks whether to trust a new folder; that is the person's call, so ask them.</summary>
     async Task AskTrustAsync()
     {
-        var request = new RequestPermissionRequest
-        {
-            SessionId = Id,
-            ToolCall = new ToolCallUpdate
-            {
-                ToolCallId = "trust-folder",
-                Title = $"Claude Code asks whether to trust the folder {Cwd}",
-                Kind = ToolKind.Other,
-                Status = ToolCallStatus.Pending,
-                Locations = [new ToolCallLocation { Path = Cwd }],
-            },
-            Options =
-            [
-                new PermissionOption { OptionId = ClaudeHooks.AllowOptionId, Name = "Trust this folder", Kind = PermissionOptionKind.AllowOnce },
-                new PermissionOption { OptionId = ClaudeHooks.DenyOptionId, Name = "Cancel", Kind = PermissionOptionKind.RejectOnce },
-            ],
-        };
+        var request = ClaudeHooks.TrustFolder(Id, Cwd);
         try
         {
             var response = await agent.RequestPermissionAsync(request, CancellationToken.None);

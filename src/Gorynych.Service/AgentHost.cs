@@ -112,6 +112,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     public bool CanResume => Info?.AgentCapabilities?.SessionCapabilities?.Resume is not null;
     public bool CanLoad => Info?.AgentCapabilities?.LoadSession == true;
     public bool CanClose => Info?.AgentCapabilities?.SessionCapabilities?.Close is not null;
+    public bool CanDelete => Info?.AgentCapabilities?.SessionCapabilities?.Delete is not null;
 
     public JsonObject Describe() => new()
     {

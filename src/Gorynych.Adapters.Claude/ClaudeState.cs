@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Gorynych.Acp.Hosting;
 
 namespace Gorynych.Adapters.Claude;
 
@@ -25,9 +26,12 @@ public sealed class ClaudeStateStore
     readonly Lock gate = new();
     readonly Dictionary<string, ClaudeSessionRecord> records = new(StringComparer.Ordinal);
 
-    public ClaudeStateStore(string path)
+    readonly Action<string>? log;
+
+    public ClaudeStateStore(string path, Action<string>? log = null)
     {
         this.path = path;
+        this.log = log;
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         if (!File.Exists(path)) return;
         try
@@ -58,9 +62,15 @@ public sealed class ClaudeStateStore
                 records[id] = r = new ClaudeSessionRecord { SessionId = id, Cwd = cwd, CreatedAt = now, UpdatedAt = now };
             }
             change(r);
-            var tmp = path + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(records.Values.ToList(), ClaudeJsonContext.Default.ListClaudeSessionRecord));
-            File.Move(tmp, path, overwrite: true);
+            try
+            {
+                AtomicFile.WriteAllText(path, JsonSerializer.Serialize(records.Values.ToList(), ClaudeJsonContext.Default.ListClaudeSessionRecord));
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                // The records stay in memory; the next update writes them.
+                log?.Invoke($"claude sessions file not saved, will retry with the next change: {e.Message}");
+            }
         }
     }
 }

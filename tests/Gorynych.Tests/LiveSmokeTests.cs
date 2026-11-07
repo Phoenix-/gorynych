@@ -226,6 +226,53 @@ public sealed class LiveSmokeTests
     }
 
     [TestMethod]
+    [Timeout(180_000, CooperativeCancellation = true)]
+    public async Task Kimi_DraftIsDeletedNatively_WhenItsClientLeaves()
+    {
+        RequireLive();
+        var dir = TestDirs.New();
+        await using var check = await RawKimiAsync();
+        await using var conductor = TestDirs.Conductor(dir, new KimiAdapter(new KimiAdapterOptions()));
+        string draft;
+        await using (var zed = await TestClient.ConnectAsync(conductor, "zed"))
+        {
+            // What Zed does when it opens a thread view, before any prompt.
+            draft = (await zed.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+            {
+                Cwd = dir,
+                McpServers = [],
+                Meta = new JsonObject { [GorynychProtocol.MetaAgent] = "kimi" },
+            })).SessionId;
+            CollectionAssert.Contains(await check.ListAsync(dir), draft, "Kimi keeps an empty native session for the draft");
+        }
+        Assert.IsNull(conductor.Store.Get(draft), "the service closed and deleted the draft without an error");
+        CollectionAssert.DoesNotContain(await check.ListAsync(dir), draft, "Kimi no longer has it");
+    }
+
+    /// <summary>A separate <c>kimi acp</c> to look at Kimi's own session list.</summary>
+    static async Task<RawAgent> RawKimiAsync()
+    {
+        var instance = await new KimiAdapter(new KimiAdapterOptions()).StartAsync(CancellationToken.None);
+        var rpc = new JsonRpcConnection(instance.Input, instance.Output, "kimi-check");
+        rpc.Start();
+        await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
+        return new RawAgent(instance, rpc);
+    }
+
+    sealed class RawAgent(AgentInstance instance, JsonRpcConnection rpc) : IAsyncDisposable
+    {
+        public async Task<List<string>> ListAsync(string cwd) =>
+            (await rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest { Cwd = cwd }))
+                .Sessions.Select(s => s.SessionId).ToList();
+
+        public async ValueTask DisposeAsync()
+        {
+            await rpc.DisposeAsync();
+            await instance.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
     [Timeout(300_000, CooperativeCancellation = true)]
     public async Task Kimi_FirstPrompt()
     {

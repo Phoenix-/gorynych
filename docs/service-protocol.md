@@ -30,14 +30,16 @@ for external ACP clients: `acp --agent claude|kimi` (see [external-clients.md](e
 
 | Method | What the service does |
 | --- | --- |
-| `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close`. |
-| `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`. A connection scoped to one agent sees only that agent's sessions. |
-| `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers`, forwards, records the session, attaches the client. |
+| `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`. |
+| `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`. A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out. |
+| `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers`, forwards, records the session as a draft, attaches the client. |
 | `session/load` | Opens the session in the agent (`session/resume`, or `session/load` with the agent's replay dropped), replays the service journal as `session/update`, then attaches the client. A session the journal has never seen is loaded from the agent instead, and journaled. |
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
-| `session/close`, anything else with a `sessionId` | Forwarded to the session's agent. |
+| `session/close` | Detaches the client. A draft no other client has open is deleted (see below); any other session is closed in its agent. |
+| `session/delete` | Closes the session in its agent if it is open, then deletes it there if the agent can (`sessionCapabilities.delete`); otherwise the overlay keeps a tombstone. Drops the journal. An unknown or already deleted session succeeds. |
+| anything else with a `sessionId` | Forwarded to the session's agent. |
 
 Agent → client requests go to the most recently attached client of the session:
 `session/request_permission` (an approval) to any client; `elicitation/create` (a form,
@@ -71,7 +73,7 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId` |
-| `_gorynych/peers` | method, `{token}` → `{sessions}` | the sessions the session behind `token` can ask (all others, with agent, title, folder) |
+| `_gorynych/peers` | method, `{token}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (a title; no drafts or deleted sessions), open ones first, then the newest; with agent, title, folder, `open` |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion` and `_gorynych/reply` | which session's `gorynych` MCP server is calling |
 
@@ -110,6 +112,29 @@ Verified live on 7 November 2026: Claude called `list_agents` and, after approva
 `ask_agent`; Kimi got the marked turn, answered with `reply`, and Claude used the answer.
 Kimi asking Claude goes through Claude's channel the same way.
 
+## Drafts and deletion
+
+ACP clients may create sessions before the person types anything: Zed sends `session/new`
+whenever a thread view opens and quits without `session/close`
+([external-clients.md](external-clients.md)). A session made by `session/new` is a **draft**
+until its first `session/prompt` or an opinion request delivered to it as a turn. A draft is
+deleted when
+
+- `session/close` arrives for it and no other client has it open, or
+- the last client attached to it disconnects, or
+- the service starts and finds it in the overlay from an earlier run.
+
+Deleting a draft closes it in its agent and, for an agent that can delete (Kimi, whose
+`session/new` makes a real empty session), sends `session/delete`; then the record and the
+journal go. A draft the agent fails to delete stays marked and hidden, and the next start
+tries again.
+
+`session/delete` from a client works the same way for any session, except that an agent
+that cannot delete (Claude: the service never touches `~/.claude`) keeps the session, so the
+overlay keeps a tombstone (`deleted`) and the session disappears from `session/list`,
+`_gorynych/peers`, `session/load` and `session/prompt` even though the agent still lists it.
+ACP allows such a soft delete.
+
 ## Journal
 
 Every `session/update` an adapter sends, and every prompt a client sends, is appended to
@@ -123,5 +148,10 @@ when the journal is read back.
 
 `sessions.json` holds, per session: the owning adapter, `cwd`, `title` and its source
 (`agent` when the harness gave it, `prompt` for the provisional first-prompt title),
-`createdAt`, `updatedAt`. Native state wins: a title or `updatedAt` from the harness
-replaces the overlay's.
+`createdAt`, `updatedAt`, and `draft` or `deleted` when set. Native state wins: a title or
+`updatedAt` from the harness replaces the overlay's.
+
+The file is replaced atomically (a temporary file moved over it). An antivirus scanner or
+the indexer can hold it open for a moment, so the move is retried for up to about 400 ms; a
+write that still fails is logged and the change stays in memory for the next write. The
+activity stamp of a streaming turn is written at most once a second.

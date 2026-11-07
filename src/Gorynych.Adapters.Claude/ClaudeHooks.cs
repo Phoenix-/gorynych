@@ -118,6 +118,25 @@ public static class ClaudeHooks
         };
     }
 
+    /// <summary>Claude's folder-trust dialog at the first launch in a folder, as an approval.</summary>
+    public static RequestPermissionRequest TrustFolder(string sessionId, string cwd) => new()
+    {
+        SessionId = sessionId,
+        ToolCall = new ToolCallUpdate
+        {
+            ToolCallId = "trust-folder",
+            Title = $"Claude Code asks whether to trust the folder {cwd}",
+            Kind = ToolKind.Other,
+            Status = ToolCallStatus.Pending,
+            Locations = [new ToolCallLocation { Path = cwd }],
+        },
+        Options =
+        [
+            new PermissionOption { OptionId = AllowOptionId, Name = "Trust this folder", Kind = PermissionOptionKind.AllowOnce },
+            new PermissionOption { OptionId = DenyOptionId, Name = "Cancel", Kind = PermissionOptionKind.RejectOnce },
+        ],
+    };
+
     /// <summary>
     /// AskUserQuestion is a question, not an approval: it becomes one ACP form
     /// (<c>elicitation/create</c>, form mode, scoped to the session and the tool call) with a

@@ -94,6 +94,7 @@ public sealed class BridgeTests
                 var init = await zed.InitializeAsync();
                 Assert.AreEqual("Gorynych: fake", (string?)init!["agentInfo"]!["title"]);
                 Assert.IsTrue((bool)init["agentCapabilities"]!["loadSession"]!);
+                Assert.IsNotNull(init["agentCapabilities"]!["sessionCapabilities"]!["delete"], "Zed sends session/delete only when it is advertised");
 
                 var created = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew,
                     new JsonObject { ["cwd"] = Path.GetTempPath(), ["mcpServers"] = new JsonArray() }).WaitAsync(Wait);
@@ -101,8 +102,7 @@ public sealed class BridgeTests
                 Assert.AreEqual("fake-1", sessionId, "a session made without _meta goes to the bridge's agent");
 
                 var list = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject()).WaitAsync(Wait);
-                CollectionAssert.AreEqual(new[] { "fake-1" }, list!["sessions"]!.AsArray().Select(s => (string)s!["sessionId"]!).ToArray(),
-                    "the list shows only the bridge's agent");
+                Assert.AreEqual(0, list!["sessions"]!.AsArray().Count, "a draft (never prompted) is not listed, nor the other agent's session");
 
                 var result = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject
                 {
@@ -110,6 +110,9 @@ public sealed class BridgeTests
                     ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "go" }),
                 }).WaitAsync(Wait);
                 Assert.AreEqual("end_turn", (string?)result!["stopReason"]);
+                list = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject()).WaitAsync(Wait);
+                CollectionAssert.AreEqual(new[] { "fake-1" }, list!["sessions"]!.AsArray().Select(s => (string)s!["sessionId"]!).ToArray(),
+                    "the list shows only the bridge's agent");
 
                 var question = zed.Approvals.Single();
                 Assert.AreEqual("Which color?", question.ToolCall.Title);

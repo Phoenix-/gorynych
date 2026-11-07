@@ -94,9 +94,10 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         signal.TrySetResult();
     }
 
-    public void Detach(ClientConnection client)
+    /// <returns>True when the client was attached.</returns>
+    public bool Detach(ClientConnection client)
     {
-        lock (clientsGate) clients.Remove(client);
+        lock (clientsGate) return clients.Remove(client);
     }
 
     /// <summary>

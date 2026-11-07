@@ -38,6 +38,7 @@ public sealed class PeersTests
             AcpMethods.Agent.Initialize => ScriptedAgent.Init(),
             AcpMethods.Agent.SessionNew => AcpJson.ToNode(new NewSessionResponse { SessionId = "answering" }),
             AcpMethods.Agent.SessionList => AcpJson.ToNode(new ListSessionsResponse { Sessions = [] }),
+            AcpMethods.Agent.SessionPrompt => AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn }),
             GorynychProtocol.MethodOpinion => RecordOpinion(opinions, req),
             _ => throw new JsonRpcException(JsonRpcException.MethodNotFound, req.Method),
         }));
@@ -63,6 +64,14 @@ public sealed class PeersTests
         Meta = new JsonObject { [GorynychProtocol.MetaAgent] = agent },
     };
 
+    /// <summary>Creates the answering session and gives it history, so <c>list_agents</c> shows it.</summary>
+    static async Task NewAnsweringSessionAsync(TestClient client)
+    {
+        await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("answerer"));
+        await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = "answering", Prompt = [new TextContent { Text = "Pick a database for the cockpit" }] });
+    }
+
     [TestMethod]
     public async Task Service_GivesEachSessionThePeerServer_AndKnowsWhoAsks()
     {
@@ -74,7 +83,7 @@ public sealed class PeersTests
             PeerServerCommand = [@"C:\svc\Gorynych.Service.exe", "peers", "--pipe", "p"],
         }, [asker, answerer]);
         await using var client = await TestClient.ConnectAsync(conductor);
-        await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("answerer"));
+        await NewAnsweringSessionAsync(client);
         await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("asker"));
 
         var server = servers.Single();
@@ -123,7 +132,7 @@ public sealed class PeersTests
         using var stop = new CancellationTokenSource();
         var listening = PipeListener.RunAsync(conductor, pipe, stop.Token);
         await using var client = await TestClient.ConnectAsync(conductor);
-        await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("answerer"));
+        await NewAnsweringSessionAsync(client);
         await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("asker"));
         var server = servers.Single();
 

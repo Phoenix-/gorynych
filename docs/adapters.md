@@ -18,6 +18,10 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
 - `session/list` returns titles and `updatedAt`.
 - Approvals arrive as `session/request_permission` with Kimi's own options (approve once,
   approve for this session, reject); tool calls stream their arguments as `tool_call_update`.
+- `session/new` creates a real, empty native session, which Kimi lists. The service
+  deletes it with Kimi's own `session/delete` (after `session/close`) when it stays a draft,
+  and forwards a client's `session/delete` the same way. Verified live on 7 November 2026
+  (`Kimi_DraftIsDeletedNatively_WhenItsClientLeaves`).
 - Verified live on 7 November 2026 after logging in: first prompt, a Write approval, the
   title, replay through the service journal, and `ask_agent` to a Claude session. Before
   the login every turn failed with `-32000 Authentication required: 403`, which the service
@@ -45,6 +49,12 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
   approvals without asking.
 - The session ID is chosen by the adapter at `session/new` and passed as `--session-id`;
   later launches use `--resume` and pass every flag again (resume does not restore them).
+- `session/new` launches nothing. The adapter's own list (`claude/sessions.json` in the
+  service data, used for `session/list` and `session/resume`) gets the session at its first
+  prompt, so a draft that is never prompted leaves nothing behind.
+- The adapter does not advertise `session/delete`: the transcript belongs to `~/.claude`.
+  Deleting a Claude session closes it (the process exits) and the service hides it with a
+  tombstone in its overlay; `claude --resume` in a terminal still finds it.
 - Environment: `CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_AGENT_SDK*` and, when started from
   inside another Claude Code session, `ANTHROPIC_BASE_URL` and the desktop MCP variables
   are removed, so the child uses the user's own login.

@@ -17,7 +17,7 @@ Console.OutputEncoding = System.Text.Encoding.UTF8;
 var options = Options.Parse(args);
 if (options.Command is null)
 {
-    Console.Error.WriteLine("usage: gorynych-test [--pipe name] [--approve ask|allow|deny] status|list|new|prompt|load|opinion|shutdown …");
+    Console.Error.WriteLine("usage: gorynych-test [--pipe name] [--approve ask|allow|deny] status|list|new|prompt|load|delete|opinion|shutdown …");
     return 2;
 }
 
@@ -115,6 +115,13 @@ switch (options.Command)
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
             try { await Task.Delay(Timeout.Infinite, stop.Token); } catch (OperationCanceledException) { }
         }
+        return 0;
+    }
+    case "delete":
+    {
+        var id = options.Positional(0);
+        await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = id });
+        Info($"session {id} deleted");
         return 0;
     }
     case "opinion":

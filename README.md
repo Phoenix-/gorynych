@@ -24,6 +24,7 @@ gorynych-test new --agent claude --cwd <folder> --wait-title 20 "first prompt"
 gorynych-test list
 gorynych-test prompt <session> "next prompt"
 gorynych-test load <session> [--follow]      # replays the history from the service journal
+gorynych-test delete <session>               # natively for Kimi; hidden for Claude
 gorynych-test opinion --to <claude session> "a question from another agent"
 gorynych-test status | shutdown
 ```

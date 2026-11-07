@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Gorynych.Acp.Hosting;
 
 namespace Gorynych.Service;
 
@@ -16,6 +17,21 @@ public sealed class SessionRecord
 
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
+
+    /// <summary>
+    /// Made by <c>session/new</c> and not prompted yet (nor asked for an opinion). Clients such
+    /// as Zed create sessions eagerly, so the service deletes a draft when it is closed or its
+    /// clients leave, and sweeps drafts left over from an earlier run at start.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool Draft { get; set; }
+
+    /// <summary>
+    /// Deleted by a client while its agent cannot delete sessions itself (Claude): a tombstone
+    /// that keeps the session out of every list, since the harness still has it.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool Deleted { get; set; }
 }
 
 public sealed class ServiceState
@@ -36,9 +52,14 @@ internal sealed partial class ServiceJsonContext : JsonSerializerContext;
 /// </summary>
 public sealed class SessionStore
 {
+    /// <summary>How often a bare activity stamp (<see cref="Touch"/>) is written at most.</summary>
+    static readonly TimeSpan TouchSaveInterval = TimeSpan.FromSeconds(1);
+
     readonly string path;
     readonly Lock gate = new();
     readonly Dictionary<string, SessionRecord> records = new(StringComparer.Ordinal);
+    bool dirty;
+    long lastSave;
 
     public SessionStore(string path)
     {
@@ -70,15 +91,24 @@ public sealed class SessionStore
     {
         lock (gate)
         {
-            if (!records.TryGetValue(sessionId, out var r))
-            {
-                var now = DateTimeOffset.UtcNow;
-                r = new SessionRecord { SessionId = sessionId, Agent = agent, CreatedAt = now, UpdatedAt = now };
-                records[sessionId] = r;
-            }
+            var r = GetOrCreate(sessionId, agent);
             change(r);
             Save();
             return Clone(r);
+        }
+    }
+
+    /// <summary>
+    /// Stamps activity on a session. Streaming produces many updates a second, so the stamp is
+    /// written at most once per <see cref="TouchSaveInterval"/>; the next save carries it anyway.
+    /// </summary>
+    public void Touch(string sessionId, string agent)
+    {
+        lock (gate)
+        {
+            GetOrCreate(sessionId, agent).UpdatedAt = DateTimeOffset.UtcNow;
+            dirty = true;
+            if (Environment.TickCount64 - lastSave >= TouchSaveInterval.TotalMilliseconds) Save();
         }
     }
 
@@ -88,17 +118,43 @@ public sealed class SessionStore
             if (records.Remove(sessionId)) Save();
     }
 
+    /// <summary>Writes pending changes, such as a recent <see cref="Touch"/>.</summary>
+    public void Flush()
+    {
+        lock (gate)
+            if (dirty) Save();
+    }
+
+    SessionRecord GetOrCreate(string sessionId, string agent)
+    {
+        if (records.TryGetValue(sessionId, out var r)) return r;
+        var now = DateTimeOffset.UtcNow;
+        return records[sessionId] = new SessionRecord { SessionId = sessionId, Agent = agent, CreatedAt = now, UpdatedAt = now };
+    }
+
+    /// <summary>
+    /// Writes the whole file. A write that still fails after <see cref="AtomicFile"/>'s retries
+    /// is logged and left pending: the records stay in memory and the next save writes them.
+    /// </summary>
     void Save()
     {
+        dirty = true;
         var json = JsonSerializer.Serialize(records.Values.OrderBy(r => r.CreatedAt).ToList(), ServiceJsonContext.Default.ListSessionRecord);
-        var tmp = path + ".tmp";
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, path, overwrite: true);
+        try
+        {
+            AtomicFile.WriteAllText(path, json);
+            dirty = false;
+            lastSave = Environment.TickCount64;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            ServiceLog.Warn($"sessions file not saved, will retry with the next change: {e.Message}");
+        }
     }
 
     static SessionRecord Clone(SessionRecord r) => new()
     {
         SessionId = r.SessionId, Agent = r.Agent, Cwd = r.Cwd, Title = r.Title, TitleSource = r.TitleSource,
-        CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt,
+        CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt, Draft = r.Draft, Deleted = r.Deleted,
     };
 }

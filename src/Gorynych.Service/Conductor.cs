@@ -41,6 +41,8 @@ public sealed class Conductor : IAsyncDisposable
     readonly ConcurrentDictionary<string, string> peerTokens = new(StringComparer.Ordinal);   // token -> session
     readonly ConcurrentDictionary<string, string> sessionTokens = new(StringComparer.Ordinal); // session -> token
     readonly ConcurrentDictionary<string, PendingOpinion> pendingOpinions = new(StringComparer.Ordinal); // message_id -> request
+    readonly ConcurrentDictionary<string, byte> removed = new(StringComparer.Ordinal); // deleted in this run
+    readonly List<string> startupDrafts;
     long opinionCount;
 
     /// <summary>The gorynych tools an agent may call without asking: looking who is there, and answering.</summary>
@@ -53,6 +55,7 @@ public sealed class Conductor : IAsyncDisposable
         journalDirectory = Path.Combine(options.DataDirectory, "journal");
         Directory.CreateDirectory(journalDirectory);
         store = new SessionStore(Path.Combine(options.DataDirectory, "sessions.json"));
+        startupDrafts = store.All().Where(r => r.Draft).Select(r => r.SessionId).ToList();
         foreach (var a in adapters) agents[a.Name] = new AgentHost(a, this);
         DefaultAgent = options.DefaultAgent ?? agents.Keys.FirstOrDefault() ?? throw new ArgumentException("no adapters");
     }
@@ -81,14 +84,20 @@ public sealed class Conductor : IAsyncDisposable
         finally
         {
             clients.TryRemove(client, out _);
-            foreach (var feed in feeds.Values) feed.Detach(client);
+            var left = new List<string>();
+            foreach (var feed in feeds.Values)
+                if (feed.Detach(client)) left.Add(feed.SessionId);
             await client.Rpc.DisposeAsync();
             ServiceLog.Info($"{name}: disconnected");
+            // A draft goes with the last client that had it open.
+            foreach (var sessionId in left) await DiscardDraftAsync(sessionId);
         }
     }
 
     internal SessionFeed Feed(string sessionId) =>
-        feeds.GetOrAdd(sessionId, id => new SessionFeed(id, new SessionJournal(Path.Combine(journalDirectory, SessionJournal.FileNameFor(id)), options.JournalMaxEntries)));
+        feeds.GetOrAdd(sessionId, id => new SessionFeed(id, new SessionJournal(JournalPath(id), options.JournalMaxEntries)));
+
+    string JournalPath(string sessionId) => Path.Combine(journalDirectory, SessionJournal.FileNameFor(sessionId));
 
     internal AgentHost HostOf(SessionRecord record) =>
         agents.TryGetValue(record.Agent, out var host)
@@ -108,7 +117,7 @@ public sealed class Conductor : IAsyncDisposable
     internal async Task OnAgentNotificationAsync(AgentHost host, string method, JsonNode? @params)
     {
         var sessionId = (string?)@params?["sessionId"];
-        if (sessionId is null) return;
+        if (sessionId is null || removed.ContainsKey(sessionId)) return;
         var feed = Feed(sessionId);
         if (method == AcpMethods.Client.SessionUpdate)
         {
@@ -125,16 +134,15 @@ public sealed class Conductor : IAsyncDisposable
 
     void Remember(AgentHost host, string sessionId, JsonObject update)
     {
-        var kind = (string?)update["sessionUpdate"];
-        store.Update(sessionId, host.Name, r =>
-        {
-            r.UpdatedAt = DateTimeOffset.UtcNow;
-            if (kind == "session_info_update" && (string?)update["title"] is { Length: > 0 } title)
+        if ((string?)update["sessionUpdate"] == "session_info_update" && (string?)update["title"] is { Length: > 0 } title)
+            store.Update(sessionId, host.Name, r =>
             {
+                r.UpdatedAt = DateTimeOffset.UtcNow;
                 r.Title = title;
                 r.TitleSource = "agent";
-            }
-        });
+            });
+        else
+            store.Touch(sessionId, host.Name);
     }
 
     /// <summary>
@@ -188,6 +196,7 @@ public sealed class Conductor : IAsyncDisposable
                         new ListSessionsRequest { Cwd = request.Cwd, Cursor = cursor }, ct);
                     foreach (var s in r.Sessions)
                     {
+                        if (removed.ContainsKey(s.SessionId) || store.Get(s.SessionId) is { Draft: true } or { Deleted: true }) continue;
                         var record = store.Update(s.SessionId, host.Name, rec =>
                         {
                             var discovered = rec.Cwd.Length == 0;
@@ -208,7 +217,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         foreach (var r in store.All())
         {
-            if (found.ContainsKey(r.SessionId)) continue;
+            if (found.ContainsKey(r.SessionId) || r.Draft || r.Deleted) continue;
             if (agentScope is not null && r.Agent != agentScope) continue;
             if (request.Cwd is not null && !string.Equals(Path.GetFullPath(r.Cwd), Path.GetFullPath(request.Cwd), StringComparison.OrdinalIgnoreCase)) continue;
             if (agents.TryGetValue(r.Agent, out var host) && host.IsRunning && host.CanList) continue; // the agent no longer has it
@@ -246,7 +255,7 @@ public sealed class Conductor : IAsyncDisposable
         var response = await rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, request, ct);
         BindToken(token, response.SessionId);
         host.MarkLive(response.SessionId);
-        store.Update(response.SessionId, host.Name, r => r.Cwd = request.Cwd);
+        store.Update(response.SessionId, host.Name, r => { r.Cwd = request.Cwd; r.Draft = true; });
         Feed(response.SessionId).Attach(client);
         response.Meta ??= [];
         response.Meta[GorynychProtocol.MetaAgent] = host.Name;
@@ -257,9 +266,12 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>Resolves a session ID the client names, refreshing from the agents if needed.</summary>
     internal async Task<SessionRecord> FindAsync(string sessionId, CancellationToken ct)
     {
-        if (store.Get(sessionId) is { } known) return known;
-        await ListAsync(new ListSessionsRequest(), ct);
-        return store.Get(sessionId) ?? throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Unknown session {sessionId}");
+        var known = store.Get(sessionId);
+        if (known is { Deleted: false }) return known;
+        if (known is null) await ListAsync(new ListSessionsRequest(), ct);
+        return store.Get(sessionId) is { Deleted: false } found
+            ? found
+            : throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Unknown session {sessionId}");
     }
 
     /// <summary>
@@ -361,6 +373,7 @@ public sealed class Conductor : IAsyncDisposable
     {
         var prompt = request.ParamsAs<PromptRequest>();
         var record = await FindAsync(prompt.SessionId, ct);
+        if (record.Draft) record = store.Update(record.SessionId, record.Agent, r => r.Draft = false);
         var (rpc, _) = await EnsureLiveAsync(record, ct);
         var feed = Feed(record.SessionId);
         feed.Attach(client);
@@ -387,7 +400,7 @@ public sealed class Conductor : IAsyncDisposable
         foreach (var block in prompt.Prompt)
         {
             var update = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = block })!.AsObject();
-            await feed.PublishAsync(update, except: client, () => store.Update(record.SessionId, record.Agent, r => r.UpdatedAt = DateTimeOffset.UtcNow));
+            await feed.PublishAsync(update, except: client, () => store.Touch(record.SessionId, record.Agent));
         }
         if (record.Title is null && FirstText(prompt.Prompt) is { } text)
         {
@@ -437,6 +450,7 @@ public sealed class Conductor : IAsyncDisposable
     internal async Task<JsonNode?> CloseAsync(ClientConnection client, string sessionId, JsonRpcRequest request, CancellationToken ct)
     {
         Feed(sessionId).Detach(client);
+        if (await DiscardDraftAsync(sessionId)) return new JsonObject();
         var record = await FindAsync(sessionId, ct);
         var host = HostOf(record);
         if (!host.IsRunning || !host.IsLive(sessionId)) return new JsonObject();
@@ -445,6 +459,108 @@ public sealed class Conductor : IAsyncDisposable
         var result = await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
         host.MarkClosed(sessionId);
         return result;
+    }
+
+    // ---------------------------------------------------------------- drafts and deletion
+
+    /// <summary>
+    /// <c>session/delete</c>. The session is closed in its agent first if it is open there,
+    /// then deleted natively when the agent can delete (Kimi); otherwise (Claude, whose files
+    /// the service never touches) it stays in the harness and the overlay keeps a tombstone that
+    /// hides it from every list. An unknown or already deleted session succeeds.
+    /// </summary>
+    internal async Task<JsonNode?> DeleteAsync(string sessionId, CancellationToken ct)
+    {
+        if (store.Get(sessionId) is not { Deleted: false } record) return new JsonObject();
+        var native = false;
+        if (agents.TryGetValue(record.Agent, out var host))
+        {
+            try
+            {
+                native = await DeleteInAgentAsync(host, sessionId, ct);
+            }
+            catch (Exception e) when (e is IOException or InvalidOperationException or System.ComponentModel.Win32Exception)
+            {
+                ServiceLog.Warn($"{host.Name}: cannot reach the agent to delete {sessionId}, hiding it instead: {e.Message}");
+            }
+        }
+        Forget(record, tombstone: !native && !record.Draft);
+        ServiceLog.Info($"{record.Agent}: deleted session {sessionId}{(native ? "" : " (hidden; the harness keeps it)")}");
+        return new JsonObject();
+    }
+
+    /// <summary>
+    /// Deletes a draft (a session never prompted) once no client has it open: natively when its
+    /// agent can, and from the overlay. Returns false when the session is not a draft or a
+    /// client still has it. A failure keeps the draft for the sweep at the next start.
+    /// </summary>
+    async Task<bool> DiscardDraftAsync(string sessionId)
+    {
+        if (shutdown.IsCancellationRequested || Volatile.Read(ref disposed) != 0) return false;
+        if (store.Get(sessionId) is not { Draft: true } record) return false;
+        if (feeds.TryGetValue(sessionId, out var feed) && feed.Clients().Length > 0) return false;
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            if (agents.TryGetValue(record.Agent, out var host)) await DeleteInAgentAsync(host, sessionId, timeout.Token);
+            Forget(record, tombstone: false);
+            ServiceLog.Info($"{record.Agent}: discarded draft session {sessionId}");
+            return true;
+        }
+        catch (Exception e) when (e is IOException or JsonRpcException or InvalidOperationException or OperationCanceledException
+            or ObjectDisposedException or System.ComponentModel.Win32Exception)
+        {
+            ServiceLog.Warn($"{record.Agent}: draft {sessionId} not discarded, the next start tries again: {e.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Deletes the drafts an earlier run left behind (a client quit without closing them). Called once at start.</summary>
+    public async Task SweepDraftsAsync()
+    {
+        foreach (var sessionId in startupDrafts) await DiscardDraftAsync(sessionId);
+    }
+
+    /// <summary>Closes the session in its agent if it is open there, then deletes it if the agent can delete.</summary>
+    /// <returns>True when the agent deleted it (or no longer had it).</returns>
+    static async Task<bool> DeleteInAgentAsync(AgentHost host, string sessionId, CancellationToken ct)
+    {
+        var rpc = await host.GetAsync(ct);
+        if (host.IsLive(sessionId))
+        {
+            if (host.CanClose)
+                try { await rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = sessionId }, ct); }
+                catch (JsonRpcException e) { ServiceLog.Warn($"{host.Name}: session/close {sessionId}: {e.Message}"); }
+            host.MarkClosed(sessionId);
+        }
+        if (!host.CanDelete) return false;
+        try
+        {
+            await rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, AcpJson.ToNode(new DeleteSessionRequest { SessionId = sessionId }), ct);
+        }
+        catch (JsonRpcException e) when (e.Code == JsonRpcException.ResourceNotFound)
+        {
+        }
+        return true;
+    }
+
+    /// <summary>Drops the service's state of a deleted session: its record (or a tombstone), journal and peer token.</summary>
+    void Forget(SessionRecord record, bool tombstone)
+    {
+        var id = record.SessionId;
+        removed[id] = 0;
+        if (tombstone) store.Update(id, record.Agent, r => { r.Deleted = true; r.Draft = false; });
+        else store.Remove(id);
+        try
+        {
+            if (feeds.TryRemove(id, out var feed)) feed.Journal.Delete();
+            else File.Delete(JournalPath(id));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            ServiceLog.Warn($"journal of {id} not deleted: {e.Message}");
+        }
+        if (sessionTokens.TryRemove(id, out var token)) peerTokens.TryRemove(token, out _);
     }
 
     // ---------------------------------------------------------------- opinions between agents
@@ -511,7 +627,11 @@ public sealed class Conductor : IAsyncDisposable
                 };
                 if (from is not null) meta["gorynych/fromSessionId"] = from;
                 var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = new TextContent { Text = text }, Meta = meta })!.AsObject();
-                await feed.PublishAsync(asked, except: null, () => store.Update(record.SessionId, record.Agent, r => r.UpdatedAt = DateTimeOffset.UtcNow));
+                await feed.PublishAsync(asked, except: null, () => store.Update(record.SessionId, record.Agent, r =>
+                {
+                    r.UpdatedAt = DateTimeOffset.UtcNow;
+                    r.Draft = false;
+                }));
                 feed.BeginOpinionTurn(messageId);
                 Task<JsonNode?> response;
                 await feed.ForwardGate.WaitAsync(CancellationToken.None);
@@ -596,9 +716,13 @@ public sealed class Conductor : IAsyncDisposable
         var token = (string?)request.Params?["token"];
         var self = token is not null && peerTokens.TryGetValue(token, out var sid) ? sid : null;
         var sessions = new JsonArray();
-        foreach (var r in store.All().Where(r => r.SessionId != self).OrderByDescending(r => r.UpdatedAt))
+        // Sessions with history only (every prompted session has a title), open ones first.
+        var candidates = store.All()
+            .Where(r => r.SessionId != self && !r.Draft && !r.Deleted && !string.IsNullOrEmpty(r.Title))
+            .Select(r => (Record: r, Live: agents.TryGetValue(r.Agent, out var host) && host.IsLive(r.SessionId)))
+            .OrderByDescending(c => c.Live).ThenByDescending(c => c.Record.UpdatedAt);
+        foreach (var (r, live) in candidates)
         {
-            var live = agents.TryGetValue(r.Agent, out var host) && host.IsLive(r.SessionId);
             sessions.Add((JsonNode)new JsonObject
             {
                 ["session_id"] = r.SessionId,
@@ -691,6 +815,7 @@ public sealed class Conductor : IAsyncDisposable
         foreach (var host in agents.Values)
             try { await host.DisposeAsync(); }
             catch (Exception e) { ServiceLog.Warn($"{host.Name}: stop failed: {e.Message}"); }
+        store.Flush();
         shutdown.Dispose();
     }
 }

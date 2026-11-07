@@ -124,9 +124,7 @@ public sealed class SessionJournal
 
     void Rewrite(List<string> all)
     {
-        var tmp = path + ".tmp";
-        File.WriteAllText(tmp, string.Join("\n", all) + "\n", Encoding.UTF8);
-        File.Move(tmp, path, overwrite: true);
+        Gorynych.Acp.Hosting.AtomicFile.WriteAllText(path, string.Join("\n", all) + "\n", Encoding.UTF8);
     }
 
     /// <summary>A file name for a session ID that may contain characters a file system rejects.</summary>

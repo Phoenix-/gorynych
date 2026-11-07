@@ -66,6 +66,8 @@ internal sealed class ClientConnection
                 return await conductor.PromptAsync(this, request, ct);
             case AcpMethods.Agent.SessionClose:
                 return await conductor.CloseAsync(this, RequireSession(request), request, ct);
+            case AcpMethods.Agent.SessionDelete:
+                return await conductor.DeleteAsync(RequireSession(request), ct);
             case GorynychProtocol.MethodStatus:
                 return conductor.Status();
             case GorynychProtocol.MethodOpinion:
@@ -79,7 +81,7 @@ internal sealed class ClientConnection
                 _ = Task.Delay(200).ContinueWith(_ => conductor.RequestShutdown(), TaskScheduler.Default);
                 return new JsonObject();
             default:
-                // Anything else about a session (modes, config options, delete) goes to its agent.
+                // Anything else about a session (modes, config options) goes to its agent.
                 if ((string?)request.Params?["sessionId"] is { } sid)
                     return await conductor.ForwardAsync(request, sid, ct);
                 throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {request.Method}");
@@ -112,6 +114,7 @@ internal sealed class ClientConnection
                 List = new SessionListCapabilities(),
                 Resume = new SessionResumeCapabilities(),
                 Close = new SessionCloseCapabilities(),
+                Delete = new SessionDeleteCapabilities(),
             },
         },
         AuthMethods = [],

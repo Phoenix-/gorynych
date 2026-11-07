@@ -24,7 +24,8 @@ Checked by `BridgeTests` (a client that sends no `_meta` and declares no forms, 
 terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real Claude:
 
 - `initialize`: agent `gorynych`, title `Gorynych: Claude Code` or `Gorynych: Kimi Code`,
-  `loadSession`, `sessionCapabilities.list/resume/close`, no auth methods, text prompts only.
+  `loadSession`, `sessionCapabilities.list/resume/close/delete`, no auth methods, text
+  prompts only.
 - The feed is standard `session/update`: message and thought chunks, `tool_call`,
   `tool_call_update`, `plan`, `usage_update`, `session_info_update`. Gorynych's own
   `_meta` keys can be ignored.
@@ -35,8 +36,41 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
   text is declined, and Claude then asks in plain text.
 - The service and its agents never call the client's `fs/*` or `terminal/*`.
 - `session/load` replays the history from the service journal.
+- Sessions created but never prompted (drafts) are deleted when the client closes them or
+  goes away, and are not listed ([service-protocol.md](service-protocol.md#drafts-and-deletion)).
 
 ## Zed
+
+### What Zed does with sessions
+
+From Zed's source (main `b5cd310`, `crates/agent_servers/src/acp/v1.rs`, `crates/agent_ui`),
+and what the service does about it:
+
+- `session/new` is eager: it fires when a thread view is created (the panel opens, `+`),
+  before any prompt. Zed does not keep the IDs of such drafts, so every restart makes
+  another one, and quitting kills the bridge without `session/close`. The service deletes
+  these drafts when the bridge disconnects, and sweeps any left over at its next start.
+- `session/close` is sent, because the service advertises `close`, when Zed drops a thread:
+  a thread or draft removed or replaced, idle threads beyond the five it keeps, an
+  abandoned new or load. Archiving and quitting send nothing.
+- Archiving is local to Zed. Deleting a thread from its history sends `session/delete` only
+  if the agent advertises `sessionCapabilities.delete`, which the service does; a
+  "not found" error (`-32002`) counts as success.
+- `session/list` is called only from the "Import threads" dialog. It passes no `cwd`,
+  follows `nextCursor`, and imports the sessions as archived threads.
+- Forms (`elicitation/create`) need no flag. Zed renders string (with `minLength`,
+  `maxLength`, `pattern`, `format`), single choice (`enum` or titled `oneOf`, never both),
+  number, integer, boolean, and multi-select arrays of strings or titled `anyOf` (with
+  `minItems`/`maxItems`). A required property it cannot render, or a string with both
+  `enum` and `oneOf`, fails the whole form with `-32602`.
+- Approvals accept only the option kinds `allow_once`, `allow_always`, `reject_once` and
+  `reject_always`, and distinct option IDs; anything else fails the request with `-32602`.
+  An unknown `toolCallId` makes Zed create the tool call.
+
+`SessionLifecycleTests.ZedRules` checks the forms the Claude adapter builds and every
+approval the service and the Claude adapter emit against these rules.
+
+### Settings
 
 Zed registers custom agents under `agent_servers` in its `settings.json`
 ([docs](https://zed.dev/docs/ai/external-agents)). Open it from Zed with

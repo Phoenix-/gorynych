@@ -58,7 +58,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     {
         this.options = options;
         this.rpc = rpc;
-        state = new ClaudeStateStore(Path.Combine(options.DataDirectory, "sessions.json"));
+        state = new ClaudeStateStore(Path.Combine(options.DataDirectory, "sessions.json"), options.Log);
         Channel = options.ChannelServerCommand is { Count: > 0 } command ? new ChannelHost(command) : null;
         rpc.RequestHandler = HandleAsync;
         rpc.NotificationHandler = OnNotificationAsync;
@@ -109,8 +109,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 var p = request.ParamsAs<NewSessionRequest>();
                 var cwd = RequireDirectory(p.Cwd);
                 var id = Guid.NewGuid().ToString();
+                // Recorded at the first prompt: a session nobody prompts never reaches the list.
                 sessions[id] = new ClaudeSession(this, options, id, cwd, resume: false) { McpServers = p.McpServers };
-                state.Update(id, cwd, _ => { });
                 return AcpJson.ToNode(new NewSessionResponse { SessionId = id });
             }
             case AcpMethods.Agent.SessionList:
@@ -142,6 +142,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 var text = string.Join("\n\n", p.Prompt.Select(BlockText).Where(t => t.Length > 0));
                 if (text.Length == 0) throw new JsonRpcException(JsonRpcException.InvalidParams, "The prompt has no text.");
                 var sequence = request.Sequence;
+                state.Update(session.Id, session.Cwd, _ => { });
                 var stop = await session.PromptAsync(text,
                     () => cancelledAt.TryGetValue(session.Id, out var at) && at > sequence, ct);
                 state.Update(session.Id, session.Cwd, r => r.UpdatedAt = DateTimeOffset.UtcNow);

@@ -63,6 +63,9 @@ await using var conductor = new Conductor(new ConductorOptions
     PeerServerCommand = args.Contains("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
 }, adapters);
 
+// Drafts a client left behind in an earlier run (Zed quits without closing them).
+_ = Task.Run(conductor.SweepDraftsAsync);
+
 using var stop = CancellationTokenSource.CreateLinkedTokenSource(conductor.ShutdownRequested);
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; Stop(stop); };
 AppDomain.CurrentDomain.ProcessExit += (_, _) => Stop(stop);
