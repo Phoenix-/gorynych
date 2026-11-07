@@ -21,3 +21,7 @@ Status: design done, MVP not started yet.
   - Claude as its interactive TUI in a pseudo console, driven only by per-launch flags.
 
 Stage one is a single local machine. The service/GUI split is there from day one.
+
+## License
+
+[MIT](LICENSE)
