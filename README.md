@@ -6,7 +6,8 @@ native harnesses and bring their conversations, approvals and session lists into
 place. The agents can also ask each other for opinions.
 
 Status: first MVP slice. The service runs Claude Code and Kimi Code sessions, and they can
-ask each other for opinions; a console test client stands in for the GUI.
+ask each other for opinions. Zed serves as the GUI through a stdio bridge
+([external clients](docs/external-clients.md)); a console test client covers the rest.
 
 ## Try it
 
@@ -41,8 +42,10 @@ Specifications: [service protocol](docs/service-protocol.md), [adapters](docs/ad
 - **Service.** A per-user background process on each machine. It owns the agent
   processes, keeps a bounded journal for every session and speaks
   [ACP](https://agentclientprotocol.com) v1 to the GUI.
-- **GUI.** Windows, C# and WinUI. It connects to one or more services and shows a
-  combined session list, the feed, the composer and approval cards.
+- **GUI.** Any ACP client. Stage one uses [Zed](https://zed.dev), which runs the service
+  as an external agent, one entry per agent. An own cockpit in C# and WinUI comes when
+  Zed's limits bite: it would connect to several services and show a combined session
+  list, the feed, the composer, approval cards and the opinions between agents.
 - **Adapters.** Each agent plugs in as an ACP agent:
   - Kimi through `kimi acp`;
   - Codex through `codex app-server`;
