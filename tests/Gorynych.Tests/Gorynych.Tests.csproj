@@ -2,6 +2,7 @@
   <PropertyGroup>
     <IsPackable>false</IsPackable>
     <OutputType>Exe</OutputType>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <EnableMSTestRunner>true</EnableMSTestRunner>
   </PropertyGroup>
   <ItemGroup>
@@ -12,6 +13,8 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Gorynych.Acp\Gorynych.Acp.csproj" />
+    <ProjectReference Include="..\..\src\Gorynych.Service\Gorynych.Service.csproj" />
+    <ProjectReference Include="..\..\src\Gorynych.Adapters.Claude\Gorynych.Adapters.Claude.csproj" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />

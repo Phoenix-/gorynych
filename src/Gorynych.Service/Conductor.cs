@@ -335,7 +335,9 @@ public sealed class Conductor : IAsyncDisposable
             var info = AcpJson.ToNode<SessionUpdate>(new SessionInfoUpdate { Title = title })!.AsObject();
             if (!feed.IsRepeatedTitle(info)) await feed.PublishAsync(info, except: null, () => { });
         }
-        return await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
+        // A turn outlives the client that started it: closing the GUI must not stop the agent.
+        // Stopping a turn is an explicit session/cancel.
+        return await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), CancellationToken.None);
     }
 
     internal async Task<JsonNode?> ForwardAsync(JsonRpcRequest request, string sessionId, CancellationToken ct)
