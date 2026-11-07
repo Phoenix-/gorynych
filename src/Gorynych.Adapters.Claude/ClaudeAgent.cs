@@ -86,6 +86,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         switch (request.Method)
         {
             case AcpMethods.Agent.Initialize:
+                ClientHasForms = request.ParamsAs<InitializeRequest>().ClientCapabilities?.Elicitation?.Form is not null;
                 return AcpJson.ToNode(new InitializeResponse
                 {
                     ProtocolVersion = AcpMethods.ProtocolVersion,
@@ -200,6 +201,12 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     public Task<RequestPermissionResponse> RequestPermissionAsync(RequestPermissionRequest request, CancellationToken ct) =>
         rpc.RequestAsync<RequestPermissionRequest, RequestPermissionResponse>(AcpMethods.Client.SessionRequestPermission, request, ct);
+
+    /// <summary>True when the ACP client declared form elicitation in <c>initialize</c>.</summary>
+    public bool ClientHasForms { get; private set; }
+
+    public Task<CreateElicitationResponse> ElicitAsync(CreateElicitationRequest request, CancellationToken ct) =>
+        rpc.RequestAsync<CreateElicitationRequest, CreateElicitationResponse>(AcpMethods.Client.ElicitationCreate, request, ct);
 
     public async Task OnTitleAsync(string sessionId, string title)
     {

@@ -58,6 +58,18 @@ sealed class TestClient : IAsyncDisposable
     readonly Task serving;
     public List<JsonObject> Updates { get; } = [];
     public List<RequestPermissionRequest> Approvals { get; } = [];
+    public List<ElicitationFormMode> Forms { get; } = [];
+
+    /// <summary>Answers a form; by default every question with its first choice.</summary>
+    public Func<ElicitationFormMode, CreateElicitationResponse> Fill { get; set; } = form => new ElicitationAcceptAction
+    {
+        Content = (form.RequestedSchema.Properties ?? []).ToDictionary(p => p.Key, p => p.Value switch
+        {
+            StringPropertySchema s => (JsonNode?)(s.OneOf?.FirstOrDefault()?.Const ?? ""),
+            MultiSelectPropertySchema m => new JsonArray((JsonNode)((TitledMultiSelectItems)m.Items).AnyOf[0].Const),
+            _ => null,
+        }),
+    };
     public Func<RequestPermissionRequest, Task<RequestPermissionOutcome>> Approve { get; set; } =
         r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = r.Options[0].OptionId });
 
@@ -69,7 +81,7 @@ sealed class TestClient : IAsyncDisposable
 
     public JsonRpcConnection Rpc { get; }
 
-    public static async Task<TestClient> ConnectAsync(Conductor conductor, string name = "test-client")
+    public static async Task<TestClient> ConnectAsync(Conductor conductor, string name = "test-client", bool forms = true)
     {
         var link = new DuplexLink();
         var (si, so) = link.AgentEnd;
@@ -84,12 +96,22 @@ sealed class TestClient : IAsyncDisposable
         };
         client.Rpc.RequestHandler = async (req, ct) =>
         {
+            if (req.Method == AcpMethods.Client.ElicitationCreate)
+            {
+                var form = (ElicitationFormMode)req.ParamsAs<CreateElicitationRequest>();
+                lock (client.Forms) client.Forms.Add(form);
+                return AcpJson.ToNode(client.Fill(form));
+            }
             var r = req.ParamsAs<RequestPermissionRequest>();
             lock (client.Approvals) client.Approvals.Add(r);
             return AcpJson.ToNode(new RequestPermissionResponse { Outcome = await client.Approve(r) });
         };
         client.Rpc.Start();
-        await client.Rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
+        await client.Rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
+        {
+            ProtocolVersion = 1,
+            ClientCapabilities = forms ? new ClientCapabilities { Elicitation = new ElicitationCapabilities { Form = new ElicitationFormCapabilities() } } : null,
+        });
         return client;
     }
 

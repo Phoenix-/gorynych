@@ -135,7 +135,7 @@ public sealed class Conductor : IAsyncDisposable
         var feed = Feed(sessionId);
         while (true)
         {
-            var client = await feed.WaitForClientAsync(ct);
+            var client = await feed.WaitForClientAsync(c => c.Accepts(request.Method), ct);
             try
             {
                 return await client.Rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);

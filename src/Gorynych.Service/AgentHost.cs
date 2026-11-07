@@ -56,6 +56,8 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
                 {
                     Fs = new FileSystemCapabilities { ReadTextFile = false, WriteTextFile = false },
                     Terminal = false,
+                    // The service relays forms to a client that declared them.
+                    Elicitation = new ElicitationCapabilities { Form = new ElicitationFormCapabilities() },
                 },
                 ClientInfo = new Implementation { Name = "gorynych", Title = "Gorynych", Version = Version },
             }, ct);

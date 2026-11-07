@@ -109,6 +109,17 @@ public sealed class ClaudeAdapterTests
         StringAssert.EndsWith(client.Text(), "not allowed");
         Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call_update" && (string?)u["status"] == "failed"));
 
+        // AskUserQuestion is a form (elicitation/create), not an approval.
+        client.Fill = form => new ElicitationAcceptAction { Content = new() { ["q1"] = "Blue" } };
+        await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = created.SessionId, Prompt = [new TextContent { Text = "a question for you" }] });
+        StringAssert.EndsWith(client.Text(), "you chose Blue");
+        var asked = client.Forms.Single();
+        Assert.AreEqual("Which color?", asked.Message);
+        Assert.AreEqual(created.SessionId, asked.SessionId);
+        Assert.IsNotNull(asked.ToolCallId);
+        Assert.AreEqual(2, client.Approvals.Count, "the question did not become an approval");
+
         // The adapter lists the session with its title.
         var list = await client.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
         Assert.AreEqual("Fake title", list.Sessions.Single(s => s.SessionId == created.SessionId).Title);

@@ -119,38 +119,70 @@ public static class ClaudeHooks
     }
 
     /// <summary>
-    /// One approval-shaped request per AskUserQuestion question: the options are the answers.
-    /// (ACP's elicitation would fit better; see docs/claude-adapter.md.)
+    /// AskUserQuestion is a question, not an approval: it becomes one ACP form
+    /// (<c>elicitation/create</c>, form mode, scoped to the session and the tool call) with a
+    /// property per question, <c>q1</c>, <c>q2</c>, …: a single choice is a string with
+    /// <c>oneOf</c>, a multi-select an array of titled items.
     /// </summary>
-    public static RequestPermissionRequest Question(string sessionId, string toolCallId, JsonObject question)
+    public static ElicitationFormMode QuestionForm(string sessionId, string toolCallId, JsonObject toolInput)
     {
-        var options = new List<PermissionOption>();
-        var i = 0;
-        foreach (var o in question["options"] as JsonArray ?? [])
-            options.Add(new PermissionOption { OptionId = $"answer:{i++}", Name = (string?)o?["label"] ?? $"Option {i}", Kind = PermissionOptionKind.AllowOnce });
-        options.Add(new PermissionOption { OptionId = DenyOptionId, Name = "Do not answer", Kind = PermissionOptionKind.RejectOnce });
-        return new RequestPermissionRequest
+        var questions = Questions(toolInput);
+        var properties = new Dictionary<string, ElicitationPropertySchema?>();
+        for (var i = 0; i < questions.Count; i++)
         {
-            SessionId = sessionId,
-            ToolCall = new ToolCallUpdate
+            var q = questions[i];
+            var options = (q["options"] as JsonArray ?? []).OfType<JsonObject>().Select(o => new EnumOption
             {
-                ToolCallId = toolCallId,
-                Title = (string?)question["question"] ?? "Question",
-                Kind = ToolKind.Other,
-                Status = ToolCallStatus.Pending,
-                RawInput = question.DeepClone(),
+                Const = (string?)o["label"] ?? "",
+                Title = (string?)o["label"] ?? "",
+                Description = (string?)o["description"],
+            }).ToList();
+            var title = (string?)q["header"] is { Length: > 0 } h ? h : (string?)q["question"];
+            properties[$"q{i + 1}"] = q["multiSelect"]?.GetValueKind() == System.Text.Json.JsonValueKind.True
+                ? new MultiSelectPropertySchema { Title = title, Description = (string?)q["question"], Items = new TitledMultiSelectItems { AnyOf = options }, MinItems = 1 }
+                : new StringPropertySchema { Title = title, Description = (string?)q["question"], OneOf = options };
+        }
+        return new ElicitationFormMode
+        {
+            Message = questions.Count == 1 ? (string?)questions[0]["question"] ?? "Claude asks" : "Claude asks you some questions",
+            SessionId = sessionId,
+            ToolCallId = toolCallId,
+            RequestedSchema = new ElicitationSchema
+            {
+                Type = ElicitationSchemaType.Object,
+                Properties = properties,
+                Required = properties.Keys.ToList(),
             },
-            Options = options,
         };
     }
 
-    /// <summary>The label chosen for <paramref name="question"/>, or null when the person declined.</summary>
-    public static string? ChosenLabel(JsonObject question, RequestPermissionOutcome outcome)
+    /// <summary>
+    /// The AskUserQuestion input with <c>answers</c> filled in from an accepted form
+    /// (<c>{question text: label}</c>, several labels joined by ", "), or null when the person
+    /// declined, cancelled or left a question unanswered.
+    /// </summary>
+    public static JsonObject? AnsweredInput(JsonObject toolInput, CreateElicitationResponse response)
     {
-        if (outcome is not SelectedPermissionOutcome { OptionId: var id } || !id.StartsWith("answer:", StringComparison.Ordinal)) return null;
-        var index = int.Parse(id.AsSpan(7));
-        return (string?)(question["options"] as JsonArray)?[index]?["label"];
+        if (response is not ElicitationAcceptAction { Content: { } content }) return null;
+        var answers = new JsonObject();
+        var questions = Questions(toolInput);
+        for (var i = 0; i < questions.Count; i++)
+        {
+            var answer = content.GetValueOrDefault($"q{i + 1}") switch
+            {
+                JsonArray many => string.Join(", ", many.Select(v => (string?)v).Where(v => !string.IsNullOrEmpty(v))),
+                JsonValue one when one.TryGetValue<string>(out var s) => s,
+                _ => null,
+            };
+            if (string.IsNullOrEmpty(answer)) return null;
+            answers[(string?)questions[i]["question"] ?? ""] = answer;
+        }
+        var updated = toolInput.DeepClone().AsObject();
+        updated["answers"] = answers;
+        return updated;
     }
+
+    static List<JsonObject> Questions(JsonObject toolInput) => (toolInput["questions"] as JsonArray ?? []).OfType<JsonObject>().ToList();
 
     public static JsonObject AllowReply(JsonObject? updatedInput = null)
     {
@@ -168,7 +200,7 @@ public static class ClaudeHooks
     };
 
     public static bool IsAllowed(RequestPermissionOutcome outcome) =>
-        outcome is SelectedPermissionOutcome s && (s.OptionId == AllowOptionId || s.OptionId.StartsWith("answer:", StringComparison.Ordinal));
+        outcome is SelectedPermissionOutcome { OptionId: AllowOptionId };
 
     public static string ToolTitle(string tool, JsonObject? input)
     {

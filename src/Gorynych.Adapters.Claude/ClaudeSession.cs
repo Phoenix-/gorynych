@@ -406,18 +406,12 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         {
             if (tool == "AskUserQuestion" && e["tool_input"] is JsonObject input)
             {
-                var updated = input.DeepClone().AsObject();
-                var answers = new JsonObject();
-                foreach (var q in input["questions"] as JsonArray ?? [])
-                {
-                    if (q is not JsonObject question) continue;
-                    var response = await agent.RequestPermissionAsync(ClaudeHooks.Question(Id, toolCallId, question), ct);
-                    if (ClaudeHooks.ChosenLabel(question, response.Outcome) is not { } label)
-                        return ClaudeHooks.DenyReply("The user chose not to answer.");
-                    answers[(string?)question["question"] ?? ""] = label;
-                }
-                updated["answers"] = answers;
-                return ClaudeHooks.AllowReply(updated);
+                if (!agent.ClientHasForms)
+                    return ClaudeHooks.DenyReply("The user's client cannot show questions; ask in plain text instead.");
+                var response = await agent.ElicitAsync(ClaudeHooks.QuestionForm(Id, toolCallId, input), ct);
+                return ClaudeHooks.AnsweredInput(input, response) is { } answered
+                    ? ClaudeHooks.AllowReply(answered)
+                    : ClaudeHooks.DenyReply("The user chose not to answer.");
             }
             var decision = await agent.RequestPermissionAsync(ClaudeHooks.Permission(Id, toolCallId, e), ct);
             if (ClaudeHooks.IsAllowed(decision.Outcome)) return ClaudeHooks.AllowReply();

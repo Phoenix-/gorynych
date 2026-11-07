@@ -28,15 +28,23 @@ client.Rpc.NotificationHandler = (method, p) =>
     if (method == AcpMethods.Client.SessionUpdate) printer.Print(p);
     return Task.CompletedTask;
 };
-client.Rpc.RequestHandler = (req, ct) => req.Method == AcpMethods.Client.SessionRequestPermission
-    ? Approvals.AnswerAsync(req, options.Approve, printer)
-    : throw new JsonRpcException(JsonRpcException.MethodNotFound, $"test client does not handle {req.Method}");
+client.Rpc.RequestHandler = (req, ct) => req.Method switch
+{
+    AcpMethods.Client.SessionRequestPermission => Approvals.AnswerAsync(req, options.Approve, printer),
+    AcpMethods.Client.ElicitationCreate => Approvals.FillAsync(req, options.Approve, printer),
+    _ => throw new JsonRpcException(JsonRpcException.MethodNotFound, $"test client does not handle {req.Method}"),
+};
 client.Rpc.Start();
 
 var init = await client.Rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
 {
     ProtocolVersion = AcpMethods.ProtocolVersion,
-    ClientCapabilities = new ClientCapabilities { Fs = new FileSystemCapabilities { ReadTextFile = false, WriteTextFile = false }, Terminal = false },
+    ClientCapabilities = new ClientCapabilities
+    {
+        Fs = new FileSystemCapabilities { ReadTextFile = false, WriteTextFile = false },
+        Terminal = false,
+        Elicitation = new ElicitationCapabilities { Form = new ElicitationFormCapabilities() },
+    },
     ClientInfo = new Implementation { Name = "gorynych-test", Version = "0.1.0" },
 });
 Info($"connected to {init.AgentInfo?.Name} {init.AgentInfo?.Version}, service {(string?)init.Meta?[GorynychProtocol.MetaServiceId]}");
@@ -362,6 +370,66 @@ static class Approvals
         {
             ConsoleGate.Release();
         }
+    }
+
+    /// <summary>Fills an <c>elicitation/create</c> form: choices by number, text as typed.</summary>
+    public static async Task<JsonNode?> FillAsync(JsonRpcRequest request, string mode, FeedPrinter printer)
+    {
+        var form = request.ParamsAs<CreateElicitationRequest>() as ElicitationFormMode
+            ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "only form elicitation is supported");
+        await ConsoleGate.WaitAsync();
+        try
+        {
+            printer.Prompt($"  [question] {form.Message}");
+            if (mode == "deny")
+            {
+                printer.Prompt("     -> declined");
+                return AcpJson.ToNode<CreateElicitationResponse>(new CreateElicitationResponseDecline());
+            }
+            var content = new Dictionary<string, JsonNode?>();
+            foreach (var (key, schema) in form.RequestedSchema.Properties ?? [])
+            {
+                var (title, choices, many) = schema switch
+                {
+                    StringPropertySchema s => (s.Title ?? key, s.OneOf?.Select(o => (o.Const, o.Title, o.Description)).ToList(), false),
+                    MultiSelectPropertySchema m => (m.Title ?? key, (m.Items as TitledMultiSelectItems)?.AnyOf.Select(o => (o.Const, o.Title, o.Description)).ToList(), true),
+                    _ => (key, null, false),
+                };
+                printer.Prompt($"     {title}{(many ? " (several)" : "")}");
+                if (choices is null)
+                {
+                    var text = mode == "allow" || Console.IsInputRedirected ? "" : Read("     text: ");
+                    content[key] = text;
+                    continue;
+                }
+                for (var i = 0; i < choices.Count; i++)
+                    printer.Prompt($"       {i + 1}. {choices[i].Title}{(choices[i].Description is { } d ? " — " + d : "")}");
+                var picked = mode == "allow" || Console.IsInputRedirected
+                    ? [0]
+                    : Read("     choose: ").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Select(t => int.TryParse(t, out var n) ? n - 1 : -1).Where(n => n >= 0 && n < choices.Count).ToArray();
+                if (picked.Length == 0)
+                {
+                    printer.Prompt("     -> cancelled");
+                    return AcpJson.ToNode<CreateElicitationResponse>(new CreateElicitationResponseCancel());
+                }
+                content[key] = many
+                    ? new JsonArray(picked.Select(n => (JsonNode)choices[n].Const).ToArray())
+                    : choices[picked[0]].Const;
+                printer.Prompt($"     -> {string.Join(", ", picked.Select(n => choices[n].Title))}");
+            }
+            return AcpJson.ToNode<CreateElicitationResponse>(new ElicitationAcceptAction { Content = content });
+        }
+        finally
+        {
+            ConsoleGate.Release();
+        }
+    }
+
+    static string Read(string prompt)
+    {
+        Console.Write(prompt);
+        return Console.ReadLine() ?? "";
     }
 
     static PermissionOption? Ask(List<PermissionOption> options)

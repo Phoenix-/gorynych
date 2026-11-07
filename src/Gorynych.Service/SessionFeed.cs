@@ -55,8 +55,11 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         lock (clientsGate) clients.Remove(client);
     }
 
-    /// <summary>Returns the most recently attached client, waiting for one if none is attached.</summary>
-    public async Task<ClientConnection> WaitForClientAsync(CancellationToken ct)
+    /// <summary>
+    /// Returns the most recently attached client that <paramref name="accepts"/> the request,
+    /// waiting for one if none is attached.
+    /// </summary>
+    public async Task<ClientConnection> WaitForClientAsync(Func<ClientConnection, bool> accepts, CancellationToken ct)
     {
         Interlocked.Increment(ref pendingRequests);
         try
@@ -66,7 +69,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
                 Task wait;
                 lock (clientsGate)
                 {
-                    var live = clients.LastOrDefault(c => !c.Rpc.IsClosed);
+                    var live = clients.LastOrDefault(c => !c.Rpc.IsClosed && accepts(c));
                     if (live is not null) return live;
                     wait = clientAttached.Task;
                 }

@@ -139,6 +139,39 @@ public sealed class ConductorTests
     }
 
     [TestMethod]
+    public async Task Forms_GoOnlyToClientsThatDeclaredThem()
+    {
+        var answers = new List<string>();
+        var adapter = Echo(onPrompt: async (agent, p, ct) =>
+        {
+            var r = await agent.Rpc.RequestAsync<CreateElicitationRequest, CreateElicitationResponse>(AcpMethods.Client.ElicitationCreate,
+                new ElicitationFormMode
+                {
+                    Message = "Which color?",
+                    SessionId = p.SessionId,
+                    RequestedSchema = new ElicitationSchema
+                    {
+                        Type = ElicitationSchemaType.Object,
+                        Properties = new() { ["q1"] = new StringPropertySchema { OneOf = [new EnumOption { Const = "Red", Title = "Red" }] } },
+                    },
+                }, ct);
+            answers.Add((string)((ElicitationAcceptAction)r).Content!["q1"]!);
+        });
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), adapter);
+        await using var withForms = await TestClient.ConnectAsync(conductor, "gui");
+        var sessionId = (await withForms.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("fake"))).SessionId;
+        // A second client without form support attaches later, so it would be the first choice.
+        await using var plain = await TestClient.ConnectAsync(conductor, "plain", forms: false);
+        await plain.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume,
+            AcpJson.ToNode(new ResumeSessionRequest { SessionId = sessionId, Cwd = Path.GetTempPath() }));
+
+        await plain.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt, Prompt(sessionId, "go"));
+        CollectionAssert.AreEqual(new[] { "Red" }, answers);
+        Assert.AreEqual(1, withForms.Forms.Count);
+        Assert.AreEqual(0, plain.Forms.Count);
+    }
+
+    [TestMethod]
     public async Task PendingApproval_WaitsForTheNextClient()
     {
         var asked = new TaskCompletionSource();

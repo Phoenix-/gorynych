@@ -70,22 +70,44 @@ public sealed class ClaudeHooksTests
     }
 
     [TestMethod]
-    public void AskUserQuestion_OffersTheAnswers_AndRepliesWithUpdatedInput()
+    public void AskUserQuestion_BecomesAForm_AndTheAnswersUpdatedInput()
     {
         var events = Fixture("hooks-write-and-question.jsonl");
-        var permission = First(events, "PermissionRequest", "AskUserQuestion");
-        var question = permission["tool_input"]!["questions"]![0]!.AsObject();
-        var request = ClaudeHooks.Question("s1", "toolu_q", question);
-        Assert.AreEqual("Which color do you prefer?", request.ToolCall.Title);
-        CollectionAssert.AreEqual(new[] { "Red", "Blue", "Do not answer" }, request.Options.Select(o => o.Name).ToArray());
+        var input = First(events, "PermissionRequest", "AskUserQuestion")["tool_input"]!.AsObject();
+        var form = ClaudeHooks.QuestionForm("s1", "toolu_q", input);
+        Assert.AreEqual("Which color do you prefer?", form.Message);
+        Assert.AreEqual("s1", form.SessionId);
+        Assert.AreEqual("toolu_q", form.ToolCallId);
+        var q1 = (StringPropertySchema)form.RequestedSchema.Properties!["q1"]!;
+        Assert.AreEqual("Color", q1.Title);
+        CollectionAssert.AreEqual(new[] { "Red", "Blue" }, q1.OneOf!.Select(o => o.Const).ToArray());
+        Assert.AreEqual("Choose blue", q1.OneOf![1].Description);
+        CollectionAssert.AreEqual(new[] { "q1" }, form.RequestedSchema.Required);
+        var wire = AcpJson.ToNode<CreateElicitationRequest>(form)!;
+        Assert.AreEqual("form", (string?)wire["mode"]);
+        Assert.AreEqual("string", (string?)wire["requestedSchema"]!["properties"]!["q1"]!["type"]);
 
-        var label = ClaudeHooks.ChosenLabel(question, new SelectedPermissionOutcome { OptionId = request.Options[1].OptionId });
-        Assert.AreEqual("Blue", label);
-        Assert.IsNull(ClaudeHooks.ChosenLabel(question, new SelectedPermissionOutcome { OptionId = ClaudeHooks.DenyOptionId }));
+        var answered = ClaudeHooks.AnsweredInput(input, new ElicitationAcceptAction { Content = new() { ["q1"] = "Blue" } });
+        Assert.AreEqual("Blue", (string?)answered!["answers"]!["Which color do you prefer?"]);
+        Assert.IsNull(ClaudeHooks.AnsweredInput(input, new CreateElicitationResponseDecline()));
+        Assert.IsNull(ClaudeHooks.AnsweredInput(input, new ElicitationAcceptAction { Content = new() }), "an unanswered question");
 
-        // The probe's listener answered with the same shape, and Claude took it (PostToolUse carries the answer).
+        // The probe's listener answered with this shape, and Claude took it (PostToolUse carries the answer).
         var post = First(events, "PostToolUse", "AskUserQuestion");
         Assert.AreEqual("Blue", (string?)post["tool_response"]!["answers"]!["Which color do you prefer?"]);
+    }
+
+    [TestMethod]
+    public void AskUserQuestion_MultiSelect_IsAnArrayOfTitledItems()
+    {
+        var input = JsonNode.Parse("""
+            {"questions":[{"question":"Which platforms?","header":"Platforms","multiSelect":true,
+              "options":[{"label":"Windows","description":"first"},{"label":"Linux"},{"label":"macOS"}]}]}
+            """)!.AsObject();
+        var q1 = (MultiSelectPropertySchema)ClaudeHooks.QuestionForm("s", "t", input).RequestedSchema.Properties!["q1"]!;
+        CollectionAssert.AreEqual(new[] { "Windows", "Linux", "macOS" }, ((TitledMultiSelectItems)q1.Items).AnyOf.Select(o => o.Const).ToArray());
+        var answered = ClaudeHooks.AnsweredInput(input, new ElicitationAcceptAction { Content = new() { ["q1"] = new JsonArray("Windows", "macOS") } });
+        Assert.AreEqual("Windows, macOS", (string?)answered!["answers"]!["Which platforms?"]);
     }
 
     [TestMethod]

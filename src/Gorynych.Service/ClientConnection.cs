@@ -29,6 +29,13 @@ internal sealed class ClientConnection
     /// <summary>The client's <c>initialize</c> params.</summary>
     public InitializeRequest? Init { get; private set; }
 
+    /// <summary>Whether this client can take <paramref name="method"/> requests from an agent.</summary>
+    public bool Accepts(string method) => method switch
+    {
+        AcpMethods.Client.ElicitationCreate => Init?.ClientCapabilities?.Elicitation?.Form is not null,
+        _ => true,
+    };
+
     async Task<JsonNode?> HandleAsync(JsonRpcRequest request, CancellationToken ct)
     {
         switch (request.Method)

@@ -74,6 +74,19 @@ async Task TurnAsync(string prompt)
             }));
         answer = allowed ? "wrote it" : "not allowed";
     }
+    else if (prompt.Contains("question", StringComparison.OrdinalIgnoreCase))
+    {
+        var toolUseId = $"toolu_fake{++tools}";
+        var input = JsonNode.Parse("""
+            {"questions":[{"question":"Which color?","header":"Color","multiSelect":false,
+              "options":[{"label":"Red","description":"warm"},{"label":"Blue","description":"cold"}]}]}
+            """)!.AsObject();
+        await PostAsync(Hook("PreToolUse", promptId, new JsonObject { ["tool_name"] = "AskUserQuestion", ["tool_input"] = input.DeepClone(), ["tool_use_id"] = toolUseId }));
+        var reply = await PostAsync(Hook("PermissionRequest", promptId, new JsonObject { ["tool_name"] = "AskUserQuestion", ["tool_input"] = input.DeepClone() }));
+        var decision = reply?["hookSpecificOutput"]?["decision"];
+        var chosen = (string?)decision?["updatedInput"]?["answers"]?["Which color?"];
+        answer = (string?)decision?["behavior"] == "allow" && chosen is not null ? "you chose " + chosen : "no answer";
+    }
     else answer = "echo: " + prompt;
     await PostAsync(Hook("MessageDisplay", promptId, new JsonObject
     {
