@@ -91,7 +91,7 @@ public sealed class SessionTreeTests
         CollectionAssert.AreEqual(new[] { "allow_once", "reject_once" }, ask.Options.Select(o => o.Kind.Value).ToArray(), "every spawn is asked");
         ZedRules.CheckPermission(ask);
 
-        await conductor.SpawnedTurnsIdleAsync();
+        await conductor.BackgroundTurnsIdleAsync();
         CollectionAssert.AreEqual(new[] { "Fix the flaky test" }, Prompts(kimi, child), "the first prompt was started");
         Assert.IsTrue(kimi.Tokens.ContainsKey(child), "the child has the peers server too");
         Assert.IsFalse(conductor.Store.Get(child)!.Draft, "a spawned session is never a draft");
@@ -246,5 +246,70 @@ public sealed class SessionTreeTests
 
         var announced = Updates() - before;
         Assert.IsTrue(announced is >= 2 and <= 3, $"{announced} activity notices for 30 updates: the first, then the last of the interval");
+    }
+
+    static string[] Reports(LifecycleAgent parentAgent, string parent) =>
+        Prompts(parentAgent, parent).Where(p => p.StartsWith("[Report from child session", StringComparison.Ordinal)).ToArray();
+
+    [TestMethod]
+    public async Task Report_EachTurnOfTheChild_ReachesAParentWithoutAChannel_AsAMarkedTurn()
+    {
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        // The child thinks aloud, runs a tool, then answers: only the answer is its final message.
+        claude.BeforePrompt = async id =>
+        {
+            await claude.Adapter.Current!.Update(id, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = "Looking around." } });
+            await claude.Adapter.Current!.Update(id, new ToolCall { ToolCallId = "t1", Title = "Read", Status = ToolCallStatus.Completed });
+        };
+        await using var conductor = Conductor(null, kimi.Adapter, claude.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "kimi", "Coordinate the release");
+        var spawned = await SpawnAsync(zed, kimi.Tokens[parent], new JsonObject { ["agent"] = "claude", ["prompt"] = "Write the notes", ["title"] = "Notes" });
+        var child = (string)spawned!["sessionId"]!;
+
+        await conductor.BackgroundTurnsIdleAsync();
+        var report = Reports(kimi, parent).Single();
+        StringAssert.StartsWith(report, $"[Report from child session {child} \"Notes\" (claude) · its turn ended]\nok\n");
+        Assert.IsFalse(report.Contains("Looking around.", StringComparison.Ordinal), report);
+        var told = zed.Snapshot().Last(u => (string?)u["sessionUpdate"] == "user_message_chunk");
+        Assert.AreEqual("report", (string?)told["_meta"]![GorynychProtocol.MetaOrigin]);
+        Assert.AreEqual("child_claude", (string?)told["_meta"]![GorynychProtocol.MetaSender]);
+        Assert.AreEqual(child, (string?)told["_meta"]![GorynychProtocol.MetaFromSessionId]);
+
+        // The person prompts the child directly: another report.
+        await using var other = await TestClient.ConnectAsync(conductor, "zed-child");
+        await PromptAsync(other, child, "Add the migration step");
+        await conductor.BackgroundTurnsIdleAsync();
+        Assert.AreEqual(2, Reports(kimi, parent).Length);
+
+        // The parent asking the child is not a turn to report.
+        await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion,
+            new JsonObject { ["sessionId"] = child, ["text"] = "Done?", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = kimi.Tokens[parent] } });
+        await conductor.BackgroundTurnsIdleAsync();
+        Assert.AreEqual(2, Reports(kimi, parent).Length);
+    }
+
+    [TestMethod]
+    public async Task Report_ToAParentWithAChannel_IsANote_AndReportFalseSendsNone()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        var token = claude.Tokens[parent];
+
+        var reported = (string)(await SpawnAsync(zed, token, new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test" }))!["sessionId"]!;
+        var quiet = (string)(await SpawnAsync(zed, token, new JsonObject { ["agent"] = "kimi", ["prompt"] = "Bump the version", ["report"] = false }))!["sessionId"]!;
+        await conductor.BackgroundTurnsIdleAsync();
+
+        var note = claude.Notes.Single();
+        Assert.AreEqual(parent, (string?)note["sessionId"]);
+        Assert.AreEqual("child_kimi", (string?)note["sender"]);
+        Assert.AreEqual(reported, (string?)note["fromSessionId"]);
+        StringAssert.StartsWith((string?)note["text"], $"[Report from child session {reported} \"Fix the flaky test\" (kimi) · its turn ended]\nok\n");
+        CollectionAssert.AreEqual(new[] { "Coordinate the release" }, Prompts(claude, parent), "a note is not a turn");
+        Assert.IsFalse(conductor.Store.Get(quiet)!.ReportToParent);
     }
 }

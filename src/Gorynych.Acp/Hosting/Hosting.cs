@@ -76,6 +76,16 @@ public static class GorynychProtocol
     /// </summary>
     public const string MethodSpawn = "_gorynych/spawn";
 
+    /// <summary>
+    /// Tells a session's agent something that needs no answer, such as a child's report:
+    /// <c>{sessionId, text, sender, fromSessionId?}</c> → <c>{}</c>. An agent without a way in
+    /// (no channel) answers method not found, and the service delivers it as a turn.
+    /// </summary>
+    public const string MethodNote = "_gorynych/note";
+
+    /// <summary>The session a peer request or a report came from, in the <c>_meta</c> of the message it became.</summary>
+    public const string MetaFromSessionId = "gorynych/fromSessionId";
+
     /// <summary>A notification to clients: <c>{sessionId, change}</c>, change <c>added</c>, <c>updated</c> or <c>removed</c>.</summary>
     public const string MethodSessionsChanged = "_gorynych/sessions_changed";
 

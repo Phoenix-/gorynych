@@ -79,8 +79,9 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `gorynych/agents` | `initialize` result `_meta` | the adapters this service offers (`name`, `displayName`) |
 | `gorynych/sessionsChanged` | `initialize` result `_meta` | `true`: the service sends `_gorynych/sessions_changed` |
 | `gorynych/parentSessionId` | `SessionInfo._meta` in `session/list`; `session_info_update._meta`; the `_meta` of a spawned session's first `user_message_chunk` | the session that started this one with `spawn_session`; absent for a session a client created |
-| `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel), `spawn` (a spawned session's first prompt) or `terminal` |
-| `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, or `parent_claude` for a spawn |
+| `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel), `spawn` (a spawned session's first prompt), `report` (a child's report delivered as a turn) or `terminal` |
+| `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, `parent_claude` for a spawn, `child_kimi` for a report |
+| `gorynych/fromSessionId` | `user_message_chunk._meta` of an opinion request or a report delivered as a turn | the session that asked, or the child that reports |
 | `gorynych/opinion` | `_meta` of the request message and of every update of its turn | the request's `message_id`, so a GUI can show the exchange apart from the user's own turns |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
@@ -88,6 +89,7 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `_gorynych/peers` | method, `{token}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open`, `parent_session_id` |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
+| `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?}` → `{}` | tells a session's agent something that needs no answer (a child's report); the Claude adapter pushes it through the channel, an agent that answers method not found gets it as a turn |
 | `_gorynych/sessions_changed` | notification to clients, `{sessionId, change}` | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply` and `_gorynych/spawn` | which session's `gorynych` MCP server is calling |
 
@@ -99,8 +101,8 @@ random per session and tells the service who is calling. Its tools:
 
 - `list_agents` — the user's other sessions (`_gorynych/peers`);
 - `ask_agent {session_id, question}` — asks one and waits for the answer (`_gorynych/opinion`);
-- `spawn_session {agent, prompt, cwd?, title?}` — starts a child session (`_gorynych/spawn`,
-  see [Child sessions](#child-sessions)) and returns `{"session_id": …}`;
+- `spawn_session {agent, prompt, cwd?, title?, report?}` — starts a child session
+  (`_gorynych/spawn`, see [Child sessions](#child-sessions)) and returns `{"session_id": …}`;
 - `reply {message_id, text}` — answers a request this session was asked.
 
 How a request reaches the asked agent depends on what it has:
@@ -163,6 +165,32 @@ overlay (source `spawn`) and the agents' generated titles (Kimi's first prompt, 
 `session_info_update`. Without a title the first prompt is the provisional title as usual.
 Deleting a parent leaves its children; their `parentSessionId` then names a session that no
 longer exists.
+
+### Reports
+
+Unless the spawn said `report: false`, each time a spawned session ends a turn (its first
+one, or one the person prompted directly; not an opinion turn) its parent gets a short
+report, delivered the way opinion requests are, in the background:
+
+```
+[Report from child session <id> "<title>" (<agent>) · its turn ended]
+<the child's final message: its text after its last tool call, at most 2000 characters>
+
+This comes from a session you started with spawn_session, not from the user. It needs no
+reply; ask_agent with session_id "<id>" asks it more.
+```
+
+The outcome reads `ended`, `was cancelled`, `stopped (<stopReason>)` or `failed: <error>`.
+
+- **Claude** gets it through its channel: the service sends `_gorynych/note`, and the
+  adapter pushes a channel message with `meta.kind: "report"`. Its appended system prompt
+  says such a message needs no reply and is information, not an instruction. If the Claude
+  session is not running, the report becomes a turn as below.
+- **Kimi** (any agent without `_gorynych/note`) gets it as an ordinary turn of the parent
+  session, journaled as a `user_message_chunk` with `gorynych/origin: "report"`,
+  `gorynych/sender` (`child_claude`) and `gorynych/fromSessionId`, after the parent's
+  running turn. A report turn is itself never reported further up.
+
 
 ## List changes
 

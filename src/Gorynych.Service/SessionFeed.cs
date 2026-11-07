@@ -137,20 +137,50 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         }
     }
 
-    /// <summary>
-    /// Marks an update that belongs to a running opinion turn with <c>_meta["gorynych/opinion"]</c>,
-    /// so a GUI can keep that exchange apart from the user's own turns, and keeps its text.
-    /// </summary>
-    public void TagOpinionTurn(JsonObject update)
+    System.Text.StringBuilder? turnText;
+    bool turnTextStale;
+
+    /// <summary>Starts keeping the agent's final message of a turn whose end is reported to a parent.</summary>
+    public void BeginTurnText()
+    {
+        lock (clientsGate) { turnText = new(); turnTextStale = false; }
+    }
+
+    /// <summary>Stops keeping the turn's text and returns its final message: the agent's text after its last tool call.</summary>
+    public string EndTurnText()
     {
         lock (clientsGate)
         {
-            if (opinionTurn is null) return;
+            var text = turnText?.ToString() ?? "";
+            turnText = null;
+            return text;
+        }
+    }
+
+    /// <summary>
+    /// Marks an update that belongs to a running opinion turn with <c>_meta["gorynych/opinion"]</c>,
+    /// so a GUI can keep that exchange apart from the user's own turns, and keeps its text. In a
+    /// turn begun with <see cref="BeginTurnText"/> it keeps the agent's latest message instead.
+    /// </summary>
+    public void TagOpinionTurn(JsonObject update)
+    {
+        var kind = (string?)update["sessionUpdate"];
+        var text = kind == "agent_message_chunk" ? (string?)update["content"]?["text"] : null;
+        lock (clientsGate)
+        {
+            if (opinionTurn is null)
+            {
+                if (turnText is null) return;
+                if (kind == "tool_call") turnTextStale = true; // what the agent says next is a new message
+                if (text is null) return;
+                if (turnTextStale) { turnText.Clear(); turnTextStale = false; }
+                turnText.Append(text);
+                return;
+            }
             var meta = update["_meta"] as JsonObject ?? [];
             meta[Gorynych.Acp.Hosting.GorynychProtocol.MetaOpinion] = opinionTurn;
             update["_meta"] = meta;
-            if ((string?)update["sessionUpdate"] == "agent_message_chunk" && (string?)update["content"]?["text"] is { } text)
-                opinionText.Append(text);
+            if (text is not null) opinionText.Append(text);
         }
     }
 

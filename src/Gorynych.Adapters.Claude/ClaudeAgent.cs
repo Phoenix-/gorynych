@@ -156,6 +156,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             }
             case GorynychProtocol.MethodOpinion:
                 return await OpinionAsync(request, ct);
+            case GorynychProtocol.MethodNote:
+                return await NoteAsync(request, ct);
             default:
                 throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {request.Method}");
         }
@@ -186,6 +188,23 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         if (!session.IsRunning) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running; prompt it first.");
         var reply = await Channel.AskAsync(id, sender, text, ct);
         return new JsonObject { ["text"] = reply };
+    }
+
+    /// <summary>
+    /// <c>_gorynych/note</c>: something for a running session that needs no answer (a child's
+    /// report), pushed through the channel. Without a channel, or with Claude not running, the
+    /// service delivers it as a turn instead.
+    /// </summary>
+    async Task<JsonNode?> NoteAsync(JsonRpcRequest request, CancellationToken ct)
+    {
+        if (Channel is null) throw new JsonRpcException(JsonRpcException.MethodNotFound, "Claude sessions run without a channel.");
+        var id = (string?)request.Params?["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
+        var text = (string?)request.Params?["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
+        var sender = (string?)request.Params?["sender"] ?? "peer_agent";
+        var session = Session(id, null);
+        if (!session.IsRunning) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running.");
+        await Channel.NotifyAsync(id, sender, text, ct);
+        return new JsonObject();
     }
 
     ClaudeSession Session(string id, string? cwd)

@@ -57,7 +57,7 @@ public sealed class Conductor : IAsyncDisposable
     readonly Task listChangesSent;
     readonly ConcurrentDictionary<string, long> lastUpdateNotice = new(StringComparer.Ordinal); // session -> tick of its last "updated"
     readonly ConcurrentDictionary<string, byte> trailingUpdateNotice = new(StringComparer.Ordinal);
-    readonly ConcurrentDictionary<Task, byte> spawnedTurns = new();
+    readonly ConcurrentDictionary<Task, byte> backgroundTurns = new();
     long opinionCount;
     long spawnCount;
 
@@ -441,7 +441,21 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             if (feed.Retired) throw NotFound(record.SessionId); // deleted while this prompt waited for the turn before it
-            return await PromptTurnAsync(client, request, prompt, record, rpc, feed);
+            if (record.ParentSessionId is null) return await PromptTurnAsync(client, request, prompt, record, rpc, feed);
+            // A spawned session reports the end of the turn to its parent.
+            feed.BeginTurnText();
+            JsonNode? result;
+            try
+            {
+                result = await PromptTurnAsync(client, request, prompt, record, rpc, feed);
+            }
+            catch (Exception e)
+            {
+                ReportTurnEnd(record.SessionId, $"failed: {e.Message}", feed.EndTurnText());
+                throw;
+            }
+            ReportTurnEnd(record.SessionId, Outcome(result), feed.EndTurnText());
+            return result;
         }
         finally
         {
@@ -1014,15 +1028,21 @@ public sealed class Conductor : IAsyncDisposable
         await feed.PublishAsync(info, except: null, () => { });
         // Take the turn now, so an ask_agent or prompt that comes right after waits for this first one.
         await feed.TurnGate.WaitAsync(CancellationToken.None);
-        var turn = Task.Run(() => SpawnedTurnAsync(feed, record, parent, prompt));
-        spawnedTurns[turn] = 0;
-        _ = turn.ContinueWith(t => spawnedTurns.TryRemove(t, out _), TaskScheduler.Default);
+        Track(Task.Run(() => SpawnedTurnAsync(feed, record, parent, prompt)));
         return id;
+    }
+
+    /// <summary>Keeps a turn or report that runs in the background, for <see cref="BackgroundTurnsIdleAsync"/>.</summary>
+    void Track(Task task)
+    {
+        backgroundTurns[task] = 0;
+        _ = task.ContinueWith(t => backgroundTurns.TryRemove(t, out _), TaskScheduler.Default);
     }
 
     /// <summary>The first turn of a spawned session. Holds the session's turn gate, taken before the spawn returned.</summary>
     async Task SpawnedTurnAsync(SessionFeed feed, SessionRecord record, SessionRecord parent, string prompt)
     {
+        var started = false;
         try
         {
             using var use = await UseAsync(record.SessionId, CancellationToken.None);
@@ -1038,6 +1058,8 @@ public sealed class Conductor : IAsyncDisposable
             var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = block, Meta = meta })!.AsObject();
             await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
             await ProvisionalTitleAsync(feed, use.Record, [block]);
+            feed.BeginTurnText();
+            started = true;
             Task<JsonNode?> response;
             await feed.ForwardGate.WaitAsync(CancellationToken.None);
             try
@@ -1049,11 +1071,13 @@ public sealed class Conductor : IAsyncDisposable
             {
                 feed.ForwardGate.Release();
             }
-            await response;
+            var result = await response;
+            ReportTurnEnd(record.SessionId, Outcome(result), feed.EndTurnText());
         }
         catch (Exception e)
         {
             ServiceLog.Warn($"{record.Agent} {record.SessionId}: the spawned session's first turn failed: {e.Message}");
+            if (started) ReportTurnEnd(record.SessionId, $"failed: {e.Message}", feed.EndTurnText());
         }
         finally
         {
@@ -1061,8 +1085,124 @@ public sealed class Conductor : IAsyncDisposable
         }
     }
 
-    /// <summary>Completes when the first turns of spawned sessions are done.</summary>
-    public Task SpawnedTurnsIdleAsync() => Task.WhenAll(spawnedTurns.Keys);
+    /// <summary>Completes when the turns and reports running in the background (spawned first turns, reports to parents) are done.</summary>
+    public async Task BackgroundTurnsIdleAsync()
+    {
+        while (backgroundTurns.Keys is { Count: > 0 } running)
+        {
+            await Task.WhenAll(running);
+            await Task.Delay(10); // a finished one is dropped from the set just after it completes
+        }
+    }
+
+    // ---------------------------------------------------------------- reports to the parent
+
+    /// <summary>How much of a child's final message a report carries.</summary>
+    const int ReportLimit = 2000;
+
+    /// <summary>
+    /// After a turn of a spawned session (its first one, or one a client prompted; not opinion
+    /// or report turns): unless its spawn said otherwise, tells its parent in the background
+    /// that the turn ended, with the child's ID, title and final message.
+    /// </summary>
+    void ReportTurnEnd(string childId, string outcome, string finalMessage)
+    {
+        if (store.Get(childId) is not { ParentSessionId: not null, ReportToParent: true }) return;
+        Track(Task.Run(() => ReportAsync(childId, outcome, finalMessage)));
+    }
+
+    static string Outcome(JsonNode? promptResponse) => (string?)promptResponse?["stopReason"] switch
+    {
+        null or "end_turn" => "ended",
+        "cancelled" => "was cancelled",
+        var reason => $"stopped ({reason})",
+    };
+
+    /// <summary>
+    /// Delivers a report like an opinion request, but expects no answer: through the parent
+    /// agent's own way in (<c>_gorynych/note</c>, Claude's channel), otherwise as a marked turn
+    /// of the parent session, which waits for the parent's running turn.
+    /// </summary>
+    async Task ReportAsync(string childId, string outcome, string finalMessage)
+    {
+        try
+        {
+            if (store.Get(childId) is not { ParentSessionId: { } parentId } child || child.Deleted) return;
+            if (store.Get(parentId) is not { Deleted: false }) return;
+            var text = ReportText(child, outcome, finalMessage);
+            var sender = $"child_{child.Agent}";
+            using var use = await UseAsync(parentId, cleanupStop.Token);
+            var (rpc, _) = await EnsureLiveAsync(use.Record, cleanupStop.Token);
+            try
+            {
+                await rpc.SendRequestAsync(GorynychProtocol.MethodNote,
+                    new JsonObject { ["sessionId"] = parentId, ["text"] = text, ["sender"] = sender, ["fromSessionId"] = childId }, cleanupStop.Token);
+                ServiceLog.Info($"report: {childId} -> {parentId} (note)");
+                return;
+            }
+            catch (JsonRpcException e) when (e.Code is JsonRpcException.MethodNotFound or JsonRpcException.InvalidRequest)
+            {
+                // No channel, or the Claude session is not running: a turn reaches it either way.
+            }
+            await ReportTurnAsync(use, rpc, sender, childId, text);
+            ServiceLog.Info($"report: {childId} -> {parentId} (turn)");
+        }
+        catch (Exception e)
+        {
+            ServiceLog.Warn($"report of {childId} to its parent not delivered: {e.Message}");
+        }
+    }
+
+    async Task ReportTurnAsync(SessionUse use, JsonRpcConnection rpc, string sender, string childId, string text)
+    {
+        var feed = use.Feed;
+        await feed.TurnGate.WaitAsync(cleanupStop.Token);
+        try
+        {
+            if (feed.Retired) return;
+            var meta = new JsonObject
+            {
+                [GorynychProtocol.MetaOrigin] = "report",
+                [GorynychProtocol.MetaSender] = sender,
+                [GorynychProtocol.MetaFromSessionId] = childId,
+            };
+            var block = new TextContent { Text = text };
+            var told = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = block, Meta = meta })!.AsObject();
+            await feed.PublishAsync(told, except: null, () => store.Touch(use.Record.SessionId));
+            Task<JsonNode?> response;
+            await feed.ForwardGate.WaitAsync(CancellationToken.None);
+            try
+            {
+                response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, AcpJson.ToNode(new PromptRequest
+                {
+                    SessionId = use.Record.SessionId,
+                    Prompt = [block],
+                    Meta = meta.DeepClone().AsObject(),
+                }), CancellationToken.None);
+            }
+            finally
+            {
+                feed.ForwardGate.Release();
+            }
+            await response;
+        }
+        finally
+        {
+            feed.TurnGate.Release();
+        }
+    }
+
+    static string ReportText(SessionRecord child, string outcome, string finalMessage)
+    {
+        var message = finalMessage.Trim();
+        if (message.Length > ReportLimit) message = message[..ReportLimit].TrimEnd() + "…";
+        if (message.Length == 0) message = "(no message)";
+        var name = child.Title is { Length: > 0 } title ? $" \"{title}\"" : "";
+        return $"[Report from child session {child.SessionId}{name} ({child.Agent}) · its turn {outcome}]\n" +
+            $"{message}\n\n" +
+            "This comes from a session you started with spawn_session, not from the user. It needs no reply; " +
+            $"ask_agent with session_id \"{child.SessionId}\" asks it more.";
+    }
 
     // ---------------------------------------------------------------- list changes
 
@@ -1195,7 +1335,7 @@ public sealed class Conductor : IAsyncDisposable
                     [GorynychProtocol.MetaSender] = sender,
                     [GorynychProtocol.MetaOpinion] = messageId,
                 };
-                if (from is not null) meta["gorynych/fromSessionId"] = from;
+                if (from is not null) meta[GorynychProtocol.MetaFromSessionId] = from;
                 var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = new TextContent { Text = text }, Meta = meta })!.AsObject();
                 await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
                 feed.BeginOpinionTurn(messageId);

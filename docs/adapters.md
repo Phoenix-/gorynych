@@ -29,7 +29,8 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
 - Kimi has no way for a client to set a session's title, so a name given to `spawn_session`
   lives in the service's overlay and wins over the title Kimi takes from the first prompt.
   The service answers Kimi's approval of `spawn_session` itself, since it asks the person
-  before it spawns ([service-protocol.md](service-protocol.md#child-sessions)).
+  before it spawns ([service-protocol.md](service-protocol.md#child-sessions)). Kimi does not
+  know `_gorynych/note`, so a child's report reaches a Kimi parent as a marked turn.
 - Verified live on 7 November 2026 after logging in: first prompt, a Write approval, the
   title, replay through the service journal, and `ask_agent` to a Claude session. Before
   the login every turn failed with `-32000 Authentication required: 403`, which the service
@@ -122,6 +123,11 @@ their behalf, and, when the peer tools are there, tells Claude about `list_agent
 `mcp__gorynych__list_agents` and `mcp__gorynych__spawn_session` without asking (the service
 asks the person before every spawn); `mcp__gorynych__ask_agent` becomes an ACP approval like
 any tool.
+
+`_gorynych/note` (a child's report to its parent) becomes a channel message with
+`meta: {sender, kind: "report"}` and no `message_id`; the system prompt says it needs no
+reply. Without a channel, or while Claude is not running, the adapter refuses it and the
+service sends the report as a turn instead.
 
 A name given to `spawn_session` stays in the service's overlay: the adapter cannot write
 Claude's own `custom-title` yet (that needs `/rename` through the PTY), and Claude's

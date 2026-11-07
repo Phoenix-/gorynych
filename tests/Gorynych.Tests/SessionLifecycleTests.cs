@@ -707,6 +707,9 @@ sealed class LifecycleAgent
                     return new JsonObject();
                 case AcpMethods.Agent.SessionClose:
                     return new JsonObject();
+                case GorynychProtocol.MethodNote when HasChannel:
+                    lock (Notes) Notes.Add(req.Params!.DeepClone().AsObject());
+                    return new JsonObject();
                 case AcpMethods.Agent.SessionDelete when canDelete:
                     if (BeforeDelete is { } beforeDelete) await beforeDelete(sessionId!);
                     if (notFoundOnDelete) throw new JsonRpcException(JsonRpcException.ResourceNotFound, "no such session");
@@ -726,6 +729,12 @@ sealed class LifecycleAgent
 
     /// <summary>Every prompt as it arrives (before <see cref="BeforePrompt"/>), with its text.</summary>
     public List<(string SessionId, string Text)> Prompts { get; } = [];
+
+    /// <summary>Takes <c>_gorynych/note</c> as Claude's channel does; otherwise the agent does not know the method, like Kimi.</summary>
+    public bool HasChannel { get; set; }
+
+    /// <summary>The <c>_gorynych/note</c> params received.</summary>
+    public List<JsonObject> Notes { get; } = [];
 
     public Func<string, Task>? BeforePrompt { get; set; }
     public Func<string, Task>? BeforeResume { get; set; }

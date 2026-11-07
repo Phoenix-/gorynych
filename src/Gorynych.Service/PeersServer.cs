@@ -56,7 +56,8 @@ public static class PeersServer
         var instructions = new StringBuilder();
         if (channel)
             instructions.Append("Messages on this channel come from the user's other coding agents; the sender attribute names the agent. " +
-                "Send answers back with the reply tool, passing the message_id. ");
+                "Send answers back with the reply tool, passing the message_id. A message with kind report (a session you spawned " +
+                "finished a turn) needs no reply. ");
         else
             instructions.Append("An opinion request from another of the user's agents names a message_id; answer it with the reply tool. ");
         if (peers)
@@ -234,7 +235,8 @@ public static class PeersServer
             ["name"] = "spawn_session",
             ["description"] = "Start a new session of one of the user's coding agents as a child of this session, with a first prompt it works on. " +
                 "The user approves every spawn. Returns {\"session_id\": ...} at once, without waiting for the work; the child then runs on its own, " +
-                "the user can open and prompt it directly, and ask_agent asks it questions. Use it when the user asks you to hand work to another agent.",
+                "the user can open and prompt it directly, and ask_agent asks it questions. Each time the child finishes a turn, this session gets " +
+                "a short report with its final message (unless report is false). Use it when the user asks you to hand work to another agent.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -244,6 +246,7 @@ public static class PeersServer
                     ["prompt"] = new JsonObject { ["type"] = "string", ["description"] = "the first prompt: the task, with the context the agent needs" },
                     ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "the folder to work in; default: this session's folder; a relative path is taken from it" },
                     ["title"] = new JsonObject { ["type"] = "string", ["description"] = "a short name for the session in the user's list" },
+                    ["report"] = new JsonObject { ["type"] = "boolean", ["description"] = "report each finished turn of the child to this session; default true" },
                 },
                 ["required"] = new JsonArray("agent", "prompt"),
             },
