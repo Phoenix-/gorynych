@@ -244,6 +244,14 @@ public sealed class LiveSmokeTests
                 Meta = new JsonObject { [GorynychProtocol.MetaAgent] = "kimi" },
             })).SessionId;
             CollectionAssert.Contains(await check.ListAsync(dir), draft, "Kimi keeps an empty native session for the draft");
+            // Zed restarted: another client loads the open session and still gets Kimi's selectors.
+            await using (var again = await TestClient.ConnectAsync(conductor, "zed-again"))
+            {
+                var loaded = await again.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
+                    new JsonObject { ["sessionId"] = draft, ["cwd"] = dir, ["mcpServers"] = new JsonArray() });
+                Assert.IsTrue(loaded?["configOptions"]?.AsArray().Count > 0, $"no config options in {loaded?.ToJsonString()}");
+                Assert.IsNotNull(loaded!["modes"]);
+            }
         }
         await conductor.CleanupsIdleAsync();
         Assert.IsNull(conductor.Store.Get(draft), "the service closed and deleted the draft without an error");

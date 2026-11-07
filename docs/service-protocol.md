@@ -33,13 +33,23 @@ for external ACP clients: `acp --agent claude|kimi` (see [external-clients.md](e
 | `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`. |
 | `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`. A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out. |
 | `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers`, forwards, records the session as a draft, attaches the client. |
-| `session/load` | Opens the session in the agent (`session/resume`, or `session/load` with the agent's replay dropped), replays the service journal as `session/update`, then attaches the client. A session the journal has never seen is loaded from the agent instead, and journaled. |
-| `session/resume` | Opens the session in the agent and attaches the client, without replay. |
+| `session/load` | Opens the session in the agent (`session/resume`, or `session/load` with the agent's replay dropped), replays the service journal as `session/update`, then attaches the client. A session the journal has never seen is loaded from the agent instead, and journaled. Returns the session state (below). |
+| `session/resume` | Opens the session in the agent and attaches the client, without replay. Returns the session state (below). |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
 | `session/close` | Detaches the client. Only when no other client has the session open is it closed in its agent, or, for a draft, discarded (see below). |
 | `session/delete` | Closes the session in its agent if it is open, then deletes it there if the agent can (`sessionCapabilities.delete`); otherwise the overlay keeps a tombstone. Drops the journal. A session only the agent knows is found through its list; an unknown or already deleted session succeeds. |
 | anything else with a `sessionId` | Forwarded to the session's agent. |
+
+The **session state** is what clients draw as selectors: `configOptions` (Kimi's model,
+thinking and mode), `modes` and, where an agent has the unstable field, `models`. When the
+service asks the agent to open the session, `session/load` and `session/resume` return the
+agent's answer. When the session is already open (another client has it, or Zed restarted and
+loads its threads again), they return the state the agent last reported, kept per session
+from its `session/new`, `session/load` and `session/resume` responses, its
+`config_option_update` and `current_mode_update` notifications, and the responses to forwarded
+`session/set_config_option` and `session/set_mode`. A load whose session the agent cannot take
+returns the history with no state.
 
 Agent → client requests go to the most recently attached client of the session:
 `session/request_permission` (an approval) to any client; `elicitation/create` (a form,

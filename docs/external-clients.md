@@ -35,7 +35,10 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
   `session/request_permission` whose options are the answers plus `Skip`. A form with free
   text is declined, and Claude then asks in plain text.
 - The service and its agents never call the client's `fs/*` or `terminal/*`.
-- `session/load` replays the history from the service journal.
+- `session/load` replays the history from the service journal. It and `session/resume`
+  return the agent's config options and modes with their current values, also for a session
+  the service already has open, so the selectors (Kimi's model, thinking, mode) survive a Zed
+  restart.
 - Sessions created but never prompted (drafts) are deleted when the client closes them or
   goes away, and are not listed ([service-protocol.md](service-protocol.md#drafts-and-deletion)).
 

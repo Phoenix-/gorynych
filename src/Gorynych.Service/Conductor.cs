@@ -130,8 +130,9 @@ public sealed class Conductor : IAsyncDisposable
         var feed = Feed(sessionId);
         if (method == AcpMethods.Client.SessionUpdate)
         {
-            if (feed.SuppressReplay > 0) return; // the agent is replaying history we already journal
             if (@params!["update"] is not JsonObject update) return;
+            feed.ApplyStateUpdate(update);
+            if (feed.SuppressReplay > 0) return; // the agent is replaying history we already journal
             if (feed.IsRepeatedTitle(update)) return;
             feed.TagOpinionTurn(update);
             await feed.PublishAsync(update, except: null, () => Remember(host, sessionId, update));
@@ -265,7 +266,9 @@ public sealed class Conductor : IAsyncDisposable
         BindToken(token, response.SessionId);
         host.MarkLive(response.SessionId);
         store.Update(response.SessionId, host.Name, r => { r.Cwd = request.Cwd; r.Draft = true; });
-        Feed(response.SessionId).Attach(client);
+        var feed = Feed(response.SessionId);
+        feed.CaptureState(AcpJson.ToNode(response));
+        feed.Attach(client);
         response.Meta ??= [];
         response.Meta[GorynychProtocol.MetaAgent] = host.Name;
         ServiceLog.Info($"{host.Name}: new session {response.SessionId} in {request.Cwd}");
@@ -334,6 +337,7 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"{host.Name} cannot reopen session {record.SessionId}");
         }
         host.MarkLive(record.SessionId);
+        Feed(record.SessionId).CaptureState(opened);
         return opened as JsonObject;
     }
 
@@ -354,20 +358,24 @@ public sealed class Conductor : IAsyncDisposable
                 opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
                     AcpJson.ToNode(new LoadSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId) }), ct) as JsonObject;
                 host.MarkLive(record.SessionId);
+                feed.CaptureState(opened);
                 return opened ?? [];
             }
         }
+        JsonObject response;
         try
         {
             (_, opened) = await EnsureLiveAsync(record, ct);
+            response = opened ?? feed.State();
         }
         catch (Exception e) when (e is JsonRpcException or IOException)
         {
             // The history is still worth showing even if the agent cannot take the session now.
             ServiceLog.Warn($"{host.Name}: cannot reopen {record.SessionId}: {e.Message}");
+            response = [];
         }
         await feed.ReplayAndAttachAsync(client);
-        return opened ?? [];
+        return response;
     }
 
     internal async Task<JsonNode?> ResumeAsync(ClientConnection client, ResumeSessionRequest request, CancellationToken ct)
@@ -375,7 +383,8 @@ public sealed class Conductor : IAsyncDisposable
         using var use = await UseAsync(request.SessionId, ct);
         var (_, opened) = await EnsureLiveAsync(use.Record, ct);
         use.Feed.Attach(client);
-        return opened ?? [];
+        // An already open session gets the state the agent last reported, so every client sees its switches.
+        return opened ?? use.Feed.State();
     }
 
     internal async Task<JsonNode?> PromptAsync(ClientConnection client, JsonRpcRequest request, CancellationToken ct)
@@ -442,7 +451,20 @@ public sealed class Conductor : IAsyncDisposable
     {
         using var use = await UseAsync(sessionId, ct);
         var (rpc, _) = await EnsureLiveAsync(use.Record, ct);
-        return await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
+        var response = await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
+        switch (request.Method)
+        {
+            case AcpMethods.Agent.SessionSetConfigOption:
+                use.Feed.CaptureState(response); // the full list with the new values
+                break;
+            case AcpMethods.Agent.SessionSetMode:
+                use.Feed.SetCurrent("modes", "currentModeId", request.Params?["modeId"]);
+                break;
+            case "session/set_model": // unstable in ACP; agents that have it answer the same way
+                use.Feed.SetCurrent("models", "currentModelId", request.Params?["modelId"]);
+                break;
+        }
+        return response;
     }
 
     internal async Task ForwardNotificationAsync(string method, JsonNode? @params, string sessionId)
