@@ -41,6 +41,13 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
   restart.
 - Sessions created but never prompted (drafts) are deleted when the client closes them or
   goes away, and are not listed ([service-protocol.md](service-protocol.md#drafts-and-deletion)).
+- A session an agent spawned is an ordinary session in `session/list`, with its parent in
+  `_meta["gorynych/parentSessionId"]`. The service asks the person to approve each spawn with
+  a `session/request_permission` on the parent session
+  ([service-protocol.md](service-protocol.md#child-sessions)).
+- `_gorynych/sessions_changed` tells a client that a session appeared, changed or went
+  away; a plain client ignores it and sees new sessions the next time it lists them
+  ([service-protocol.md](service-protocol.md#list-changes)).
 
 ## Zed
 
@@ -73,7 +80,8 @@ and what the service does about it:
   An unknown `toolCallId` makes Zed create the tool call.
 
 `SessionLifecycleTests.ZedRules` checks the forms the Claude adapter builds and every
-approval the service and the Claude adapter emit against these rules.
+approval the service and the Claude adapter emit against these rules, the spawn approval
+included.
 
 ### Settings
 

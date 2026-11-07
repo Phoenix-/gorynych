@@ -493,7 +493,7 @@ public sealed class SessionLifecycleTests
         var store = new SessionStore(path);
         store.Update("a", "kimi", r => r.Title = "t");
         Thread.Sleep(20);
-        store.Touch("a", "kimi");
+        store.Touch("a");
         var stamped = store.Get("a")!.UpdatedAt;
         Assert.AreNotEqual(stamped, new SessionStore(path).Get("a")!.UpdatedAt, "a stamp right after a write waits");
 
@@ -511,9 +511,9 @@ public sealed class SessionLifecycleTests
         Thread.Sleep(1100);
         using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
         {
-            store.Touch("a", "kimi"); // tries, and spends its retries
+            store.Touch("a"); // tries, and spends its retries
             var watch = System.Diagnostics.Stopwatch.StartNew();
-            for (var i = 0; i < 20; i++) store.Touch("a", "kimi");
+            for (var i = 0; i < 20; i++) store.Touch("a");
             Assert.IsTrue(watch.ElapsedMilliseconds < 200, $"later stamps waited {watch.ElapsedMilliseconds} ms");
         }
     }
@@ -526,7 +526,7 @@ public sealed class SessionLifecycleTests
         store.Update("a", "kimi", r => r.Title = "t");
         store.Remove("a");
 
-        store.Touch("a", "kimi");
+        store.Touch("a");
         Assert.IsNull(store.Update("a", "kimi", r => r.Title = "late"));
 
         Assert.IsNull(store.Get("a"));
@@ -685,6 +685,8 @@ sealed class LifecycleAgent
                     var id = $"{name}-{Interlocked.Increment(ref next)}";
                     lock (sessions) sessions.Add(id);
                     lock (calls) calls.Add((req.Method, id));
+                    if (req.Params?["mcpServers"]?.AsArray().FirstOrDefault(s => (string?)s?["name"] == "gorynych")?["args"]?.AsArray() is { Count: > 0 } peerArgs)
+                        lock (Tokens) Tokens[id] = (string)peerArgs[peerArgs.Count - 1]!;
                     await agent.Update(id, new AvailableCommandsUpdate { AvailableCommands = [] });
                     return AcpJson.ToNode(new NewSessionResponse { SessionId = id });
                 case AcpMethods.Agent.SessionList:
@@ -694,8 +696,10 @@ sealed class LifecycleAgent
                             Sessions = sessions.Select(s => new SessionInfo { SessionId = s, Cwd = Path.GetTempPath(), Title = this.titles.GetValueOrDefault(s) }).ToList(),
                         });
                 case AcpMethods.Agent.SessionPrompt:
+                    var text = ((TextContent)req.ParamsAs<PromptRequest>().Prompt[0]).Text;
+                    lock (Prompts) Prompts.Add((sessionId!, text));
                     if (BeforePrompt is { } beforePrompt) await beforePrompt(sessionId!);
-                    lock (sessions) this.titles.TryAdd(sessionId!, ((TextContent)req.ParamsAs<PromptRequest>().Prompt[0]).Text);
+                    lock (sessions) this.titles.TryAdd(sessionId!, text);
                     await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = "ok" } });
                     return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn });
                 case AcpMethods.Agent.SessionResume:
@@ -716,6 +720,12 @@ sealed class LifecycleAgent
     }
 
     public ScriptedAdapter Adapter { get; }
+
+    /// <summary>The peer token each session got in its <c>gorynych</c> MCP server.</summary>
+    public Dictionary<string, string> Tokens { get; } = [];
+
+    /// <summary>Every prompt as it arrives (before <see cref="BeforePrompt"/>), with its text.</summary>
+    public List<(string SessionId, string Text)> Prompts { get; } = [];
 
     public Func<string, Task>? BeforePrompt { get; set; }
     public Func<string, Task>? BeforeResume { get; set; }

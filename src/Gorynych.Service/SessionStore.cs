@@ -32,6 +32,17 @@ public sealed class SessionRecord
     /// </summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool Deleted { get; set; }
+
+    /// <summary>The session that started this one with <c>spawn_session</c>; null for one a client created.</summary>
+    public string? ParentSessionId { get; set; }
+
+    /// <summary>A spawned session reports the end of each of its turns to its parent.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool ReportToParent { get; set; }
+
+    /// <summary>Shown in client lists: neither a draft nor deleted.</summary>
+    [JsonIgnore]
+    public bool Listed => !Draft && !Deleted;
 }
 
 public sealed class ServiceState
@@ -79,6 +90,15 @@ public sealed class SessionStore
         }
     }
 
+    /// <summary>
+    /// Called with copies of a record before and after each change (null when it did not exist,
+    /// or was removed), under the store's lock and in the order of the changes. It must not block.
+    /// </summary>
+    public Action<SessionRecord?, SessionRecord>? Changed { get; set; }
+
+    /// <summary>Called with a copy of a record when it is removed, like <see cref="Changed"/>.</summary>
+    public Action<SessionRecord>? Removed { get; set; }
+
     public SessionRecord? Get(string sessionId)
     {
         lock (gate) return records.TryGetValue(sessionId, out var r) ? Clone(r) : null;
@@ -101,10 +121,12 @@ public sealed class SessionStore
         (string Json, long Version) snapshot;
         lock (gate)
         {
+            var before = records.TryGetValue(sessionId, out var existing) ? Clone(existing) : null;
             if (GetOrCreate(sessionId, agent) is not { } r) return null;
             change(r);
             result = Clone(r);
             snapshot = Snapshot();
+            Changed?.Invoke(before, Clone(r));
         }
         Write(snapshot, durable);
         return result;
@@ -113,16 +135,19 @@ public sealed class SessionStore
     /// <summary>
     /// Stamps activity on a session. Streaming produces many updates a second, so a stamp tries
     /// to write the file at most once per <see cref="TouchSaveInterval"/> after the last attempt
-    /// (successful or not); the next write carries it anyway. Ignores removed and deleted sessions.
+    /// (successful or not); the next write carries it anyway. Ignores unknown, removed and deleted
+    /// sessions: an update that arrives before its session is recorded must not record it.
     /// </summary>
-    public void Touch(string sessionId, string agent)
+    public void Touch(string sessionId)
     {
         (string Json, long Version) snapshot;
         lock (gate)
         {
-            if (GetOrCreate(sessionId, agent) is not { Deleted: false } r) return;
+            if (!records.TryGetValue(sessionId, out var r) || r.Deleted) return;
+            var before = Clone(r);
             r.UpdatedAt = DateTimeOffset.UtcNow;
             changes++;
+            Changed?.Invoke(before, Clone(r));
             if (Environment.TickCount64 - lastAttempt < TouchSaveInterval.TotalMilliseconds) return;
             snapshot = Snapshot(counted: true);
         }
@@ -136,8 +161,9 @@ public sealed class SessionStore
         lock (gate)
         {
             removed.Add(sessionId);
-            if (!records.Remove(sessionId)) return;
+            if (!records.Remove(sessionId, out var gone)) return;
             snapshot = Snapshot();
+            Removed?.Invoke(Clone(gone));
         }
         Write(snapshot, durable: false);
     }
@@ -196,5 +222,6 @@ public sealed class SessionStore
     {
         SessionId = r.SessionId, Agent = r.Agent, Cwd = r.Cwd, Title = r.Title, TitleSource = r.TitleSource,
         CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt, Draft = r.Draft, Deleted = r.Deleted,
+        ParentSessionId = r.ParentSessionId, ReportToParent = r.ReportToParent,
     };
 }

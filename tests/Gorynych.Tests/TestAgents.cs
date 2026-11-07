@@ -58,6 +58,11 @@ sealed class TestClient : IAsyncDisposable
     readonly Task serving;
     public List<JsonObject> Updates { get; } = [];
     public List<RequestPermissionRequest> Approvals { get; } = [];
+
+    /// <summary>The <c>_gorynych/sessions_changed</c> notifications received, in order.</summary>
+    public List<JsonObject> Changes { get; } = [];
+
+    public InitializeResponse? Initialized { get; private set; }
     public List<ElicitationFormMode> Forms { get; } = [];
 
     /// <summary>Answers a form; by default every question with its first choice.</summary>
@@ -81,7 +86,8 @@ sealed class TestClient : IAsyncDisposable
 
     public JsonRpcConnection Rpc { get; }
 
-    public static async Task<TestClient> ConnectAsync(Conductor conductor, string name = "test-client", bool forms = true)
+    /// <param name="agent">Scopes the connection to one agent, as the stdio bridge does.</param>
+    public static async Task<TestClient> ConnectAsync(Conductor conductor, string name = "test-client", bool forms = true, string? agent = null)
     {
         var link = new DuplexLink();
         var (si, so) = link.AgentEnd;
@@ -92,6 +98,8 @@ sealed class TestClient : IAsyncDisposable
         {
             if (method == AcpMethods.Client.SessionUpdate && p?["update"] is JsonObject u)
                 lock (client.Updates) client.Updates.Add(u);
+            else if (method == GorynychProtocol.MethodSessionsChanged && p is JsonObject change)
+                lock (client.Changes) client.Changes.Add(change);
             return Task.CompletedTask;
         };
         client.Rpc.RequestHandler = async (req, ct) =>
@@ -107,12 +115,19 @@ sealed class TestClient : IAsyncDisposable
             return AcpJson.ToNode(new RequestPermissionResponse { Outcome = await client.Approve(r) });
         };
         client.Rpc.Start();
-        await client.Rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
+        client.Initialized = await client.Rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
         {
             ProtocolVersion = 1,
             ClientCapabilities = forms ? new ClientCapabilities { Elicitation = new ElicitationCapabilities { Form = new ElicitationFormCapabilities() } } : null,
+            Meta = agent is null ? null : new JsonObject { [GorynychProtocol.MetaAgent] = agent },
         });
         return client;
+    }
+
+    /// <summary>The <c>sessions_changed</c> notifications so far, as "change sessionId".</summary>
+    public string[] ChangeLog()
+    {
+        lock (Changes) return Changes.Select(c => $"{(string?)c["change"]} {(string?)c["sessionId"]}").ToArray();
     }
 
     public JsonObject[] Snapshot()

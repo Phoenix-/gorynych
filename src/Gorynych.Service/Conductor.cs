@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
+using System.Threading.Channels;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
@@ -21,6 +22,12 @@ public sealed class ConductorOptions
     /// session in <c>mcpServers</c> with a token; null gives agents no peer tools.
     /// </summary>
     public IReadOnlyList<string>? PeerServerCommand { get; init; }
+
+    /// <summary>
+    /// How often a session's bare activity (a new <c>updatedAt</c>) may be announced with
+    /// <c>_gorynych/sessions_changed</c>; the last change in an interval is announced at its end.
+    /// </summary>
+    public TimeSpan ActivityNoticeInterval { get; init; } = TimeSpan.FromSeconds(10);
 }
 
 /// <summary>
@@ -45,10 +52,23 @@ public sealed class Conductor : IAsyncDisposable
     readonly List<string> startupDrafts;
     readonly ConcurrentDictionary<Task, byte> cleanups = new();
     readonly CancellationTokenSource cleanupStop = new();
+    readonly Channel<(string SessionId, string Agent, string Change)> listChanges =
+        Channel.CreateUnbounded<(string, string, string)>(new UnboundedChannelOptions { SingleReader = true });
+    readonly Task listChangesSent;
+    readonly ConcurrentDictionary<string, long> lastUpdateNotice = new(StringComparer.Ordinal); // session -> tick of its last "updated"
+    readonly ConcurrentDictionary<string, byte> trailingUpdateNotice = new(StringComparer.Ordinal);
+    readonly ConcurrentDictionary<Task, byte> spawnedTurns = new();
     long opinionCount;
+    long spawnCount;
 
-    /// <summary>The gorynych tools an agent may call without asking: looking who is there, and answering.</summary>
-    static readonly HashSet<string> PreAllowedTools = ["mcp__gorynych__list_agents", "mcp__gorynych__reply"];
+    /// <summary>
+    /// The gorynych tools an agent may call without asking: looking who is there, and answering.
+    /// <c>spawn_session</c> is here because the service itself asks the person before it spawns.
+    /// </summary>
+    static readonly HashSet<string> PreAllowedTools = ["mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__spawn_session"];
+
+    /// <summary>The title source of a name given to <c>spawn_session</c>: harness titles do not replace it.</summary>
+    const string SpawnTitle = "spawn";
 
     public Conductor(ConductorOptions options, IEnumerable<IAgentAdapter> adapters)
     {
@@ -60,6 +80,9 @@ public sealed class Conductor : IAsyncDisposable
         startupDrafts = store.All().Where(r => r.Draft).Select(r => r.SessionId).ToList();
         foreach (var a in adapters) agents[a.Name] = new AgentHost(a, this);
         DefaultAgent = options.DefaultAgent ?? agents.Keys.FirstOrDefault() ?? throw new ArgumentException("no adapters");
+        store.Changed = OnRecordChanged;
+        store.Removed = r => { if (r.Listed) AnnounceList(r.SessionId, r.Agent, "removed"); };
+        listChangesSent = Task.Run(SendListChangesAsync);
     }
 
     public string DefaultAgent { get; }
@@ -133,6 +156,7 @@ public sealed class Conductor : IAsyncDisposable
             if (@params!["update"] is not JsonObject update) return;
             feed.ApplyStateUpdate(update);
             if (feed.SuppressReplay > 0) return; // the agent is replaying history we already journal
+            KeepSpawnTitle(sessionId, update);
             if (feed.IsRepeatedTitle(update)) return;
             feed.TagOpinionTurn(update);
             await feed.PublishAsync(update, except: null, () => Remember(host, sessionId, update));
@@ -145,14 +169,28 @@ public sealed class Conductor : IAsyncDisposable
     void Remember(AgentHost host, string sessionId, JsonObject update)
     {
         if ((string?)update["sessionUpdate"] == "session_info_update" && (string?)update["title"] is { Length: > 0 } title)
+        {
+            // A title must not record a session the service does not know (yet): it would be listed and announced.
+            if (store.Get(sessionId) is null) return;
             store.Update(sessionId, host.Name, r =>
             {
                 r.UpdatedAt = DateTimeOffset.UtcNow;
+                if (r.TitleSource == SpawnTitle) return;
                 r.Title = title;
                 r.TitleSource = "agent";
             });
+        }
         else
-            store.Touch(sessionId, host.Name);
+        {
+            store.Touch(sessionId);
+        }
+    }
+
+    /// <summary>A session named by <c>spawn_session</c> keeps that name: the agent's own title is replaced with it.</summary>
+    void KeepSpawnTitle(string sessionId, JsonObject update)
+    {
+        if ((string?)update["sessionUpdate"] != "session_info_update" || update["title"] is null) return;
+        if (store.Get(sessionId) is { TitleSource: SpawnTitle, Title: { } name }) update["title"] = name;
     }
 
     /// <summary>
@@ -211,7 +249,7 @@ public sealed class Conductor : IAsyncDisposable
                         {
                             var discovered = rec.Cwd.Length == 0;
                             rec.Cwd = s.Cwd;
-                            if (s.Title is { Length: > 0 } t) { rec.Title = t; rec.TitleSource = "agent"; }
+                            if (s.Title is { Length: > 0 } t && rec.TitleSource != SpawnTitle) { rec.Title = t; rec.TitleSource = "agent"; }
                             if (ParseTime(s.UpdatedAt) is { } at && (discovered || at > rec.UpdatedAt)) rec.UpdatedAt = at;
                         });
                         if (record is not null) found[s.SessionId] = Describe(record, s);
@@ -244,12 +282,13 @@ public sealed class Conductor : IAsyncDisposable
     {
         var meta = native?.Meta?.DeepClone().AsObject() ?? [];
         meta[GorynychProtocol.MetaAgent] = r.Agent;
+        if (r.ParentSessionId is not null) meta[GorynychProtocol.MetaParentSessionId] = r.ParentSessionId;
         return new SessionInfo
         {
             SessionId = r.SessionId,
             Cwd = native?.Cwd ?? r.Cwd,
             AdditionalDirectories = native?.AdditionalDirectories,
-            Title = native?.Title is { Length: > 0 } t ? t : r.Title,
+            Title = r.TitleSource != SpawnTitle && native?.Title is { Length: > 0 } t ? t : r.Title,
             UpdatedAt = r.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
             Meta = meta,
         };
@@ -419,15 +458,9 @@ public sealed class Conductor : IAsyncDisposable
         foreach (var block in prompt.Prompt)
         {
             var update = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = block })!.AsObject();
-            await feed.PublishAsync(update, except: client, () => store.Touch(record.SessionId, record.Agent));
+            await feed.PublishAsync(update, except: client, () => store.Touch(record.SessionId));
         }
-        if (record.Title is null && FirstText(prompt.Prompt) is { } text)
-        {
-            var title = Shorten(text);
-            store.Update(record.SessionId, record.Agent, r => { r.Title ??= title; r.TitleSource ??= "prompt"; });
-            var info = AcpJson.ToNode<SessionUpdate>(new SessionInfoUpdate { Title = title })!.AsObject();
-            if (!feed.IsRepeatedTitle(info)) await feed.PublishAsync(info, except: null, () => { });
-        }
+        await ProvisionalTitleAsync(feed, record, prompt.Prompt);
         // A turn outlives the client that started it: closing the GUI must not stop the agent.
         // Stopping a turn is an explicit session/cancel, which must reach the agent after the
         // prompt, so both go through the session's forward gate.
@@ -443,6 +476,16 @@ public sealed class Conductor : IAsyncDisposable
             feed.ForwardGate.Release();
         }
         return await response;
+    }
+
+    /// <summary>Uses the first prompt as the session's title until the harness provides one.</summary>
+    async Task ProvisionalTitleAsync(SessionFeed feed, SessionRecord record, IEnumerable<ContentBlock> prompt)
+    {
+        if (record.Title is not null || FirstText(prompt) is not { } text) return;
+        var title = Shorten(text);
+        store.Update(record.SessionId, record.Agent, r => { r.Title ??= title; r.TitleSource ??= "prompt"; });
+        var info = AcpJson.ToNode<SessionUpdate>(new SessionInfoUpdate { Title = title })!.AsObject();
+        if (!feed.IsRepeatedTitle(info)) await feed.PublishAsync(info, except: null, () => { });
     }
 
     static JsonNode? Cancelled() => AcpJson.ToNode(new PromptResponse { StopReason = StopReason.Cancelled });
@@ -819,6 +862,267 @@ public sealed class Conductor : IAsyncDisposable
     SessionJournal JournalOf(string sessionId) =>
         feeds.TryGetValue(sessionId, out var feed) ? feed.Journal : new SessionJournal(JournalPath(sessionId), options.JournalMaxEntries);
 
+    // ---------------------------------------------------------------- child sessions
+
+    /// <summary>
+    /// <c>_gorynych/spawn</c>, from the peers MCP server's <c>spawn_session</c>. Asks the person on
+    /// the calling session, then creates a session in the chosen agent with the caller as its
+    /// parent and starts its first prompt in the background. Returns the new session's ID at once.
+    /// A spawned session is never a draft.
+    /// </summary>
+    internal async Task<JsonNode?> SpawnAsync(JsonRpcRequest request, CancellationToken ct)
+    {
+        var token = (string?)request.Params?["_meta"]?[GorynychProtocol.MetaPeerToken];
+        if (token is null || !peerTokens.TryGetValue(token, out var parentId))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, "Only an agent's session can spawn one: unknown peer token");
+        var prompt = (string?)request.Params?["prompt"];
+        if (string.IsNullOrWhiteSpace(prompt)) throw new JsonRpcException(JsonRpcException.InvalidParams, "prompt is required");
+        var host = Agent((string?)request.Params?["agent"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "agent is required"));
+        var title = ((string?)request.Params?["title"])?.Trim() is { Length: > 0 } named ? Shorten(named) : null;
+        var report = request.Params?["report"] is not JsonValue flag || !flag.TryGetValue<bool>(out var r) || r;
+
+        using var parentUse = await UseAsync(parentId, ct);
+        var parent = parentUse.Record;
+        var cwd = ResolveFolder(parent.Cwd, (string?)request.Params?["cwd"]);
+        var callId = "gorynych-spawn-" + Interlocked.Increment(ref spawnCount);
+        var what = $"Start a {host.DisplayName} session" + (title is null ? "" : $": {title}");
+        bool allowed;
+        try
+        {
+            allowed = await AskToSpawnAsync(parentUse.Feed, parent, callId, what, host, cwd, prompt, title, ct);
+        }
+        catch (Exception e) when (e is OperationCanceledException or JsonRpcException)
+        {
+            await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, "Not started: nobody answered.");
+            throw;
+        }
+        if (!allowed)
+        {
+            await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, "Not started: the user declined.");
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, "The user declined to start the session.");
+        }
+        string childId;
+        try
+        {
+            childId = await CreateChildAsync(parent, host, cwd, prompt, title, report, ct);
+        }
+        catch (Exception e)
+        {
+            await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, $"Not started: {e.Message}");
+            throw;
+        }
+        await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Completed, $"Started {host.DisplayName} session {childId}.");
+        ServiceLog.Info($"{parent.Agent} {parent.SessionId}: spawned {host.Name} session {childId} in {cwd}");
+        return new JsonObject { ["sessionId"] = childId };
+    }
+
+    /// <summary>The spawned session's folder: the caller's by default; a relative path is taken from the caller's.</summary>
+    static string ResolveFolder(string parentCwd, string? cwd)
+    {
+        if (string.IsNullOrWhiteSpace(cwd))
+            return parentCwd.Length > 0 ? parentCwd : throw new JsonRpcException(JsonRpcException.InvalidParams, "cwd is required");
+        var full = Path.GetFullPath(Path.IsPathRooted(cwd) || parentCwd.Length == 0 ? cwd : Path.Combine(parentCwd, cwd));
+        return Directory.Exists(full) ? full : throw new JsonRpcException(JsonRpcException.InvalidParams, $"No such folder: {full}");
+    }
+
+    /// <summary>
+    /// Shows the spawn in the caller's thread as a tool call and asks the person there, with
+    /// <c>session/request_permission</c> on the calling session (allow once or reject, never
+    /// always: every spawn is asked). Waits for a client if none is attached.
+    /// </summary>
+    async Task<bool> AskToSpawnAsync(SessionFeed feed, SessionRecord parent, string callId, string what, AgentHost host, string cwd,
+        string prompt, string? title, CancellationToken ct)
+    {
+        var input = new JsonObject { ["agent"] = host.Name, ["cwd"] = cwd, ["prompt"] = prompt };
+        if (title is not null) input["title"] = title;
+        var card = new ToolCall
+        {
+            ToolCallId = callId,
+            Title = what,
+            Kind = ToolKind.Other,
+            Status = ToolCallStatus.Pending,
+            RawInput = input.DeepClone(),
+            Content = [new Content { ContentValue = new TextContent { Text = $"{prompt}\n\nFolder: {cwd}" } }],
+        };
+        await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(card)!.AsObject(), except: null, () => store.Touch(parent.SessionId));
+        var ask = new RequestPermissionRequest
+        {
+            SessionId = parent.SessionId,
+            ToolCall = new ToolCallUpdate { ToolCallId = callId, Title = what, Kind = ToolKind.Other, Status = ToolCallStatus.Pending, RawInput = input },
+            Options =
+            [
+                new PermissionOption { OptionId = "start", Name = "Start", Kind = PermissionOptionKind.AllowOnce },
+                new PermissionOption { OptionId = "decline", Name = "Don't start", Kind = PermissionOptionKind.RejectOnce },
+            ],
+        };
+        while (true)
+        {
+            var client = await feed.WaitForClientAsync(_ => true, ct);
+            try
+            {
+                var answer = await client.Rpc.RequestAsync<RequestPermissionRequest, RequestPermissionResponse>(AcpMethods.Client.SessionRequestPermission, ask, ct);
+                return answer.Outcome is SelectedPermissionOutcome { OptionId: "start" };
+            }
+            catch (Exception e) when (e is IOException or TimeoutException || (e is OperationCanceledException && !ct.IsCancellationRequested))
+            {
+                feed.Detach(client); // gone before answering: ask the next one
+            }
+        }
+    }
+
+    Task EndSpawnCardAsync(SessionFeed feed, SessionRecord parent, string callId, ToolCallStatus status, string text) =>
+        feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(new SessionUpdateToolCallUpdate
+        {
+            ToolCallId = callId,
+            Status = status,
+            Content = [new Content { ContentValue = new TextContent { Text = text } }],
+        })!.AsObject(), except: null, () => store.Touch(parent.SessionId));
+
+    /// <summary>Creates the child in its agent, records it, and starts its first turn without waiting for it.</summary>
+    async Task<string> CreateChildAsync(SessionRecord parent, AgentHost host, string cwd, string prompt, string? title, bool report, CancellationToken ct)
+    {
+        var rpc = await host.GetAsync(ct);
+        var token = NewToken();
+        var response = await rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+            new NewSessionRequest { Cwd = cwd, McpServers = WithPeers([], token) }, ct);
+        var id = response.SessionId;
+        BindToken(token, id);
+        host.MarkLive(id);
+        var feed = Feed(id);
+        feed.CaptureState(AcpJson.ToNode(response));
+        // One change, so the session is announced with its parent.
+        var record = store.Update(id, host.Name, rec =>
+        {
+            rec.Cwd = cwd;
+            rec.Draft = false;
+            rec.ParentSessionId = parent.SessionId;
+            rec.ReportToParent = report;
+            if (title is null) return;
+            rec.Title = title;
+            rec.TitleSource = SpawnTitle;
+        }) ?? throw NotFound(id);
+        var info = new JsonObject
+        {
+            ["sessionUpdate"] = "session_info_update",
+            ["_meta"] = new JsonObject { [GorynychProtocol.MetaParentSessionId] = parent.SessionId },
+        };
+        if (title is not null)
+        {
+            info["title"] = title;
+            feed.IsRepeatedTitle(new JsonObject { ["sessionUpdate"] = "session_info_update", ["title"] = title }); // so the same title is not sent again
+        }
+        await feed.PublishAsync(info, except: null, () => { });
+        // Take the turn now, so an ask_agent or prompt that comes right after waits for this first one.
+        await feed.TurnGate.WaitAsync(CancellationToken.None);
+        var turn = Task.Run(() => SpawnedTurnAsync(feed, record, parent, prompt));
+        spawnedTurns[turn] = 0;
+        _ = turn.ContinueWith(t => spawnedTurns.TryRemove(t, out _), TaskScheduler.Default);
+        return id;
+    }
+
+    /// <summary>The first turn of a spawned session. Holds the session's turn gate, taken before the spawn returned.</summary>
+    async Task SpawnedTurnAsync(SessionFeed feed, SessionRecord record, SessionRecord parent, string prompt)
+    {
+        try
+        {
+            using var use = await UseAsync(record.SessionId, CancellationToken.None);
+            if (feed.Retired) return;
+            var (rpc, _) = await EnsureLiveAsync(use.Record, CancellationToken.None);
+            var block = new TextContent { Text = prompt };
+            var meta = new JsonObject
+            {
+                [GorynychProtocol.MetaOrigin] = "spawn",
+                [GorynychProtocol.MetaSender] = $"parent_{parent.Agent}",
+                [GorynychProtocol.MetaParentSessionId] = parent.SessionId,
+            };
+            var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = block, Meta = meta })!.AsObject();
+            await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
+            await ProvisionalTitleAsync(feed, use.Record, [block]);
+            Task<JsonNode?> response;
+            await feed.ForwardGate.WaitAsync(CancellationToken.None);
+            try
+            {
+                response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt,
+                    AcpJson.ToNode(new PromptRequest { SessionId = record.SessionId, Prompt = [block] }), CancellationToken.None);
+            }
+            finally
+            {
+                feed.ForwardGate.Release();
+            }
+            await response;
+        }
+        catch (Exception e)
+        {
+            ServiceLog.Warn($"{record.Agent} {record.SessionId}: the spawned session's first turn failed: {e.Message}");
+        }
+        finally
+        {
+            feed.TurnGate.Release();
+        }
+    }
+
+    /// <summary>Completes when the first turns of spawned sessions are done.</summary>
+    public Task SpawnedTurnsIdleAsync() => Task.WhenAll(spawnedTurns.Keys);
+
+    // ---------------------------------------------------------------- list changes
+
+    /// <summary>
+    /// Turns a change of the overlay into <c>_gorynych/sessions_changed</c>, by what clients list:
+    /// a session that becomes listed (spawned, a draft's first prompt, found in an agent's list)
+    /// is <c>added</c>, one that stops being listed (deleted) is <c>removed</c>, and a listed one
+    /// whose title or parent changes is <c>updated</c>; so is its activity, throttled. Drafts are
+    /// never announced. Runs under the store's lock, so changes are queued in their order.
+    /// </summary>
+    void OnRecordChanged(SessionRecord? before, SessionRecord after)
+    {
+        var listed = before?.Listed ?? false;
+        if (!listed && after.Listed) AnnounceList(after.SessionId, after.Agent, "added");
+        else if (listed && !after.Listed) AnnounceList(after.SessionId, after.Agent, "removed");
+        else if (!after.Listed) return;
+        else if (before!.Title != after.Title || before.ParentSessionId != after.ParentSessionId) AnnounceList(after.SessionId, after.Agent, "updated");
+        else if (before.UpdatedAt != after.UpdatedAt) AnnounceActivity(after.SessionId, after.Agent);
+    }
+
+    void AnnounceList(string sessionId, string agent, string change)
+    {
+        if (change == "updated") lastUpdateNotice[sessionId] = Environment.TickCount64;
+        else if (change == "removed") lastUpdateNotice.TryRemove(sessionId, out _);
+        listChanges.Writer.TryWrite((sessionId, agent, change));
+    }
+
+    /// <summary>
+    /// Announces a new <c>updatedAt</c> at most once per <see cref="ConductorOptions.ActivityNoticeInterval"/>
+    /// per session; a change inside the interval is announced at its end.
+    /// </summary>
+    void AnnounceActivity(string sessionId, string agent)
+    {
+        var interval = (long)options.ActivityNoticeInterval.TotalMilliseconds;
+        var since = Environment.TickCount64 - lastUpdateNotice.GetValueOrDefault(sessionId, long.MinValue / 2);
+        if (since >= interval)
+        {
+            AnnounceList(sessionId, agent, "updated");
+            return;
+        }
+        if (!trailingUpdateNotice.TryAdd(sessionId, 0)) return;
+        _ = Task.Delay(TimeSpan.FromMilliseconds(interval - since)).ContinueWith(delay =>
+        {
+            trailingUpdateNotice.TryRemove(sessionId, out _);
+            if (store.Get(sessionId) is { Listed: true }) AnnounceList(sessionId, agent, "updated");
+        }, TaskScheduler.Default);
+    }
+
+    /// <summary>Sends the queued list changes to every client whose agent scope covers the session.</summary>
+    async Task SendListChangesAsync()
+    {
+        await foreach (var (sessionId, agent, change) in listChanges.Reader.ReadAllAsync())
+        {
+            var notice = new JsonObject { ["sessionId"] = sessionId, ["change"] = change };
+            foreach (var client in clients.Keys)
+                if (client.Init is not null && (client.AgentScope is null || client.AgentScope == agent))
+                    await client.NotifyAsync(GorynychProtocol.MethodSessionsChanged, notice.DeepClone());
+        }
+    }
+
     // ---------------------------------------------------------------- opinions between agents
 
     /// <summary>
@@ -893,7 +1197,7 @@ public sealed class Conductor : IAsyncDisposable
                 };
                 if (from is not null) meta["gorynych/fromSessionId"] = from;
                 var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = new TextContent { Text = text }, Meta = meta })!.AsObject();
-                await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId, record.Agent));
+                await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
                 feed.BeginOpinionTurn(messageId);
                 Task<JsonNode?> response;
                 await feed.ForwardGate.WaitAsync(CancellationToken.None);
@@ -993,6 +1297,7 @@ public sealed class Conductor : IAsyncDisposable
                 ["cwd"] = r.Cwd,
                 ["open"] = live,
                 ["updated_at"] = r.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
+                ["parent_session_id"] = r.ParentSessionId,
             });
         }
         return new JsonObject { ["sessions"] = sessions };
@@ -1081,6 +1386,9 @@ public sealed class Conductor : IAsyncDisposable
             try { await host.DisposeAsync(); }
             catch (Exception e) { ServiceLog.Warn($"{host.Name}: stop failed: {e.Message}"); }
         store.Flush();
+        listChanges.Writer.TryComplete();
+        try { await listChangesSent.WaitAsync(TimeSpan.FromSeconds(5)); }
+        catch (Exception e) { ServiceLog.Warn($"list changes at exit: {e.Message}"); }
         shutdown.Dispose();
         cleanupStop.Dispose();
     }

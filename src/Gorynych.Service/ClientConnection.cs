@@ -76,6 +76,8 @@ internal sealed class ClientConnection
                 return conductor.Peers(request);
             case GorynychProtocol.MethodReply:
                 return conductor.Reply(request);
+            case GorynychProtocol.MethodSpawn:
+                return await conductor.SpawnAsync(request, ct);
             case GorynychProtocol.MethodShutdown:
                 ServiceLog.Info($"{Rpc.Name}: asked the service to exit");
                 _ = Task.Delay(200).ContinueWith(_ => conductor.RequestShutdown(), TaskScheduler.Default);
@@ -123,8 +125,31 @@ internal sealed class ClientConnection
             [GorynychProtocol.MetaServiceId] = conductor.ServiceId,
             [GorynychProtocol.MetaAgents] = new JsonArray(conductor.Agents.Values
                 .Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["displayName"] = a.DisplayName }).ToArray()),
+            [GorynychProtocol.MetaSessionsChanged] = true,
         },
     };
+
+    static readonly TimeSpan NotifyTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Sends a notification that belongs to no session, such as <c>_gorynych/sessions_changed</c>.
+    /// A client that stops reading for 15 seconds is disconnected, as for session updates.
+    /// </summary>
+    public async Task NotifyAsync(string method, JsonNode? @params)
+    {
+        try
+        {
+            await Rpc.SendNotificationAsync(method, @params).WaitAsync(NotifyTimeout);
+        }
+        catch (Exception e) when (e is IOException or OperationCanceledException or ObjectDisposedException)
+        {
+        }
+        catch (TimeoutException)
+        {
+            ServiceLog.Warn($"{Rpc.Name}: not reading; disconnecting it");
+            _ = Rpc.DisposeAsync().AsTask();
+        }
+    }
 
     static string RequireSession(JsonRpcRequest request) =>
         (string?)request.Params?["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");

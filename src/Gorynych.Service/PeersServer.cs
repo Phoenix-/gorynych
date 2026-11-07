@@ -13,8 +13,9 @@ namespace Gorynych.Service;
 /// The <c>gorynych</c> stdio MCP server agents start from their <c>mcpServers</c>:
 /// <c>Gorynych.Service peers [--pipe P --token T] [--channel-url U]</c>.
 /// <list type="bullet">
-/// <item>With a pipe and token it offers <c>list_agents</c> and <c>ask_agent</c>, which go to
-/// the service; the token tells the service which session is asking.</item>
+/// <item>With a pipe and token it offers <c>list_agents</c>, <c>ask_agent</c> and
+/// <c>spawn_session</c>, which go to the service; the token tells the service which session is
+/// asking.</item>
 /// <item>With a channel URL (Claude Code) it is also a development channel: it declares
 /// <c>claude/channel</c>, long-polls the Claude adapter and pushes
 /// <c>notifications/claude/channel</c>.</item>
@@ -59,8 +60,9 @@ public static class PeersServer
         else
             instructions.Append("An opinion request from another of the user's agents names a message_id; answer it with the reply tool. ");
         if (peers)
-            instructions.Append("list_agents shows the user's other coding-agent sessions and ask_agent asks one for its opinion. " +
-                "They only give opinions; they do not act on your behalf.");
+            instructions.Append("list_agents shows the user's other coding-agent sessions and ask_agent asks one for its opinion; " +
+                "they only give opinions, they do not act on your behalf. spawn_session starts a new child session of one of these agents " +
+                "with a task, after the user approves it.");
         return new JsonObject
         {
             ["protocolVersion"] = req.Params?["protocolVersion"]?.DeepClone() ?? "2025-06-18",
@@ -137,6 +139,25 @@ public static class PeersServer
                     }, ct);
                     return Text((string?)reply?["text"] ?? "(no answer)");
                 }
+                case "spawn_session" when pipe is not null && token is not null:
+                {
+                    var agent = (string?)args?["agent"];
+                    var prompt = (string?)args?["prompt"];
+                    if (string.IsNullOrWhiteSpace(agent) || string.IsNullOrWhiteSpace(prompt))
+                        return Text("agent and prompt are required", error: true);
+                    var spawn = new JsonObject
+                    {
+                        ["agent"] = agent,
+                        ["prompt"] = prompt,
+                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token },
+                    };
+                    if (args?["cwd"] is JsonValue cwd && cwd.TryGetValue<string>(out var folder) && folder.Length > 0) spawn["cwd"] = folder;
+                    if (args?["title"] is JsonValue title && title.TryGetValue<string>(out var name) && name.Length > 0) spawn["title"] = name;
+                    if (args?["report"] is JsonValue report && report.TryGetValue<bool>(out var reports)) spawn["report"] = reports;
+                    await using var service = await ConnectAsync(pipe, ct);
+                    var started = await service.SendRequestAsync(GorynychProtocol.MethodSpawn, spawn, ct);
+                    return Text(new JsonObject { ["session_id"] = (string?)started?["sessionId"] }.ToJsonString());
+                }
                 default:
                     return Text($"unknown tool {tool}", error: true);
             }
@@ -188,7 +209,8 @@ public static class PeersServer
         var list = new JsonObject
         {
             ["name"] = "list_agents",
-            ["description"] = "List the user's other coding-agent sessions in Gorynych that you can ask for an opinion: session ID, agent, title, folder.",
+            ["description"] = "List the user's other coding-agent sessions in Gorynych that you can ask for an opinion: session ID, agent, title, " +
+                "folder, whether it is open, and parent_session_id for a session another session started with spawn_session.",
             ["inputSchema"] = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject() },
         };
         var ask = new JsonObject
@@ -207,7 +229,26 @@ public static class PeersServer
                 ["required"] = new JsonArray("session_id", "question"),
             },
         };
-        return [list, ask, reply];
+        var spawn = new JsonObject
+        {
+            ["name"] = "spawn_session",
+            ["description"] = "Start a new session of one of the user's coding agents as a child of this session, with a first prompt it works on. " +
+                "The user approves every spawn. Returns {\"session_id\": ...} at once, without waiting for the work; the child then runs on its own, " +
+                "the user can open and prompt it directly, and ask_agent asks it questions. Use it when the user asks you to hand work to another agent.",
+            ["inputSchema"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["agent"] = new JsonObject { ["type"] = "string", ["description"] = "the agent to run: claude or kimi" },
+                    ["prompt"] = new JsonObject { ["type"] = "string", ["description"] = "the first prompt: the task, with the context the agent needs" },
+                    ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "the folder to work in; default: this session's folder; a relative path is taken from it" },
+                    ["title"] = new JsonObject { ["type"] = "string", ["description"] = "a short name for the session in the user's list" },
+                },
+                ["required"] = new JsonArray("agent", "prompt"),
+            },
+        };
+        return [list, ask, spawn, reply];
     }
 }
 

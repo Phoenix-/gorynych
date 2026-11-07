@@ -26,6 +26,10 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   Kimi lists it untitled, and forwards a client's `session/delete` the same way. Verified
   live on 7 November 2026 (`Kimi_DraftIsDeletedNatively_WhenItsClientLeaves`, and a probe of
   the list and delete answers).
+- Kimi has no way for a client to set a session's title, so a name given to `spawn_session`
+  lives in the service's overlay and wins over the title Kimi takes from the first prompt.
+  The service answers Kimi's approval of `spawn_session` itself, since it asks the person
+  before it spawns ([service-protocol.md](service-protocol.md#child-sessions)).
 - Verified live on 7 November 2026 after logging in: first prompt, a Write approval, the
   title, replay through the service journal, and `ask_agent` to a Claude session. Before
   the login every turn failed with `-32000 Authentication required: 403`, which the service
@@ -113,13 +117,19 @@ and posts `reply` back. Without a service-given server the adapter starts a chan
 `gorynych` server itself.
 
 `--append-system-prompt` authorizes opinions from the user's agents, forbids actions on
-their behalf, and, when the peer tools are there, tells Claude about `list_agents` and
-`ask_agent`. The PermissionRequest hook allows `mcp__gorynych__reply` and
-`mcp__gorynych__list_agents` without asking; `mcp__gorynych__ask_agent` becomes an ACP
-approval like any tool.
+their behalf, and, when the peer tools are there, tells Claude about `list_agents`,
+`ask_agent` and `spawn_session`. The PermissionRequest hook allows `mcp__gorynych__reply`,
+`mcp__gorynych__list_agents` and `mcp__gorynych__spawn_session` without asking (the service
+asks the person before every spawn); `mcp__gorynych__ask_agent` becomes an ACP approval like
+any tool.
+
+A name given to `spawn_session` stays in the service's overlay: the adapter cannot write
+Claude's own `custom-title` yet (that needs `/rename` through the PTY), and Claude's
+generated `ai-title` does not replace the name.
 
 ### Not done yet
 
 - A Unix PTY host; the adapter reports "not supported" off Windows, the service still builds.
 - Listing Claude sessions the adapter did not start (`~/.claude/projects`).
-- Subagent events, `/rename` from the GUI, resizing the pseudo console.
+- Subagent events, `/rename` from the GUI (and so a spawn name written as Claude's own
+  `custom-title`), resizing the pseudo console.

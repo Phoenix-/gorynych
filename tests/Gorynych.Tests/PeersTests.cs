@@ -33,10 +33,15 @@ public sealed class PeersTests
             AcpMethods.Agent.SessionList => AcpJson.ToNode(new ListSessionsResponse { Sessions = [] }),
             _ => throw new JsonRpcException(JsonRpcException.MethodNotFound, req.Method),
         }));
+        var created = 0;
         var answerer = new ScriptedAdapter("answerer", (agent, req, ct) => Task.FromResult(req.Method switch
         {
             AcpMethods.Agent.Initialize => ScriptedAgent.Init(),
-            AcpMethods.Agent.SessionNew => AcpJson.ToNode(new NewSessionResponse { SessionId = "answering" }),
+            // The first is the session asked for opinions; later ones are spawned.
+            AcpMethods.Agent.SessionNew => AcpJson.ToNode(new NewSessionResponse
+            {
+                SessionId = Interlocked.Increment(ref created) == 1 ? "answering" : $"child-{created}",
+            }),
             AcpMethods.Agent.SessionList => AcpJson.ToNode(new ListSessionsResponse { Sessions = [] }),
             AcpMethods.Agent.SessionPrompt => AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn }),
             GorynychProtocol.MethodOpinion => RecordOpinion(opinions, req),
@@ -151,7 +156,7 @@ public sealed class PeersTests
             var init = await mcp.SendRequestAsync("initialize", new JsonObject { ["protocolVersion"] = "2025-06-18", ["capabilities"] = new JsonObject() });
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "ask_agent", "reply" }, tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
+            CollectionAssert.AreEqual(new[] { "list_agents", "ask_agent", "spawn_session", "reply" }, tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
 
             var listed = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_agents", ["arguments"] = new JsonObject() });
             StringAssert.Contains((string?)listed!["content"]![0]!["text"], "answering");
@@ -164,6 +169,18 @@ public sealed class PeersTests
             Assert.AreEqual("SQLite, for one user.", (string?)answer!["content"]![0]!["text"]);
             Assert.IsFalse((bool)answer["isError"]!);
             Assert.AreEqual("peer_asker", (string?)opinions.Single()["sender"]);
+
+            var spawned = await mcp.SendRequestAsync("tools/call", new JsonObject
+            {
+                ["name"] = "spawn_session",
+                ["arguments"] = new JsonObject { ["agent"] = "answerer", ["prompt"] = "Write the tests", ["title"] = "Tests" },
+            });
+            var text = (string)spawned!["content"]![0]!["text"]!;
+            Assert.IsFalse((bool)spawned["isError"]!, text);
+            Assert.AreEqual("child-2", (string?)JsonNode.Parse(text)!["session_id"]);
+            var approval = client.Approvals.Single();
+            Assert.AreEqual("asking", approval.SessionId, "asked on the calling session");
+            StringAssert.Contains(approval.ToolCall.Title, "Tests");
             await mcp.DisposeAsync();
         }
         finally

@@ -30,8 +30,8 @@ for external ACP clients: `acp --agent claude|kimi` (see [external-clients.md](e
 
 | Method | What the service does |
 | --- | --- |
-| `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`. |
-| `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`. A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out. |
+| `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`, and `_meta["gorynych/sessionsChanged"]: true` (see [List changes](#list-changes)). |
+| `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`, and a spawned session also `_meta["gorynych/parentSessionId"]` (absent for a session a client created). A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out. |
 | `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers`, forwards, records the session as a draft, attaches the client. |
 | `session/load` | Opens the session in the agent (`session/resume`, or `session/load` with the agent's replay dropped), replays the service journal as `session/update`, then attaches the client. A session the journal has never seen is loaded from the agent instead, and journaled. Returns the session state (below). |
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. Returns the session state (below). |
@@ -77,15 +77,19 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `gorynych/agent` | `initialize` params `_meta` | scopes the connection to one adapter: its default for `session/new` and the only one in `session/list` (the stdio bridge sets it for plain clients) |
 | `gorynych/serviceId` | `initialize` result `_meta` | the service's persistent ID; a GUI keys sessions as service/session |
 | `gorynych/agents` | `initialize` result `_meta` | the adapters this service offers (`name`, `displayName`) |
-| `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel) or `terminal` |
-| `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude` |
+| `gorynych/sessionsChanged` | `initialize` result `_meta` | `true`: the service sends `_gorynych/sessions_changed` |
+| `gorynych/parentSessionId` | `SessionInfo._meta` in `session/list`; `session_info_update._meta`; the `_meta` of a spawned session's first `user_message_chunk` | the session that started this one with `spawn_session`; absent for a session a client created |
+| `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel), `spawn` (a spawned session's first prompt) or `terminal` |
+| `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, or `parent_claude` for a spawn |
 | `gorynych/opinion` | `_meta` of the request message and of every update of its turn | the request's `message_id`, so a GUI can show the exchange apart from the user's own turns |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId` |
-| `_gorynych/peers` | method, `{token}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open` |
+| `_gorynych/peers` | method, `{token}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open`, `parent_session_id` |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
-| `gorynych/peerToken` | `_meta` of `_gorynych/opinion` and `_gorynych/reply` | which session's `gorynych` MCP server is calling |
+| `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
+| `_gorynych/sessions_changed` | notification to clients, `{sessionId, change}` | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
+| `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply` and `_gorynych/spawn` | which session's `gorynych` MCP server is calling |
 
 ## Opinions between agents
 
@@ -95,6 +99,8 @@ random per session and tells the service who is calling. Its tools:
 
 - `list_agents` — the user's other sessions (`_gorynych/peers`);
 - `ask_agent {session_id, question}` — asks one and waits for the answer (`_gorynych/opinion`);
+- `spawn_session {agent, prompt, cwd?, title?}` — starts a child session (`_gorynych/spawn`,
+  see [Child sessions](#child-sessions)) and returns `{"session_id": …}`;
 - `reply {message_id, text}` — answers a request this session was asked.
 
 How a request reaches the asked agent depends on what it has:
@@ -116,11 +122,66 @@ Approvals are the same for every agent: `list_agents` (read only) and `reply` (a
 user's own agent was asked for) run without asking — the Claude adapter allows them in its
 PermissionRequest hook, the service answers Kimi's `session/request_permission` for them —
 while `ask_agent` always asks the person, because it hands context to another agent and
-spends its turns.
+spends its turns. `spawn_session` is also allowed without the agent's own approval, because
+the service itself asks the person before every spawn (below), so it is asked once.
 
 Verified live on 7 November 2026: Claude called `list_agents` and, after approval,
 `ask_agent`; Kimi got the marked turn, answered with `reply`, and Claude used the answer.
 Kimi asking Claude goes through Claude's channel the same way.
+
+## Child sessions
+
+A session can start another: a coordinator hands work to coder sessions, and the person can
+open and prompt any of them directly. ACP's subagents RFD hides a subagent from
+`session/list` and forbids prompting it, so a Gorynych child is an ordinary top-level ACP
+session that names its parent in `_meta["gorynych/parentSessionId"]`; a stock client shows
+it as one more session, a Gorynych GUI can draw the tree.
+
+The agent calls the peers server's `spawn_session {agent, prompt, cwd?, title?}`, which sends
+`_gorynych/spawn` with its peer token. The service then
+
+1. shows the spawn in the calling session as a `tool_call` (kind `other`, the prompt and the
+   folder as content) and asks the person with `session/request_permission` on that session:
+   `Start` (`allow_once`) or `Don't start` (`reject_once`), never "always", so every spawn is
+   asked. Without a client attached the question waits for one, like an agent's approval;
+2. on `Start`, creates the session in the chosen agent with `session/new` (the folder is
+   the caller's unless `cwd` names another; a relative path is taken from the caller's),
+   with the peers server like any session, and records the caller as its parent;
+3. journals a `session_info_update` with the parent in `_meta` (and the title, if given),
+   takes the session's turn and returns `{sessionId}` at once. The first prompt runs in the
+   background: it is journaled as a `user_message_chunk` with
+   `_meta["gorynych/origin"]: "spawn"`, `gorynych/sender` (`parent_claude`) and the parent,
+   and forwarded. A question with `ask_agent` or a prompt that comes meanwhile waits for it;
+4. ends the tool call `completed` with the new session's ID, or `failed` when the person
+   declined (the call then fails with "The user declined to start the session") or the
+   agent could not create the session.
+
+A spawned session is never a draft, so it is listed and kept like any prompted session. A
+`title` names it: no agent lets the service set a title natively, so the name lives in the
+overlay (source `spawn`) and the agents' generated titles (Kimi's first prompt, Claude's
+`ai-title`) do not replace it, neither in the lists nor in the session's own
+`session_info_update`. Without a title the first prompt is the provisional title as usual.
+Deleting a parent leaves its children; their `parentSessionId` then names a session that no
+longer exists.
+
+## List changes
+
+Clients learn about changes to their session lists from the notification
+`_gorynych/sessions_changed {sessionId, change}`, advertised by
+`_meta["gorynych/sessionsChanged"]: true` in the `initialize` result. ACP clients ignore
+notifications they do not know, so stock clients are unaffected. It goes to every connected
+client whose agent scope covers the session (all clients for an unscoped connection), and
+reflects what `session/list` shows:
+
+- `added`: a session appears: spawned, a draft's first prompt (or an opinion it answered),
+  or a session the service finds in an agent's own list for the first time;
+- `updated`: a listed session's title or parent changed, or its `updatedAt` (at most once per
+  10 seconds per session; a change inside that interval is announced at its end);
+- `removed`: a listed session was deleted.
+
+Drafts are never announced: neither when created nor when discarded. Notifications keep the
+order of the changes. They carry no data beyond the ID; a client reads the session again
+with `session/list`.
 
 ## Drafts and deletion
 
@@ -181,9 +242,11 @@ when the journal is read back.
 ## Overlay
 
 `sessions.json` holds, per session: the owning adapter, `cwd`, `title` and its source
-(`agent` when the harness gave it, `prompt` for the provisional first-prompt title),
-`createdAt`, `updatedAt`, and `draft` or `deleted` when set. Native state wins: a title or
-`updatedAt` from the harness replaces the overlay's.
+(`agent` when the harness gave it, `prompt` for the provisional first-prompt title, `spawn`
+for a name given to `spawn_session`), `createdAt`, `updatedAt`, `parentSessionId` and
+`reportToParent` for a spawned session, and `draft` or `deleted` when set. Native state wins:
+a title or `updatedAt` from the harness replaces the overlay's, except a `spawn` name, which
+no harness can store yet.
 
 The file is replaced atomically (a temporary file moved over it). An antivirus scanner or
 the indexer can hold it open for a moment, so the move is retried for up to about 400 ms,
@@ -191,4 +254,6 @@ outside the lock on the records. A write that still fails is logged and the chan
 memory for the next write; ending a draft is the exception (see above). The activity stamp of
 a streaming turn tries a write at most once a second after the last attempt, so a file that
 cannot be written does not slow every update down. A session removed in this run is not
-recreated by a late write.
+recreated by a late write, and an activity stamp never creates a record: an update an agent
+sends before its `session/new` answer (Kimi announces its commands) must not list the
+session ahead of time.

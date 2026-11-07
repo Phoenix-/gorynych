@@ -64,6 +64,24 @@ public static class GorynychProtocol
     /// <summary>The sessions a peer can ask: <c>{token}</c> → <c>{sessions: [...]}</c>.</summary>
     public const string MethodPeers = "_gorynych/peers";
 
+    /// <summary>
+    /// The session that started this one with <c>spawn_session</c>: in every <c>SessionInfo._meta</c>
+    /// of <c>session/list</c>, and in a <c>session_info_update._meta</c> when it is set.
+    /// </summary>
+    public const string MetaParentSessionId = "gorynych/parentSessionId";
+
+    /// <summary>
+    /// Starts a child of the calling session, after asking the person:
+    /// <c>{agent, prompt, cwd?, title?, report?}</c> with the caller's peer token → <c>{sessionId}</c>.
+    /// </summary>
+    public const string MethodSpawn = "_gorynych/spawn";
+
+    /// <summary>A notification to clients: <c>{sessionId, change}</c>, change <c>added</c>, <c>updated</c> or <c>removed</c>.</summary>
+    public const string MethodSessionsChanged = "_gorynych/sessions_changed";
+
+    /// <summary>In the <c>initialize</c> result: the service sends <see cref="MethodSessionsChanged"/>.</summary>
+    public const string MetaSessionsChanged = "gorynych/sessionsChanged";
+
     /// <summary>Returns service status: ID, process, adapters, sessions.</summary>
     public const string MethodStatus = "_gorynych/status";
 
