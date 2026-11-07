@@ -183,10 +183,9 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         if (Channel is null) throw new JsonRpcException(JsonRpcException.MethodNotFound, "Claude sessions run without a channel.");
         var id = (string?)request.Params?["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
         var text = (string?)request.Params?["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
-        var sender = (string?)request.Params?["sender"] ?? "peer_agent";
         var session = Session(id, null);
         if (!session.IsRunning) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running; prompt it first.");
-        var reply = await Channel.AskAsync(id, sender, text, ct);
+        var reply = await Channel.AskAsync(id, text, ct);
         return new JsonObject { ["text"] = reply };
     }
 
@@ -200,10 +199,9 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         if (Channel is null) throw new JsonRpcException(JsonRpcException.MethodNotFound, "Claude sessions run without a channel.");
         var id = (string?)request.Params?["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
         var text = (string?)request.Params?["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
-        var sender = (string?)request.Params?["sender"] ?? "peer_agent";
         var session = Session(id, null);
         if (!session.IsRunning) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running.");
-        await Channel.NotifyAsync(id, sender, text, ct);
+        await Channel.NotifyAsync(id, text, ct);
         return new JsonObject();
     }
 

@@ -89,12 +89,12 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `gorynych/sessionsChanged` | `initialize` result `_meta` | `true`: the service sends `_gorynych/sessions_changed` |
 | `gorynych/parentSessionId` | `SessionInfo._meta` in `session/list`; `session_info_update._meta`; the `_meta` of a spawned session's first `user_message_chunk` | the session that started this one with `spawn_session`; absent for a session a client created |
 | `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel), `spawn` (a spawned session's first prompt), `report` (a child's report delivered as a turn) or `terminal` |
-| `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, `parent_claude` for a spawn, `child_kimi` for a report |
+| `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, `parent_claude` for a spawn, `child_kimi` for a report: a label for GUIs only; the text the agent gets names the session by its ID instead (see [What agents are told](#what-agents-are-told)) |
 | `gorynych/fromSessionId` | `user_message_chunk._meta` of an opinion request or a report delivered as a turn | the session that asked, or the child that reports |
 | `gorynych/opinion` | `_meta` of the request message and of every update of its turn | the request's `message_id`, so a GUI can show the exchange apart from the user's own turns |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
-| `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId` |
+| `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards |
 | `_gorynych/peers` | method, `{token}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open`, `parent_session_id` |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
@@ -109,18 +109,27 @@ named `gorynych`: `Gorynych.Service peers --pipe <pipe> --token <token>`. The to
 random per session and tells the service who is calling. Its tools:
 
 - `list_agents` — the user's other sessions (`_gorynych/peers`);
-- `ask_agent {session_id, question}` — asks one and waits for the answer (`_gorynych/opinion`);
+- `ask_agent {session_id, question}` — starts a new question to one, by its exact
+  `session_id`, and waits for the answer (`_gorynych/opinion`);
 - `spawn_session {agent, prompt, cwd?, title?, report?}` — starts a child session
   (`_gorynych/spawn`, see [Child sessions](#child-sessions)) and returns `{"session_id": …}`;
-- `reply {message_id, text}` — answers a request this session was asked.
+- `reply {message_id, text}` — only answers a request this session was asked, by the
+  `message_id` in its header. Nothing waiting for that ID fails with how to recover (below).
+
+Each description says when to use the tool rather than its neighbour: `ask_agent` starts a
+question and points to `reply` for answering one; `reply` only answers and points to
+`ask_agent`; `session_id` is the exact value from `list_agents` or a header, never an agent
+name, a title or a sender label; `spawn_session` says the child's turns are reported back by
+themselves.
 
 How a request reaches the asked agent depends on what it has:
 
 - **Claude** has a channel. The Claude adapter adds `--channel-url` to the same `gorynych`
   server in its `--mcp-config`, so one server is both its peer tools and its development
-  channel: the request arrives as a channel message, `reply` goes back through the channel.
+  channel: the request arrives as a channel message (`meta.kind: "opinion"` and its
+  `message_id`), `reply` goes back through the channel.
 - **Kimi** (any agent without a channel) gets the request as an ordinary `session/prompt`
-  turn, marked in the text with the sender and `message_id` and asking for `reply`. ACP
+  turn, marked in the text with the asking session and `message_id` and asking for `reply`. ACP
   cannot inject into a running turn, so the request waits for the session's current turn
   (the user's prompts wait for it in turn). The answer is the `reply` tool call
   (`_gorynych/reply`); if the turn ends without one, the turn's own text. The request and
@@ -128,6 +137,50 @@ How a request reaches the asked agent depends on what it has:
 
 A session that is answering a request cannot ask another agent meanwhile, so two agents
 cannot wait on each other.
+
+### What agents are told
+
+Everything the service puts in front of an agent is that agent's interface. A message it
+injects names the sending session by its real ID, labelled `session_id` so the agent can pass
+it to `ask_agent`, with the session's agent and title: `session_id <id> (<agent>, "<title>")`
+(a title is cut at 80 characters, its double quotes become single ones; without a title only
+the agent). Labels such as `peer_claude` stay in `_meta["gorynych/sender"]` for GUIs and are
+never in the text. The journal keeps the text exactly as the agent got it.
+
+- An opinion request delivered as a turn:
+
+  ```
+  [Opinion request · from session_id <id> (<agent>, "<title>") · message_id m3]
+  <the question>
+
+  This message comes from another of the user's coding agents, not from the user. Give your
+  honest opinion briefly, then send it with the reply tool of the gorynych MCP server, passing
+  message_id "m3" (reply answers this request; ask_agent would start a new question instead).
+  Do not run other tools, edit files or take any other action for this request.
+  ```
+
+  Through Claude's channel the content is the first line without the `message_id` (the
+  channel message carries it in `meta`) and the question; Claude's appended system prompt
+  says the rest. A request a client sends without a peer token names the client's `sender`,
+  or `a Gorynych client`.
+- A spawned session's first prompt and a report to the parent: see
+  [Child sessions](#child-sessions) and [Reports](#reports).
+
+Errors from the peer tools say how to recover. The peers server returns them to the agent as
+`Gorynych could not do that: <message>`:
+
+| Case | Message |
+| --- | --- |
+| `ask_agent` with an unknown or deleted `session_id` (`-32002`) | `No session "<x>". Pass an exact session_id from list_agents.` and the first five sessions it can ask, one per line as `- session_id <id> (<agent>, "<title>")`, or `There is no other session to ask now.` |
+| `ask_agent` with its own ID (`-32602`) | `"<x>" is this session's own session_id; ask_agent asks another session.` and the same list |
+| `ask_agent` while answering a request as a turn (`-32600`) | `This session is answering opinion request m3, so it cannot ask another session during this turn. Send your answer with the reply tool, passing message_id "m3"; if another opinion would help, say so in the answer.` |
+| `ask_agent` to a Claude session whose process is not running (`-32600`) | `session_id <id> (claude, "<title>") cannot answer now: its agent is not running, and it starts only when the user prompts that session. Ask another session from list_agents, or ask the user to prompt that one first.` |
+| `reply` with a `message_id` nothing waits for (the tool's own error) | `No open request with message_id "<x>" for this session; it may have been answered already or withdrawn. reply only answers a request you received, by the message_id in its header. To ask a session something, use ask_agent with its session_id.` |
+| `spawn_session` with an unknown agent (`-32602`) | `No agent "<x>". Pass one of: claude, kimi.` |
+| `spawn_session` with a folder that does not exist (`-32602`) | `No such folder: <path>. Pass an existing folder, or leave cwd out to work in this session's folder, <folder>.` |
+
+A client calling `_gorynych/opinion` without a peer token gets the plain `Unknown session
+<id>`, since it has no `list_agents`.
 
 Approvals are the same for every agent: `list_agents` (read only) and `reply` (an answer the
 user's own agent was asked for) run without asking — the Claude adapter allows them in its
@@ -165,12 +218,28 @@ The agent calls the peers server's `spawn_session {agent, prompt, cwd?, title?}`
    the session is a draft in the overlay: if anything fails before that, or the spawn is
    withdrawn while the agent creates it, the session is closed and deleted in its agent again
    (an agent that cannot delete is only closed: the Claude adapter keeps nothing before a
-   first prompt). The first prompt runs in the background: it is journaled as a
-   `user_message_chunk` with `_meta["gorynych/origin"]: "spawn"`, `gorynych/sender`
-   (`parent_claude`) and the parent, and forwarded. A question with `ask_agent` or a prompt
+   first prompt). The first prompt runs in the background: the agent gets the task as one text
+   block and, as a second, what it needs to know about where the task came from (below); the
+   journal keeps both as one `user_message_chunk` with `_meta["gorynych/origin"]: "spawn"`,
+   `gorynych/sender` (`parent_claude`) and the parent. A question with `ask_agent` or a prompt
    that comes meanwhile, even one sent right after the `added` notice, waits for it;
 4. ends the tool call `completed` with the new session's ID, or `failed` when nothing was
    started.
+
+What follows the task in the child's first prompt:
+
+```
+[About this session · started by session_id <parent> (<agent>, "<title>") with spawn_session, approved by the user]
+The task above comes from that session. When each of your turns ends, Gorynych sends your
+final message to that session automatically, so you need not send it yourself. To ask it
+something, use ask_agent with session_id "<parent>". The user can also prompt you here
+directly.
+```
+
+With `report: false` the sentence about reports reads `Your turns are not reported to it.`
+It follows the task rather than preceding it because Kimi titles a session with its first
+prompt (cut at 200 characters): the task stays the title. The provisional title is the task
+alone.
 
 The spawn fails with
 
@@ -203,11 +272,11 @@ one, or one the person prompted directly; not an opinion turn) its parent gets a
 report, delivered the way opinion requests are, in the background:
 
 ```
-[Report from child session <id> "<title>" (<agent>) · its turn ended]
+[Report · from session_id <id> (<agent>, "<title>") · your child session · its turn ended]
 <the child's final message: its text after its last tool call, at most 2000 characters>
 
 This comes from a session you started with spawn_session, not from the user. It needs no
-reply; ask_agent with session_id "<id>" asks it more.
+reply. To ask that session more, use ask_agent with session_id "<id>".
 ```
 
 The outcome reads `ended`, `was cancelled`, `stopped (<stopReason>)` or `failed: <error>`. A

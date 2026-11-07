@@ -115,20 +115,25 @@ service's `gorynych` server. With a channel (the default; `--no-channel` turns i
 adapter adds `--channel-url …/channel/<session>/<token>` to that `gorynych` server and starts
 Claude with `--dangerously-load-development-channels server:gorynych`: the one server then
 declares `capabilities.experimental["claude/channel"]`, long-polls the adapter for opinion
-requests, pushes them as `notifications/claude/channel` with `meta: {sender, message_id}`,
-and posts `reply` back. Without a service-given server the adapter starts a channel-only
+requests, pushes them as `notifications/claude/channel` with `meta: {kind: "opinion",
+message_id}`, and posts `reply` back. The content's first line names the asking session by
+its `session_id` ([service-protocol.md](service-protocol.md#what-agents-are-told)); the meta
+carries no sender label, which Claude could take for a session ID. `reply` reports an error
+when the channel has no request with that `message_id`. Without a service-given server the adapter starts a channel-only
 `gorynych` server itself.
 
 `--append-system-prompt` authorizes opinions from the user's agents, forbids actions on
-their behalf, and, when the peer tools are there, tells Claude about `list_agents`,
-`ask_agent` and `spawn_session`. The PermissionRequest hook allows `mcp__gorynych__reply`,
+their behalf, says each channel message names the asking session by its `session_id`, and,
+when the peer tools are there, tells Claude about `list_agents`, `ask_agent` (by exact
+`session_id`; `reply` only answers) and `spawn_session`. The PermissionRequest hook allows `mcp__gorynych__reply`,
 `mcp__gorynych__list_agents` and `mcp__gorynych__spawn_session` without asking (the service
 asks the person before every spawn); `mcp__gorynych__ask_agent` becomes an ACP approval like
 any tool.
 
 `_gorynych/note` (a child's report to its parent) becomes a channel message with
-`meta: {sender, kind: "report"}` and no `message_id`; the system prompt says it needs no
-reply. Without a channel the adapter answers method not found; while Claude's process is not
+`meta: {kind: "report"}` and no `message_id`; the system prompt says it needs no reply. The
+adapter ignores the `sender` param of `_gorynych/opinion` and `_gorynych/note`: the text names
+the session. Without a channel the adapter answers method not found; while Claude's process is not
 running (`session/resume` registers a session without starting one) it answers `-32600`.
 Either way the service sends the report as a turn instead, which starts Claude.
 

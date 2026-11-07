@@ -174,8 +174,8 @@ public sealed class LiveSmokeTests
             Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call" && ((string?)u["title"] ?? "").Contains("ask_agent", StringComparison.OrdinalIgnoreCase)),
                 "Kimi called ask_agent");
             Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "user_message_chunk"
-                && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == "channel" && ((string?)u["content"]?["text"] ?? "").Contains("peer_kimi")),
-                "the question reached Claude through the channel, from peer_kimi");
+                && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == "channel" && ((string?)u["content"]?["text"] ?? "").Contains($"from session_id {kimi}")),
+                "the question reached Claude through the channel, naming Kimi's session");
         }
         finally
         {

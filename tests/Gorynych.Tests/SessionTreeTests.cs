@@ -76,7 +76,7 @@ public sealed class SessionTreeTests
         var claude = new LifecycleAgent("claude", canDelete: false);
         var kimi = new LifecycleAgent("kimi", canDelete: true);
         // Kimi titles a session from its first prompt; a name given to spawn_session wins.
-        kimi.BeforePrompt = id => kimi.Adapter.Current!.Update(id, new SessionInfoUpdate { Title = Prompts(kimi, id)[0] });
+        kimi.BeforePrompt = id => kimi.Adapter.Current!.Update(id, new SessionInfoUpdate { Title = kimi.FirstBlocks(id)[0] });
         await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
@@ -94,7 +94,7 @@ public sealed class SessionTreeTests
         ZedRules.CheckPermission(ask);
 
         await conductor.BackgroundTurnsIdleAsync();
-        CollectionAssert.AreEqual(new[] { "Fix the flaky test" }, Prompts(kimi, child), "the first prompt was started");
+        Assert.AreEqual("Fix the flaky test", kimi.FirstBlocks(child)[0], "the first prompt was started, its task first");
         Assert.IsTrue(kimi.Tokens.ContainsKey(child), "the child has the peers server too");
         Assert.IsFalse(conductor.Store.Get(child)!.Draft, "a spawned session is never a draft");
 
@@ -122,7 +122,7 @@ public sealed class SessionTreeTests
         CollectionAssert.AreEqual(new[] { "Flaky test" }, infos.Select(u => (string?)u["title"]).Distinct().ToArray(), "Kimi's own title does not replace the name");
         var asked = replay.Single(u => (string?)u["sessionUpdate"] == "user_message_chunk");
         Assert.AreEqual("spawn", (string?)asked["_meta"]![GorynychProtocol.MetaOrigin]);
-        Assert.AreEqual("Fix the flaky test", (string?)asked["content"]!["text"]);
+        StringAssert.StartsWith((string?)asked["content"]!["text"], "Fix the flaky test\n\n[About this session · ", "the journal keeps what the agent got");
         Assert.AreEqual("ok", other.Text());
     }
 
@@ -251,7 +251,7 @@ public sealed class SessionTreeTests
     }
 
     static string[] Reports(LifecycleAgent parentAgent, string parent) =>
-        Prompts(parentAgent, parent).Where(p => p.StartsWith("[Report from child session", StringComparison.Ordinal)).ToArray();
+        Prompts(parentAgent, parent).Where(p => p.StartsWith("[Report · from session_id ", StringComparison.Ordinal)).ToArray();
 
     [TestMethod]
     public async Task Report_EachTurnOfTheChild_ReachesAParentWithoutAChannel_AsAMarkedTurn()
@@ -272,7 +272,7 @@ public sealed class SessionTreeTests
 
         await conductor.BackgroundTurnsIdleAsync();
         var report = Reports(kimi, parent).Single();
-        StringAssert.StartsWith(report, $"[Report from child session {child} \"Notes\" (claude) · its turn ended]\nok\n");
+        StringAssert.StartsWith(report, $"[Report · from session_id {child} (claude, \"Notes\") · your child session · its turn ended]\nok\n");
         Assert.IsFalse(report.Contains("Looking around.", StringComparison.Ordinal), report);
         var told = zed.Snapshot().Last(u => (string?)u["sessionUpdate"] == "user_message_chunk");
         Assert.AreEqual("report", (string?)told["_meta"]![GorynychProtocol.MetaOrigin]);
@@ -310,7 +310,7 @@ public sealed class SessionTreeTests
         Assert.AreEqual(parent, (string?)note["sessionId"]);
         Assert.AreEqual("child_kimi", (string?)note["sender"]);
         Assert.AreEqual(reported, (string?)note["fromSessionId"]);
-        StringAssert.StartsWith((string?)note["text"], $"[Report from child session {reported} \"Fix the flaky test\" (kimi) · its turn ended]\nok\n");
+        StringAssert.StartsWith((string?)note["text"], $"[Report · from session_id {reported} (kimi, \"Fix the flaky test\") · your child session · its turn ended]\nok\n");
         CollectionAssert.AreEqual(new[] { "Coordinate the release" }, Prompts(claude, parent), "a note is not a turn");
         Assert.IsFalse(conductor.Store.Get(quiet)!.ReportToParent);
     }
@@ -363,7 +363,7 @@ public sealed class SessionTreeTests
 
         await conductor.BackgroundTurnsIdleAsync();
         var report = Reports(claude, parent).Single();
-        StringAssert.StartsWith(report, $"[Report from child session {child} \"Flaky test\" (kimi) · its turn failed: Kimi lost the session]\n(no final message)\n");
+        StringAssert.StartsWith(report, $"[Report · from session_id {child} (kimi, \"Flaky test\") · your child session · its turn failed: Kimi lost the session]\n(no final message)\n");
         Assert.AreEqual(0, Prompts(kimi, child).Length, "the turn never reached the agent");
     }
 
@@ -385,7 +385,7 @@ public sealed class SessionTreeTests
 
         await conductor.BackgroundTurnsIdleAsync();
         var report = Reports(kimi, parent).Single();
-        StringAssert.StartsWith(report, $"[Report from child session {child} \"Notes\" (claude) · its turn ended]\n(no final message)\n");
+        StringAssert.StartsWith(report, $"[Report · from session_id {child} (claude, \"Notes\") · your child session · its turn ended]\n(no final message)\n");
         Assert.IsFalse(report.Contains("Looking around.", StringComparison.Ordinal), "the text before the last tool call is not the final message");
 
         // A final message longer than a report carries is cut, never inside a surrogate pair.
@@ -534,7 +534,7 @@ public sealed class SessionTreeTests
         await conductor.BackgroundTurnsIdleAsync();
 
         Assert.AreEqual(0, claude.Notes.Count);
-        StringAssert.StartsWith(Reports(claude, parent).Single(), $"[Report from child session {child} ");
+        StringAssert.StartsWith(Reports(claude, parent).Single(), $"[Report · from session_id {child} ");
     }
 
     [TestMethod]
@@ -559,5 +559,116 @@ public sealed class SessionTreeTests
         var mine = await NewAsync(zed, "kimi");
         Assert.AreEqual(Path.TrimEndingDirectorySeparator(Cwd), conductor.Store.Get(mine)!.Cwd);
         Assert.IsTrue(Cwd.EndsWith(Path.DirectorySeparatorChar), "the test needs a folder spelled with a trailing separator");
+    }
+
+    // ---------------------------------------------------------------- what agents are told
+
+    [TestMethod]
+    public async Task Spawn_TheChildIsToldAfterItsTask_WhoStartedIt_BySessionId()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        var token = claude.Tokens[parent];
+
+        var child = (string)(await SpawnAsync(zed, token, new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test" }))!["sessionId"]!;
+        var quiet = (string)(await SpawnAsync(zed, token, new JsonObject { ["agent"] = "kimi", ["prompt"] = "Bump the version", ["report"] = false }))!["sessionId"]!;
+        await conductor.BackgroundTurnsIdleAsync();
+
+        var context =
+            $"[About this session · started by session_id {parent} (claude, \"Coordinate the release\") with spawn_session, approved by the user]\n" +
+            "The task above comes from that session. When each of your turns ends, Gorynych sends your final message to that session " +
+            $"automatically, so you need not send it yourself. To ask it something, use ask_agent with session_id \"{parent}\". " +
+            "The user can also prompt you here directly.";
+        CollectionAssert.AreEqual(new[] { "Fix the flaky test", context }, kimi.FirstBlocks(child), "the task first, then where it came from");
+        var quietContext = kimi.FirstBlocks(quiet)[1];
+        StringAssert.Contains(quietContext, "Your turns are not reported to it.");
+        Assert.IsFalse(quietContext.Contains("automatically", StringComparison.Ordinal), quietContext);
+        Assert.AreEqual("Fix the flaky test", conductor.Store.Get(child)!.Title, "the task titles the session, not what follows it");
+
+        // The journal keeps what the agent got, as one message; the label for GUIs stays.
+        await using var other = await TestClient.ConnectAsync(conductor, "zed-2");
+        await other.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject { ["sessionId"] = child, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
+        var told = other.Snapshot().Single(u => (string?)u["sessionUpdate"] == "user_message_chunk");
+        Assert.AreEqual($"Fix the flaky test\n\n{context}", (string?)told["content"]!["text"]);
+        Assert.AreEqual("parent_claude", (string?)told["_meta"]![GorynychProtocol.MetaSender]);
+        Assert.IsFalse(Prompts(kimi, child).Single().Contains("parent_claude", StringComparison.Ordinal), "no label that looks like a session ID");
+    }
+
+    [TestMethod]
+    public async Task PeerTools_AnUnknownSessionOrAgentOrFolder_FailsWithWhatToPassInstead()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var asker = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        var other = await NewPromptedAsync(zed, "kimi", "Review the \"API\"");
+        var token = claude.Tokens[asker];
+        Task<JsonNode?> Ask(string target) => zed.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion,
+            new JsonObject { ["sessionId"] = target, ["text"] = "Done?", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token } });
+        var askable = $"Sessions you can ask:\n- session_id {other} (kimi, \"Review the 'API'\")";
+
+        var unknown = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => Ask("peer_claude"));
+        Assert.AreEqual(JsonRpcException.ResourceNotFound, unknown.Code);
+        Assert.AreEqual($"No session \"peer_claude\". Pass an exact session_id from list_agents. {askable}", unknown.Message);
+
+        var self = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => Ask(asker));
+        Assert.AreEqual(JsonRpcException.InvalidParams, self.Code);
+        Assert.AreEqual($"\"{asker}\" is this session's own session_id; ask_agent asks another session. {askable}", self.Message);
+
+        var agent = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => SpawnAsync(zed, token, new JsonObject { ["agent"] = "codex", ["prompt"] = "x" }));
+        Assert.AreEqual(JsonRpcException.InvalidParams, agent.Code);
+        Assert.AreEqual("No agent \"codex\". Pass one of: claude, kimi.", agent.Message);
+
+        var missing = FolderPath.Normalize(Path.Combine(Cwd, "no-such-folder-" + Guid.NewGuid().ToString("N")));
+        var folder = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => SpawnAsync(zed, token, new JsonObject { ["agent"] = "kimi", ["prompt"] = "x", ["cwd"] = missing }));
+        Assert.AreEqual(JsonRpcException.InvalidParams, folder.Code);
+        Assert.AreEqual($"No such folder: {missing}. Pass an existing folder, or leave cwd out to work in this session's folder, {FolderPath.Normalize(Cwd)}.", folder.Message);
+
+        // A client that asks has no list_agents: it gets the plain error.
+        var plain = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion,
+            new JsonObject { ["sessionId"] = "peer_claude", ["text"] = "Done?" }));
+        Assert.AreEqual("Unknown session peer_claude", plain.Message);
+    }
+
+    [TestMethod]
+    public async Task PeerTools_WithNoOtherSession_TheErrorSaysSo()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        await using var conductor = Conductor(null, claude.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var asker = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        await NewAsync(zed, "claude"); // a draft is not offered
+
+        var e = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion,
+            new JsonObject { ["sessionId"] = "peer_kimi", ["text"] = "Done?", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = claude.Tokens[asker] } }));
+        Assert.AreEqual("No session \"peer_kimi\". Pass an exact session_id from list_agents. There is no other session to ask now.", e.Message);
+    }
+
+    [TestMethod]
+    public async Task Ask_ThroughClaudesChannel_NamesTheAsker_AndANotRunningClaudeSaysWhatToDoInstead()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var asked = await NewPromptedAsync(zed, "claude", "Write the notes");
+        var asker = await NewPromptedAsync(zed, "kimi", "Coordinate the release");
+        Task<JsonNode?> Ask() => zed.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion,
+            new JsonObject { ["sessionId"] = asked, ["text"] = "Done?", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = kimi.Tokens[asker] } });
+
+        await Ask();
+        var opinion = claude.Opinions.Single();
+        Assert.AreEqual($"[Opinion request · from session_id {asker} (kimi, \"Coordinate the release\")]\nDone?", (string?)opinion["text"]);
+        Assert.AreEqual("peer_kimi", (string?)opinion["sender"], "the label for GUIs stays");
+
+        claude.Running = false;
+        var e = await Assert.ThrowsExactlyAsync<JsonRpcException>(Ask);
+        Assert.AreEqual(JsonRpcException.InvalidRequest, e.Code);
+        Assert.AreEqual($"session_id {asked} (claude, \"Write the notes\") cannot answer now: its agent is not running, and it starts only when " +
+            "the user prompts that session. Ask another session from list_agents, or ask the user to prompt that one first.", e.Message);
     }
 }

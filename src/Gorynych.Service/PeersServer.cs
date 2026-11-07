@@ -60,15 +60,17 @@ public static class PeersServer
         if (channel) capabilities["experimental"] = new JsonObject { ["claude/channel"] = new JsonObject() };
         var instructions = new StringBuilder();
         if (channel)
-            instructions.Append("Messages on this channel come from the user's other coding agents; the sender attribute names the agent. " +
-                "Send answers back with the reply tool, passing the message_id. A message with kind report (a session you spawned " +
-                "finished a turn) needs no reply. ");
+            instructions.Append("Messages on this channel come from the user's other coding-agent sessions; their first line names the " +
+                "sending session by its session_id. Answer a message with kind opinion with the reply tool, passing its message_id. " +
+                "A message with kind report (a session you spawned finished a turn) needs no reply. ");
         else
-            instructions.Append("An opinion request from another of the user's agents names a message_id; answer it with the reply tool. ");
+            instructions.Append("An opinion request from another of the user's agents names a message_id in its first line; answer it " +
+                "with the reply tool, passing that message_id. ");
         if (peers)
-            instructions.Append("list_agents shows the user's other coding-agent sessions and ask_agent asks one for its opinion; " +
-                "they only give opinions, they do not act on your behalf. spawn_session starts a new child session of one of these agents " +
-                "with a task, after the user approves it.");
+            instructions.Append("list_agents shows the user's other coding-agent sessions and ask_agent asks one for its opinion, by " +
+                "its exact session_id; they only give opinions, they do not act on your behalf. spawn_session starts a new child session " +
+                "of one of these agents with a task, after the user approves it; each turn the child finishes is reported back to you " +
+                "automatically.");
         return new JsonObject
         {
             ["protocolVersion"] = req.Params?["protocolVersion"]?.DeepClone() ?? "2025-06-18",
@@ -108,21 +110,28 @@ public static class PeersServer
                     var messageId = (string?)args?["message_id"];
                     var text = (string?)args?["text"];
                     if (string.IsNullOrWhiteSpace(messageId) || text is null) return Text("message_id and text are required", error: true);
+                    bool delivered;
                     if (channelUrl is not null)
                     {
                         using var response = await http.PostAsync($"{channelUrl}/reply",
                             new StringContent(new JsonObject { ["message_id"] = messageId, ["text"] = text }.ToJsonString(), Encoding.UTF8, "application/json"), ct);
-                        return response.IsSuccessStatusCode ? Text("delivered") : Text("not delivered", error: true);
+                        if (!response.IsSuccessStatusCode) return Text("not delivered: the channel did not take it", error: true);
+                        var body = await response.Content.ReadFromJsonAsync(PeersJsonContext.Default.JsonObject, ct);
+                        delivered = (bool?)body?["delivered"] ?? true;
                     }
-                    if (pipe is null || token is null) return Text("no route for replies", error: true);
-                    await using var service = await ConnectAsync(pipe, ct);
-                    await service.SendRequestAsync(GorynychProtocol.MethodReply, new JsonObject
+                    else
                     {
-                        ["messageId"] = messageId,
-                        ["text"] = text,
-                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token },
-                    }, ct);
-                    return Text("delivered");
+                        if (pipe is null || token is null) return Text("no route for replies", error: true);
+                        await using var service = await ConnectAsync(pipe, ct);
+                        var result = await service.SendRequestAsync(GorynychProtocol.MethodReply, new JsonObject
+                        {
+                            ["messageId"] = messageId,
+                            ["text"] = text,
+                            ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token },
+                        }, ct);
+                        delivered = (bool?)result?["delivered"] ?? false;
+                    }
+                    return delivered ? Text("delivered") : Text(NotDelivered(messageId), error: true);
                 }
                 case "list_agents" when pipe is not null && token is not null:
                 {
@@ -188,24 +197,35 @@ public static class PeersServer
         return rpc;
     }
 
+    /// <summary>What <c>reply</c> says when nothing waits for its <c>message_id</c>.</summary>
+    internal static string NotDelivered(string messageId) =>
+        $"No open request with message_id \"{messageId}\" for this session; it may have been answered already or withdrawn. " +
+        "reply only answers a request you received, by the message_id in its header. To ask a session something, use ask_agent " +
+        "with its session_id.";
+
     static JsonObject Text(string text, bool error = false) => new()
     {
         ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
         ["isError"] = error,
     };
 
-    static JsonNode[] Tools(bool peers)
+    internal static JsonNode[] Tools(bool peers)
     {
         var reply = new JsonObject
         {
             ["name"] = "reply",
-            ["description"] = "Send your answer to an opinion request from another of the user's coding agents, passing its message_id.",
+            ["description"] = "Answer an opinion request you received from another of the user's coding agents, passing the message_id " +
+                "from its header. Use it only to answer; to start a question of your own, use ask_agent.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
                 {
-                    ["message_id"] = new JsonObject { ["type"] = "string", ["description"] = "message_id of the request being answered" },
+                    ["message_id"] = new JsonObject
+                    {
+                        ["type"] = "string",
+                        ["description"] = "the message_id of the request you are answering, from its header (or the channel message's message_id)",
+                    },
                     ["text"] = new JsonObject { ["type"] = "string", ["description"] = "the answer" },
                 },
                 ["required"] = new JsonArray("message_id", "text"),
@@ -215,21 +235,27 @@ public static class PeersServer
         var list = new JsonObject
         {
             ["name"] = "list_agents",
-            ["description"] = "List the user's other coding-agent sessions in Gorynych that you can ask for an opinion: session ID, agent, title, " +
-                "folder, whether it is open, and parent_session_id for a session another session started with spawn_session.",
+            ["description"] = "List the user's other coding-agent sessions in Gorynych that you can ask with ask_agent: session_id (pass it " +
+                "exactly), agent, title, folder, whether it is open, and parent_session_id for a session another session started with spawn_session.",
             ["inputSchema"] = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject() },
         };
         var ask = new JsonObject
         {
             ["name"] = "ask_agent",
-            ["description"] = "Ask another of the user's coding agents for its opinion and wait for the answer. " +
-                "The other agent answers from its own session and context; it does not run tools for you.",
+            ["description"] = "Start a new question to another of the user's coding-agent sessions and wait for its answer. " +
+                "The other agent answers from its own session and context; it does not run tools for you. " +
+                "To answer a request you received (its header names a message_id), use reply instead.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
                 {
-                    ["session_id"] = new JsonObject { ["type"] = "string", ["description"] = "the session to ask, from list_agents" },
+                    ["session_id"] = new JsonObject
+                    {
+                        ["type"] = "string",
+                        ["description"] = "the exact session_id of the session to ask, from list_agents or from a header that says " +
+                            "\"session_id ...\"; never an agent name, a title or a sender label",
+                    },
                     ["question"] = new JsonObject { ["type"] = "string", ["description"] = "the question, with the context the other agent needs" },
                 },
                 ["required"] = new JsonArray("session_id", "question"),
@@ -241,8 +267,9 @@ public static class PeersServer
             ["description"] = "Start a new session of one of the user's coding agents as a child of this session, with a first prompt it works on. " +
                 "The user approves every spawn; if they decline, nothing starts and the call fails. " +
                 "Returns {\"session_id\": ...} at once, without waiting for the work; the child then runs on its own, " +
-                "the user can open and prompt it directly, and ask_agent asks it questions. Each time the child finishes a turn, this session gets " +
-                "a short report with its final message, also when that turn failed (unless report is false). " +
+                "the user can open and prompt it directly, and ask_agent asks it questions. Each time the child finishes a turn, Gorynych " +
+                "sends this session a short report with the child's final message by itself, also when that turn failed (unless report " +
+                "is false), so you need not poll the child, and it need not report. " +
                 "Use it when the user asks you to hand work to another agent.",
             ["inputSchema"] = new JsonObject
             {

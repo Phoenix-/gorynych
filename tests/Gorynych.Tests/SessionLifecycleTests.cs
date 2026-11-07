@@ -697,10 +697,12 @@ sealed class LifecycleAgent
                             Sessions = sessions.Select(s => new SessionInfo { SessionId = s, Cwd = ListCwd, Title = this.titles.GetValueOrDefault(s) }).ToList(),
                         });
                 case AcpMethods.Agent.SessionPrompt:
-                    var text = ((TextContent)req.ParamsAs<PromptRequest>().Prompt[0]).Text;
-                    lock (Prompts) Prompts.Add((sessionId!, text));
+                    var blocks = req.ParamsAs<PromptRequest>().Prompt.OfType<TextContent>().Select(t => t.Text).ToArray();
+                    // The blocks joined as the Claude adapter joins them; the title from the first, like Kimi's.
+                    var text = string.Join("\n\n", blocks);
+                    lock (Prompts) { Prompts.Add((sessionId!, text)); firstBlocks.TryAdd(sessionId!, blocks); }
                     if (BeforePrompt is { } beforePrompt) await beforePrompt(sessionId!);
-                    lock (sessions) this.titles.TryAdd(sessionId!, text);
+                    lock (sessions) this.titles.TryAdd(sessionId!, blocks[0]);
                     if (Answer is { } answer) await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = answer } });
                     return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn });
                 case AcpMethods.Agent.SessionResume:
@@ -708,6 +710,10 @@ sealed class LifecycleAgent
                     return new JsonObject();
                 case AcpMethods.Agent.SessionClose:
                     return new JsonObject();
+                case GorynychProtocol.MethodOpinion when HasChannel:
+                    if (!Running) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running; prompt it first.");
+                    lock (Opinions) Opinions.Add(req.Params!.DeepClone().AsObject());
+                    return new JsonObject { ["text"] = Answer ?? "" };
                 case GorynychProtocol.MethodNote when HasChannel:
                     if (!Running) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running.");
                     lock (Notes) Notes.Add(req.Params!.DeepClone().AsObject());
@@ -729,8 +735,16 @@ sealed class LifecycleAgent
     /// <summary>The peer token each session got in its <c>gorynych</c> MCP server.</summary>
     public Dictionary<string, string> Tokens { get; } = [];
 
-    /// <summary>Every prompt as it arrives (before <see cref="BeforePrompt"/>), with its text.</summary>
+    /// <summary>Every prompt as it arrives (before <see cref="BeforePrompt"/>), with its text blocks joined.</summary>
     public List<(string SessionId, string Text)> Prompts { get; } = [];
+
+    readonly Dictionary<string, string[]> firstBlocks = [];
+
+    /// <summary>The text blocks of the session's first prompt, apart.</summary>
+    public string[] FirstBlocks(string sessionId)
+    {
+        lock (Prompts) return firstBlocks.GetValueOrDefault(sessionId) ?? [];
+    }
 
     /// <summary>Takes <c>_gorynych/note</c> as Claude's channel does; otherwise the agent does not know the method, like Kimi.</summary>
     public bool HasChannel { get; set; }
@@ -738,7 +752,10 @@ sealed class LifecycleAgent
     /// <summary>The <c>_gorynych/note</c> params received.</summary>
     public List<JsonObject> Notes { get; } = [];
 
-    /// <summary>False refuses notes as the Claude adapter does while Claude's process is not running.</summary>
+    /// <summary>The <c>_gorynych/opinion</c> params received through the channel (with <see cref="HasChannel"/>).</summary>
+    public List<JsonObject> Opinions { get; } = [];
+
+    /// <summary>False refuses notes and opinions as the Claude adapter does while Claude's process is not running.</summary>
     public bool Running { get; set; } = true;
 
     /// <summary>The text a turn answers with after <see cref="BeforePrompt"/>; null answers with none.</summary>

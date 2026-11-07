@@ -109,7 +109,9 @@ public sealed class PeersTests
         });
         Assert.AreEqual("SQLite, for one user.", (string?)reply!["text"]);
         var asked = opinions.Single();
-        Assert.AreEqual("peer_asker", (string?)asked["sender"]);
+        Assert.AreEqual("peer_asker", (string?)asked["sender"], "the label for GUIs stays");
+        Assert.AreEqual("[Opinion request · from session_id asking (asker)]\nSQLite or PostgreSQL?", (string?)asked["text"],
+            "the asked agent sees the asking session by its ID");
         Assert.AreEqual("asking", (string?)asked["fromSessionId"]);
 
         var bad = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => client.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject
@@ -119,6 +121,21 @@ public sealed class PeersTests
             ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = "forged" },
         }));
         Assert.AreEqual(JsonRpcException.InvalidRequest, bad.Code);
+    }
+
+    [TestMethod]
+    public void ToolDescriptions_SayWhenToUseWhich()
+    {
+        var tools = PeersServer.Tools(peers: true).ToDictionary(t => (string)t["name"]!);
+        string Description(string tool) => (string)tools[tool]["description"]!;
+
+        StringAssert.Contains(Description("ask_agent"), "Start a new question");
+        StringAssert.Contains(Description("ask_agent"), "To answer a request you received (its header names a message_id), use reply instead.");
+        StringAssert.Contains((string?)tools["ask_agent"]["inputSchema"]!["properties"]!["session_id"]!["description"],
+            "never an agent name, a title or a sender label");
+        StringAssert.Contains(Description("reply"), "Use it only to answer; to start a question of your own, use ask_agent.");
+        StringAssert.Contains(Description("spawn_session"), "sends this session a short report with the child's final message by itself");
+        StringAssert.Contains(Description("list_agents"), "session_id (pass it exactly)");
     }
 
     [TestMethod]
@@ -169,6 +186,23 @@ public sealed class PeersTests
             Assert.AreEqual("SQLite, for one user.", (string?)answer!["content"]![0]!["text"]);
             Assert.IsFalse((bool)answer["isError"]!);
             Assert.AreEqual("peer_asker", (string?)opinions.Single()["sender"]);
+
+            // What an agent sees when it passes a sender label, or answers nothing.
+            var wrong = await mcp.SendRequestAsync("tools/call", new JsonObject
+            {
+                ["name"] = "ask_agent",
+                ["arguments"] = new JsonObject { ["session_id"] = "peer_answerer", ["question"] = "SQLite or PostgreSQL?" },
+            });
+            Assert.IsTrue((bool)wrong!["isError"]!);
+            Assert.AreEqual("Gorynych could not do that: No session \"peer_answerer\". Pass an exact session_id from list_agents. " +
+                "Sessions you can ask:\n- session_id answering (answerer, \"Pick a database for the cockpit\")", (string?)wrong["content"]![0]!["text"]);
+            var stray = await mcp.SendRequestAsync("tools/call", new JsonObject
+            {
+                ["name"] = "reply",
+                ["arguments"] = new JsonObject { ["message_id"] = "m99", ["text"] = "SQLite." },
+            });
+            Assert.IsTrue((bool)stray!["isError"]!);
+            Assert.AreEqual(PeersServer.NotDelivered("m99"), (string?)stray["content"]![0]!["text"]);
 
             var spawned = await mcp.SendRequestAsync("tools/call", new JsonObject
             {

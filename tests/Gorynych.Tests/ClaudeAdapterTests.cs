@@ -20,6 +20,23 @@ public sealed class ClaudeAdapterTests
     }
 
     [TestMethod]
+    public async Task ChannelMessages_CarryTheirKind_AndNoSenderLabel()
+    {
+        var channel = new ChannelHost(["svc.exe", "peers"]);
+        var asking = channel.AskAsync("s1", "[Opinion request · from session_id k1 (kimi)]\nTabs?", CancellationToken.None);
+        await channel.NotifyAsync("s1", "[Report · from session_id k2 (kimi) · your child session · its turn ended]\nok", CancellationToken.None);
+
+        var messages = (await channel.NextAsync("s1", CancellationToken.None))["messages"]!.AsArray();
+        Assert.AreEqual(2, messages.Count);
+        Assert.AreEqual("""{"kind":"opinion","message_id":"m1"}""", messages[0]!["meta"]!.ToJsonString());
+        Assert.AreEqual("""{"kind":"report"}""", messages[1]!["meta"]!.ToJsonString());
+        StringAssert.StartsWith((string?)messages[0]!["content"], "[Opinion request · from session_id k1 (kimi)]");
+
+        channel.Reply(new System.Text.Json.Nodes.JsonObject { ["message_id"] = "m1", ["text"] = "Spaces." });
+        Assert.AreEqual("Spaces.", await asking);
+    }
+
+    [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
     public async Task PeerTools_ComeThroughTheLaunchFlags_AndOnlyAskAgentNeedsApproval()
     {

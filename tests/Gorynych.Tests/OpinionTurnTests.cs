@@ -109,7 +109,8 @@ public sealed partial class OpinionTurnTests
         Assert.AreEqual("Spaces.", (string?)reply!["text"]);
 
         var prompt = kimi.Prompts.Single();
-        StringAssert.StartsWith(prompt, "[Opinion request from peer_claude · message_id m1]");
+        StringAssert.StartsWith(prompt, "[Opinion request · from session_id asking (claude) · message_id m1]");
+        Assert.IsFalse(prompt.Contains("peer_claude", StringComparison.Ordinal), "no label that looks like a session ID");
         StringAssert.Contains(prompt, "Tabs or spaces for C#?");
         StringAssert.Contains(prompt, "reply tool of the gorynych MCP server");
 
@@ -172,7 +173,7 @@ public sealed partial class OpinionTurnTests
         await user.WaitAsync(Wait);
         Assert.AreEqual("answer", (string?)(await opinion.WaitAsync(Wait))!["text"]);
         Assert.AreEqual(1, kimi.MaxRunning, "never two turns at once");
-        StringAssert.StartsWith(kimi.Prompts[1], "[Opinion request from peer_claude");
+        StringAssert.StartsWith(kimi.Prompts[1], "[Opinion request · from session_id asking (claude)");
     }
 
     [TestMethod]
@@ -236,5 +237,30 @@ public sealed partial class OpinionTurnTests
         var reply = await Ask(client, asker.Token!, "kimi-1", "q");
         Assert.IsFalse(await outcome.Task.WaitAsync(Wait));
         Assert.AreEqual("real", (string?)reply!["text"]);
+    }
+
+    [TestMethod]
+    public async Task AskingWhileAnswering_FailsWithHowToAnswer()
+    {
+        var asker = new TurnAgent { Name = "claude", SessionId = "asking" };
+        var kimi = new TurnAgent { Name = "kimi", SessionId = "kimi-1" };
+        await using var conductor = Conductor(asker.Adapter(), kimi.Adapter());
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var refused = new TaskCompletionSource<JsonRpcException>();
+        kimi.OnPrompt = async (agent, p, text) =>
+        {
+            // Kimi, asked, tries to ask the asker back instead of answering.
+            try { await Ask(client, kimi.Token!, "asking", "What do you mean?"); }
+            catch (JsonRpcException e) { refused.SetResult(e); }
+            await agent.Update(p.SessionId, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = "Spaces." } });
+        };
+        await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("kimi"));
+        await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("claude"));
+
+        await Ask(client, asker.Token!, "kimi-1", "Tabs or spaces?");
+        var e = await refused.Task.WaitAsync(Wait);
+        Assert.AreEqual(JsonRpcException.InvalidRequest, e.Code);
+        Assert.AreEqual("This session is answering opinion request m1, so it cannot ask another session during this turn. " +
+            "Send your answer with the reply tool, passing message_id \"m1\"; if another opinion would help, say so in the answer.", e.Message);
     }
 }

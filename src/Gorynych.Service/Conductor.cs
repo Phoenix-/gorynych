@@ -894,7 +894,10 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.InvalidRequest, "Only an agent's session can spawn one: unknown peer token");
         var prompt = (string?)request.Params?["prompt"];
         if (string.IsNullOrWhiteSpace(prompt)) throw new JsonRpcException(JsonRpcException.InvalidParams, "prompt is required");
-        var host = Agent((string?)request.Params?["agent"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "agent is required"));
+        var agentName = (string?)request.Params?["agent"];
+        if (agentName is null || !agents.TryGetValue(agentName, out var host))
+            throw new JsonRpcException(JsonRpcException.InvalidParams,
+                (agentName is null ? "agent is required." : $"No agent \"{agentName}\".") + $" Pass one of: {string.Join(", ", agents.Keys)}.");
         var title = ((string?)request.Params?["title"])?.Trim() is { Length: > 0 } named ? Shorten(named) : null;
         var report = request.Params?["report"] is not JsonValue flag || !flag.TryGetValue<bool>(out var r) || r;
 
@@ -948,9 +951,13 @@ public sealed class Conductor : IAsyncDisposable
     static string ResolveFolder(string parentCwd, string? cwd)
     {
         if (string.IsNullOrWhiteSpace(cwd))
-            return parentCwd.Length > 0 ? FolderPath.Normalize(parentCwd) : throw new JsonRpcException(JsonRpcException.InvalidParams, "cwd is required");
+            return parentCwd.Length > 0
+                ? FolderPath.Normalize(parentCwd)
+                : throw new JsonRpcException(JsonRpcException.InvalidParams, "This session has no folder, so pass cwd: a full path to an existing folder.");
         var full = FolderPath.Normalize(Path.GetFullPath(Path.IsPathRooted(cwd) || parentCwd.Length == 0 ? cwd : Path.Combine(parentCwd, cwd)));
-        return Directory.Exists(full) ? full : throw new JsonRpcException(JsonRpcException.InvalidParams, $"No such folder: {full}");
+        if (Directory.Exists(full)) return full;
+        throw new JsonRpcException(JsonRpcException.InvalidParams, $"No such folder: {full}. Pass an existing folder" +
+            (parentCwd.Length > 0 ? $", or leave cwd out to work in this session's folder, {FolderPath.Normalize(parentCwd)}." : "."));
     }
 
     /// <summary>
@@ -1121,23 +1128,27 @@ public sealed class Conductor : IAsyncDisposable
             using var use = await UseAsync(record.SessionId, CancellationToken.None);
             if (feed.Retired) return;
             var (rpc, _) = await EnsureLiveAsync(use.Record, CancellationToken.None);
-            var block = new TextContent { Text = prompt };
+            // The task, then what the child needs to know about where it came from: two blocks, so
+            // the task stays the first one; the journal keeps both as the one message the agent got.
+            var task = new TextContent { Text = prompt };
+            var context = new TextContent { Text = SpawnContext(store.Get(parent.SessionId) ?? parent, use.Record.ReportToParent) };
             var meta = new JsonObject
             {
                 [GorynychProtocol.MetaOrigin] = "spawn",
                 [GorynychProtocol.MetaSender] = $"parent_{parent.Agent}",
                 [GorynychProtocol.MetaParentSessionId] = parent.SessionId,
             };
-            var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = block, Meta = meta })!.AsObject();
+            var shown = new TextContent { Text = $"{task.Text}\n\n{context.Text}" };
+            var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = shown, Meta = meta })!.AsObject();
             await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
-            await ProvisionalTitleAsync(feed, use.Record, [block]);
+            await ProvisionalTitleAsync(feed, use.Record, [task]);
             feed.BeginTurnText(ReportLimit + 1);
             Task<JsonNode?> response;
             await feed.ForwardGate.WaitAsync(CancellationToken.None);
             try
             {
                 response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt,
-                    AcpJson.ToNode(new PromptRequest { SessionId = record.SessionId, Prompt = [block] }), CancellationToken.None);
+                    AcpJson.ToNode(new PromptRequest { SessionId = record.SessionId, Prompt = [task, context] }), CancellationToken.None);
             }
             finally
             {
@@ -1270,12 +1281,24 @@ public sealed class Conductor : IAsyncDisposable
         var message = finalMessage.Trim();
         if (message.Length > ReportLimit) message = Cut(message, ReportLimit) + "…";
         if (message.Length == 0) message = "(no final message)";
-        var name = child.Title is { Length: > 0 } title ? $" \"{title}\"" : "";
-        return $"[Report from child session {child.SessionId}{name} ({child.Agent}) · its turn {outcome}]\n" +
+        return $"[Report · from {Who(child)} · your child session · its turn {outcome}]\n" +
             $"{message}\n\n" +
-            "This comes from a session you started with spawn_session, not from the user. It needs no reply; " +
-            $"ask_agent with session_id \"{child.SessionId}\" asks it more.";
+            "This comes from a session you started with spawn_session, not from the user. It needs no reply. " +
+            $"To ask that session more, use ask_agent with session_id \"{child.SessionId}\".";
     }
+
+    /// <summary>
+    /// What a spawned session is told after its task: who started it, that its turns are reported
+    /// there by themselves, and the ID to ask that session by. It follows the task, so an agent
+    /// that titles a session from its first prompt (Kimi) takes the task as the title.
+    /// </summary>
+    static string SpawnContext(SessionRecord parent, bool report) =>
+        $"[About this session · started by {Who(parent)} with spawn_session, approved by the user]\n" +
+        "The task above comes from that session. " +
+        (report
+            ? "When each of your turns ends, Gorynych sends your final message to that session automatically, so you need not send it yourself. "
+            : "Your turns are not reported to it. ") +
+        $"To ask it something, use ask_agent with session_id \"{parent.SessionId}\". The user can also prompt you here directly.";
 
     // ---------------------------------------------------------------- list changes
 
@@ -1349,17 +1372,24 @@ public sealed class Conductor : IAsyncDisposable
         if ((string?)request.Params?["_meta"]?[GorynychProtocol.MetaPeerToken] is { } token)
         {
             from = peerTokens.TryGetValue(token, out var sid) ? sid : throw new JsonRpcException(JsonRpcException.InvalidRequest, "Unknown peer token");
-            if (from == target) throw new JsonRpcException(JsonRpcException.InvalidParams, "A session cannot ask itself.");
+            if (from == target)
+                throw new JsonRpcException(JsonRpcException.InvalidParams,
+                    $"\"{target}\" is this session's own session_id; ask_agent asks another session." + AskableHint(from));
             sender = $"peer_{store.Get(from)?.Agent ?? "agent"}";
         }
-        if (from is not null && Feed(from).CurrentOpinion is not null)
-            throw new JsonRpcException(JsonRpcException.InvalidRequest, "A session answering an opinion request cannot ask another agent meanwhile.");
-        using var use = await UseAsync(target, ct);
+        if (from is not null && Feed(from).CurrentOpinion is { } answering)
+            throw new JsonRpcException(JsonRpcException.InvalidRequest,
+                $"This session is answering opinion request {answering}, so it cannot ask another session during this turn. " +
+                $"Send your answer with the reply tool, passing message_id \"{answering}\"; if another opinion would help, say so in the answer.");
+        using var use = await UseAskedAsync(target, from, ct);
         var record = use.Record;
         var (rpc, _) = await EnsureLiveAsync(record, ct);
         ServiceLog.Info($"opinion: {from ?? "client"} asks {record.Agent} {target}");
+        // The asked agent sees who asks by the asking session's real ID, which it can pass to ask_agent;
+        // sender (peer_claude) is only a label for GUIs.
+        var origin = from is not null && store.Get(from) is { } asking ? $"from {Who(asking)}" : $"from {sender ?? "a Gorynych client"}";
         sender ??= "peer_agent";
-        var forwarded = new JsonObject { ["sessionId"] = target, ["text"] = text, ["sender"] = sender };
+        var forwarded = new JsonObject { ["sessionId"] = target, ["text"] = $"[Opinion request · {origin}]\n{text}", ["sender"] = sender };
         if (from is not null) forwarded["fromSessionId"] = from;
         try
         {
@@ -1375,8 +1405,54 @@ public sealed class Conductor : IAsyncDisposable
         }
         catch (JsonRpcException e) when (e.Code == JsonRpcException.MethodNotFound)
         {
-            return await OpinionTurnAsync(record, rpc, sender, from, text, ct);
+            return await OpinionTurnAsync(record, rpc, sender, from, origin, text, ct);
         }
+        catch (JsonRpcException e) when (from is not null && e.Code == JsonRpcException.InvalidRequest)
+        {
+            // The Claude adapter refuses while Claude's process is not running; only a prompt starts it.
+            throw new JsonRpcException(JsonRpcException.InvalidRequest,
+                $"{Who(record)} cannot answer now: its agent is not running, and it starts only when the user prompts that session. " +
+                "Ask another session from list_agents, or ask the user to prompt that one first.");
+        }
+    }
+
+    /// <summary>The asked session; for an agent that asks, an unknown ID fails with the IDs it can pass instead.</summary>
+    async Task<SessionUse> UseAskedAsync(string target, string? from, CancellationToken ct)
+    {
+        try
+        {
+            return await UseAsync(target, ct);
+        }
+        catch (JsonRpcException e) when (from is not null && e.Code == JsonRpcException.ResourceNotFound)
+        {
+            throw new JsonRpcException(JsonRpcException.ResourceNotFound,
+                $"No session \"{target}\". Pass an exact session_id from list_agents." + AskableHint(from));
+        }
+    }
+
+    /// <summary>
+    /// How a message the service puts in front of an agent names a session: its exact ID, labelled
+    /// <c>session_id</c> so the agent can pass it to <c>ask_agent</c>, then its agent and title.
+    /// </summary>
+    static string Who(SessionRecord r) =>
+        $"session_id {r.SessionId} ({r.Agent}" + (r.Title is { Length: > 0 } title ? $", \"{Shorten(title).Replace('"', '\'')}\"" : "") + ")";
+
+    /// <summary>The sessions <paramref name="self"/> can ask: the others with history, open ones first, then the newest.</summary>
+    IEnumerable<(SessionRecord Record, bool Live)> Askable(string? self) => store.All()
+        .Where(r => r.SessionId != self && HasHistory(r))
+        .Select(r => (Record: r, Live: agents.TryGetValue(r.Agent, out var host) && host.IsLive(r.SessionId)))
+        .OrderByDescending(c => c.Live).ThenByDescending(c => c.Record.UpdatedAt);
+
+    /// <summary>For a peer tool's error: the first sessions the caller can ask, so it can retry with an exact ID.</summary>
+    string AskableHint(string self)
+    {
+        const int Shown = 5;
+        var askable = Askable(self).Take(Shown + 1).Select(c => c.Record).ToList();
+        if (askable.Count == 0) return " There is no other session to ask now.";
+        var hint = new StringBuilder(" Sessions you can ask:");
+        foreach (var r in askable.Take(Shown)) hint.Append("\n- ").Append(Who(r));
+        if (askable.Count > Shown) hint.Append("\n- and more: list_agents shows them all");
+        return hint.ToString();
     }
 
     /// <summary>
@@ -1385,7 +1461,7 @@ public sealed class Conductor : IAsyncDisposable
     /// turn, since ACP cannot inject into a running one. The answer is the agent's
     /// <c>reply</c> tool call (<c>_gorynych/reply</c>), or else the turn's own text.
     /// </summary>
-    async Task<JsonNode?> OpinionTurnAsync(SessionRecord record, JsonRpcConnection rpc, string sender, string? from, string question, CancellationToken ct)
+    async Task<JsonNode?> OpinionTurnAsync(SessionRecord record, JsonRpcConnection rpc, string sender, string? from, string origin, string question, CancellationToken ct)
     {
         var feed = Feed(record.SessionId);
         var messageId = "m" + Interlocked.Increment(ref opinionCount);
@@ -1399,7 +1475,7 @@ public sealed class Conductor : IAsyncDisposable
             {
                 if (feed.Retired) throw NotFound(record.SessionId);
                 record = Promote(record);
-                var text = OpinionPrompt(sender, messageId, question);
+                var text = OpinionPrompt(origin, messageId, question);
                 var meta = new JsonObject
                 {
                     [GorynychProtocol.MetaOrigin] = "peer",
@@ -1451,11 +1527,12 @@ public sealed class Conductor : IAsyncDisposable
         }
     }
 
-    static string OpinionPrompt(string sender, string messageId, string question) =>
-        $"[Opinion request from {sender} · message_id {messageId}]\n" +
+    static string OpinionPrompt(string origin, string messageId, string question) =>
+        $"[Opinion request · {origin} · message_id {messageId}]\n" +
         $"{question}\n\n" +
         "This message comes from another of the user's coding agents, not from the user. Give your honest opinion briefly, " +
-        $"then send it with the reply tool of the gorynych MCP server, passing message_id \"{messageId}\". " +
+        $"then send it with the reply tool of the gorynych MCP server, passing message_id \"{messageId}\" " +
+        "(reply answers this request; ask_agent would start a new question instead). " +
         "Do not run other tools, edit files or take any other action for this request.";
 
     /// <summary><c>_gorynych/reply</c>: the asked session answers an opinion request it got as a turn.</summary>
@@ -1493,12 +1570,7 @@ public sealed class Conductor : IAsyncDisposable
         var token = (string?)request.Params?["token"];
         var self = token is not null && peerTokens.TryGetValue(token, out var sid) ? sid : null;
         var sessions = new JsonArray();
-        // Sessions with history only, open ones first.
-        var candidates = store.All()
-            .Where(r => r.SessionId != self && HasHistory(r))
-            .Select(r => (Record: r, Live: agents.TryGetValue(r.Agent, out var host) && host.IsLive(r.SessionId)))
-            .OrderByDescending(c => c.Live).ThenByDescending(c => c.Record.UpdatedAt);
-        foreach (var (r, live) in candidates)
+        foreach (var (r, live) in Askable(self))
         {
             sessions.Add((JsonNode)new JsonObject
             {
