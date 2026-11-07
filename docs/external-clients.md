@@ -52,10 +52,12 @@ and what the service does about it:
   these drafts when the bridge disconnects, and sweeps any left over at its next start.
 - `session/close` is sent, because the service advertises `close`, when Zed drops a thread:
   a thread or draft removed or replaced, idle threads beyond the five it keeps, an
-  abandoned new or load. Archiving and quitting send nothing.
+  abandoned new or load. Archiving and quitting send nothing. The service closes a session in
+  its agent only when no other client has it open.
 - Archiving is local to Zed. Deleting a thread from its history sends `session/delete` only
   if the agent advertises `sessionCapabilities.delete`, which the service does; a
-  "not found" error (`-32002`) counts as success.
+  "not found" error (`-32002`) counts as success. Kimi itself answers `-32602` for a session
+  it no longer has; the service turns that into success when Kimi no longer lists it.
 - `session/list` is called only from the "Import threads" dialog. It passes no `cwd`,
   follows `nextCursor`, and imports the sessions as archived threads.
 - Forms (`elicitation/create`) need no flag. Zed renders string (with `minLength`,

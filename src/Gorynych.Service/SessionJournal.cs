@@ -16,10 +16,14 @@ public sealed class SessionJournal
     static readonly JsonSerializerOptions LineOptions = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
     static readonly HashSet<string> ChunkKinds = ["agent_message_chunk", "agent_thought_chunk", "user_message_chunk"];
 
+    /// <summary>Updates that only a turn produces; the rest (commands, modes, config) also come with an empty session.</summary>
+    static readonly HashSet<string> TurnKinds = ["user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan"];
+
     readonly string path;
     readonly int maxEntries;
     readonly Lock gate = new();
     List<string>? lines;
+    bool turns;
 
     public SessionJournal(string path, int maxEntries)
     {
@@ -32,6 +36,21 @@ public sealed class SessionJournal
         get { lock (gate) return Load().Count; }
     }
 
+    /// <summary>True when the journal holds any part of a turn: a message, a thought, a tool call or a plan.</summary>
+    public bool HasTurns
+    {
+        get
+        {
+            lock (gate)
+            {
+                Load();
+                return turns;
+            }
+        }
+    }
+
+    static bool IsTurn(JsonNode? node) => node is JsonObject o && TurnKinds.Contains((string?)o["sessionUpdate"] ?? "");
+
     public void Append(JsonNode update)
     {
         var line = update.ToJsonString(LineOptions);
@@ -39,6 +58,7 @@ public sealed class SessionJournal
         {
             var all = Load();
             all.Add(line);
+            turns |= IsTurn(update);
             if (all.Count > maxEntries)
             {
                 Compact(all);
@@ -68,6 +88,7 @@ public sealed class SessionJournal
         lock (gate)
         {
             lines = [];
+            turns = false;
             File.Delete(path);
         }
     }
@@ -82,7 +103,8 @@ public sealed class SessionJournal
         foreach (var l in text.Split('\n'))
         {
             if (l.Length == 0) continue;
-            if (TryParse(l) is null) { dropped = true; continue; } // a line torn by a crash
+            if (TryParse(l) is not { } node) { dropped = true; continue; } // a line torn by a crash
+            turns |= IsTurn(node);
             lines.Add(l);
         }
         if (dropped || (text.Length > 0 && text[^1] != '\n')) Rewrite(lines);

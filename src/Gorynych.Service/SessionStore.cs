@@ -52,14 +52,17 @@ internal sealed partial class ServiceJsonContext : JsonSerializerContext;
 /// </summary>
 public sealed class SessionStore
 {
-    /// <summary>How often a bare activity stamp (<see cref="Touch"/>) is written at most.</summary>
+    /// <summary>How often a bare activity stamp (<see cref="Touch"/>) may try to write the file.</summary>
     static readonly TimeSpan TouchSaveInterval = TimeSpan.FromSeconds(1);
 
     readonly string path;
-    readonly Lock gate = new();
+    readonly Lock gate = new();      // the records
+    readonly Lock writeGate = new(); // the file; its retries never hold the records' lock
     readonly Dictionary<string, SessionRecord> records = new(StringComparer.Ordinal);
-    bool dirty;
-    long lastSave;
+    readonly HashSet<string> removed = new(StringComparer.Ordinal);
+    long changes;     // in-memory changes so far (under gate)
+    long written;     // the change count the file holds (under writeGate)
+    long lastAttempt; // when a write was last tried (under gate)
 
     public SessionStore(string path)
     {
@@ -86,69 +89,106 @@ public sealed class SessionStore
         lock (gate) return records.Values.Select(Clone).ToList();
     }
 
-    /// <summary>Applies <paramref name="change"/> to the record (created if missing) and saves.</summary>
-    public SessionRecord Update(string sessionId, string agent, Action<SessionRecord> change)
+    /// <summary>
+    /// Applies <paramref name="change"/> to the record (created if missing) and saves. Returns
+    /// null for a session removed in this run, which a late update must not bring back.
+    /// </summary>
+    /// <param name="durable">Throw an <see cref="IOException"/> when the change could not be written,
+    /// instead of logging it and leaving it for the next write. The change stays in memory either way.</param>
+    public SessionRecord? Update(string sessionId, string agent, Action<SessionRecord> change, bool durable = false)
     {
+        SessionRecord result;
+        (string Json, long Version) snapshot;
         lock (gate)
         {
-            var r = GetOrCreate(sessionId, agent);
+            if (GetOrCreate(sessionId, agent) is not { } r) return null;
             change(r);
-            Save();
-            return Clone(r);
+            result = Clone(r);
+            snapshot = Snapshot();
         }
+        Write(snapshot, durable);
+        return result;
     }
 
     /// <summary>
-    /// Stamps activity on a session. Streaming produces many updates a second, so the stamp is
-    /// written at most once per <see cref="TouchSaveInterval"/>; the next save carries it anyway.
+    /// Stamps activity on a session. Streaming produces many updates a second, so a stamp tries
+    /// to write the file at most once per <see cref="TouchSaveInterval"/> after the last attempt
+    /// (successful or not); the next write carries it anyway. Ignores removed and deleted sessions.
     /// </summary>
     public void Touch(string sessionId, string agent)
     {
+        (string Json, long Version) snapshot;
         lock (gate)
         {
-            GetOrCreate(sessionId, agent).UpdatedAt = DateTimeOffset.UtcNow;
-            dirty = true;
-            if (Environment.TickCount64 - lastSave >= TouchSaveInterval.TotalMilliseconds) Save();
+            if (GetOrCreate(sessionId, agent) is not { Deleted: false } r) return;
+            r.UpdatedAt = DateTimeOffset.UtcNow;
+            changes++;
+            if (Environment.TickCount64 - lastAttempt < TouchSaveInterval.TotalMilliseconds) return;
+            snapshot = Snapshot(counted: true);
         }
+        Write(snapshot, durable: false);
     }
 
+    /// <summary>Removes the record; later updates of the same session in this run are ignored.</summary>
     public void Remove(string sessionId)
     {
+        (string Json, long Version) snapshot;
         lock (gate)
-            if (records.Remove(sessionId)) Save();
+        {
+            removed.Add(sessionId);
+            if (!records.Remove(sessionId)) return;
+            snapshot = Snapshot();
+        }
+        Write(snapshot, durable: false);
     }
 
     /// <summary>Writes pending changes, such as a recent <see cref="Touch"/>.</summary>
     public void Flush()
     {
+        (string Json, long Version) snapshot;
         lock (gate)
-            if (dirty) Save();
+        {
+            if (changes <= Volatile.Read(ref written)) return;
+            snapshot = Snapshot(counted: true);
+        }
+        Write(snapshot, durable: false);
     }
 
-    SessionRecord GetOrCreate(string sessionId, string agent)
+    SessionRecord? GetOrCreate(string sessionId, string agent)
     {
         if (records.TryGetValue(sessionId, out var r)) return r;
+        if (removed.Contains(sessionId)) return null;
         var now = DateTimeOffset.UtcNow;
         return records[sessionId] = new SessionRecord { SessionId = sessionId, Agent = agent, CreatedAt = now, UpdatedAt = now };
     }
 
-    /// <summary>
-    /// Writes the whole file. A write that still fails after <see cref="AtomicFile"/>'s retries
-    /// is logged and left pending: the records stay in memory and the next save writes them.
-    /// </summary>
-    void Save()
+    /// <summary>The file's content as of now, numbered by the in-memory change count. Called under <c>gate</c>.</summary>
+    (string Json, long Version) Snapshot(bool counted = false)
     {
-        dirty = true;
-        var json = JsonSerializer.Serialize(records.Values.OrderBy(r => r.CreatedAt).ToList(), ServiceJsonContext.Default.ListSessionRecord);
-        try
+        if (!counted) changes++;
+        lastAttempt = Environment.TickCount64;
+        return (JsonSerializer.Serialize(records.Values.OrderBy(r => r.CreatedAt).ToList(), ServiceJsonContext.Default.ListSessionRecord), changes);
+    }
+
+    /// <summary>
+    /// Writes a snapshot unless a later one is already on disk. A write that still fails after
+    /// <see cref="AtomicFile"/>'s retries is logged and left for the next write, or thrown when durable.
+    /// </summary>
+    void Write((string Json, long Version) snapshot, bool durable)
+    {
+        lock (writeGate)
         {
-            AtomicFile.WriteAllText(path, json);
-            dirty = false;
-            lastSave = Environment.TickCount64;
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            ServiceLog.Warn($"sessions file not saved, will retry with the next change: {e.Message}");
+            if (written >= snapshot.Version) return;
+            try
+            {
+                AtomicFile.WriteAllText(path, snapshot.Json);
+                Volatile.Write(ref written, snapshot.Version);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                if (durable) throw new IOException($"The sessions file could not be saved: {e.Message}", e);
+                ServiceLog.Warn($"sessions file not saved, will retry with the next change: {e.Message}");
+            }
         }
     }
 

@@ -18,10 +18,14 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
 - `session/list` returns titles and `updatedAt`.
 - Approvals arrive as `session/request_permission` with Kimi's own options (approve once,
   approve for this session, reject); tool calls stream their arguments as `tool_call_update`.
-- `session/new` creates a real, empty native session, which Kimi lists. The service
-  deletes it with Kimi's own `session/delete` (after `session/close`) when it stays a draft,
-  and forwards a client's `session/delete` the same way. Verified live on 7 November 2026
-  (`Kimi_DraftIsDeletedNatively_WhenItsClientLeaves`).
+- `session/new` creates a real, empty native session. Kimi lists it with `title: null`
+  until the first prompt titles it, and `session/close` keeps it listed. A `session/delete`
+  of a session Kimi does not have answers `-32602 Invalid params: Unknown sessionId`, not
+  ACP's `-32002`.
+- The service deletes a draft with Kimi's own `session/delete` (after `session/close`) once
+  Kimi lists it untitled, and forwards a client's `session/delete` the same way. Verified
+  live on 7 November 2026 (`Kimi_DraftIsDeletedNatively_WhenItsClientLeaves`, and a probe of
+  the list and delete answers).
 - Verified live on 7 November 2026 after logging in: first prompt, a Write approval, the
   title, replay through the service journal, and `ask_agent` to a Claude session. Before
   the login every turn failed with `-32000 Authentication required: 403`, which the service

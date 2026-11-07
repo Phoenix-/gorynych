@@ -37,8 +37,8 @@ for external ACP clients: `acp --agent claude|kimi` (see [external-clients.md](e
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
-| `session/close` | Detaches the client. A draft no other client has open is deleted (see below); any other session is closed in its agent. |
-| `session/delete` | Closes the session in its agent if it is open, then deletes it there if the agent can (`sessionCapabilities.delete`); otherwise the overlay keeps a tombstone. Drops the journal. An unknown or already deleted session succeeds. |
+| `session/close` | Detaches the client. Only when no other client has the session open is it closed in its agent, or, for a draft, discarded (see below). |
+| `session/delete` | Closes the session in its agent if it is open, then deletes it there if the agent can (`sessionCapabilities.delete`); otherwise the overlay keeps a tombstone. Drops the journal. A session only the agent knows is found through its list; an unknown or already deleted session succeeds. |
 | anything else with a `sessionId` | Forwarded to the session's agent. |
 
 Agent → client requests go to the most recently attached client of the session:
@@ -73,7 +73,7 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId` |
-| `_gorynych/peers` | method, `{token}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (a title; no drafts or deleted sessions), open ones first, then the newest; with agent, title, folder, `open` |
+| `_gorynych/peers` | method, `{token}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open` |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion` and `_gorynych/reply` | which session's `gorynych` MCP server is calling |
 
@@ -117,23 +117,47 @@ Kimi asking Claude goes through Claude's channel the same way.
 ACP clients may create sessions before the person types anything: Zed sends `session/new`
 whenever a thread view opens and quits without `session/close`
 ([external-clients.md](external-clients.md)). A session made by `session/new` is a **draft**
-until its first `session/prompt` or an opinion request delivered to it as a turn. A draft is
-deleted when
+until its first `session/prompt` or an opinion it answers (as a turn, or through Claude's
+channel). Ending a draft is written to `sessions.json` before anything reaches the agent; if
+that write fails the prompt is refused, because a draft left in the file is swept at the next
+start.
+
+A draft is discarded when
 
 - `session/close` arrives for it and no other client has it open, or
-- the last client attached to it disconnects, or
-- the service starts and finds it in the overlay from an earlier run.
+- the last client attached to it disconnects (in the background, so the disconnect is not
+  held up), or
+- the service starts and finds it marked in the overlay from an earlier run.
 
-Deleting a draft closes it in its agent and, for an agent that can delete (Kimi, whose
-`session/new` makes a real empty session), sends `session/delete`; then the record and the
-journal go. A draft the agent fails to delete stays marked and hidden, and the next start
-tries again.
+A native delete cannot be undone, so a discard keeps the session whenever it is unsure:
 
-`session/delete` from a client works the same way for any session, except that an agent
-that cannot delete (Claude: the service never touches `~/.claude`) keeps the session, so the
-overlay keeps a tombstone (`deleted`) and the session disappears from `session/list`,
+1. Every session has a gate. Load, resume, prompt, opinions and forwarded requests register
+   under it; a discard holds it throughout and goes ahead only if no client is attached and no
+   operation is registered. A client that comes back meanwhile waits for the outcome, and then
+   finds the session gone or kept.
+2. A draft whose journal holds part of a turn (a message, a thought, a tool call, a plan) is
+   kept, and its mark cleared.
+3. An agent that can delete must list the session without a title. Kimi titles a session from
+   its first prompt and lists an empty one with `title: null` (Kimi Code 2.4.1). A titled
+   session is kept; one the agent does not list is hidden with a tombstone, not deleted.
+4. Only then is the session closed in its agent and deleted there. An agent that cannot
+   delete (Claude) has nothing native to delete: the Claude adapter records a session at its
+   first prompt. The record and the journal go.
+
+A discard that fails leaves the mark, and the next start tries again.
+
+`session/delete` from a client closes the session in its agent if it is open (stopping its
+turn) and deletes it there when the agent can. A session the agent no longer has counts as
+deleted: ACP's not-found (`-32002`), or any error while the agent no longer lists it (Kimi
+2.4.1 answers `-32602 Unknown sessionId`). An agent that cannot delete (Claude: the service
+never touches `~/.claude`) keeps the session, and so does one that cannot be reached; the
+overlay then keeps a tombstone (`deleted`), and the session disappears from `session/list`,
 `_gorynych/peers`, `session/load` and `session/prompt` even though the agent still lists it.
 ACP allows such a soft delete.
+
+Nothing that arrives after a delete brings the session back: late updates from the agent are
+dropped, a prompt queued behind the deleted session's turn fails with not found, and late
+writes to the overlay are ignored.
 
 ## Journal
 
@@ -152,6 +176,9 @@ when the journal is read back.
 `updatedAt` from the harness replaces the overlay's.
 
 The file is replaced atomically (a temporary file moved over it). An antivirus scanner or
-the indexer can hold it open for a moment, so the move is retried for up to about 400 ms; a
-write that still fails is logged and the change stays in memory for the next write. The
-activity stamp of a streaming turn is written at most once a second.
+the indexer can hold it open for a moment, so the move is retried for up to about 400 ms,
+outside the lock on the records. A write that still fails is logged and the change stays in
+memory for the next write; ending a draft is the exception (see above). The activity stamp of
+a streaming turn tries a write at most once a second after the last attempt, so a file that
+cannot be written does not slow every update down. A session removed in this run is not
+recreated by a late write.

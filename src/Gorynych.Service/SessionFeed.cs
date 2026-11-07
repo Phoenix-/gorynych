@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
+using Gorynych.Acp.JsonRpc;
 
 namespace Gorynych.Service;
 
@@ -29,6 +30,42 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
 
     /// <summary>One prompt turn at a time: the user's turns and opinion requests delivered as turns.</summary>
     public SemaphoreSlim TurnGate { get; } = new(1, 1);
+
+    /// <summary>
+    /// Held for the whole of a draft's discard or a deletion. An operation that uses the session
+    /// takes it briefly to register (<see cref="EnterUse"/>), so it waits for a discard under way
+    /// and a discard never starts under it.
+    /// </summary>
+    public SemaphoreSlim LifeGate { get; } = new(1, 1);
+
+    int users;
+
+    /// <summary>Operations using the session now: loads, resumes, prompts, opinions, forwarded requests.</summary>
+    public int Users => Volatile.Read(ref users);
+
+    public void EnterUse() => Interlocked.Increment(ref users);
+    public void ExitUse() => Interlocked.Decrement(ref users);
+
+    bool retired;
+
+    /// <summary>True once the session is deleted: nothing more is journaled or sent.</summary>
+    public bool Retired
+    {
+        get { lock (clientsGate) return retired; }
+    }
+
+    /// <summary>Marks the session deleted: detaches its clients and fails requests waiting for one.</summary>
+    public void Retire()
+    {
+        TaskCompletionSource signal;
+        lock (clientsGate)
+        {
+            retired = true;
+            clients.Clear();
+            signal = clientAttached;
+        }
+        signal.TrySetResult();
+    }
 
     string? opinionTurn;
     System.Text.StringBuilder opinionText = new();
@@ -86,6 +123,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         TaskCompletionSource signal;
         lock (clientsGate)
         {
+            if (retired) return;
             clients.Remove(client);
             clients.Add(client);
             signal = clientAttached;
@@ -114,6 +152,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
                 Task wait;
                 lock (clientsGate)
                 {
+                    if (retired) throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Session {SessionId} was deleted");
                     var open = clients.Where(c => !c.Rpc.IsClosed).ToList();
                     var live = open.LastOrDefault(prefer) ?? open.LastOrDefault();
                     if (live is not null) return live;
@@ -152,6 +191,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         await gate.WaitAsync();
         try
         {
+            if (Retired) return; // a late update of a deleted session must not bring its journal back
             Journal.Append(update);
             remember();
             foreach (var client in Clients())
@@ -170,6 +210,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         await gate.WaitAsync();
         try
         {
+            if (Retired) return;
             foreach (var update in Journal.ReadAll())
                 if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update))) return;
             Attach(client);

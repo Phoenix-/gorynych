@@ -245,6 +245,7 @@ public sealed class LiveSmokeTests
             })).SessionId;
             CollectionAssert.Contains(await check.ListAsync(dir), draft, "Kimi keeps an empty native session for the draft");
         }
+        await conductor.CleanupsIdleAsync();
         Assert.IsNull(conductor.Store.Get(draft), "the service closed and deleted the draft without an error");
         CollectionAssert.DoesNotContain(await check.ListAsync(dir), draft, "Kimi no longer has it");
     }

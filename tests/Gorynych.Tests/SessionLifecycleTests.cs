@@ -11,11 +11,13 @@ namespace Gorynych.Tests;
 /// Drafts, deletion and the peer list, as an external client like Zed drives them: it creates
 /// a session whenever a thread view opens, closes sessions when it drops a thread, quits
 /// without closing anything, and deletes from its history only when the agent advertises it.
+/// A native delete cannot be undone, so whenever the service is unsure it keeps the session.
 /// </summary>
 [TestClass]
 public sealed class SessionLifecycleTests
 {
     static readonly string Cwd = Path.GetTempPath();
+    static readonly TimeSpan Wait = TimeSpan.FromSeconds(10);
 
     static async Task<string> NewAsync(TestClient client) =>
         (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
@@ -24,6 +26,9 @@ public sealed class SessionLifecycleTests
     static Task PromptAsync(TestClient client, string sessionId, string text) =>
         client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
             new PromptRequest { SessionId = sessionId, Prompt = [new TextContent { Text = text }] });
+
+    static Task ResumeAsync(TestClient client, string sessionId) =>
+        client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, AcpJson.ToNode(new ResumeSessionRequest { SessionId = sessionId, Cwd = Cwd }));
 
     static Task CloseAsync(TestClient client, string sessionId) =>
         client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = sessionId });
@@ -35,6 +40,17 @@ public sealed class SessionLifecycleTests
         (await client.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest()))
             .Sessions.Select(s => s.SessionId).ToArray();
 
+    static async Task<string[]> PeersAsync(TestClient client) =>
+        (await client.Rpc.SendRequestAsync(GorynychProtocol.MethodPeers, new JsonObject()))!["sessions"]!.AsArray()
+            .Select(p => (string)p!["session_id"]!).ToArray();
+
+    /// <summary>Disconnects a client and waits for the drafts it leaves to be dealt with.</summary>
+    static async Task LeaveAsync(Conductor conductor, TestClient client)
+    {
+        await client.DisposeAsync();
+        await conductor.CleanupsIdleAsync().WaitAsync(Wait);
+    }
+
     // ---------------------------------------------------------------- drafts
 
     [TestMethod]
@@ -43,14 +59,13 @@ public sealed class SessionLifecycleTests
         var kimi = new LifecycleAgent("kimi", canDelete: true);
         var dir = TestDirs.New();
         await using var conductor = TestDirs.Conductor(dir, kimi.Adapter);
-        string draft;
-        await using (var zed = await TestClient.ConnectAsync(conductor, "zed"))
-        {
-            draft = await NewAsync(zed);
-            Assert.IsTrue(conductor.Store.Get(draft)!.Draft);
-            Assert.AreEqual(0, (await ListAsync(zed)).Length, "a draft is not listed, though its agent lists it");
-        }
-        // Disposing the client waits for the service side of the connection, which discards the draft.
+        var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var draft = await NewAsync(zed);
+        Assert.IsTrue(conductor.Store.Get(draft)!.Draft);
+        Assert.AreEqual(0, (await ListAsync(zed)).Length, "a draft is not listed, though its agent lists it");
+
+        await LeaveAsync(conductor, zed);
+
         CollectionAssert.AreEqual(new[] { "session/new", "session/close", "session/delete" }, kimi.CallsFor(draft));
         Assert.IsNull(conductor.Store.Get(draft));
         Assert.AreEqual(0, Directory.GetFiles(Path.Combine(dir, "journal")).Length, "the draft's journal is gone");
@@ -77,6 +92,23 @@ public sealed class SessionLifecycleTests
     }
 
     [TestMethod]
+    public async Task Close_LeavesTheSessionOpenWhileAnotherClientHasIt()
+    {
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), kimi.Adapter);
+        await using var first = await TestClient.ConnectAsync(conductor, "first");
+        await using var second = await TestClient.ConnectAsync(conductor, "second");
+        var id = await NewAsync(first);
+        await PromptAsync(first, id, "hello");
+        await ResumeAsync(second, id);
+
+        await CloseAsync(first, id);
+        CollectionAssert.DoesNotContain(kimi.CallsFor(id), "session/close", "the second client still has it open");
+        await CloseAsync(second, id);
+        CollectionAssert.Contains(kimi.CallsFor(id), "session/close");
+    }
+
+    [TestMethod]
     public async Task Draft_StaysWhileAnotherClientHasItOpen()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);
@@ -84,12 +116,11 @@ public sealed class SessionLifecycleTests
         var first = await TestClient.ConnectAsync(conductor, "first");
         var draft = await NewAsync(first);
         var second = await TestClient.ConnectAsync(conductor, "second");
-        await second.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume,
-            AcpJson.ToNode(new ResumeSessionRequest { SessionId = draft, Cwd = Cwd }));
+        await ResumeAsync(second, draft);
 
-        await first.DisposeAsync();
+        await LeaveAsync(conductor, first);
         Assert.IsNotNull(conductor.Store.Get(draft), "the second client still has it open");
-        await second.DisposeAsync();
+        await LeaveAsync(conductor, second);
         Assert.IsNull(conductor.Store.Get(draft));
         CollectionAssert.Contains(kimi.CallsFor(draft), "session/delete");
     }
@@ -99,12 +130,112 @@ public sealed class SessionLifecycleTests
     {
         var claude = new LifecycleAgent("claude", canDelete: false);
         await using var conductor = TestDirs.Conductor(TestDirs.New(), claude.Adapter);
-        string draft;
-        await using (var zed = await TestClient.ConnectAsync(conductor, "zed"))
-            draft = await NewAsync(zed);
+        var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var draft = await NewAsync(zed);
+
+        await LeaveAsync(conductor, zed);
 
         CollectionAssert.AreEqual(new[] { "session/new", "session/close" }, claude.CallsFor(draft));
         Assert.IsNull(conductor.Store.Get(draft), "no tombstone: a draft never reached the harness's own list");
+    }
+
+    [TestMethod]
+    public async Task ADiscardUnderWay_MakesAResumeWaitForItsOutcome()
+    {
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        var deleting = new TaskCompletionSource();
+        var release = new TaskCompletionSource();
+        kimi.BeforeDelete = async _ => { deleting.TrySetResult(); await release.Task; };
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), kimi.Adapter);
+        var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var draft = await NewAsync(zed);
+        await zed.DisposeAsync();
+        await deleting.Task.WaitAsync(Wait); // the discard is in the agent now
+
+        await using var again = await TestClient.ConnectAsync(conductor, "zed-again");
+        var resume = ResumeAsync(again, draft);
+        await Task.Delay(200);
+        Assert.IsFalse(resume.IsCompleted, "the resume waits for the discard");
+        release.SetResult();
+
+        var error = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => resume.WaitAsync(Wait));
+        Assert.AreEqual(JsonRpcException.ResourceNotFound, error.Code);
+        await conductor.CleanupsIdleAsync().WaitAsync(Wait);
+        CollectionAssert.AreEqual(new[] { "session/new", "session/close", "session/delete" }, kimi.CallsFor(draft), "nothing reached the agent after the delete");
+    }
+
+    [TestMethod]
+    public async Task ADiscard_SkipsADraftThatAnOperationIsUsing()
+    {
+        var dir = TestDirs.New();
+        new SessionStore(Path.Combine(dir, "sessions.json")).Update("kimi-old", "kimi", r => { r.Cwd = Cwd; r.Draft = true; });
+        var kimi = new LifecycleAgent("kimi", canDelete: true, existing: ["kimi-old"]);
+        var resuming = new TaskCompletionSource();
+        var release = new TaskCompletionSource();
+        kimi.BeforeResume = async _ => { resuming.TrySetResult(); await release.Task; };
+        await using var conductor = TestDirs.Conductor(dir, kimi.Adapter);
+        var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var resume = ResumeAsync(zed, "kimi-old");
+        await resuming.Task.WaitAsync(Wait);
+
+        await conductor.SweepDraftsAsync(); // a client reached the draft first
+
+        CollectionAssert.DoesNotContain(kimi.CallsFor("kimi-old"), "session/delete");
+        release.SetResult();
+        await resume.WaitAsync(Wait);
+        Assert.IsNotNull(conductor.Store.Get("kimi-old"));
+        await LeaveAsync(conductor, zed);
+        Assert.IsNull(conductor.Store.Get("kimi-old"), "the draft goes with the client that had it open");
+    }
+
+    [TestMethod]
+    public async Task ADraftMarkThatCannotBeSaved_RefusesThePrompt_AndKeepsTheSession()
+    {
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, kimi.Adapter);
+        var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var draft = await NewAsync(zed);
+
+        JsonRpcException error;
+        // An antivirus scanner holds the sessions file through every retry.
+        using (new FileStream(Path.Combine(dir, "sessions.json"), FileMode.Open, FileAccess.Read, FileShare.Read))
+            error = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(zed, draft, "hello"));
+
+        Assert.AreEqual(JsonRpcException.InternalError, error.Code);
+        CollectionAssert.DoesNotContain(kimi.CallsFor(draft), "session/prompt", "nothing reached the agent");
+        Assert.IsFalse(conductor.Store.Get(draft)!.Draft, "this run keeps it");
+        await LeaveAsync(conductor, zed);
+        Assert.IsNotNull(conductor.Store.Get(draft));
+        CollectionAssert.DoesNotContain(kimi.CallsFor(draft), "session/delete");
+    }
+
+    [TestMethod]
+    public async Task TheSweep_DeletesOnlyDraftsShownToBeEmpty()
+    {
+        var dir = TestDirs.New();
+        var earlier = new SessionStore(Path.Combine(dir, "sessions.json"));
+        foreach (var id in new[] { "kimi-with-turn", "kimi-titled", "kimi-unlisted", "kimi-empty" })
+            earlier.Update(id, "kimi", r => { r.Cwd = Cwd; r.Draft = true; });
+        earlier.Update("kimi-used", "kimi", r => { r.Cwd = Cwd; r.Title = "Used"; });
+        // The mark says draft, but the journal holds a turn.
+        Directory.CreateDirectory(Path.Combine(dir, "journal"));
+        new SessionJournal(Path.Combine(dir, "journal", SessionJournal.FileNameFor("kimi-with-turn")), 100)
+            .Append(AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = new TextContent { Text = "hi" } })!);
+        var kimi = new LifecycleAgent("kimi", canDelete: true, existing: ["kimi-with-turn", "kimi-titled", "kimi-empty", "kimi-used"],
+            titles: new() { ["kimi-titled"] = "Fix the build" });
+        await using var conductor = TestDirs.Conductor(dir, kimi.Adapter);
+
+        await conductor.SweepDraftsAsync();
+
+        CollectionAssert.AreEqual(new[] { "session/delete" }, kimi.CallsFor("kimi-empty"), "listed without a title: empty, deleted");
+        foreach (var kept in new[] { "kimi-with-turn", "kimi-titled", "kimi-unlisted", "kimi-used" })
+            CollectionAssert.DoesNotContain(kimi.CallsFor(kept), "session/delete", kept);
+        Assert.IsNull(conductor.Store.Get("kimi-empty"));
+        Assert.IsFalse(conductor.Store.Get("kimi-with-turn")!.Draft, "a turn in the journal: kept");
+        Assert.IsFalse(conductor.Store.Get("kimi-titled")!.Draft, "the agent titled it: kept");
+        Assert.IsTrue(conductor.Store.Get("kimi-unlisted")!.Deleted, "not listed, so not shown to be empty: hidden, not deleted");
+        Assert.IsFalse(conductor.Store.Get("kimi-used")!.Draft);
     }
 
     [TestMethod]
@@ -123,6 +254,37 @@ public sealed class SessionLifecycleTests
         Assert.AreEqual(0, kimi.CallsFor("kimi-old-used").Length);
         Assert.IsNull(conductor.Store.Get("kimi-old-draft"));
         Assert.IsNotNull(conductor.Store.Get("kimi-old-used"));
+    }
+
+    [TestMethod]
+    public async Task ADraftThatAnsweredThroughItsChannel_IsKept()
+    {
+        var answerer = new ScriptedAdapter("claude", async (agent, req, ct) =>
+        {
+            switch (req.Method)
+            {
+                case AcpMethods.Agent.Initialize: return ScriptedAgent.Init();
+                case AcpMethods.Agent.SessionNew: return AcpJson.ToNode(new NewSessionResponse { SessionId = "answering" });
+                case AcpMethods.Agent.SessionList: return AcpJson.ToNode(new ListSessionsResponse { Sessions = [] });
+                case GorynychProtocol.MethodOpinion:
+                    // As Claude's hooks report a channel message and the answer.
+                    await agent.Update("answering", new SessionUpdateUserMessageChunk { Content = new TextContent { Text = "<channel>SQLite?</channel>" } });
+                    await agent.Update("answering", new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = "SQLite." } });
+                    return new JsonObject { ["text"] = "SQLite." };
+                default: throw new JsonRpcException(JsonRpcException.MethodNotFound, req.Method);
+            }
+        });
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), answerer);
+        var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var draft = await NewAsync(zed);
+
+        var reply = await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject { ["sessionId"] = draft, ["text"] = "SQLite?" });
+
+        Assert.AreEqual("SQLite.", (string?)reply!["text"]);
+        await LeaveAsync(conductor, zed);
+        Assert.IsFalse(conductor.Store.Get(draft)!.Draft);
+        await using var other = await TestClient.ConnectAsync(conductor, "other");
+        CollectionAssert.AreEqual(new[] { draft }, await PeersAsync(other), "it has history, so other agents can ask it");
     }
 
     // ---------------------------------------------------------------- session/delete
@@ -151,6 +313,19 @@ public sealed class SessionLifecycleTests
     }
 
     [TestMethod]
+    public async Task Delete_ReachesASessionOnlyTheAgentKnows()
+    {
+        var kimi = new LifecycleAgent("kimi", canDelete: true, existing: ["kimi-native"], titles: new() { ["kimi-native"] = "Old work" });
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+
+        await DeleteAsync(zed, "kimi-native");
+
+        CollectionAssert.AreEqual(new[] { "session/delete" }, kimi.CallsFor("kimi-native"));
+        Assert.AreEqual(0, (await ListAsync(zed)).Length);
+    }
+
+    [TestMethod]
     public async Task Delete_HidesASessionItsAgentKeeps_AcrossARestart()
     {
         var dir = TestDirs.New();
@@ -168,7 +343,7 @@ public sealed class SessionLifecycleTests
             CollectionAssert.AreEqual(new[] { "session/new", "session/prompt", "session/close" }, claude.CallsFor(id), "closed, never deleted in the harness");
             Assert.IsTrue(conductor.Store.Get(id)!.Deleted);
             Assert.AreEqual(0, (await ListAsync(zed)).Length, "hidden although the agent still lists it");
-            Assert.AreEqual(0, (await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodPeers, new JsonObject()))!["sessions"]!.AsArray().Count);
+            Assert.AreEqual(0, (await PeersAsync(zed)).Length);
             var prompt = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(zed, id, "again"));
             Assert.AreEqual(JsonRpcException.ResourceNotFound, prompt.Code);
         }
@@ -196,6 +371,52 @@ public sealed class SessionLifecycleTests
         await DeleteAsync(zed, id);
 
         Assert.IsNull(conductor.Store.Get(id));
+    }
+
+    [TestMethod]
+    public async Task Delete_OfASessionTheAgentAlreadyLost_Succeeds()
+    {
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var id = await NewAsync(zed);
+        await PromptAsync(zed, id, "hello");
+        kimi.LoseNatively(id); // deleted from Kimi's own CLI, say
+
+        await DeleteAsync(zed, id); // Kimi answers -32602 "Unknown sessionId", and no longer lists it
+
+        Assert.IsNull(conductor.Store.Get(id));
+    }
+
+    [TestMethod]
+    public async Task Delete_LateUpdatesAndAQueuedPrompt_BringNothingBack()
+    {
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        var started = new TaskCompletionSource();
+        var release = new TaskCompletionSource();
+        kimi.BeforePrompt = async _ => { started.TrySetResult(); await release.Task; };
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var id = await NewAsync(zed);
+        var first = PromptAsync(zed, id, "first");
+        await started.Task.WaitAsync(Wait);
+        var second = PromptAsync(zed, id, "second"); // waits for the first turn
+        await Task.Delay(100);
+
+        await DeleteAsync(zed, id);
+        release.SetResult(); // the agent now streams the rest of the first turn and ends it
+        await first.WaitAsync(Wait);
+        var error = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => second.WaitAsync(Wait));
+        Assert.AreEqual(JsonRpcException.ResourceNotFound, error.Code);
+        await Task.Delay(100);
+
+        CollectionAssert.AreEqual(new[] { "session/new", "session/prompt", "session/close", "session/delete" }, kimi.CallsFor(id));
+        Assert.IsNull(conductor.Store.Get(id));
+        Assert.IsNull(new SessionStore(Path.Combine(dir, "sessions.json")).Get(id));
+        Assert.AreEqual(0, Directory.GetFiles(Path.Combine(dir, "journal")).Length, "no journal came back");
+        Assert.AreEqual(0, (await ListAsync(zed)).Length);
+        Assert.AreEqual(0, (await PeersAsync(zed)).Length);
     }
 
     // ---------------------------------------------------------------- list_agents
@@ -252,7 +473,10 @@ public sealed class SessionLifecycleTests
         var store = new SessionStore(path);
         store.Update("a", "kimi", r => r.Title = "first");
         using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
             store.Update("a", "kimi", r => r.Title = "second"); // every retry fails: logged, not thrown
+            Assert.ThrowsExactly<IOException>(() => store.Update("a", "kimi", r => r.Draft = false, durable: true));
+        }
         Assert.AreEqual("first", new SessionStore(path).Get("a")!.Title);
 
         store.Update("b", "kimi", r => r.Title = "other");
@@ -271,11 +495,42 @@ public sealed class SessionLifecycleTests
         Thread.Sleep(20);
         store.Touch("a", "kimi");
         var stamped = store.Get("a")!.UpdatedAt;
-        Assert.AreNotEqual(stamped, new SessionStore(path).Get("a")!.UpdatedAt, "a stamp right after a save waits");
+        Assert.AreNotEqual(stamped, new SessionStore(path).Get("a")!.UpdatedAt, "a stamp right after a write waits");
 
         store.Flush();
 
         Assert.AreEqual(stamped, new SessionStore(path).Get("a")!.UpdatedAt);
+    }
+
+    [TestMethod]
+    public void Store_BacksOffFromAFailedWrite_InsteadOfRetryingOnEveryStamp()
+    {
+        var path = Path.Combine(TestDirs.New(), "sessions.json");
+        var store = new SessionStore(path);
+        store.Update("a", "kimi", r => r.Title = "t");
+        Thread.Sleep(1100);
+        using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            store.Touch("a", "kimi"); // tries, and spends its retries
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            for (var i = 0; i < 20; i++) store.Touch("a", "kimi");
+            Assert.IsTrue(watch.ElapsedMilliseconds < 200, $"later stamps waited {watch.ElapsedMilliseconds} ms");
+        }
+    }
+
+    [TestMethod]
+    public void Store_IgnoresUpdatesOfARemovedSession()
+    {
+        var path = Path.Combine(TestDirs.New(), "sessions.json");
+        var store = new SessionStore(path);
+        store.Update("a", "kimi", r => r.Title = "t");
+        store.Remove("a");
+
+        store.Touch("a", "kimi");
+        Assert.IsNull(store.Update("a", "kimi", r => r.Title = "late"));
+
+        Assert.IsNull(store.Get("a"));
+        Assert.IsNull(new SessionStore(path).Get("a"));
     }
 
     // ---------------------------------------------------------------- Zed's rules for forms and approvals
@@ -386,19 +641,23 @@ static class ZedRules
 }
 
 /// <summary>
-/// A scripted agent with numbered sessions that records every call by session. Like Kimi it
-/// announces its commands as soon as a session exists. One that cannot delete keeps listing a
-/// session after a delete, as the Claude adapter keeps listing the sessions it started.
+/// A scripted agent with numbered sessions that records every call by session and behaves like
+/// Kimi 2.4.1 where it matters: it announces its commands as soon as a session exists, lists
+/// sessions untitled until their first prompt titles them, and answers a delete of a session it
+/// does not have with -32602. One that cannot delete keeps listing a session after a delete, as
+/// the Claude adapter keeps listing the sessions it started.
 /// </summary>
 sealed class LifecycleAgent
 {
     readonly List<(string Method, string? SessionId)> calls = [];
     readonly List<string> sessions;
+    readonly Dictionary<string, string> titles;
     int next;
 
-    public LifecycleAgent(string name, bool canDelete, bool notFoundOnDelete = false, string[]? existing = null)
+    public LifecycleAgent(string name, bool canDelete, bool notFoundOnDelete = false, string[]? existing = null, Dictionary<string, string>? titles = null)
     {
         sessions = [.. existing ?? []];
+        this.titles = titles ?? [];
         Adapter = new ScriptedAdapter(name, async (agent, req, ct) =>
         {
             var sessionId = (string?)req.Params?["sessionId"];
@@ -430,16 +689,25 @@ sealed class LifecycleAgent
                     return AcpJson.ToNode(new NewSessionResponse { SessionId = id });
                 case AcpMethods.Agent.SessionList:
                     lock (sessions)
-                        return AcpJson.ToNode(new ListSessionsResponse { Sessions = sessions.Select(s => new SessionInfo { SessionId = s, Cwd = Path.GetTempPath() }).ToList() });
+                        return AcpJson.ToNode(new ListSessionsResponse
+                        {
+                            Sessions = sessions.Select(s => new SessionInfo { SessionId = s, Cwd = Path.GetTempPath(), Title = this.titles.GetValueOrDefault(s) }).ToList(),
+                        });
                 case AcpMethods.Agent.SessionPrompt:
+                    if (BeforePrompt is { } beforePrompt) await beforePrompt(sessionId!);
+                    lock (sessions) this.titles.TryAdd(sessionId!, ((TextContent)req.ParamsAs<PromptRequest>().Prompt[0]).Text);
                     await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = "ok" } });
                     return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn });
                 case AcpMethods.Agent.SessionResume:
+                    if (BeforeResume is { } beforeResume) await beforeResume(sessionId!);
+                    return new JsonObject();
                 case AcpMethods.Agent.SessionClose:
                     return new JsonObject();
                 case AcpMethods.Agent.SessionDelete when canDelete:
+                    if (BeforeDelete is { } beforeDelete) await beforeDelete(sessionId!);
                     if (notFoundOnDelete) throw new JsonRpcException(JsonRpcException.ResourceNotFound, "no such session");
-                    lock (sessions) sessions.Remove(sessionId!);
+                    lock (sessions)
+                        if (!sessions.Remove(sessionId!)) throw new JsonRpcException(JsonRpcException.InvalidParams, $"Invalid params: Unknown sessionId: {sessionId}");
                     return new JsonObject();
                 default:
                     throw new JsonRpcException(JsonRpcException.MethodNotFound, req.Method);
@@ -448,6 +716,16 @@ sealed class LifecycleAgent
     }
 
     public ScriptedAdapter Adapter { get; }
+
+    public Func<string, Task>? BeforePrompt { get; set; }
+    public Func<string, Task>? BeforeResume { get; set; }
+    public Func<string, Task>? BeforeDelete { get; set; }
+
+    /// <summary>The agent forgets the session on its own, as if deleted from its own CLI.</summary>
+    public void LoseNatively(string sessionId)
+    {
+        lock (sessions) sessions.Remove(sessionId);
+    }
 
     /// <summary>The methods called for <paramref name="sessionId"/>, in order (session/new counted under the ID it returned).</summary>
     public string[] CallsFor(string sessionId)
