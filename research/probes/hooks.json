@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "SessionStart":       [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "UserPromptSubmit":   [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "PreToolUse":         [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "PostToolUse":        [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "PostToolUseFailure": [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "PermissionRequest":  [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "Notification":       [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "MessageDisplay":     [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "Stop":               [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "StopFailure":        [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "SubagentStart":      [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "SubagentStop":       [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "TaskCreated":        [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "TaskCompleted":      [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}],
+    "SessionEnd":         [{"hooks": [{"type": "http", "url": "http://127.0.0.1:47811/hook", "timeout": 30}]}]
+  }
+}
