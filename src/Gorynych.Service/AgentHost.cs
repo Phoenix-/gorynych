@@ -108,9 +108,9 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
 
     public async ValueTask DisposeAsync()
     {
-        var rpc = connection;
-        connection = null;
+        var rpc = Interlocked.Exchange(ref connection, null);
+        var running = Interlocked.Exchange(ref instance, null);
         if (rpc is not null) await rpc.DisposeAsync();
-        if (instance is not null) await instance.DisposeAsync();
+        if (running is not null) await running.DisposeAsync();
     }
 }

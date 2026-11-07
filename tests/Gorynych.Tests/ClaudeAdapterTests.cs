@@ -71,5 +71,23 @@ public sealed class ClaudeAdapterTests
         // The adapter lists the session with its title.
         var list = await client.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
         Assert.AreEqual("Fake title", list.Sessions.Single(s => s.SessionId == created.SessionId).Title);
+
+        // After a service restart the next prompt relaunches Claude with --resume.
+        await client.DisposeAsync();
+        await conductor.DisposeAsync();
+        var log = new List<string>();
+        await using var restarted = TestDirs.Conductor(dir, new ClaudeAdapter(new ClaudeAdapterOptions
+        {
+            DataDirectory = Path.Combine(dir, "claude"),
+            Executable = FakeClaude(),
+            StartupTimeoutSeconds = 30,
+            Log = m => { lock (log) log.Add(m); },
+        }));
+        await using var later = await TestClient.ConnectAsync(restarted, "later");
+        var resumed = await later.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = created.SessionId, Prompt = [new TextContent { Text = "after restart" }] });
+        Assert.AreEqual(StopReason.EndTurn, resumed.StopReason);
+        Assert.AreEqual("echo: after restart", later.Text());
+        lock (log) Assert.IsTrue(log.Any(l => l.Contains($"claude {created.SessionId}: launching") && l.EndsWith("(resume)", StringComparison.Ordinal)), string.Join(Environment.NewLine, log));
     }
 }

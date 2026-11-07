@@ -249,8 +249,11 @@ public sealed class JsonRpcConnection : IAsyncDisposable
             try { cts.Cancel(); } catch (ObjectDisposedException) { }
     }
 
+    int disposed;
+
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         Close();
         lifetime.Cancel();
         try { output.Dispose(); } catch { }

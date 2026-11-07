@@ -409,8 +409,11 @@ public sealed class Conductor : IAsyncDisposable
 
     static string EncodeCursor(int offset) => Convert.ToBase64String(Encoding.UTF8.GetBytes("o:" + offset));
 
+    int disposed;
+
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         foreach (var host in agents.Values)
             try { await host.DisposeAsync(); }
             catch (Exception e) { ServiceLog.Warn($"{host.Name}: stop failed: {e.Message}"); }
