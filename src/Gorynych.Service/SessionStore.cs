@@ -93,11 +93,19 @@ public sealed class SessionStore
     /// <summary>
     /// Called with copies of a record before and after each change (null when it did not exist,
     /// or was removed), under the store's lock and in the order of the changes. It must not block.
+    /// A bare activity stamp (<see cref="Touch"/>) calls <see cref="Active"/> instead.
     /// </summary>
     public Action<SessionRecord?, SessionRecord>? Changed { get; set; }
 
     /// <summary>Called with a copy of a record when it is removed, like <see cref="Changed"/>.</summary>
     public Action<SessionRecord>? Removed { get; set; }
+
+    /// <summary>
+    /// Called with the session and its agent when <see cref="Touch"/> stamps activity on a listed
+    /// session (one that is neither a draft nor deleted), under the store's lock like
+    /// <see cref="Changed"/>. Streaming touches a session many times a second, so it gets no copies.
+    /// </summary>
+    public Action<string, string>? Active { get; set; }
 
     public SessionRecord? Get(string sessionId)
     {
@@ -107,6 +115,15 @@ public sealed class SessionStore
     public List<SessionRecord> All()
     {
         lock (gate) return records.Values.Select(Clone).ToList();
+    }
+
+    /// <summary>
+    /// Runs <paramref name="look"/> with a copy of the record (null when there is none) under the
+    /// store's lock, so no change comes in between; like <see cref="Changed"/>, it must not block.
+    /// </summary>
+    public void Inspect(string sessionId, Action<SessionRecord?> look)
+    {
+        lock (gate) look(records.TryGetValue(sessionId, out var r) ? Clone(r) : null);
     }
 
     /// <summary>
@@ -144,10 +161,9 @@ public sealed class SessionStore
         lock (gate)
         {
             if (!records.TryGetValue(sessionId, out var r) || r.Deleted) return;
-            var before = Clone(r);
             r.UpdatedAt = DateTimeOffset.UtcNow;
             changes++;
-            Changed?.Invoke(before, Clone(r));
+            if (r.Listed) Active?.Invoke(r.SessionId, r.Agent);
             if (Environment.TickCount64 - lastAttempt < TouchSaveInterval.TotalMilliseconds) return;
             snapshot = Snapshot(counted: true);
         }

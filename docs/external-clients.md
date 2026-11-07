@@ -44,7 +44,12 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
 - A session an agent spawned is an ordinary session in `session/list`, with its parent in
   `_meta["gorynych/parentSessionId"]`. The service asks the person to approve each spawn with
   a `session/request_permission` on the parent session
-  ([service-protocol.md](service-protocol.md#child-sessions)).
+  ([service-protocol.md](service-protocol.md#child-sessions)). If the spawn is withdrawn
+  first, the service sends `$/cancel_request` for that question; a client that ignores it
+  keeps the card, and its answer changes nothing. Whether Zed handles `$/cancel_request` for
+  an agent's request is not confirmed.
+- Folders in `session/list` are spelled one way (on Windows: backslashes, no trailing
+  separator), whatever spelling the agent used.
 - `_gorynych/sessions_changed` tells a client that a session appeared, changed or went
   away; a plain client ignores it and sees new sessions the next time it lists them
   ([service-protocol.md](service-protocol.md#list-changes)).

@@ -31,7 +31,12 @@ public static class PeersServer
     {
         var peers = pipe is not null && token is not null;
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
-        var mcp = new JsonRpcConnection(Console.OpenStandardInput(), Console.OpenStandardOutput(), "gorynych-mcp");
+        // A cancelled tool call (the agent's turn was stopped) cancels the request to the service,
+        // which withdraws what it waits for, such as the person's answer to a spawn.
+        var mcp = new JsonRpcConnection(Console.OpenStandardInput(), Console.OpenStandardOutput(), "gorynych-mcp")
+        {
+            CancelNotification = "notifications/cancelled",
+        };
         mcp.RequestHandler = async (req, ct) => req.Method switch
         {
             "initialize" => Initialize(req, peers, channelUrl is not null),
@@ -234,9 +239,11 @@ public static class PeersServer
         {
             ["name"] = "spawn_session",
             ["description"] = "Start a new session of one of the user's coding agents as a child of this session, with a first prompt it works on. " +
-                "The user approves every spawn. Returns {\"session_id\": ...} at once, without waiting for the work; the child then runs on its own, " +
+                "The user approves every spawn; if they decline, nothing starts and the call fails. " +
+                "Returns {\"session_id\": ...} at once, without waiting for the work; the child then runs on its own, " +
                 "the user can open and prompt it directly, and ask_agent asks it questions. Each time the child finishes a turn, this session gets " +
-                "a short report with its final message (unless report is false). Use it when the user asks you to hand work to another agent.",
+                "a short report with its final message, also when that turn failed (unless report is false). " +
+                "Use it when the user asks you to hand work to another agent.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",

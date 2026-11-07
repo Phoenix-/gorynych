@@ -75,6 +75,12 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     /// <summary>Receives handler failures and malformed input.</summary>
     public Action<string>? Log { get; set; }
 
+    /// <summary>
+    /// The notification that cancels a request, sent and received with its <c>requestId</c>:
+    /// ACP's <c>$/cancel_request</c> by default; MCP calls it <c>notifications/cancelled</c>.
+    /// </summary>
+    public string CancelNotification { get; init; } = AcpMethods.Protocol.CancelRequest;
+
     /// <summary>The <see cref="JsonRpcRequest.Sequence"/> position of the notification being handled.</summary>
     public long NotificationSequence { get; private set; }
 
@@ -103,7 +109,7 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         var registration = ct.Register(() =>
         {
             if (pending.TryRemove(id, out var p) && p.TrySetCanceled(ct))
-                _ = SendNotificationAsync(AcpMethods.Protocol.CancelRequest, new JsonObject { ["requestId"] = id });
+                _ = SendNotificationAsync(CancelNotification, new JsonObject { ["requestId"] = id });
         });
         _ = tcs.Task.ContinueWith(_ => registration.Dispose(), TaskScheduler.Default);
         try
@@ -188,7 +194,7 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         @params?.Parent?.AsObject().Remove("params");
         if (id is null)
         {
-            if (method == AcpMethods.Protocol.CancelRequest)
+            if (method == CancelNotification)
             {
                 var key = @params?["requestId"]?.ToJsonString();
                 if (key is not null && incoming.TryGetValue(key, out var cts))

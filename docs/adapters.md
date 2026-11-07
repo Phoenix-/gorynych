@@ -15,7 +15,9 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   additionalDirectories; one terminal auth method (`kimi login`).
 - `session/new` returns config options (model, thinking, mode) and modes; the first
   prompt immediately yields `session_info_update` with the prompt as the title.
-- `session/list` returns titles and `updatedAt`.
+- `session/list` returns titles and `updatedAt`. A folder may come with forward slashes
+  (`C:/Users/x`); the service lists and keeps it in one spelling
+  ([service-protocol.md](service-protocol.md#standard-methods)).
 - Approvals arrive as `session/request_permission` with Kimi's own options (approve once,
   approve for this session, reject); tool calls stream their arguments as `tool_call_update`.
 - `session/new` creates a real, empty native session. Kimi lists it with `title: null`
@@ -126,8 +128,9 @@ any tool.
 
 `_gorynych/note` (a child's report to its parent) becomes a channel message with
 `meta: {sender, kind: "report"}` and no `message_id`; the system prompt says it needs no
-reply. Without a channel, or while Claude is not running, the adapter refuses it and the
-service sends the report as a turn instead.
+reply. Without a channel the adapter answers method not found; while Claude's process is not
+running (`session/resume` registers a session without starting one) it answers `-32600`.
+Either way the service sends the report as a turn instead, which starts Claude.
 
 A name given to `spawn_session` stays in the service's overlay: the adapter cannot write
 Claude's own `custom-title` yet (that needs `/rename` through the PTY), and Claude's

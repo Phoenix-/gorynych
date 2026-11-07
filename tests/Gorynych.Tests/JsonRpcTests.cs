@@ -98,4 +98,35 @@ public sealed class JsonRpcTests
         await client.Completion.WaitAsync(TimeSpan.FromSeconds(5));
         await client.DisposeAsync();
     }
+
+    [TestMethod]
+    public async Task ACancelledRequest_CancelsTheHandler_WithTheConnectionsOwnCancelNotification()
+    {
+        // ACP's $/cancel_request by default; the peers server speaks MCP, whose notification is notifications/cancelled.
+        foreach (var name in new[] { AcpMethods.Protocol.CancelRequest, "notifications/cancelled" })
+        {
+            var link = new DuplexLink();
+            var (ci, co) = link.ClientEnd;
+            var (ai, ao) = link.AgentEnd;
+            await using var client = new JsonRpcConnection(ci, co, "client") { CancelNotification = name };
+            await using var agent = new JsonRpcConnection(ai, ao, "agent") { CancelNotification = name };
+            var handlerCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            agent.RequestHandler = async (req, ct) =>
+            {
+                try { await Task.Delay(Timeout.Infinite, ct); }
+                catch (OperationCanceledException) { handlerCancelled.TrySetResult(); throw; }
+                return null;
+            };
+            client.Start();
+            agent.Start();
+            using var cts = new CancellationTokenSource();
+            var call = client.SendRequestAsync("tools/call", new JsonObject());
+            var cancelled = client.SendRequestAsync("tools/call", new JsonObject(), cts.Token);
+            await Task.Delay(50);
+            cts.Cancel();
+            await Assert.ThrowsAsync<OperationCanceledException>(() => cancelled);
+            await handlerCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.IsFalse(call.IsCompleted, $"{name} cancels only the request it names");
+        }
+    }
 }

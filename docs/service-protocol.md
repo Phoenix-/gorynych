@@ -51,6 +51,13 @@ from its `session/new`, `session/load` and `session/resume` responses, its
 `session/set_config_option` and `session/set_mode`. A load whose session the agent cannot take
 returns the history with no state.
 
+**Folders** are spelled one way wherever the service lists or keeps them (`SessionInfo.cwd`,
+the overlay, `list_agents`): on Windows with backslashes, an upper-case drive letter and no
+`.` or `..` segments, and everywhere without a trailing separator (except on a root). Agents
+differ (Kimi may report `C:/Users/x` for the folder Zed calls `C:\Users\x`), and a client
+that compares folders as text would see two projects. Other casing is kept as the agent gave
+it.
+
 Agent → client requests go to the most recently attached client of the session:
 `session/request_permission` (an approval) to any client; `elicitation/create` (a form,
 such as Claude's questions) preferably to a client that declared
@@ -64,7 +71,9 @@ replay. When the agent withdraws the request (`$/cancel_request`), it is withdra
 client too.
 
 A client that stops reading for 15 seconds is disconnected, so one stuck GUI cannot stall
-the agent whose updates it is not taking.
+the agent whose updates it is not taking. Notifications that belong to no session
+(`_gorynych/sessions_changed`) go through a queue per client, so a slow or broken client
+delays only its own.
 
 ## Extensions
 
@@ -146,20 +155,41 @@ The agent calls the peers server's `spawn_session {agent, prompt, cwd?, title?}`
    folder as content) and asks the person with `session/request_permission` on that session:
    `Start` (`allow_once`) or `Don't start` (`reject_once`), never "always", so every spawn is
    asked. Without a client attached the question waits for one, like an agent's approval;
-2. on `Start`, creates the session in the chosen agent with `session/new` (the folder is
-   the caller's unless `cwd` names another; a relative path is taken from the caller's),
-   with the peers server like any session, and records the caller as its parent;
-3. journals a `session_info_update` with the parent in `_meta` (and the title, if given),
-   takes the session's turn and returns `{sessionId}` at once. The first prompt runs in the
-   background: it is journaled as a `user_message_chunk` with
-   `_meta["gorynych/origin"]: "spawn"`, `gorynych/sender` (`parent_claude`) and the parent,
-   and forwarded. A question with `ask_agent` or a prompt that comes meanwhile waits for it;
-4. ends the tool call `completed` with the new session's ID, or `failed` when the person
-   declined (the call then fails with "The user declined to start the session") or the
-   agent could not create the session.
+2. on `Start`, checks that the caller still exists (one deleted while the person decided
+   starts nothing), then creates the session in the chosen agent with `session/new` (the
+   folder is the caller's unless `cwd` names another; a relative path is taken from the
+   caller's), with the peers server like any session;
+3. takes the session's turn, records the caller as its parent, journals a
+   `session_info_update` with the parent in `_meta` (and the title, if given), and only then
+   lists the session (`added`, with its parent) and returns `{sessionId}`. Until it is listed
+   the session is a draft in the overlay: if anything fails before that, or the spawn is
+   withdrawn while the agent creates it, the session is closed and deleted in its agent again
+   (an agent that cannot delete is only closed: the Claude adapter keeps nothing before a
+   first prompt). The first prompt runs in the background: it is journaled as a
+   `user_message_chunk` with `_meta["gorynych/origin"]: "spawn"`, `gorynych/sender`
+   (`parent_claude`) and the parent, and forwarded. A question with `ask_agent` or a prompt
+   that comes meanwhile, even one sent right after the `added` notice, waits for it;
+4. ends the tool call `completed` with the new session's ID, or `failed` when nothing was
+   started.
 
-A spawned session is never a draft, so it is listed and kept like any prompted session. A
-`title` names it: no agent lets the service set a title natively, so the name lives in the
+The spawn fails with
+
+- `-32600` for `Don't start` ("The user declined to start the session."), for a caller
+  deleted meanwhile, and for an unknown peer token;
+- `-32602` for an unknown agent or a folder that does not exist;
+- `-32800` when the caller's turn was cancelled: a client that sends `session/cancel` answers
+  that session's pending approvals with the `cancelled` outcome, as ACP requires;
+- the agent's own error when it could not create the session.
+
+A spawn can also be withdrawn before the person answers: the agent's tool call is cancelled
+(the agent sends MCP's `notifications/cancelled` to the peers server, which cancels its
+request to the service) or the peers server goes away. The service then cancels its
+question with ACP's `$/cancel_request`, which ACP stabilized as an optional notification in
+June 2026. A client that does not support it keeps showing the question; answering it then
+changes nothing, since nothing is waiting for the answer.
+
+A spawned session is not a draft once it is listed, so it is listed and kept like any
+prompted session. A `title` names it: no agent lets the service set a title natively, so the name lives in the
 overlay (source `spawn`) and the agents' generated titles (Kimi's first prompt, Claude's
 `ai-title`) do not replace it, neither in the lists nor in the session's own
 `session_info_update`. Without a title the first prompt is the provisional title as usual.
@@ -180,12 +210,18 @@ This comes from a session you started with spawn_session, not from the user. It 
 reply; ask_agent with session_id "<id>" asks it more.
 ```
 
-The outcome reads `ended`, `was cancelled`, `stopped (<stopReason>)` or `failed: <error>`.
+The outcome reads `ended`, `was cancelled`, `stopped (<stopReason>)` or `failed: <error>`. A
+turn that ends with a tool call, with no text after it, has no final message, and the report
+says `(no final message)`; so does a first turn that failed before it reached the agent (the
+agent exited right after creating the session, say), which is reported too, because the
+parent already holds the child's ID. A longer message is cut at 2000 characters with `…`.
 
 - **Claude** gets it through its channel: the service sends `_gorynych/note`, and the
   adapter pushes a channel message with `meta.kind: "report"`. Its appended system prompt
-  says such a message needs no reply and is information, not an instruction. If the Claude
-  session is not running, the report becomes a turn as below.
+  says such a message needs no reply and is information, not an instruction. The service
+  opens the parent with `session/resume`, which only registers it in the adapter and starts
+  no Claude process, so the parent's Claude may not be running. The adapter then refuses the
+  note (`-32600`), and the report becomes a turn as below, which starts Claude with it.
 - **Kimi** (any agent without `_gorynych/note`) gets it as an ordinary turn of the parent
   session, journaled as a `user_message_chunk` with `gorynych/origin: "report"`,
   `gorynych/sender` (`child_claude`) and `gorynych/fromSessionId`, after the parent's
@@ -204,12 +240,16 @@ reflects what `session/list` shows:
 - `added`: a session appears: spawned, a draft's first prompt (or an opinion it answered),
   or a session the service finds in an agent's own list for the first time;
 - `updated`: a listed session's title or parent changed, or its `updatedAt` (at most once per
-  10 seconds per session; a change inside that interval is announced at its end);
+  10 seconds per session, the `added` counting as the interval's first notice; a change
+  inside an interval is announced at its end, unless the session is gone by then);
 - `removed`: a listed session was deleted.
 
 Drafts are never announced: neither when created nor when discarded. Notifications keep the
-order of the changes. They carry no data beyond the ID; a client reads the session again
-with `session/list`.
+order of the changes, and nothing about a session follows its `removed`. Each client has its
+own queue, so a client that stops reading delays only its own notifications. They carry no
+data beyond the ID; a client reads the session again with `session/list`. In a rare race a
+list that runs while a session is spawned can find it in its agent first; it is then
+`added` without its parent and `updated` with it a moment later.
 
 ## Drafts and deletion
 

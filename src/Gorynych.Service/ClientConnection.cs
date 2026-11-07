@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using System.Threading.Channels;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
@@ -17,7 +18,12 @@ internal sealed class ClientConnection
         rpc.RequestHandler = HandleAsync;
         rpc.NotificationHandler = OnNotificationAsync;
         rpc.Log = m => ServiceLog.Warn(m);
+        _ = Task.Run(SendNoticesAsync);
+        _ = rpc.Completion.ContinueWith(_ => notices.Writer.TryComplete(), TaskScheduler.Default);
     }
+
+    readonly Channel<(string Method, JsonNode? Params)> notices =
+        Channel.CreateUnbounded<(string, JsonNode?)>(new UnboundedChannelOptions { SingleReader = true });
 
     readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> cancelledAt = new(StringComparer.Ordinal);
 
@@ -132,22 +138,32 @@ internal sealed class ClientConnection
     static readonly TimeSpan NotifyTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>
-    /// Sends a notification that belongs to no session, such as <c>_gorynych/sessions_changed</c>.
-    /// A client that stops reading for 15 seconds is disconnected, as for session updates.
+    /// Queues a notification that belongs to no session, such as <c>_gorynych/sessions_changed</c>.
+    /// Never blocks: each client has its own queue and sender, so a client that is slow or broken
+    /// delays and stops only its own notices, which keep their order.
     /// </summary>
-    public async Task NotifyAsync(string method, JsonNode? @params)
+    public void Notify(string method, JsonNode? @params) => notices.Writer.TryWrite((method, @params));
+
+    async Task SendNoticesAsync()
     {
-        try
+        await foreach (var (method, @params) in notices.Reader.ReadAllAsync())
         {
-            await Rpc.SendNotificationAsync(method, @params).WaitAsync(NotifyTimeout);
-        }
-        catch (Exception e) when (e is IOException or OperationCanceledException or ObjectDisposedException)
-        {
-        }
-        catch (TimeoutException)
-        {
-            ServiceLog.Warn($"{Rpc.Name}: not reading; disconnecting it");
-            _ = Rpc.DisposeAsync().AsTask();
+            if (Rpc.IsClosed) continue; // drain without sending
+            try
+            {
+                await Rpc.SendNotificationAsync(method, @params).WaitAsync(NotifyTimeout);
+            }
+            catch (TimeoutException)
+            {
+                // A client that stops reading for 15 seconds is disconnected, as for session updates.
+                ServiceLog.Warn($"{Rpc.Name}: not reading; disconnecting it");
+                _ = Rpc.DisposeAsync().AsTask();
+            }
+            catch (Exception e)
+            {
+                if (e is not (IOException or OperationCanceledException or ObjectDisposedException))
+                    ServiceLog.Warn($"{Rpc.Name}: {method} not sent: {e.Message}");
+            }
         }
     }
 

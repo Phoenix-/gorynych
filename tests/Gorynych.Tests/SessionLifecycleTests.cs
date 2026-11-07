@@ -687,20 +687,21 @@ sealed class LifecycleAgent
                     lock (calls) calls.Add((req.Method, id));
                     if (req.Params?["mcpServers"]?.AsArray().FirstOrDefault(s => (string?)s?["name"] == "gorynych")?["args"]?.AsArray() is { Count: > 0 } peerArgs)
                         lock (Tokens) Tokens[id] = (string)peerArgs[peerArgs.Count - 1]!;
+                    if (BeforeNew is { } beforeNew) await beforeNew(id);
                     await agent.Update(id, new AvailableCommandsUpdate { AvailableCommands = [] });
                     return AcpJson.ToNode(new NewSessionResponse { SessionId = id });
                 case AcpMethods.Agent.SessionList:
                     lock (sessions)
                         return AcpJson.ToNode(new ListSessionsResponse
                         {
-                            Sessions = sessions.Select(s => new SessionInfo { SessionId = s, Cwd = Path.GetTempPath(), Title = this.titles.GetValueOrDefault(s) }).ToList(),
+                            Sessions = sessions.Select(s => new SessionInfo { SessionId = s, Cwd = ListCwd, Title = this.titles.GetValueOrDefault(s) }).ToList(),
                         });
                 case AcpMethods.Agent.SessionPrompt:
                     var text = ((TextContent)req.ParamsAs<PromptRequest>().Prompt[0]).Text;
                     lock (Prompts) Prompts.Add((sessionId!, text));
                     if (BeforePrompt is { } beforePrompt) await beforePrompt(sessionId!);
                     lock (sessions) this.titles.TryAdd(sessionId!, text);
-                    await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = "ok" } });
+                    if (Answer is { } answer) await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = answer } });
                     return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn });
                 case AcpMethods.Agent.SessionResume:
                     if (BeforeResume is { } beforeResume) await beforeResume(sessionId!);
@@ -708,6 +709,7 @@ sealed class LifecycleAgent
                 case AcpMethods.Agent.SessionClose:
                     return new JsonObject();
                 case GorynychProtocol.MethodNote when HasChannel:
+                    if (!Running) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running.");
                     lock (Notes) Notes.Add(req.Params!.DeepClone().AsObject());
                     return new JsonObject();
                 case AcpMethods.Agent.SessionDelete when canDelete:
@@ -735,6 +737,18 @@ sealed class LifecycleAgent
 
     /// <summary>The <c>_gorynych/note</c> params received.</summary>
     public List<JsonObject> Notes { get; } = [];
+
+    /// <summary>False refuses notes as the Claude adapter does while Claude's process is not running.</summary>
+    public bool Running { get; set; } = true;
+
+    /// <summary>The text a turn answers with after <see cref="BeforePrompt"/>; null answers with none.</summary>
+    public string? Answer { get; set; } = "ok";
+
+    /// <summary>The folder the agent lists its sessions in, spelled its own way.</summary>
+    public string ListCwd { get; set; } = Path.GetTempPath();
+
+    /// <summary>Runs before <c>session/new</c> answers, with the new session's ID.</summary>
+    public Func<string, Task>? BeforeNew { get; set; }
 
     public Func<string, Task>? BeforePrompt { get; set; }
     public Func<string, Task>? BeforeResume { get; set; }

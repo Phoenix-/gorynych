@@ -1,3 +1,5 @@
+using System.IO.Pipelines;
+using System.Text;
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
@@ -311,5 +313,251 @@ public sealed class SessionTreeTests
         StringAssert.StartsWith((string?)note["text"], $"[Report from child session {reported} \"Fix the flaky test\" (kimi) · its turn ended]\nok\n");
         CollectionAssert.AreEqual(new[] { "Coordinate the release" }, Prompts(claude, parent), "a note is not a turn");
         Assert.IsFalse(conductor.Store.Get(quiet)!.ReportToParent);
+    }
+
+    // ---------------------------------------------------------------- review fixes
+
+    [TestMethod]
+    public async Task SessionsChanged_AClientThatStopsReading_DelaysNoOtherClient()
+    {
+        var kimi = new LifecycleAgent("kimi", canDelete: false);
+        await using var conductor = Conductor(null, kimi.Adapter);
+        // A client that initializes and then never reads again; its pipe holds about 1 KB.
+        var toService = new Pipe();
+        var toStuck = new Pipe(new PipeOptions(pauseWriterThreshold: 1024, resumeWriterThreshold: 512));
+        var stuckServed = conductor.ServeClientAsync(toService.Reader.AsStream(), toStuck.Writer.AsStream(), "stuck");
+        await toService.Writer.WriteAsync(Encoding.UTF8.GetBytes("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n"));
+        using (var reader = new StreamReader(toStuck.Reader.AsStream(leaveOpen: true), leaveOpen: true))
+            StringAssert.Contains(await reader.ReadLineAsync(), "\"result\"");
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var id = await NewPromptedAsync(zed, "kimi", "Write the docs");
+
+        // Thirty renames: ten times what the stuck client's pipe can hold.
+        for (var i = 0; i < 30; i++)
+            await kimi.Adapter.Current!.Update(id, new SessionInfoUpdate { Title = $"Docs, take {i}" });
+
+        await Until(() => zed.ChangeLog().Count(l => l == $"updated {id}") >= 30, "every rename, well within the stuck client's 15 s");
+        toService.Writer.Complete();
+        await stuckServed.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [TestMethod]
+    public async Task Spawn_TheFirstTurnFailsBeforeItStarts_TheParentIsToldAnyway()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        // Hold the child's first turn before it opens the session, and let its agent die meanwhile.
+        var childFeed = conductor.Feed("kimi-1");
+        await childFeed.LifeGate.WaitAsync();
+
+        var spawned = await SpawnAsync(zed, claude.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test", ["title"] = "Flaky test" });
+        var child = (string)spawned!["sessionId"]!;
+        Assert.AreEqual("kimi-1", child);
+        kimi.BeforeResume = _ => throw new JsonRpcException(JsonRpcException.InternalError, "Kimi lost the session");
+        await kimi.Adapter.Current!.Rpc.DisposeAsync();
+        await Until(() => !conductor.Agents["kimi"].IsRunning, "the agent's exit");
+        childFeed.LifeGate.Release();
+
+        await conductor.BackgroundTurnsIdleAsync();
+        var report = Reports(claude, parent).Single();
+        StringAssert.StartsWith(report, $"[Report from child session {child} \"Flaky test\" (kimi) · its turn failed: Kimi lost the session]\n(no final message)\n");
+        Assert.AreEqual(0, Prompts(kimi, child).Length, "the turn never reached the agent");
+    }
+
+    [TestMethod]
+    public async Task Report_ATurnThatEndsWithAToolCall_HasNoFinalMessage_AndALongOneIsCutWhole()
+    {
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        var claude = new LifecycleAgent("claude", canDelete: false) { Answer = null };
+        claude.BeforePrompt = async id =>
+        {
+            if (Prompts(claude, id).Length > 1) return;
+            await claude.Adapter.Current!.Update(id, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = "Looking around." } });
+            await claude.Adapter.Current!.Update(id, new ToolCall { ToolCallId = "t1", Title = "Read", Status = ToolCallStatus.Completed });
+        };
+        await using var conductor = Conductor(null, kimi.Adapter, claude.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "kimi", "Coordinate the release");
+        var child = (string)(await SpawnAsync(zed, kimi.Tokens[parent], new JsonObject { ["agent"] = "claude", ["prompt"] = "Write the notes", ["title"] = "Notes" }))!["sessionId"]!;
+
+        await conductor.BackgroundTurnsIdleAsync();
+        var report = Reports(kimi, parent).Single();
+        StringAssert.StartsWith(report, $"[Report from child session {child} \"Notes\" (claude) · its turn ended]\n(no final message)\n");
+        Assert.IsFalse(report.Contains("Looking around.", StringComparison.Ordinal), "the text before the last tool call is not the final message");
+
+        // A final message longer than a report carries is cut, never inside a surrogate pair.
+        claude.Answer = new string('a', 1999) + "😀" + new string('b', 100_000);
+        await using var other = await TestClient.ConnectAsync(conductor, "zed-child");
+        await PromptAsync(other, child, "Add the migration step");
+        await conductor.BackgroundTurnsIdleAsync();
+        var cut = Reports(kimi, parent)[1];
+        StringAssert.Contains(cut, "\n" + new string('a', 1999) + "…\n");
+        Assert.IsFalse(cut.Contains('b'), "nothing past the cut");
+    }
+
+    [TestMethod]
+    public async Task SessionsChanged_AddedCountsForTheInterval_AndNothingFollowsRemoved()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        kimi.BeforePrompt = _ => hold.Task;
+        await using var conductor = Conductor(TimeSpan.FromMilliseconds(1500), claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        var child = (string)(await SpawnAsync(zed, claude.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test", ["title"] = "Flaky test" }))!["sessionId"]!;
+        await Until(() => zed.ChangeLog().Contains($"added {child}") && Prompts(kimi, child).Length == 1, "the child and its first prompt");
+
+        // The first prompt's activity right after "added" waits for the end of the interval.
+        await Task.Delay(300);
+        Assert.IsFalse(zed.ChangeLog().Contains($"updated {child}"), string.Join(", ", zed.ChangeLog()));
+
+        // Deleted before that notice is due: nothing follows "removed".
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = child });
+        hold.SetResult();
+        await Task.Delay(1800);
+        var mine = zed.ChangeLog().Where(l => l.EndsWith(" " + child, StringComparison.Ordinal)).ToArray();
+        CollectionAssert.AreEqual(new[] { $"added {child}", $"removed {child}" }, mine, string.Join(", ", mine));
+    }
+
+    [TestMethod]
+    public async Task Spawn_TheCallerIsDeletedWhileThePersonDecides_NothingStarts()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        var token = claude.Tokens[parent];
+        zed.Approve = async r =>
+        {
+            await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = parent });
+            return new SelectedPermissionOutcome { OptionId = "start" };
+        };
+
+        var refused = await Assert.ThrowsExactlyAsync<JsonRpcException>(() =>
+            SpawnAsync(zed, token, new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test" }));
+
+        Assert.AreEqual(JsonRpcException.InvalidRequest, refused.Code);
+        StringAssert.Contains(refused.Message, "deleted");
+        Assert.AreEqual(0, kimi.Adapter.Starts, "Kimi was not even started");
+    }
+
+    [TestMethod]
+    public async Task Spawn_TheCallersTurnIsCancelled_NothingStarts()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        // ACP: a client that cancels a turn answers its pending approvals with "cancelled".
+        zed.Approve = _ => Task.FromResult<RequestPermissionOutcome>(new RequestPermissionOutcomeCancelled());
+
+        var cancelled = await Assert.ThrowsExactlyAsync<JsonRpcException>(() =>
+            SpawnAsync(zed, claude.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test" }));
+
+        Assert.AreEqual(JsonRpcException.RequestCancelled, cancelled.Code);
+        Assert.AreEqual(0, kimi.Adapter.Starts);
+        await Until(() => zed.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call_update" && (string?)u["status"] == "failed"), "the failed spawn card");
+    }
+
+    [TestMethod]
+    public async Task Spawn_AChildThatFailsBeforeItIsListed_IsDeletedAgain()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        // The child's journal cannot be written, so its parent cannot be recorded in it.
+        var journal = Path.Combine((string)conductor.Status()["dataDirectory"]!, "journal", SessionJournal.FileNameFor("kimi-1"));
+        JsonRpcException failed;
+        using (new FileStream(journal, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+            failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() =>
+                SpawnAsync(zed, claude.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test" }));
+
+        Assert.AreEqual(JsonRpcException.InternalError, failed.Code, failed.Message);
+        CollectionAssert.AreEqual(new[] { AcpMethods.Agent.SessionNew, AcpMethods.Agent.SessionClose, AcpMethods.Agent.SessionDelete }, kimi.CallsFor("kimi-1"));
+        Assert.IsNull(conductor.Store.Get("kimi-1"));
+        Assert.IsFalse(zed.ChangeLog().Any(l => l.EndsWith(" kimi-1", StringComparison.Ordinal)), string.Join(", ", zed.ChangeLog()));
+        CollectionAssert.AreEqual(new[] { parent }, (await ListAsync(zed)).Sessions.Select(s => s.SessionId).ToArray());
+        await Until(() => zed.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call_update" && (string?)u["status"] == "failed"), "the failed spawn card");
+    }
+
+    [TestMethod]
+    public async Task Spawn_WithdrawnWhileTheAgentCreatesTheChild_TheChildIsDeletedAgain()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        using var withdraw = new CancellationTokenSource();
+        kimi.BeforeNew = async id =>
+        {
+            if (id != "kimi-1") return;
+            withdraw.Cancel(); // the caller's tool call is cancelled while Kimi creates the session
+            await Task.Delay(300);
+        };
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        var args = new JsonObject
+        {
+            ["agent"] = "kimi",
+            ["prompt"] = "Fix the flaky test",
+            ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = claude.Tokens[parent] },
+        };
+
+        await Assert.ThrowsAsync<OperationCanceledException>(() => zed.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, args, withdraw.Token));
+
+        await Until(() => kimi.CallsFor("kimi-1").Contains(AcpMethods.Agent.SessionDelete), "the withdrawn child's deletion");
+        await conductor.CleanupsIdleAsync();
+        CollectionAssert.AreEqual(new[] { AcpMethods.Agent.SessionNew, AcpMethods.Agent.SessionClose, AcpMethods.Agent.SessionDelete }, kimi.CallsFor("kimi-1"));
+        Assert.IsNull(conductor.Store.Get("kimi-1"));
+        Assert.AreEqual(0, Prompts(kimi, "kimi-1").Length);
+        Assert.IsFalse(zed.ChangeLog().Any(l => l.EndsWith(" kimi-1", StringComparison.Ordinal)), string.Join(", ", zed.ChangeLog()));
+    }
+
+    [TestMethod]
+    public async Task Report_ToAClaudeParentThatIsNotRunning_IsATurn()
+    {
+        // The service opens the parent with session/resume, which starts no Claude process, so the adapter refuses the note.
+        var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true, Running = false };
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+
+        var child = (string)(await SpawnAsync(zed, claude.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test" }))!["sessionId"]!;
+        await conductor.BackgroundTurnsIdleAsync();
+
+        Assert.AreEqual(0, claude.Notes.Count);
+        StringAssert.StartsWith(Reports(claude, parent).Single(), $"[Report from child session {child} ");
+    }
+
+    [TestMethod]
+    public async Task Lists_SpellEveryFolderOneWay()
+    {
+        var windows = OperatingSystem.IsWindows();
+        var kimi = new LifecycleAgent("kimi", canDelete: false, existing: ["kimi-native"], titles: new() { ["kimi-native"] = "Native" })
+        {
+            ListCwd = windows ? "c:/Work/Repo/" : "/work/repo/",
+        };
+        var expected = windows ? @"C:\Work\Repo" : "/work/repo";
+        await using var conductor = Conductor(null, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+
+        var listed = (await ListAsync(zed)).Sessions.Single(s => s.SessionId == "kimi-native");
+        Assert.AreEqual(expected, listed.Cwd);
+        Assert.AreEqual(expected, conductor.Store.Get("kimi-native")!.Cwd);
+        var peers = await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodPeers, new JsonObject());
+        Assert.AreEqual(expected, (string?)peers!["sessions"]!.AsArray().Single(s => (string?)s!["session_id"] == "kimi-native")!["cwd"]);
+
+        // A client's own folder, with a trailing separator, is kept without it.
+        var mine = await NewAsync(zed, "kimi");
+        Assert.AreEqual(Path.TrimEndingDirectorySeparator(Cwd), conductor.Store.Get(mine)!.Cwd);
+        Assert.IsTrue(Cwd.EndsWith(Path.DirectorySeparatorChar), "the test needs a folder spelled with a trailing separator");
     }
 }

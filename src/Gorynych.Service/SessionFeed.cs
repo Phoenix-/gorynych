@@ -138,21 +138,29 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     }
 
     System.Text.StringBuilder? turnText;
-    bool turnTextStale;
+    int turnTextLimit;
+    bool turnTextStale; // a tool call came after the text kept so far
 
-    /// <summary>Starts keeping the agent's final message of a turn whose end is reported to a parent.</summary>
-    public void BeginTurnText()
+    /// <summary>
+    /// Starts keeping the agent's final message of a turn whose end is reported to a parent: at
+    /// most the first <paramref name="limit"/> characters of it.
+    /// </summary>
+    public void BeginTurnText(int limit)
     {
-        lock (clientsGate) { turnText = new(); turnTextStale = false; }
+        lock (clientsGate) { turnText = new(); turnTextLimit = limit; turnTextStale = false; }
     }
 
-    /// <summary>Stops keeping the turn's text and returns its final message: the agent's text after its last tool call.</summary>
+    /// <summary>
+    /// Stops keeping the turn's text and returns its final message: the agent's text after its
+    /// last tool call, empty when no text followed that call.
+    /// </summary>
     public string EndTurnText()
     {
         lock (clientsGate)
         {
-            var text = turnText?.ToString() ?? "";
+            var text = turnTextStale ? "" : turnText?.ToString() ?? "";
             turnText = null;
+            turnTextStale = false;
             return text;
         }
     }
@@ -174,7 +182,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
                 if (kind == "tool_call") turnTextStale = true; // what the agent says next is a new message
                 if (text is null) return;
                 if (turnTextStale) { turnText.Clear(); turnTextStale = false; }
-                turnText.Append(text);
+                var room = turnTextLimit - turnText.Length;
+                if (room > 0) turnText.Append(text, 0, Math.Min(room, text.Length));
                 return;
             }
             var meta = update["_meta"] as JsonObject ?? [];
