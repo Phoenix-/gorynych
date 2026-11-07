@@ -33,13 +33,18 @@ Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent 
 | `session/load` | Opens the session in the agent (`session/resume`, or `session/load` with the agent's replay dropped), replays the service journal as `session/update`, then attaches the client. A session the journal has never seen is loaded from the agent instead, and journaled. |
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. |
 | `session/prompt` | Journals the prompt as `user_message_chunk` (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
-| `session/cancel`, `session/close`, anything else with a `sessionId` | Forwarded to the session's agent. |
+| `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
+| `session/close`, anything else with a `sessionId` | Forwarded to the session's agent. |
 
 Agent → client requests (`session/request_permission`, `elicitation/create`) go to the
 most recently attached client of the session. If none is attached the request waits; if
 the client disconnects before answering it goes to the next one. So an approval raised
 while the GUI is closed appears when the GUI loads the session again, right after the
-replay.
+replay. When the agent withdraws the request (`$/cancel_request`), it is withdrawn from the
+client too.
+
+A client that stops reading for 15 seconds is disconnected, so one stuck GUI cannot stall
+the agent whose updates it is not taking.
 
 ## Extensions
 
@@ -62,7 +67,8 @@ Every `session/update` an adapter sends, and every prompt a client sends, is app
 `journal/<session>.<hash>.jsonl` as the raw update object, so variants this schema
 version does not know are kept and replayed unchanged. Past the limit (default 5000
 entries) the journal merges consecutive text chunks of one message and then drops the
-oldest entries down to three quarters of the limit.
+oldest entries down to three quarters of the limit. A line torn by a crash is dropped
+when the journal is read back.
 
 ## Overlay
 

@@ -25,6 +25,12 @@ Console.Out.Write("\x1b[?2004h fake claude ready\r\n");
 Console.Out.Flush();
 RawInput();
 
+// "hang" stands for a launch stuck on a dialog nobody answers: no hooks ever arrive.
+if (firstPrompt?.Contains("hang", StringComparison.OrdinalIgnoreCase) == true)
+{
+    Console.Out.Write("Do you want to continue? (a dialog the adapter does not know)\r\n");
+    await Task.Delay(Timeout.Infinite);
+}
 if (firstPrompt is not null) await TurnAsync(firstPrompt);
 
 var stdin = Console.OpenStandardInput();

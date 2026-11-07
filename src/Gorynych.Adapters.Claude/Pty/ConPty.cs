@@ -118,10 +118,15 @@ public sealed unsafe partial class ConPty : IDisposable
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         ClosePseudoConsole(pseudoConsole);
-        if (!Exited.Wait(2000)) Kill();
+        if (!Exited.Wait(2000))
+        {
+            Kill();
+            Exited.Wait(2000);
+        }
         input.Dispose();
         output.Dispose();
-        process.Dispose();
+        // The exit watcher still uses the handle until the process is gone; never close it under it.
+        if (Exited.IsCompleted) process.Dispose();
     }
 
     static char[] EnvironmentBlock(IDictionary<string, string> environment)

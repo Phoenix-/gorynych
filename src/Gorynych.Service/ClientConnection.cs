@@ -19,7 +19,12 @@ internal sealed class ClientConnection
         rpc.Log = m => ServiceLog.Warn(m);
     }
 
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> cancelledAt = new(StringComparer.Ordinal);
+
     public JsonRpcConnection Rpc { get; }
+
+    /// <summary>True when the client sent <c>session/cancel</c> for the session after the message at <paramref name="sequence"/>.</summary>
+    public bool CancelledAfter(string sessionId, long sequence) => cancelledAt.TryGetValue(sessionId, out var at) && at > sequence;
 
     /// <summary>The client's <c>initialize</c> params.</summary>
     public InitializeRequest? Init { get; private set; }
@@ -62,8 +67,9 @@ internal sealed class ClientConnection
 
     async Task OnNotificationAsync(string method, JsonNode? @params)
     {
-        if ((string?)@params?["sessionId"] is { } sid)
-            try { await conductor.ForwardNotificationAsync(method, @params, sid); }
+        if ((string?)@params?["sessionId"] is not { } sid) return;
+        if (method == AcpMethods.Agent.SessionCancel) cancelledAt[sid] = Rpc.NotificationSequence;
+        try { await conductor.ForwardNotificationAsync(method, @params, sid); }
             catch (Exception e) when (e is IOException or JsonRpcException) { ServiceLog.Warn($"{method} for {sid}: {e.Message}"); }
     }
 

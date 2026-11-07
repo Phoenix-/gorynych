@@ -46,8 +46,10 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
                 Log = m => ServiceLog.Warn(m),
             };
             rpc.Start();
-            _ = rpc.Completion.ContinueWith(_ => OnClosed(rpc), TaskScheduler.Default);
-            var init = await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
+            InitializeResponse init;
+            try
+            {
+                init = await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
             {
                 ProtocolVersion = AcpMethods.ProtocolVersion,
                 ClientCapabilities = new ClientCapabilities
@@ -57,11 +59,22 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
                 },
                 ClientInfo = new Implementation { Name = "gorynych", Title = "Gorynych", Version = Version },
             }, ct);
+            }
+            catch
+            {
+                await rpc.DisposeAsync();
+                await started.DisposeAsync();
+                throw;
+            }
             ServiceLog.Info($"{Name}: initialized {init.AgentInfo?.Name} {init.AgentInfo?.Version}");
+            var previous = instance;
+            lock (liveGate) live.Clear();
             instance = started;
             Info = init;
             connection = rpc;
-            lock (liveGate) live.Clear();
+            _ = rpc.Completion.ContinueWith(_ => OnClosed(rpc), TaskScheduler.Default);
+            if (previous is not null)
+                try { await previous.DisposeAsync(); } catch (Exception e) { ServiceLog.Warn($"{Name}: old instance: {e.Message}"); }
             return rpc;
         }
         finally

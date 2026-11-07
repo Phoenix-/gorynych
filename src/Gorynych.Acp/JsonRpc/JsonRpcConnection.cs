@@ -7,7 +7,14 @@ using System.Text.Json.Nodes;
 namespace Gorynych.Acp.JsonRpc;
 
 /// <summary>An incoming JSON-RPC request.</summary>
-public sealed record JsonRpcRequest(JsonNode Id, string Method, JsonNode? Params);
+public sealed record JsonRpcRequest(JsonNode Id, string Method, JsonNode? Params)
+{
+    /// <summary>
+    /// The position of this message among everything received on the connection, so a
+    /// handler can tell whether a notification (such as <c>session/cancel</c>) came after it.
+    /// </summary>
+    public long Sequence { get; init; }
+}
 
 /// <summary>A JSON-RPC error, thrown by a request handler or received as a response.</summary>
 public sealed class JsonRpcException(int code, string message, JsonNode? data = null) : Exception(message)
@@ -43,6 +50,7 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     readonly CancellationTokenSource lifetime = new();
     readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     long nextId;
+    long received;
     Task? readLoop;
 
     public JsonRpcConnection(Stream input, Stream output, string name)
@@ -67,6 +75,9 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     /// <summary>Receives handler failures and malformed input.</summary>
     public Action<string>? Log { get; set; }
 
+    /// <summary>The <see cref="JsonRpcRequest.Sequence"/> position of the notification being handled.</summary>
+    public long NotificationSequence { get; private set; }
+
     /// <summary>Completes when the peer closes the stream or the connection is disposed.</summary>
     public Task Completion => closed.Task;
 
@@ -74,7 +85,14 @@ public sealed class JsonRpcConnection : IAsyncDisposable
 
     public void Start() => readLoop ??= Task.Run(ReadLoopAsync);
 
-    public async Task<JsonNode?> SendRequestAsync(string method, JsonNode? @params, CancellationToken ct = default)
+    public async Task<JsonNode?> SendRequestAsync(string method, JsonNode? @params, CancellationToken ct = default) =>
+        await await StartRequestAsync(method, @params, ct);
+
+    /// <summary>
+    /// Sends a request and completes once it is written, returning the task of its result.
+    /// Lets a caller order the request against later messages without waiting for the answer.
+    /// </summary>
+    public async Task<Task<JsonNode?>> StartRequestAsync(string method, JsonNode? @params, CancellationToken ct = default)
     {
         var id = Interlocked.Increment(ref nextId);
         var tcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -82,21 +100,22 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         if (IsClosed) { pending.TryRemove(id, out _); throw new IOException($"{Name}: connection closed"); }
         var message = new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["method"] = method };
         if (@params is not null) message["params"] = @params;
-        await using var registration = ct.Register(() =>
+        var registration = ct.Register(() =>
         {
             if (pending.TryRemove(id, out var p) && p.TrySetCanceled(ct))
                 _ = SendNotificationAsync(AcpMethods.Protocol.CancelRequest, new JsonObject { ["requestId"] = id });
         });
+        _ = tcs.Task.ContinueWith(_ => registration.Dispose(), TaskScheduler.Default);
         try
         {
             await WriteAsync(message);
         }
-        catch
+        catch (Exception e)
         {
-            pending.TryRemove(id, out _);
+            if (pending.TryRemove(id, out _)) tcs.TrySetException(e);
             throw;
         }
-        return await tcs.Task;
+        return tcs.Task;
     }
 
     public Task SendNotificationAsync(string method, JsonNode? @params)
@@ -159,6 +178,7 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     {
         var method = message["method"] is JsonValue m && m.TryGetValue<string>(out var s) ? s : null;
         var id = message["id"];
+        var sequence = ++received;
         if (method is null)
         {
             CompleteResponse(id, message);
@@ -171,16 +191,19 @@ public sealed class JsonRpcConnection : IAsyncDisposable
             if (method == AcpMethods.Protocol.CancelRequest)
             {
                 var key = @params?["requestId"]?.ToJsonString();
-                if (key is not null && incoming.TryGetValue(key, out var cts)) cts.Cancel();
+                if (key is not null && incoming.TryGetValue(key, out var cts))
+                    try { cts.Cancel(); } catch (ObjectDisposedException) { }
                 return;
             }
             if (NotificationHandler is null) return;
+            NotificationSequence = sequence;
             try { await NotificationHandler(method, @params).ConfigureAwait(false); }
             catch (Exception e) { Log?.Invoke($"{Name}: notification {method} failed: {e}"); }
             return;
         }
         id = id.DeepClone();
-        _ = Task.Run(() => HandleRequestAsync(new JsonRpcRequest(id, method, @params)));
+        var request = new JsonRpcRequest(id, method, @params) { Sequence = sequence };
+        _ = Task.Run(() => HandleRequestAsync(request));
     }
 
     void CompleteResponse(JsonNode? id, JsonObject message)

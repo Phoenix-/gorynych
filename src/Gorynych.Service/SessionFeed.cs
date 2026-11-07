@@ -16,8 +16,16 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     TaskCompletionSource clientAttached = new(TaskCreationOptions.RunContinuationsAsynchronously);
     int pendingRequests;
 
+    static readonly TimeSpan SendTimeout = TimeSpan.FromSeconds(15);
+
     /// <summary>Non-zero while the agent replays history the service already has.</summary>
     public int SuppressReplay;
+
+    /// <summary>Orders a prompt and a later <c>session/cancel</c> on their way to the agent.</summary>
+    public SemaphoreSlim ForwardGate { get; } = new(1, 1);
+
+    /// <summary>One resume or load of the session in its agent at a time.</summary>
+    public SemaphoreSlim OpenGate { get; } = new(1, 1);
 
     public string SessionId { get; } = sessionId;
     public SessionJournal Journal { get; } = journal;
@@ -98,11 +106,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             Journal.Append(update);
             remember();
             foreach (var client in Clients())
-            {
-                if (ReferenceEquals(client, except)) continue;
-                try { await client.Rpc.SendNotificationAsync(AcpMethods.Client.SessionUpdate, Notification(update.DeepClone())); }
-                catch (IOException) { Detach(client); }
-            }
+                if (!ReferenceEquals(client, except))
+                    await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update.DeepClone()));
         }
         finally
         {
@@ -117,12 +122,35 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         try
         {
             foreach (var update in Journal.ReadAll())
-                await client.Rpc.SendNotificationAsync(AcpMethods.Client.SessionUpdate, Notification(update));
+                if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update))) return;
             Attach(client);
         }
         finally
         {
             gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Sends to one client. A client that is gone, or stops reading for <see cref="SendTimeout"/>,
+    /// is detached and disconnected, so it cannot stall the agent that produced the update.
+    /// </summary>
+    public async Task<bool> SendAsync(ClientConnection client, string method, JsonNode? @params)
+    {
+        try
+        {
+            await client.Rpc.SendNotificationAsync(method, @params).WaitAsync(SendTimeout);
+            return true;
+        }
+        catch (Exception e) when (e is IOException or OperationCanceledException or TimeoutException)
+        {
+            Detach(client);
+            if (e is TimeoutException)
+            {
+                ServiceLog.Warn($"{client.Rpc.Name}: not reading; disconnecting it");
+                _ = client.Rpc.DisposeAsync().AsTask();
+            }
+            return false;
         }
     }
 

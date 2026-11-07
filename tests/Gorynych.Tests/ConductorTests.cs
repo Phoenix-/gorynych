@@ -228,6 +228,41 @@ public sealed class ConductorTests
     }
 
     [TestMethod]
+    public async Task CancelRightAfterPrompt_ReachesTheAgentAfterThePrompt()
+    {
+        var adapter = Echo(onPrompt: (agent, p, ct) => Task.Delay(300, CancellationToken.None));
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), adapter);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("fake"))).SessionId;
+        for (var i = 0; i < 20; i++)
+        {
+            var prompt = client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, AcpJson.ToNode(Prompt(sessionId, $"p{i}")));
+            await client.Rpc.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId });
+            await prompt;
+        }
+        await Task.Delay(100);
+        string[] methods;
+        lock (adapter.Methods) methods = adapter.Methods.Where(m => m is AcpMethods.Agent.SessionPrompt or AcpMethods.Agent.SessionCancel).ToArray();
+        // Every cancel that reached the agent came after a prompt, never before one it was meant to stop.
+        for (var i = 0; i < methods.Length; i++)
+            if (methods[i] == AcpMethods.Agent.SessionPrompt)
+                Assert.IsTrue(i + 1 < methods.Length && methods[i + 1] == AcpMethods.Agent.SessionCancel, string.Join(",", methods));
+    }
+
+    [TestMethod]
+    public void Journal_SkipsALineTornByACrash()
+    {
+        var path = Path.Combine(TestDirs.New(), "j.jsonl");
+        File.WriteAllText(path, """{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"kept"}}""" + "\n" + """{"sessionUpdate":"agent_mess""");
+        var journal = new SessionJournal(path, maxEntries: 100);
+        Assert.AreEqual(1, journal.Count);
+        journal.Append(AcpJson.ToNode<SessionUpdate>(new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = " and new" } })!);
+        var entries = new SessionJournal(path, maxEntries: 100).ReadAll();
+        Assert.AreEqual(2, entries.Count);
+        Assert.AreEqual(" and new", (string?)entries[1]["content"]!["text"]);
+    }
+
+    [TestMethod]
     public void Journal_MergesStreamedChunks_AndStaysBounded()
     {
         var path = Path.Combine(TestDirs.New(), "j.jsonl");

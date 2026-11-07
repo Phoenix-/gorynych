@@ -28,6 +28,9 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
     TranscriptWatcher? transcript;
     Turn? turn;
     TaskCompletionSource idle = NewSignal();
+    TaskCompletionSource cancelSignal = NewSignal();
+    readonly CancellationTokenSource lifetime = new();
+    int turnCount;
     bool resume;
     bool sawPrompt;
     bool acceptedChannelWarning;
@@ -57,33 +60,51 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
 
     // ---------------------------------------------------------------- prompts
 
-    public async Task<StopReason> PromptAsync(string text, CancellationToken ct)
+    /// <param name="cancelled">True once the client cancelled after sending this prompt.</param>
+    public async Task<StopReason> PromptAsync(string text, Func<bool> cancelled, CancellationToken ct)
     {
         await promptGate.WaitAsync(ct);
         try
         {
+            if (cancelled()) return StopReason.Cancelled;
             var current = new Turn(text);
-            Task<int> exited;
-            if (!IsRunning)
+            if (IsRunning)
             {
-                lock (stateGate) { turn = current; idle = NewSignal(); }
+                // Paste only into an idle composer; a cancel stops the wait.
+                while (!idle.Task.IsCompleted)
+                {
+                    Task wake;
+                    lock (stateGate) wake = Task.WhenAny(idle.Task, cancelSignal.Task);
+                    await wake.WaitAsync(ct);
+                    if (cancelled()) return StopReason.Cancelled;
+                }
+                if (cancelled()) return StopReason.Cancelled;
+            }
+            Task<int> exited;
+            if (!IsRunning) // not started yet, or it ended while we waited
+            {
+                lock (stateGate) { turn = current; idle = NewSignal(); turnCount++; }
                 Launch(text);
                 exited = pty!.Exited;
                 // A launch that never reaches the prompt (a dialog nobody answers) must not hang forever.
-                _ = WatchStartupAsync(current);
+                _ = WatchStartupAsync(current, pty);
             }
             else
             {
-                await idle.Task.WaitAsync(ct);
-                lock (stateGate) { turn = current; idle = NewSignal(); }
+                lock (stateGate) { turn = current; idle = NewSignal(); turnCount++; }
                 await PasteAsync(text);
                 exited = pty!.Exited;
             }
             await using var registration = ct.Register(() => current.TryComplete(StopReason.Cancelled));
             var finished = await Task.WhenAny(current.Task, exited);
             if (finished == exited && !current.Task.IsCompleted)
-                throw new JsonRpcException(JsonRpcException.InternalError,
-                    $"Claude exited with code {exited.Result} before the turn ended. Last screen: {ScreenTailText()}");
+            {
+                // The Stop hook may still be on its way when the process exits right after it.
+                await Task.WhenAny(current.Task, Task.Delay(1500));
+                if (!current.Task.IsCompleted)
+                    throw new JsonRpcException(JsonRpcException.InternalError,
+                        $"Claude exited with code {exited.Result} before the turn ended. Last screen: {ScreenTailText()}");
+            }
             return await current.Task;
         }
         finally
@@ -93,12 +114,18 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         }
     }
 
-    async Task WatchStartupAsync(Turn current)
+    async Task WatchStartupAsync(Turn current, ConPty launched)
     {
-        await Task.Delay(TimeSpan.FromSeconds(options.StartupTimeoutSeconds));
-        if (sawPrompt || current.Task.IsCompleted) return;
+        try { await Task.Delay(TimeSpan.FromSeconds(options.StartupTimeoutSeconds), lifetime.Token); }
+        catch (OperationCanceledException) { return; }
+        if (sawPrompt || current.Task.IsCompleted || !ReferenceEquals(pty, launched)) return;
+        var screenText = ScreenTailText();
+        // Stop the stuck process, so the next prompt starts a fresh one instead of waiting forever.
+        launched.Kill();
+        await Task.WhenAny(launched.Exited, Task.Delay(5000));
+        SetIdle();
         current.TryFail(new JsonRpcException(JsonRpcException.InternalError,
-            $"Claude did not start the turn within {options.StartupTimeoutSeconds} s. Last screen: {ScreenTailText()}"));
+            $"Claude did not start the turn within {options.StartupTimeoutSeconds} s. Last screen: {screenText}"));
     }
 
     async Task PasteAsync(string text)
@@ -113,12 +140,29 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
     public void Cancel()
     {
         Turn? current;
-        lock (stateGate) current = turn;
-        if (current is null || !IsRunning) return;
-        pty!.Write("\x1b"); // Esc interrupts the turn in the TUI
-        current.TryComplete(StopReason.Cancelled);
-        // Stop may not follow an interrupt; treat the session as idle shortly after.
-        _ = Task.Delay(1500).ContinueWith(_ => SetIdle(), TaskScheduler.Default);
+        int generation;
+        bool busy;
+        lock (stateGate)
+        {
+            current = turn;
+            generation = turnCount;
+            busy = !idle.Task.IsCompleted;
+            var wake = cancelSignal;
+            cancelSignal = NewSignal();
+            wake.TrySetResult();
+        }
+        if (IsRunning && (current is not null || busy))
+        {
+            pty!.Write("\x1b"); // Esc interrupts the turn in the TUI
+            // Stop may not follow an interrupt; treat the session as idle shortly after,
+            // unless another turn has started meanwhile.
+            _ = Task.Delay(1500).ContinueWith(_ =>
+            {
+                lock (stateGate)
+                    if (turnCount == generation) idle.TrySetResult();
+            }, TaskScheduler.Default);
+        }
+        current?.TryComplete(StopReason.Cancelled);
     }
 
     void SetIdle()
@@ -152,9 +196,11 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         sawPrompt = false;
         acceptedChannelWarning = false;
         screen.Clear();
+        var previous = pty;
+        pty = null;
+        previous?.Dispose();
         agent.Log($"claude {Id}: launching in {Cwd} ({(resume ? "resume" : "new")})");
         pty = ConPty.Start(commandLine, Cwd, LaunchEnvironment());
-        resume = true; // from now on the conversation exists in Claude's own store
         var current = pty;
         _ = Task.Run(() => PumpOutput(current));
         _ = current.Exited.ContinueWith(t => OnExited(current, t.Result), TaskScheduler.Default);
@@ -277,11 +323,12 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
 
     // ---------------------------------------------------------------- hooks
 
-    public async Task<JsonObject> OnHookAsync(JsonObject e)
+    /// <param name="ct">Cancelled when Claude abandons the hook call (timeout, answer in the TUI, interrupt).</param>
+    public async Task<JsonObject> OnHookAsync(JsonObject e, CancellationToken ct)
     {
         var name = ClaudeHooks.Name(e);
         if ((string?)e["transcript_path"] is { Length: > 0 } path) transcript?.Follow(path);
-        if (name == "PermissionRequest") return await OnPermissionAsync(e);
+        if (name == "PermissionRequest") return await OnPermissionAsync(e, ct);
         await emitGate.WaitAsync();
         try { await OnEventAsync(name, e); }
         finally { emitGate.Release(); }
@@ -295,6 +342,7 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
             case "UserPromptSubmit":
             {
                 sawPrompt = true;
+                resume = true; // the conversation now exists in Claude's own store
                 var prompt = (string?)e["prompt"] ?? "";
                 Turn? current;
                 lock (stateGate) { current = turn; idle = idle.Task.IsCompleted ? NewSignal() : idle; }
@@ -333,7 +381,9 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
                     await agent.EmitAsync(Id, ClaudeHooks.TextChunk($"\n[Claude stopped with an error: {(string?)e["error"] ?? (string?)e["reason"] ?? "unknown"}]"));
                 await agent.TouchAsync(Id);
                 SetIdle();
-                current?.TryComplete(StopReason.EndTurn);
+                // Only a turn Claude has started ends here; a late Stop of an interrupted turn
+                // must not end the prompt pasted after it.
+                if (current is { Confirmed: true }) current.TryComplete(StopReason.EndTurn);
                 break;
             }
             default:
@@ -342,8 +392,10 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         }
     }
 
-    async Task<JsonObject> OnPermissionAsync(JsonObject e)
+    async Task<JsonObject> OnPermissionAsync(JsonObject e, CancellationToken hookAborted)
     {
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(hookAborted, lifetime.Token);
+        var ct = linked.Token;
         var tool = (string?)e["tool_name"] ?? "";
         // The reply tool of our own channel answers another agent's opinion request; it needs no approval.
         if (agent.Channel is not null && tool == ChannelHost.ReplyToolName) return ClaudeHooks.AllowReply();
@@ -359,7 +411,7 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
                 foreach (var q in input["questions"] as JsonArray ?? [])
                 {
                     if (q is not JsonObject question) continue;
-                    var response = await agent.RequestPermissionAsync(ClaudeHooks.Question(Id, toolCallId, question), CancellationToken.None);
+                    var response = await agent.RequestPermissionAsync(ClaudeHooks.Question(Id, toolCallId, question), ct);
                     if (ClaudeHooks.ChosenLabel(question, response.Outcome) is not { } label)
                         return ClaudeHooks.DenyReply("The user chose not to answer.");
                     answers[(string?)question["question"] ?? ""] = label;
@@ -367,7 +419,7 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
                 updated["answers"] = answers;
                 return ClaudeHooks.AllowReply(updated);
             }
-            var decision = await agent.RequestPermissionAsync(ClaudeHooks.Permission(Id, toolCallId, e), CancellationToken.None);
+            var decision = await agent.RequestPermissionAsync(ClaudeHooks.Permission(Id, toolCallId, e), ct);
             if (ClaudeHooks.IsAllowed(decision.Outcome)) return ClaudeHooks.AllowReply();
             await agent.EmitAsync(Id, ClaudeHooks.ToolCallStatusUpdate(toolCallId, ToolCallStatus.Failed, "Denied in Gorynych."));
             return ClaudeHooks.DenyReply("The user denied this tool call in Gorynych.");
@@ -386,8 +438,11 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         lock (stateGate) turn?.TryComplete(StopReason.Cancelled);
+        lifetime.Cancel();
         if (transcript is not null) await transcript.DisposeAsync();
-        pty?.Dispose();
+        var running = pty;
+        pty = null;
+        if (running is not null) await Task.Run(running.Dispose);
     }
 
     /// <summary>One prompt turn sent by the ACP client.</summary>

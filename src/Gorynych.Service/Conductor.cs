@@ -106,8 +106,7 @@ public sealed class Conductor : IAsyncDisposable
             return;
         }
         foreach (var c in feed.Clients())
-            try { await c.Rpc.SendNotificationAsync(method, @params!.DeepClone()); }
-            catch (IOException) { feed.Detach(c); }
+            await feed.SendAsync(c, method, @params!.DeepClone());
     }
 
     void Remember(AgentHost host, string sessionId, JsonObject update)
@@ -141,7 +140,7 @@ public sealed class Conductor : IAsyncDisposable
             {
                 return await client.Rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or TimeoutException || (e is OperationCanceledException && !ct.IsCancellationRequested))
             {
                 feed.Detach(client);
             }
@@ -245,6 +244,22 @@ public sealed class Conductor : IAsyncDisposable
         var host = HostOf(record);
         var rpc = await host.GetAsync(ct);
         if (host.IsLive(record.SessionId)) return (rpc, null);
+        var gate = Feed(record.SessionId).OpenGate;
+        await gate.WaitAsync(ct);
+        try
+        {
+            rpc = await host.GetAsync(ct);
+            if (host.IsLive(record.SessionId)) return (rpc, null);
+            return (rpc, await OpenAsync(host, rpc, record, ct));
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    async Task<JsonObject?> OpenAsync(AgentHost host, JsonRpcConnection rpc, SessionRecord record, CancellationToken ct)
+    {
         JsonNode? opened;
         if (host.CanResume)
         {
@@ -270,7 +285,7 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"{host.Name} cannot reopen session {record.SessionId}");
         }
         host.MarkLive(record.SessionId);
-        return (rpc, opened as JsonObject);
+        return opened as JsonObject;
     }
 
     internal async Task<JsonNode?> LoadAsync(ClientConnection client, LoadSessionRequest request, CancellationToken ct)
@@ -321,6 +336,7 @@ public sealed class Conductor : IAsyncDisposable
         var (rpc, _) = await EnsureLiveAsync(record, ct);
         var feed = Feed(record.SessionId);
         feed.Attach(client);
+        if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
         // Journal the user's message, show it to the session's other clients, and use the
         // first prompt as the title until the harness provides one.
         foreach (var block in prompt.Prompt)
@@ -336,9 +352,23 @@ public sealed class Conductor : IAsyncDisposable
             if (!feed.IsRepeatedTitle(info)) await feed.PublishAsync(info, except: null, () => { });
         }
         // A turn outlives the client that started it: closing the GUI must not stop the agent.
-        // Stopping a turn is an explicit session/cancel.
-        return await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), CancellationToken.None);
+        // Stopping a turn is an explicit session/cancel, which must reach the agent after the
+        // prompt, so both go through the session's forward gate.
+        Task<JsonNode?> response;
+        await feed.ForwardGate.WaitAsync(CancellationToken.None);
+        try
+        {
+            if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
+            response = await rpc.StartRequestAsync(request.Method, request.Params?.DeepClone(), CancellationToken.None);
+        }
+        finally
+        {
+            feed.ForwardGate.Release();
+        }
+        return await response;
     }
+
+    static JsonNode? Cancelled() => AcpJson.ToNode(new PromptResponse { StopReason = StopReason.Cancelled });
 
     internal async Task<JsonNode?> ForwardAsync(JsonRpcRequest request, string sessionId, CancellationToken ct)
     {
@@ -353,7 +383,10 @@ public sealed class Conductor : IAsyncDisposable
         var host = HostOf(record);
         if (!host.IsRunning) return;
         var rpc = await host.GetAsync(CancellationToken.None);
-        await rpc.SendNotificationAsync(method, @params?.DeepClone());
+        var feed = Feed(sessionId);
+        await feed.ForwardGate.WaitAsync();
+        try { await rpc.SendNotificationAsync(method, @params?.DeepClone()); }
+        finally { feed.ForwardGate.Release(); }
     }
 
     internal async Task<JsonNode?> CloseAsync(ClientConnection client, string sessionId, JsonRpcRequest request, CancellationToken ct)

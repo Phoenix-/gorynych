@@ -54,7 +54,13 @@ public sealed class SessionJournal
     public List<JsonNode> ReadAll()
     {
         lock (gate)
-            return Load().Select(l => JsonNode.Parse(l)).OfType<JsonNode>().ToList();
+            return Load().Select(TryParse).OfType<JsonNode>().ToList();
+    }
+
+    static JsonNode? TryParse(string line)
+    {
+        try { return JsonNode.Parse(line); }
+        catch (JsonException) { return null; }
     }
 
     public void Delete()
@@ -70,9 +76,16 @@ public sealed class SessionJournal
     {
         if (lines is not null) return lines;
         lines = [];
-        if (File.Exists(path))
-            foreach (var l in File.ReadLines(path, Encoding.UTF8))
-                if (l.Length > 0) lines.Add(l);
+        if (!File.Exists(path)) return lines;
+        var text = File.ReadAllText(path, Encoding.UTF8);
+        var dropped = false;
+        foreach (var l in text.Split('\n'))
+        {
+            if (l.Length == 0) continue;
+            if (TryParse(l) is null) { dropped = true; continue; } // a line torn by a crash
+            lines.Add(l);
+        }
+        if (dropped || (text.Length > 0 && text[^1] != '\n')) Rewrite(lines);
         return lines;
     }
 
@@ -83,7 +96,7 @@ public sealed class SessionJournal
         JsonObject? pending = null;
         foreach (var line in all)
         {
-            var node = JsonNode.Parse(line) as JsonObject;
+            var node = TryParse(line) as JsonObject;
             if (pending is not null && node is not null && TryMerge(pending, node)) continue;
             if (pending is not null) merged.Add(pending.ToJsonString(LineOptions));
             pending = node is not null && IsTextChunk(node) ? node : null;

@@ -21,6 +21,47 @@ public sealed class ClaudeAdapterTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task StuckLaunch_FailsThePrompt_AndTheNextPromptStartsAFreshProcess()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var dir = TestDirs.New();
+        var log = new List<string>();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(new ClaudeAdapterOptions
+        {
+            DataDirectory = Path.Combine(dir, "claude"),
+            Executable = FakeClaude(),
+            StartupTimeoutSeconds = 3,
+            Log = m => { lock (log) log.Add($"{DateTime.Now:HH:mm:ss.fff} {m}"); },
+        }));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+        {
+            Cwd = dir,
+            McpServers = [],
+            Meta = new System.Text.Json.Nodes.JsonObject { ["gorynych/agent"] = "claude" },
+        })).SessionId;
+
+        var stuck = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt,
+            AcpJson.ToNode(new PromptRequest { SessionId = sessionId, Prompt = [new TextContent { Text = "hang here" }] })));
+        StringAssert.Contains(stuck.Message, "did not start the turn");
+        StringAssert.Contains(stuck.Message, "a dialog the adapter does not know", "the error shows the last screen");
+
+        PromptResponse next;
+        try
+        {
+            next = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = sessionId, Prompt = [new TextContent { Text = "hello" }] });
+        }
+        catch (JsonRpcException e)
+        {
+            lock (log) throw new AssertFailedException(e.Message + Environment.NewLine + string.Join(Environment.NewLine, log));
+        }
+        Assert.AreEqual(StopReason.EndTurn, next.StopReason);
+        Assert.AreEqual("echo: hello", client.Text());
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task Session_FromFirstPrompt_Approval_Paste_AndTitle()
     {
         if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");

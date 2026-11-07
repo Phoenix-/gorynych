@@ -50,10 +50,10 @@ public sealed class TranscriptWatcher : IAsyncDisposable
     readonly TranscriptTitles titles = new();
     readonly Action<string> onTitle;
     readonly CancellationTokenSource stop = new();
+    readonly Lock gate = new();
     readonly Task loop;
     string path;
     long offset;
-    string partial = "";
 
     public TranscriptWatcher(string path, Action<string> onTitle)
     {
@@ -67,10 +67,12 @@ public sealed class TranscriptWatcher : IAsyncDisposable
     /// <summary>Switches to the path Claude reported in a hook payload.</summary>
     public void Follow(string reportedPath)
     {
-        if (string.Equals(reportedPath, path, StringComparison.OrdinalIgnoreCase)) return;
-        path = reportedPath;
-        offset = 0;
-        partial = "";
+        lock (gate)
+        {
+            if (string.Equals(reportedPath, path, StringComparison.OrdinalIgnoreCase)) return;
+            path = reportedPath;
+            offset = 0;
+        }
     }
 
     async Task RunAsync()
@@ -87,19 +89,24 @@ public sealed class TranscriptWatcher : IAsyncDisposable
 
     void ReadNew()
     {
-        if (!File.Exists(path)) return;
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        if (fs.Length < offset) { offset = 0; partial = ""; }
-        if (fs.Length == offset) return;
-        fs.Seek(offset, SeekOrigin.Begin);
-        var buffer = new byte[fs.Length - offset];
-        var read = fs.ReadAtLeast(buffer, buffer.Length, throwOnEndOfStream: false);
-        offset += read;
-        var text = partial + Encoding.UTF8.GetString(buffer, 0, read);
-        var lines = text.Split('\n');
-        partial = lines[^1];
-        foreach (var line in lines.AsSpan(0, lines.Length - 1))
-            if (titles.Feed(line) && titles.Title is { } t) onTitle(t);
+        var changed = new List<string>();
+        lock (gate)
+        {
+            if (!File.Exists(path)) return;
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (fs.Length < offset) offset = 0;
+            if (fs.Length == offset) return;
+            fs.Seek(offset, SeekOrigin.Begin);
+            var buffer = new byte[fs.Length - offset];
+            var read = fs.ReadAtLeast(buffer, buffer.Length, throwOnEndOfStream: false);
+            // Take whole lines only, so a multi-byte character split by a write is read later in one piece.
+            var end = Array.LastIndexOf(buffer, (byte)'\n', read - 1);
+            if (end < 0) return;
+            offset += end + 1;
+            foreach (var line in Encoding.UTF8.GetString(buffer, 0, end).Split('\n'))
+                if (titles.Feed(line) && titles.Title is { } t) changed.Add(t);
+        }
+        foreach (var t in changed) onTitle(t);
     }
 
     public async ValueTask DisposeAsync()

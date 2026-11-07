@@ -51,6 +51,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     readonly JsonRpcConnection rpc;
     readonly ClaudeStateStore state;
     readonly ConcurrentDictionary<string, ClaudeSession> sessions = new(StringComparer.Ordinal);
+    readonly ConcurrentDictionary<string, long> cancelledAt = new(StringComparer.Ordinal);
     HookServer? hooks;
 
     public ClaudeAgent(ClaudeAdapterOptions options, JsonRpcConnection rpc)
@@ -138,7 +139,9 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 var session = Session(p.SessionId, null);
                 var text = string.Join("\n\n", p.Prompt.Select(BlockText).Where(t => t.Length > 0));
                 if (text.Length == 0) throw new JsonRpcException(JsonRpcException.InvalidParams, "The prompt has no text.");
-                var stop = await session.PromptAsync(text, ct);
+                var sequence = request.Sequence;
+                var stop = await session.PromptAsync(text,
+                    () => cancelledAt.TryGetValue(session.Id, out var at) && at > sequence, ct);
                 state.Update(session.Id, session.Cwd, r => r.UpdatedAt = DateTimeOffset.UtcNow);
                 return AcpJson.ToNode(new PromptResponse { StopReason = stop });
             }
@@ -157,8 +160,11 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     Task OnNotificationAsync(string method, JsonNode? @params)
     {
-        if (method == AcpMethods.Agent.SessionCancel && (string?)@params?["sessionId"] is { } id && sessions.TryGetValue(id, out var s))
-            s.Cancel();
+        if (method == AcpMethods.Agent.SessionCancel && (string?)@params?["sessionId"] is { } id)
+        {
+            cancelledAt[id] = rpc.NotificationSequence;
+            if (sessions.TryGetValue(id, out var s)) s.Cancel();
+        }
         return Task.CompletedTask;
     }
 
@@ -225,7 +231,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         switch (kind)
         {
             case "hook" when body is not null:
-                return await session.OnHookAsync(body);
+                return await session.OnHookAsync(body, ct);
             case "channel-next" when Channel is not null:
                 return await Channel.NextAsync(sessionId, ct);
             case "channel-reply" when Channel is not null:

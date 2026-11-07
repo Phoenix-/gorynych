@@ -51,13 +51,19 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
 
 ### Prompts and turns
 
-- The first `session/prompt` is the launch argument (after `--`).
+- The first `session/prompt` is the launch argument (after `--`). Until Claude has taken
+  a prompt the launch uses `--session-id`; after that, `--resume`.
 - Later prompts wait until `Stop` says Claude is idle, then go in as a bracketed paste
   (`ESC[200~ … ESC[201~`) and, 400 ms later, Enter. That arrives as a real user turn.
-- A turn ends with the `Stop` hook (`end_turn`). `session/cancel` sends Esc and ends the
-  turn with `cancelled`.
-- A launch that does not reach `UserPromptSubmit` within 90 s fails the prompt with the
-  last screen text, so a stuck dialog is visible instead of a hang.
+- A turn ends with the `Stop` hook (`end_turn`), but only a turn Claude has acknowledged
+  with `UserPromptSubmit`, so a late `Stop` of an interrupted turn cannot end the next one.
+- `session/cancel` sends Esc and ends the turn with `cancelled`; a prompt still waiting for
+  the composer is dropped with `cancelled`.
+- A launch that does not reach `UserPromptSubmit` within 90 s is killed and fails the
+  prompt with the last screen text, so a stuck dialog is visible instead of a hang; the
+  next prompt starts a fresh process.
+- An approval is withdrawn when Claude abandons the hook call (its timeout, an answer typed
+  in the TUI, an interrupt).
 
 ### Hooks → ACP
 
