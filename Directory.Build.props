@@ -1,0 +1,14 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <Authors>Mikhail Kazakov</Authors>
+    <Copyright>Copyright (c) 2026 Mikhail Kazakov</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <!-- Keep the service Native AOT friendly: no reflection-based JSON. -->
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+  </PropertyGroup>
+</Project>

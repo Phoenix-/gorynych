@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Gorynych.Acp/Gorynych.Acp.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Gorynych.Tests/Gorynych.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/Gorynych.AcpGen/Gorynych.AcpGen.csproj" />
+  </Folder>
+</Solution>
