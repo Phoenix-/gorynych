@@ -48,7 +48,7 @@ public sealed class LiveSmokeTests
         {
             DataDirectory = Path.Combine(dir, "claude"),
             Model = "haiku",
-            ChannelServerCommand = [ServiceExe(root), "channel"],
+            ChannelServerCommand = [ServiceExe(root), "peers"],
         });
         await using var conductor = TestDirs.Conductor(dir, adapter);
         string sessionId;
@@ -98,7 +98,7 @@ public sealed class LiveSmokeTests
 
     [TestMethod]
     [Timeout(600_000, CooperativeCancellation = true)]
-    public async Task Kimi_AsksClaude_ForAnOpinion()
+    public async Task Opinions_BothWays_ClaudeAsksKimi_KimiAsksClaude()
     {
         RequireLive();
         if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
@@ -112,7 +112,7 @@ public sealed class LiveSmokeTests
             ServiceId = "live",
             PeerServerCommand = [exe, "peers", "--pipe", pipe],
         }, [
-            new ClaudeAdapter(new ClaudeAdapterOptions { DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "channel"] }),
+            new ClaudeAdapter(new ClaudeAdapterOptions { DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "peers"] }),
             new KimiAdapter(new KimiAdapterOptions()),
         ]);
         using var stop = new CancellationTokenSource();
@@ -136,6 +136,29 @@ public sealed class LiveSmokeTests
         })).SessionId;
         try
         {
+            // Claude asks Kimi: the request reaches Kimi as a marked turn, Kimi answers with reply.
+            var mark = client.Text().Length;
+            var asked = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt, new PromptRequest
+            {
+                SessionId = claude,
+                Prompt = [new TextContent { Text =
+                    $"Use the gorynych ask_agent tool to ask the agent session {kimi} this question: " +
+                    "\"Tabs or spaces for C#, and why? One sentence.\" Then reply with ANSWER: followed by the answer you got." }],
+            });
+            Assert.AreEqual(StopReason.EndTurn, asked.StopReason);
+            var claudeText = client.Text()[mark..];
+            StringAssert.Contains(claudeText, "ANSWER");
+            Assert.IsTrue(client.Approvals.Any(a => a.ToolCall.Title == "ask_agent (gorynych)"), "Claude's ask_agent asked for approval");
+            var request = client.Snapshot().FirstOrDefault(u => (string?)u["sessionUpdate"] == "user_message_chunk"
+                && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == "peer");
+            Assert.IsNotNull(request, "the question reached Kimi as a marked turn");
+            Assert.AreEqual("peer_claude", (string?)request["_meta"]![GorynychProtocol.MetaSender]);
+            var opinion = (string?)request["_meta"]![GorynychProtocol.MetaOpinion];
+            var replied = client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call"
+                && (string?)u["_meta"]?[GorynychProtocol.MetaOpinion] == opinion && ((string?)u["title"] ?? "").Contains("reply", StringComparison.Ordinal));
+            Console.WriteLine($"Claude asked Kimi; Kimi answered {(replied ? "with the reply tool" : "in the turn's text")}: {claudeText.Trim()}");
+
+            // Kimi asks Claude: the question reaches Claude through its channel.
             var before = client.Text().Length;
             var result = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt, new PromptRequest
             {

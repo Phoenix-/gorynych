@@ -5,8 +5,8 @@ several AI coding agents (Claude Code, Codex, Kimi Code, DeepSeek Harness) in th
 native harnesses and bring their conversations, approvals and session lists into one
 place. The agents can also ask each other for opinions.
 
-Status: first MVP slice. The service runs Claude Code and Kimi Code sessions, and Kimi can
-ask a running Claude session for an opinion; a console test client stands in for the GUI.
+Status: first MVP slice. The service runs Claude Code and Kimi Code sessions, and they can
+ask each other for opinions; a console test client stands in for the GUI.
 
 ## Try it
 

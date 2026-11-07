@@ -109,7 +109,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 var p = request.ParamsAs<NewSessionRequest>();
                 var cwd = RequireDirectory(p.Cwd);
                 var id = Guid.NewGuid().ToString();
-                sessions[id] = new ClaudeSession(this, options, id, cwd, resume: false);
+                sessions[id] = new ClaudeSession(this, options, id, cwd, resume: false) { McpServers = p.McpServers };
                 state.Update(id, cwd, _ => { });
                 return AcpJson.ToNode(new NewSessionResponse { SessionId = id });
             }
@@ -131,7 +131,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             case AcpMethods.Agent.SessionResume:
             {
                 var p = request.ParamsAs<ResumeSessionRequest>();
-                Session(p.SessionId, p.Cwd);
+                var session = Session(p.SessionId, p.Cwd);
+                if (p.McpServers is { } servers) session.McpServers = servers;
                 return AcpJson.ToNode(new ResumeSessionResponse());
             }
             case AcpMethods.Agent.SessionPrompt:
@@ -175,7 +176,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     /// </summary>
     async Task<JsonNode?> OpinionAsync(JsonRpcRequest request, CancellationToken ct)
     {
-        if (Channel is null) throw new JsonRpcException(JsonRpcException.InvalidRequest, "Claude sessions run without a channel.");
+        // Without a channel the service falls back to asking in an ordinary turn.
+        if (Channel is null) throw new JsonRpcException(JsonRpcException.MethodNotFound, "Claude sessions run without a channel.");
         var id = (string?)request.Params?["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
         var text = (string?)request.Params?["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
         var sender = (string?)request.Params?["sender"] ?? "peer_agent";

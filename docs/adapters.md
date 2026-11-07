@@ -86,19 +86,23 @@ and questions are kept apart: `session/request_permission` asks to allow an acti
 `elicitation/create` asks for information. If the client cannot show forms, the question
 is denied with a note so Claude asks in plain text.
 
-### Channel (opinions from other agents)
+### MCP servers and the channel (opinions both ways)
 
-With a channel (the default; `--no-channel` turns it off), Claude starts
-`Gorynych.Service channel --url …/channel/<session>/<token>` over stdio. It is an MCP
-server declaring `capabilities.experimental["claude/channel"]`; it long-polls the adapter
-for messages, pushes them as `notifications/claude/channel` with
-`meta: {sender, message_id}`, and posts `reply` tool calls back. `--append-system-prompt`
-authorizes opinions from the user's agents and forbids actions on their behalf; the
-adapter's PermissionRequest hook allows the channel's own `reply` tool without asking.
-`_gorynych/opinion` on the service is the entry point.
+The `mcpServers` of `session/new` and `session/resume` go into the per-launch
+`--mcp-config` (stdio, http and sse), so Claude gets the client's servers and the
+service's `gorynych` server. With a channel (the default; `--no-channel` turns it off) the
+adapter adds `--channel-url …/channel/<session>/<token>` to that `gorynych` server and starts
+Claude with `--dangerously-load-development-channels server:gorynych`: the one server then
+declares `capabilities.experimental["claude/channel"]`, long-polls the adapter for opinion
+requests, pushes them as `notifications/claude/channel` with `meta: {sender, message_id}`,
+and posts `reply` back. Without a service-given server the adapter starts a channel-only
+`gorynych` server itself.
 
-Claude does not get the peers MCP server yet (the adapter ignores `mcpServers`), so Claude
-can be asked but cannot ask.
+`--append-system-prompt` authorizes opinions from the user's agents, forbids actions on
+their behalf, and, when the peer tools are there, tells Claude about `list_agents` and
+`ask_agent`. The PermissionRequest hook allows `mcp__gorynych__reply` and
+`mcp__gorynych__list_agents` without asking; `mcp__gorynych__ask_agent` becomes an ACP
+approval like any tool.
 
 ### Not done yet
 

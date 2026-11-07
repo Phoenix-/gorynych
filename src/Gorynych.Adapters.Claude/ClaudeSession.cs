@@ -54,6 +54,14 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
     /// <summary>The secret in this session's hook URL, so other local processes cannot post events.</summary>
     public string Token { get; }
 
+    /// <summary>
+    /// The MCP servers the ACP client gave this session (<c>session/new</c>, <c>session/resume</c>),
+    /// passed to Claude through the per-launch <c>--mcp-config</c>; they apply from the next launch.
+    /// </summary>
+    public List<McpServer> McpServers { get; set; } = [];
+
+    bool HasPeerTools => McpServers.OfType<McpServerStdio>().Any(s => s.Name == ChannelHost.ServerName);
+
     public bool IsRunning => pty is { Exited.IsCompleted: false };
 
     string Folder => Path.Combine(options.DataDirectory, "sessions", Id);
@@ -182,12 +190,17 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
 
         var args = new List<string> { "--settings", settingsPath, "--permission-mode", options.PermissionMode };
         if (options.Model is { Length: > 0 } model) args.AddRange(["--model", model]);
+        var mcpPath = Path.Combine(Folder, "mcp.json");
         if (agent.Channel is { } channel)
         {
-            var mcpPath = Path.Combine(Folder, "mcp.json");
-            File.WriteAllText(mcpPath, channel.McpConfig(Id, Token).ToJsonString());
+            File.WriteAllText(mcpPath, channel.McpConfig(Id, Token, McpServers).ToJsonString());
             args.AddRange(["--mcp-config", mcpPath, "--dangerously-load-development-channels", "server:" + ChannelHost.ServerName,
-                "--append-system-prompt", ChannelHost.SystemPrompt]);
+                "--append-system-prompt", ChannelHost.SystemPrompt(HasPeerTools)]);
+        }
+        else if (McpServers.Count > 0)
+        {
+            File.WriteAllText(mcpPath, Claude.McpServers.Config(McpServers).ToJsonString());
+            args.AddRange(["--mcp-config", mcpPath]);
         }
         args.AddRange(resume ? ["--resume", Id] : ["--session-id", Id]);
         args.AddRange(["--", prompt]);
@@ -397,8 +410,9 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(hookAborted, lifetime.Token);
         var ct = linked.Token;
         var tool = (string?)e["tool_name"] ?? "";
-        // The reply tool of our own channel answers another agent's opinion request; it needs no approval.
-        if (agent.Channel is not null && tool == ChannelHost.ReplyToolName) return ClaudeHooks.AllowReply();
+        // Answering an opinion request and looking who is there need no approval; asking another
+        // agent (ask_agent) does, as it does for every agent (see docs/service-protocol.md).
+        if (ChannelHost.PreAllowedTools.Contains(tool)) return ClaudeHooks.AllowReply();
         string toolCallId;
         lock (stateGate)
             toolCallId = toolIds.TryGetValue(ToolKey(e), out var known) ? known : $"permission-{++permissionCount}";

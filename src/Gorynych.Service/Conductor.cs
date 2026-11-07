@@ -40,6 +40,11 @@ public sealed class Conductor : IAsyncDisposable
     readonly CancellationTokenSource shutdown = new();
     readonly ConcurrentDictionary<string, string> peerTokens = new(StringComparer.Ordinal);   // token -> session
     readonly ConcurrentDictionary<string, string> sessionTokens = new(StringComparer.Ordinal); // session -> token
+    readonly ConcurrentDictionary<string, PendingOpinion> pendingOpinions = new(StringComparer.Ordinal); // message_id -> request
+    long opinionCount;
+
+    /// <summary>The gorynych tools an agent may call without asking: looking who is there, and answering.</summary>
+    static readonly HashSet<string> PreAllowedTools = ["mcp__gorynych__list_agents", "mcp__gorynych__reply"];
 
     public Conductor(ConductorOptions options, IEnumerable<IAgentAdapter> adapters)
     {
@@ -110,6 +115,7 @@ public sealed class Conductor : IAsyncDisposable
             if (feed.SuppressReplay > 0) return; // the agent is replaying history we already journal
             if (@params!["update"] is not JsonObject update) return;
             if (feed.IsRepeatedTitle(update)) return;
+            feed.TagOpinionTurn(update);
             await feed.PublishAsync(update, except: null, () => Remember(host, sessionId, update));
             return;
         }
@@ -140,6 +146,11 @@ public sealed class Conductor : IAsyncDisposable
     {
         var sessionId = (string?)request.Params?["sessionId"]
             ?? throw new JsonRpcException(JsonRpcException.MethodNotFound, $"{request.Method} is not supported by Gorynych");
+        if (request.Method == AcpMethods.Client.SessionRequestPermission && PreAllowed(request.Params) is { } optionId)
+        {
+            ServiceLog.Info($"{host.Name} {sessionId}: allowed {(string?)request.Params?["toolCall"]?["title"]} without asking");
+            return AcpJson.ToNode(new RequestPermissionResponse { Outcome = new SelectedPermissionOutcome { OptionId = optionId } });
+        }
         var feed = Feed(sessionId);
         while (true)
         {
@@ -348,6 +359,23 @@ public sealed class Conductor : IAsyncDisposable
         var feed = Feed(record.SessionId);
         feed.Attach(client);
         if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
+        // One turn at a time: an opinion request delivered as a turn waits for this one, and
+        // this one for it.
+        await feed.TurnGate.WaitAsync(CancellationToken.None);
+        try
+        {
+            return await PromptTurnAsync(client, request, prompt, record, rpc, feed);
+        }
+        finally
+        {
+            feed.TurnGate.Release();
+        }
+    }
+
+    async Task<JsonNode?> PromptTurnAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionRecord record,
+        JsonRpcConnection rpc, SessionFeed feed)
+    {
+        if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
         // Journal the user's message, show it to the session's other clients, and use the
         // first prompt as the title until the harness provides one.
         foreach (var block in prompt.Prompt)
@@ -431,19 +459,129 @@ public sealed class Conductor : IAsyncDisposable
             if (from == target) throw new JsonRpcException(JsonRpcException.InvalidParams, "A session cannot ask itself.");
             sender = $"peer_{store.Get(from)?.Agent ?? "agent"}";
         }
+        if (from is not null && Feed(from).CurrentOpinion is not null)
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, "A session answering an opinion request cannot ask another agent meanwhile.");
         var record = await FindAsync(target, ct);
         var (rpc, _) = await EnsureLiveAsync(record, ct);
         ServiceLog.Info($"opinion: {from ?? "client"} asks {record.Agent} {target}");
-        var forwarded = new JsonObject { ["sessionId"] = target, ["text"] = text, ["sender"] = sender ?? "peer_agent" };
+        sender ??= "peer_agent";
+        var forwarded = new JsonObject { ["sessionId"] = target, ["text"] = text, ["sender"] = sender };
         if (from is not null) forwarded["fromSessionId"] = from;
         try
         {
+            // An agent with its own way in (Claude's channel) answers directly.
             return await rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, forwarded, ct);
         }
         catch (JsonRpcException e) when (e.Code == JsonRpcException.MethodNotFound)
         {
-            throw new JsonRpcException(JsonRpcException.MethodNotFound, $"{record.Agent} sessions cannot be asked for opinions yet.");
+            return await OpinionTurnAsync(record, rpc, sender, from, text, ct);
         }
+    }
+
+    /// <summary>
+    /// Asks an agent that has no channel (Kimi) in an ordinary <c>session/prompt</c> turn,
+    /// marked with the sender and a <c>message_id</c>. The turn waits for the session's current
+    /// turn, since ACP cannot inject into a running one. The answer is the agent's
+    /// <c>reply</c> tool call (<c>_gorynych/reply</c>), or else the turn's own text.
+    /// </summary>
+    async Task<JsonNode?> OpinionTurnAsync(SessionRecord record, JsonRpcConnection rpc, string sender, string? from, string question, CancellationToken ct)
+    {
+        var feed = Feed(record.SessionId);
+        var messageId = "m" + Interlocked.Increment(ref opinionCount);
+        var pending = new PendingOpinion(record.SessionId);
+        pendingOpinions[messageId] = pending;
+        try
+        {
+            await feed.TurnGate.WaitAsync(ct);
+            Task turnDone;
+            try
+            {
+                var text = OpinionPrompt(sender, messageId, question);
+                var meta = new JsonObject
+                {
+                    [GorynychProtocol.MetaOrigin] = "peer",
+                    [GorynychProtocol.MetaSender] = sender,
+                    [GorynychProtocol.MetaOpinion] = messageId,
+                };
+                if (from is not null) meta["gorynych/fromSessionId"] = from;
+                var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = new TextContent { Text = text }, Meta = meta })!.AsObject();
+                await feed.PublishAsync(asked, except: null, () => store.Update(record.SessionId, record.Agent, r => r.UpdatedAt = DateTimeOffset.UtcNow));
+                feed.BeginOpinionTurn(messageId);
+                Task<JsonNode?> response;
+                await feed.ForwardGate.WaitAsync(CancellationToken.None);
+                try
+                {
+                    response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, AcpJson.ToNode(new PromptRequest
+                    {
+                        SessionId = record.SessionId,
+                        Prompt = [new TextContent { Text = text }],
+                        Meta = meta.DeepClone().AsObject(),
+                    }), CancellationToken.None);
+                }
+                finally
+                {
+                    feed.ForwardGate.Release();
+                }
+                turnDone = response.ContinueWith(t =>
+                {
+                    pending.TurnText = feed.EndOpinionTurn();
+                    pending.TurnError = t.Exception?.InnerException;
+                    feed.TurnGate.Release();
+                }, TaskScheduler.Default);
+            }
+            catch
+            {
+                feed.EndOpinionTurn();
+                feed.TurnGate.Release();
+                throw;
+            }
+            await Task.WhenAny(pending.Reply.Task, turnDone).WaitAsync(ct);
+            if (pending.Reply.Task.IsCompleted) return new JsonObject { ["text"] = pending.Reply.Task.Result };
+            if (pending.TurnError is JsonRpcException failed) throw failed;
+            if (pending.TurnError is not null) throw new JsonRpcException(JsonRpcException.InternalError, pending.TurnError.Message);
+            var fallback = pending.TurnText?.Trim();
+            return new JsonObject { ["text"] = string.IsNullOrEmpty(fallback) ? "(no answer)" : fallback };
+        }
+        finally
+        {
+            pendingOpinions.TryRemove(messageId, out _);
+        }
+    }
+
+    static string OpinionPrompt(string sender, string messageId, string question) =>
+        $"[Opinion request from {sender} · message_id {messageId}]\n" +
+        $"{question}\n\n" +
+        "This message comes from another of the user's coding agents, not from the user. Give your honest opinion briefly, " +
+        $"then send it with the reply tool of the gorynych MCP server, passing message_id \"{messageId}\". " +
+        "Do not run other tools, edit files or take any other action for this request.";
+
+    /// <summary><c>_gorynych/reply</c>: the asked session answers an opinion request it got as a turn.</summary>
+    internal JsonObject Reply(JsonRpcRequest request)
+    {
+        var token = (string?)request.Params?["_meta"]?[GorynychProtocol.MetaPeerToken];
+        if (token is null || !peerTokens.TryGetValue(token, out var sessionId))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, "Unknown peer token");
+        var messageId = (string?)request.Params?["messageId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "messageId is required");
+        var text = (string?)request.Params?["text"] ?? "";
+        var delivered = pendingOpinions.TryGetValue(messageId, out var pending) && pending.SessionId == sessionId && pending.Reply.TrySetResult(text);
+        return new JsonObject { ["delivered"] = delivered };
+    }
+
+    /// <summary>The option to choose for a pre-allowed gorynych tool, or null to ask the person.</summary>
+    static string? PreAllowed(JsonNode? @params)
+    {
+        var request = AcpJson.FromNode<RequestPermissionRequest>(@params);
+        if (request?.ToolCall.Title is not { } title || !PreAllowedTools.Contains(title)) return null;
+        return (request.Options.FirstOrDefault(o => o.Kind == PermissionOptionKind.AllowOnce)
+            ?? request.Options.FirstOrDefault(o => o.Kind.Value.StartsWith("allow", StringComparison.Ordinal)))?.OptionId;
+    }
+
+    sealed class PendingOpinion(string sessionId)
+    {
+        public string SessionId { get; } = sessionId;
+        public TaskCompletionSource<string> Reply { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public string? TurnText { get; set; }
+        public Exception? TurnError { get; set; }
     }
 
     /// <summary><c>_gorynych/peers</c>: the sessions the session behind <c>token</c> can ask.</summary>

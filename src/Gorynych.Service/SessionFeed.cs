@@ -27,6 +27,50 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <summary>One resume or load of the session in its agent at a time.</summary>
     public SemaphoreSlim OpenGate { get; } = new(1, 1);
 
+    /// <summary>One prompt turn at a time: the user's turns and opinion requests delivered as turns.</summary>
+    public SemaphoreSlim TurnGate { get; } = new(1, 1);
+
+    string? opinionTurn;
+    System.Text.StringBuilder opinionText = new();
+
+    /// <summary>The <c>message_id</c> of the opinion request whose turn is running, if any.</summary>
+    public string? CurrentOpinion
+    {
+        get { lock (clientsGate) return opinionTurn; }
+    }
+
+    public void BeginOpinionTurn(string messageId)
+    {
+        lock (clientsGate) { opinionTurn = messageId; opinionText = new(); }
+    }
+
+    /// <summary>Ends the opinion turn and returns the agent's text from it.</summary>
+    public string EndOpinionTurn()
+    {
+        lock (clientsGate)
+        {
+            opinionTurn = null;
+            return opinionText.ToString();
+        }
+    }
+
+    /// <summary>
+    /// Marks an update that belongs to a running opinion turn with <c>_meta["gorynych/opinion"]</c>,
+    /// so a GUI can keep that exchange apart from the user's own turns, and keeps its text.
+    /// </summary>
+    public void TagOpinionTurn(JsonObject update)
+    {
+        lock (clientsGate)
+        {
+            if (opinionTurn is null) return;
+            var meta = update["_meta"] as JsonObject ?? [];
+            meta[Gorynych.Acp.Hosting.GorynychProtocol.MetaOpinion] = opinionTurn;
+            update["_meta"] = meta;
+            if ((string?)update["sessionUpdate"] == "agent_message_chunk" && (string?)update["content"]?["text"] is { } text)
+                opinionText.Append(text);
+        }
+    }
+
     public string SessionId { get; } = sessionId;
     public SessionJournal Journal { get; } = journal;
     public int PendingRequests => Volatile.Read(ref pendingRequests);

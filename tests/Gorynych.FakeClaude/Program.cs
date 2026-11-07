@@ -16,6 +16,8 @@ var url = (string)JsonNode.Parse(File.ReadAllText(settingsPath))!["hooks"]!["Sto
 var cwd = Environment.CurrentDirectory;
 var transcript = Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", sessionId + ".jsonl");
 Directory.CreateDirectory(Path.GetDirectoryName(transcript)!);
+// Leave the launch arguments next to the transcript, so tests can check the per-launch flags.
+File.WriteAllText(Path.ChangeExtension(transcript, ".args.json"), new JsonArray(args.Select(a => (JsonNode)a).ToArray()).ToJsonString());
 using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
 var turns = 0;
 var tools = 0;
@@ -73,6 +75,21 @@ async Task TurnAsync(string prompt)
                 ["tool_response"] = new JsonObject { ["type"] = "create", ["filePath"] = (string)input["file_path"]! },
             }));
         answer = allowed ? "wrote it" : "not allowed";
+    }
+    else if (prompt.Contains("peers", StringComparison.OrdinalIgnoreCase))
+    {
+        // Calls the two gorynych peer tools the way Claude would: each asks PermissionRequest first.
+        var verdicts = new List<string>();
+        foreach (var (tool, input) in new[]
+        {
+            ("mcp__gorynych__list_agents", new JsonObject()),
+            ("mcp__gorynych__ask_agent", new JsonObject { ["session_id"] = "other", ["question"] = "tabs?" }),
+        })
+        {
+            var reply = await PostAsync(Hook("PermissionRequest", promptId, new JsonObject { ["tool_name"] = tool, ["tool_input"] = input }));
+            verdicts.Add($"{tool.Split("__")[2]}:{(string?)reply?["hookSpecificOutput"]?["decision"]?["behavior"]}");
+        }
+        answer = string.Join(" ", verdicts);
     }
     else if (prompt.Contains("question", StringComparison.OrdinalIgnoreCase))
     {

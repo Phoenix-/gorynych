@@ -21,9 +21,9 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   service ID), `sessions.json` (the overlay), `journal/`, `claude/`, `logs/`.
 
 Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi]
-[--claude-model <model>] [--no-channel] [--no-peers] [--console]`. The same executable also
-runs the two stdio helpers agents start: `channel --url …` (Claude's development channel)
-and `peers --pipe … --token …` (the peers MCP server).
+[--claude-model <model>] [--no-channel] [--no-peers] [--console]`. The same executable is
+also the `gorynych` MCP server agents start over stdio:
+`peers [--pipe … --token …] [--channel-url …]` (see Opinions below).
 
 ## Standard methods
 
@@ -34,7 +34,7 @@ and `peers --pipe … --token …` (the peers MCP server).
 | `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (default: `--default-agent`, else the first), adds the peers MCP server to `mcpServers`, forwards, records the session, attaches the client. |
 | `session/load` | Opens the session in the agent (`session/resume`, or `session/load` with the agent's replay dropped), replays the service journal as `session/update`, then attaches the client. A session the journal has never seen is loaded from the agent instead, and journaled. |
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. |
-| `session/prompt` | Journals the prompt as `user_message_chunk` (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
+| `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
 | `session/close`, anything else with a `sessionId` | Forwarded to the session's agent. |
 
@@ -61,27 +61,50 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `gorynych/agent` | `session/new` params, `SessionInfo._meta`, `session/new` result | the adapter that owns the session |
 | `gorynych/serviceId` | `initialize` result `_meta` | the service's persistent ID; a GUI keys sessions as service/session |
 | `gorynych/agents` | `initialize` result `_meta` | the adapters this service offers (`name`, `displayName`) |
-| `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `channel` (another agent) or `terminal` |
+| `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel) or `terminal` |
+| `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude` |
+| `gorynych/opinion` | `_meta` of the request message and of every update of its turn | the request's `message_id`, so a GUI can show the exchange apart from the user's own turns |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId` |
 | `_gorynych/peers` | method, `{token}` → `{sessions}` | the sessions the session behind `token` can ask (all others, with agent, title, folder) |
-| `gorynych/peerToken` | `_meta` of `_gorynych/opinion` | which session's peers server is asking |
+| `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
+| `gorynych/peerToken` | `_meta` of `_gorynych/opinion` and `_gorynych/reply` | which session's `gorynych` MCP server is calling |
 
 ## Opinions between agents
 
 Every session gets, in `mcpServers` (the ACP way to give an agent tools), a stdio MCP server
 named `gorynych`: `Gorynych.Service peers --pipe <pipe> --token <token>`. The token is
-random per session and tells the service who is asking. Its tools:
+random per session and tells the service who is calling. Its tools:
 
 - `list_agents` — the user's other sessions (`_gorynych/peers`);
-- `ask_agent {session_id, question}` — waits for the other agent's answer (`_gorynych/opinion`).
+- `ask_agent {session_id, question}` — asks one and waits for the answer (`_gorynych/opinion`);
+- `reply {message_id, text}` — answers a request this session was asked.
 
-The agent asks for approval before calling them, like any MCP tool. Verified live on
-7 November 2026: Kimi called `list_agents` and `ask_agent`, the question reached a running
-Claude session through its channel from `peer_kimi`, and Claude's `reply` came back as the
-tool result. Asking Kimi (or any agent without a channel) is not supported yet; the plan is
-an ordinary turn marked with the sender.
+How a request reaches the asked agent depends on what it has:
+
+- **Claude** has a channel. The Claude adapter adds `--channel-url` to the same `gorynych`
+  server in its `--mcp-config`, so one server is both its peer tools and its development
+  channel: the request arrives as a channel message, `reply` goes back through the channel.
+- **Kimi** (any agent without a channel) gets the request as an ordinary `session/prompt`
+  turn, marked in the text with the sender and `message_id` and asking for `reply`. ACP
+  cannot inject into a running turn, so the request waits for the session's current turn
+  (the user's prompts wait for it in turn). The answer is the `reply` tool call
+  (`_gorynych/reply`); if the turn ends without one, the turn's own text. The request and
+  every update of its turn carry `_meta["gorynych/opinion"]`.
+
+A session that is answering a request cannot ask another agent meanwhile, so two agents
+cannot wait on each other.
+
+Approvals are the same for every agent: `list_agents` (read only) and `reply` (an answer the
+user's own agent was asked for) run without asking — the Claude adapter allows them in its
+PermissionRequest hook, the service answers Kimi's `session/request_permission` for them —
+while `ask_agent` always asks the person, because it hands context to another agent and
+spends its turns.
+
+Verified live on 7 November 2026: Claude called `list_agents` and, after approval,
+`ask_agent`; Kimi got the marked turn, answered with `reply`, and Claude used the answer.
+Kimi asking Claude goes through Claude's channel the same way.
 
 ## Journal
 

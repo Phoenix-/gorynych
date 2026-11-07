@@ -55,6 +55,12 @@ public static class GorynychProtocol
     /// <summary>Asks a session's agent for an opinion: <c>{sessionId, text, sender?}</c> → <c>{text}</c>.</summary>
     public const string MethodOpinion = "_gorynych/opinion";
 
+    /// <summary>An answer to an opinion request that was delivered as a turn: <c>{messageId, text}</c>.</summary>
+    public const string MethodReply = "_gorynych/reply";
+
+    /// <summary>The opinion request a message or update belongs to (its <c>message_id</c>).</summary>
+    public const string MetaOpinion = "gorynych/opinion";
+
     /// <summary>The sessions a peer can ask: <c>{token}</c> → <c>{sessions: [...]}</c>.</summary>
     public const string MethodPeers = "_gorynych/peers";
 

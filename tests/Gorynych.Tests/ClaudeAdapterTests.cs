@@ -21,6 +21,52 @@ public sealed class ClaudeAdapterTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task PeerTools_ComeThroughTheLaunchFlags_AndOnlyAskAgentNeedsApproval()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var dir = TestDirs.New();
+        await using var conductor = new Gorynych.Service.Conductor(new Gorynych.Service.ConductorOptions
+        {
+            DataDirectory = dir,
+            ServiceId = "t",
+            PeerServerCommand = [@"C:\svc\Gorynych.Service.exe", "peers", "--pipe", "p"],
+        }, [new ClaudeAdapter(new ClaudeAdapterOptions
+        {
+            DataDirectory = Path.Combine(dir, "claude"),
+            Executable = FakeClaude(),
+            ChannelServerCommand = [@"C:\svc\Gorynych.Service.exe", "peers"],
+            StartupTimeoutSeconds = 30,
+        })]);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = ClaudeHooks.DenyOptionId });
+        var sessionId = (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+        {
+            Cwd = dir,
+            McpServers = [new McpServerStdio { Name = "other", Command = "other.exe", Args = ["--x"], Env = [new EnvVariable { Name = "K", Value = "V" }] }],
+            Meta = new System.Text.Json.Nodes.JsonObject { ["gorynych/agent"] = "claude" },
+        })).SessionId;
+
+        await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = sessionId, Prompt = [new TextContent { Text = "try the peers tools" }] });
+        Assert.AreEqual("list_agents:allow ask_agent:deny", client.Text(), "list_agents is pre-allowed, ask_agent asks the person");
+        Assert.AreEqual("ask_agent (gorynych)", client.Approvals.Single().ToolCall.Title);
+
+        var args = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", sessionId + ".args.json")))!
+            .AsArray().Select(a => (string)a!).ToList();
+        CollectionAssert.Contains(args, "server:gorynych");
+        StringAssert.Contains(args[args.IndexOf("--append-system-prompt") + 1], "ask_agent");
+        var mcp = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(args[args.IndexOf("--mcp-config") + 1]))!["mcpServers"]!;
+        var gorynych = mcp["gorynych"]!["args"]!.AsArray().Select(a => (string)a!).ToArray();
+        CollectionAssert.AreEqual(new[] { "peers", "--pipe", "p", "--token" }, gorynych[..4]);
+        Assert.AreEqual("--channel-url", gorynych[5], "one server is both the peer tools and the channel");
+        StringAssert.Contains(gorynych[6], $"/channel/{sessionId}/");
+        Assert.AreEqual(@"C:\svc\Gorynych.Service.exe", (string?)mcp["gorynych"]!["command"]);
+        Assert.AreEqual("other.exe", (string?)mcp["other"]!["command"], "the client's own MCP servers reach Claude too");
+        Assert.AreEqual("V", (string?)mcp["other"]!["env"]!["K"]);
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task StuckLaunch_FailsThePrompt_AndTheNextPromptStartsAFreshProcess()
     {
         if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");

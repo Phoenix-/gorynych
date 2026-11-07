@@ -8,13 +8,10 @@ using Gorynych.Adapters.Kimi;
 using Gorynych.Service;
 
 // Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi] [--claude-model <m>] [--no-channel] [--console]
-// Gorynych.Service channel --url <url>      (the Claude channel server; Claude starts it over stdio)
-if (args.Length > 0 && args[0] == "channel")
-    return await ChannelServer.RunAsync(Arg(args, "--url") ?? throw new ArgumentException("--url is required"));
-// Gorynych.Service peers --pipe <name> --token <t>   (the peers MCP server; agents start it over stdio)
+// Gorynych.Service peers [--pipe <name> --token <t>] [--channel-url <url>]
+//   the gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel
 if (args.Length > 0 && args[0] == "peers")
-    return await PeersServer.RunAsync(Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName,
-        Arg(args, "--token") ?? throw new ArgumentException("--token is required"));
+    return await PeersServer.RunAsync(Arg(args, "--pipe"), Arg(args, "--token"), Arg(args, "--channel-url"));
 
 var pipeName = Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName;
 var dataDirectory = Path.GetFullPath(Arg(args, "--data")
@@ -43,7 +40,7 @@ var adapters = new List<IAgentAdapter>
     {
         DataDirectory = Path.Combine(dataDirectory, "claude"),
         Model = Arg(args, "--claude-model"),
-        ChannelServerCommand = args.Contains("--no-channel") ? null : [Environment.ProcessPath!, "channel"],
+        ChannelServerCommand = args.Contains("--no-channel") ? null : [Environment.ProcessPath!, "peers"],
         Log = ServiceLog.Info,
     }),
     new KimiAdapter(new KimiAdapterOptions { Log = ServiceLog.Info }),

@@ -142,7 +142,7 @@ public sealed class PeersTests
             var init = await mcp.SendRequestAsync("initialize", new JsonObject { ["protocolVersion"] = "2025-06-18", ["capabilities"] = new JsonObject() });
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "ask_agent" }, tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
+            CollectionAssert.AreEqual(new[] { "list_agents", "ask_agent", "reply" }, tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
 
             var listed = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_agents", ["arguments"] = new JsonObject() });
             StringAssert.Contains((string?)listed!["content"]![0]!["text"], "answering");
