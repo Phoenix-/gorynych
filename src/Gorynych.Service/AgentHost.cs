@@ -124,11 +124,13 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// <summary>The agent keeps nothing durable before a session's first prompt.</summary>
     public bool DraftsNotDurable => Flag(GorynychProtocol.CapDraftsNotDurable);
 
-    /// <summary>The idle time the adapter asks for its sessions, or null for the service's own.</summary>
+    /// <summary>The idle time the adapter asks for its sessions (at most a day), or null for the service's own.</summary>
     public TimeSpan? UnloadAfter =>
         Info?.AgentCapabilities?.Meta?[GorynychProtocol.CapUnloadAfter] is JsonValue v && v.TryGetValue<double>(out var seconds) && seconds >= 0
-            ? TimeSpan.FromSeconds(seconds)
+            ? TimeSpan.FromSeconds(Math.Min(seconds, MaxUnloadAfter.TotalSeconds))
             : null;
+
+    static readonly TimeSpan MaxUnloadAfter = TimeSpan.FromDays(1);
 
     bool Flag(string key) => Info?.AgentCapabilities?.Meta?[key] is JsonValue v && v.TryGetValue<bool>(out var on) && on;
 

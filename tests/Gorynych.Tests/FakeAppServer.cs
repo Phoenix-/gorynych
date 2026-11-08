@@ -13,7 +13,10 @@ namespace Gorynych.Tests;
 /// gorynych tool call (asking first), <c>think</c> reasoning, <c>plan</c> a plan, <c>usage</c>
 /// token usage, <c>name</c> a generated title, <c>ask</c> request_user_input, <c>slow</c> a command
 /// whose approval waits until the turn is interrupted, <c>fail</c> a failed turn; anything else
-/// answers "ok".
+/// answers "ok". Also: <c>wait</c> runs until interrupted, <c>stuck</c> never ends, not even when
+/// interrupted, <c>closed</c> unloads the thread mid-turn (<c>thread/closed</c>), <c>perm</c> asks for
+/// more permissions until answered or interrupted, <c>form</c> is an MCP server's own form, and
+/// <c>late</c> sends a file change's approval before its <c>item/started</c>.
 /// </summary>
 sealed class FakeAppServer
 {
@@ -73,10 +76,13 @@ sealed class FakeAppServer
         lock (calls) return calls.Where(c => c.Method == method).Select(c => c.Params).ToArray();
     }
 
+    /// <summary>When set, <c>turn/start</c> answers only once it completes.</summary>
+    public TaskCompletionSource? HoldTurnStart { get; set; }
+
     /// <summary>A thread made earlier in Codex itself, with a turn of history.</summary>
-    public FakeThread Existing(string id, string cwd, string? name = null, bool archived = false, bool openElsewhere = false)
+    public FakeThread Existing(string id, string cwd, string? name = null, bool archived = false, bool openElsewhere = false, JsonObject? settings = null)
     {
-        var t = new FakeThread { Id = id, Cwd = cwd, Name = name, Archived = archived, Durable = true, OpenElsewhere = openElsewhere };
+        var t = new FakeThread { Id = id, Cwd = cwd, Name = name, Archived = archived, Durable = true, OpenElsewhere = openElsewhere, Settings = settings ?? DefaultSettings() };
         t.Items.Add(("turn-0", new JsonObject
         {
             ["type"] = "userMessage", ["id"] = $"{id}-u1", ["clientId"] = null,
@@ -102,11 +108,17 @@ sealed class FakeAppServer
 
     // ---------------------------------------------------------------- requests from the adapter
 
-    Task<JsonNode?> HandleAsync(JsonRpcRequest request, CancellationToken ct)
+    async Task<JsonNode?> HandleAsync(JsonRpcRequest request, CancellationToken ct)
     {
         var p = request.Params as JsonObject ?? [];
         lock (calls) calls.Add((request.Method, (JsonObject)p.DeepClone()));
-        switch (request.Method)
+        if (request.Method == "turn/start" && HoldTurnStart is { } hold) await hold.Task;
+        return await AnswerAsync(request.Method, p);
+    }
+
+    Task<JsonNode?> AnswerAsync(string method, JsonObject p)
+    {
+        switch (method)
         {
             case "initialize":
                 return Done(new JsonObject { ["userAgent"] = "fake/0.167.0", ["codexHome"] = "C:\\fake", ["platformFamily"] = "windows", ["platformOs"] = "windows" });
@@ -196,7 +208,7 @@ sealed class FakeAppServer
                 if (interrupts.TryGetValue((string)p["turnId"]!, out var stop)) stop.TrySetResult();
                 return Done(new JsonObject());
             default:
-                throw new JsonRpcException(JsonRpcException.MethodNotFound, $"fake app-server: {request.Method}");
+                throw new JsonRpcException(JsonRpcException.MethodNotFound, $"fake app-server: {method}");
         }
     }
 
@@ -298,7 +310,7 @@ sealed class FakeAppServer
             var asking = Ask("item/commandExecution/requestApproval", new JsonObject
             {
                 ["threadId"] = t.Id, ["turnId"] = turnId, ["itemId"] = id, ["startedAtMs"] = 1, ["command"] = "\"pwsh.exe\" -Command \"cmd /c echo hi\"",
-                ["cwd"] = t.Cwd, ["reason"] = null,
+                ["cwd"] = t.Cwd, ["reason"] = null, ["commandActions"] = Command(id, t.Cwd, "inProgress", null)["commandActions"]!.DeepClone(),
                 ["availableDecisions"] = new JsonArray("accept", new JsonObject
                 {
                     ["acceptWithExecpolicyAmendment"] = new JsonObject { ["execpolicy_amendment"] = new JsonArray("cmd", "/c", "echo") },
@@ -332,11 +344,24 @@ sealed class FakeAppServer
                 ["type"] = "fileChange", ["id"] = id, ["status"] = s,
                 ["changes"] = new JsonArray(new JsonObject { ["path"] = Path.Combine(t.Cwd, "note.txt"), ["kind"] = new JsonObject { ["type"] = "add" }, ["diff"] = "hi\n" }),
             };
-            await Notify("item/started", new JsonObject { ["threadId"] = t.Id, ["turnId"] = turnId, ["item"] = Change("inProgress"), ["startedAtMs"] = 1 });
-            var decision = (string?)(await Ask("item/fileChange/requestApproval", new JsonObject
+            Task<JsonNode?> Approval() => Ask("item/fileChange/requestApproval", new JsonObject
             {
                 ["threadId"] = t.Id, ["turnId"] = turnId, ["itemId"] = id, ["startedAtMs"] = 1, ["reason"] = null, ["grantRoot"] = null,
-            }))?["decision"];
+            });
+            Task<JsonNode?> asking;
+            if (text.Contains("late"))
+            {
+                // the approval overtakes the item: app-server's requests and notifications are handled apart
+                asking = Approval();
+                await Task.Delay(100);
+                await Notify("item/started", new JsonObject { ["threadId"] = t.Id, ["turnId"] = turnId, ["item"] = Change("inProgress"), ["startedAtMs"] = 1 });
+            }
+            else
+            {
+                await Notify("item/started", new JsonObject { ["threadId"] = t.Id, ["turnId"] = turnId, ["item"] = Change("inProgress"), ["startedAtMs"] = 1 });
+                asking = Approval();
+            }
+            var decision = (string?)(await asking)?["decision"];
             await Notify("item/completed", new JsonObject
             {
                 ["threadId"] = t.Id, ["turnId"] = turnId, ["completedAtMs"] = 2, ["item"] = Change(decision is "accept" or "acceptForSession" ? "completed" : "declined"),
@@ -395,6 +420,44 @@ sealed class FakeAppServer
         {
             t.Name = "Generated title";
             await Notify("thread/name/updated", new JsonObject { ["threadId"] = t.Id, ["threadName"] = t.Name });
+        }
+        if (text.Contains("form"))
+        {
+            var answered = await Ask("mcpServer/elicitation/request", new JsonObject
+            {
+                ["threadId"] = t.Id, ["turnId"] = turnId, ["serverName"] = "other-tool", ["mode"] = "form", ["message"] = "Which branch?",
+                ["requestedSchema"] = new JsonObject
+                {
+                    ["type"] = "object", ["properties"] = new JsonObject { ["branch"] = new JsonObject { ["type"] = "string", ["title"] = "Branch" } },
+                },
+            });
+            answer = "branch " + ((string?)answered?["content"]?["branch"] ?? "none");
+        }
+        if (text.Contains("perm"))
+        {
+            var asking = Ask("item/permissions/requestApproval", new JsonObject
+            {
+                ["threadId"] = t.Id, ["turnId"] = turnId, ["itemId"] = $"perm-{turnId}", ["startedAtMs"] = 1, ["cwd"] = t.Cwd, ["reason"] = "Fetch the docs",
+                ["permissions"] = new JsonObject { ["network"] = new JsonObject { ["enabled"] = true } },
+            });
+            if (await Task.WhenAny(asking, interrupts[turnId].Task) != asking)
+            {
+                await Notify("serverRequest/resolved", new JsonObject { ["threadId"] = t.Id, ["requestId"] = LastRequestId });
+                status = "interrupted";
+            }
+            else answer = "scope " + (string?)(await asking)?["scope"];
+        }
+        if (text.Contains("wait"))
+        {
+            await interrupts[turnId].Task;
+            status = "interrupted";
+        }
+        if (text.Contains("stuck")) await new TaskCompletionSource().Task; // never ends, interrupted or not
+        if (text.Contains("closed"))
+        {
+            t.Loaded = false;
+            await Notify("thread/closed", new JsonObject { ["threadId"] = t.Id });
+            return; // and no turn/completed
         }
         if (text.Contains("fail"))
         {

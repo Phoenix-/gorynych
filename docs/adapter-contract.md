@@ -289,6 +289,9 @@ in the middle of one.
 - The adapter SHOULD implement `session/close` (`sessionCapabilities.close`): it stops the
   session's turn and frees what the session holds (Claude's process), and the session stays
   listed and can be opened again.
+- A prompt still running when its session is closed, deleted or unloaded by the agent MUST
+  end (`cancelled`), even when the agent never reports the turn's end; a cancel that comes
+  before the agent has named the turn MUST still stop it. (Codex)
 - The service sends it to unload a session that has been idle with no client attached for its
   idle time (`--unload-after`): one a client let go of, with `session/close` or by
   disconnecting without it (Zed when it quits), and one the service woke for service turns
@@ -322,7 +325,8 @@ in the middle of one.
 - An adapter MUST NOT offer an approval option whose effect is written to the agent's own
   configuration or kept beyond the session (Codex's exec-policy and network amendments, which
   go to `~/.codex/rules/default.rules`, and MCP's `persist: always`). `allow_always` then means
-  "for this session". (Codex) The service
+  "for this session". (Codex) An option ID the adapter did not offer MUST count as a refusal,
+  never as an approval. (Codex) The service
   relays each to the client that attached to the session last, waits while none is attached,
   and asks the next client if one goes away before answering.
 - When the agent abandons a question, the adapter SHOULD withdraw it with `$/cancel_request`;
@@ -410,7 +414,7 @@ Codex 0.167.0 as built and probed on 8 November 2026 ([adapters.md](adapters.md#
 | Approvals ([§8](#8-approvals-and-forms)) | PermissionRequest hook; pre-allows the three tools | Kimi's own `session/request_permission`; the service pre-allows | command, file change, permissions and MCP tool approvals; no option that writes `~/.codex`; the gorynych tools ask the person | unknown |
 | Forms | `AskUserQuestion` as `elicitation/create` | none seen | `item/tool/requestUserInput` and MCP form elicitations as `elicitation/create`; URL elicitations declined | unknown |
 | Titles ([§9](#9-titles)) | `ai-title` / `custom-title` from the transcript; no way to set one | the first prompt, cut at 200 characters; no way to set one | `thread/name/updated`; `_gorynych/set_title` → `thread/name/set` for spawn names | its own |
-| Close ([§7](#7-closing-and-unloading)) | ends the process | `session/close`, still listed | `turn/interrupt`, then `thread/unsubscribe` (unloads an idle thread at once) | frees nothing native |
+| Close ([§7](#7-closing-and-unloading)) | ends the process | `session/close`, still listed | `turn/interrupt`, up to 5 s for the turn to end, then `thread/unsubscribe` (unloads an idle thread at once) | frees nothing native |
 | Delete ([§10](#10-delete)) | none: a tombstone | `session/delete` (`-32602` for an unknown one) | `thread/delete` (also deletes Codex's own sub-agent threads); a thread Codex lacks: `-32002` | its own store |
 | Archive ([§11](#11-archive)) | none: the overlay | native in Kimi's UI, not in `kimi acp`: the overlay | native, but an archived thread cannot be resumed: the overlay; Codex-archived threads left out | none: the overlay |
 

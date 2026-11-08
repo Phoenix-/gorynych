@@ -108,19 +108,22 @@ static class CodexMap
     /// <summary>How an MCP tool is named in a tool call and its approval: <c>&lt;tool&gt; (&lt;server&gt;)</c>, as Claude's titles are.</summary>
     public static string McpTitle(string server, string tool) => $"{tool} ({server})";
 
-    static string CommandTitle(CommandExecutionThreadItem c)
+    static string CommandTitle(CommandExecutionThreadItem c) => CommandTitle(c.Command, c.CommandActions);
+
+    /// <summary>A command's title from what Codex parsed of it; its approval request carries the same as its item.</summary>
+    public static string CommandTitle(string command, List<CommandAction> actions)
     {
-        if (c.CommandActions.Count == 1)
+        if (actions.Count == 1)
         {
-            switch (c.CommandActions[0])
+            switch (actions[0])
             {
                 case ReadCommandAction r: return $"Read {r.Name}";
                 case ListFilesCommandAction l: return l.Path is { Length: > 0 } p ? $"List {p}" : "List files";
                 case SearchCommandAction s: return s.Query is { Length: > 0 } q ? $"Search {q}" + (s.Path is { Length: > 0 } sp ? $" in {sp}" : "") : "Search";
             }
         }
-        var commands = c.CommandActions.Select(CommandOf).Where(x => x.Length > 0).ToList();
-        return commands.Count > 0 ? string.Join(" && ", commands) : c.Command;
+        var commands = actions.Select(CommandOf).Where(x => x.Length > 0).ToList();
+        return commands.Count > 0 ? string.Join(" && ", commands) : command;
     }
 
     static string CommandOf(CommandAction a) => a switch
@@ -132,9 +135,11 @@ static class CodexMap
         _ => "",
     };
 
-    static ToolKind CommandKind(CommandExecutionThreadItem c) =>
-        c.CommandActions.Count > 0 && c.CommandActions.All(a => a is ReadCommandAction) ? ToolKind.Read
-        : c.CommandActions.Count > 0 && c.CommandActions.All(a => a is ReadCommandAction or ListFilesCommandAction or SearchCommandAction) ? ToolKind.Search
+    static ToolKind CommandKind(CommandExecutionThreadItem c) => CommandKind(c.CommandActions);
+
+    public static ToolKind CommandKind(List<CommandAction> actions) =>
+        actions.Count > 0 && actions.All(a => a is ReadCommandAction) ? ToolKind.Read
+        : actions.Count > 0 && actions.All(a => a is ReadCommandAction or ListFilesCommandAction or SearchCommandAction) ? ToolKind.Search
         : ToolKind.Execute;
 
     public static string FileChangeTitle(FileChangeThreadItem f) => f.Changes.Count switch
@@ -215,34 +220,56 @@ static class CodexMap
 
     // ---------------------------------------------------------------- settings
 
-    /// <summary>A thread's settings as the adapter shows and changes them.</summary>
-    public sealed record CodexSettings(string? Model, string? Effort, string ApprovalPolicy, string Sandbox, string Reviewer);
+    /// <summary>
+    /// A thread's settings as Codex reports them. The approval policy and the sandbox are kept as
+    /// Codex's own values (a granular policy object, a sandbox with its writable roots and network
+    /// access), so that whatever goes back to Codex is what it gave.
+    /// </summary>
+    public sealed record CodexSettings(string? Model, string? Effort, JsonNode? ApprovalPolicy, SandboxPolicy? Sandbox, string Reviewer)
+    {
+        /// <summary>The approval policy's name; <c>granular</c> for Codex's per-kind policy object.</summary>
+        public string Policy => ApprovalPolicy is JsonValue v && v.TryGetValue<string>(out var p) ? p : "granular";
 
-    public static CodexSettings SettingsOf(string model, string? effort, JsonNode approvalPolicy, SandboxPolicy sandbox, ApprovalsReviewer reviewer) =>
-        new(model, effort, approvalPolicy is JsonValue v && v.TryGetValue<string>(out var p) ? p : "granular", sandbox.Tag ?? "", reviewer.Value);
+        public string SandboxType => Sandbox?.Tag ?? "unknown";
+    }
+
+    /// <summary>
+    /// What a client changed since a thread's last turn, sent with the next one: only these fields
+    /// go to Codex, and a mode sends its approval policy, sandbox and reviewer.
+    /// </summary>
+    public sealed record CodexChange(string? Model = null, string? Effort = null, CodexMode? Mode = null)
+    {
+        public bool IsEmpty => Model is null && Effort is null && Mode is null;
+    }
+
+    public sealed record CodexMode(string Id, string Name, string Description, string Policy, string Sandbox, string Reviewer);
+
+    public static CodexSettings SettingsOf(string model, string? effort, JsonNode? approvalPolicy, SandboxPolicy? sandbox, ApprovalsReviewer reviewer) =>
+        new(model, effort, approvalPolicy?.DeepClone(), sandbox, reviewer.Value ?? "user");
 
     /// <summary>
     /// Codex's permission presets, as the <c>mode</c> option: approval policy, sandbox and approval
     /// reviewer. "Approve for me" is Codex's automatic reviewer (<c>approvalsReviewer: auto_review</c>),
     /// a per-thread setting of app-server.
     /// </summary>
-    public static readonly (string Id, string Name, string Description, string Policy, string Sandbox, string Reviewer)[] Modes =
+    public static readonly CodexMode[] Modes =
     [
-        ("read-only", "Read only", "Codex reads files and asks before anything else.", "on-request", "readOnly", "user"),
-        ("auto", "Auto", "Codex works in this folder and asks before going outside it.", "on-request", "workspaceWrite", "user"),
-        ("auto-review", "Approve for me", "As Auto, but Codex's automatic reviewer answers its questions instead of you.", "on-request", "workspaceWrite", "auto_review"),
-        ("full-access", "Full access", "Codex runs anything without asking, outside this folder too.", "never", "dangerFullAccess", "user"),
+        new("read-only", "Read only", "Codex reads files and asks before anything else.", "on-request", "readOnly", "user"),
+        new("auto", "Auto", "Codex works in this folder and asks before going outside it.", "on-request", "workspaceWrite", "user"),
+        new("auto-review", "Approve for me", "As Auto, but Codex's automatic reviewer answers its questions instead of you.", "on-request", "workspaceWrite", "auto_review"),
+        new("full-access", "Full access", "Codex runs anything without asking, outside this folder too.", "never", "dangerFullAccess", "user"),
     ];
 
     public static string ModeOf(CodexSettings s) =>
-        Modes.FirstOrDefault(m => m.Policy == s.ApprovalPolicy && m.Sandbox == s.Sandbox && m.Reviewer == s.Reviewer).Id ?? "custom";
+        Modes.FirstOrDefault(m => m.Policy == s.Policy && m.Sandbox == s.SandboxType && m.Reviewer == s.Reviewer)?.Id ?? "custom";
 
-    public static SandboxPolicy SandboxOf(string type) => type switch
+    /// <summary>Codex's default sandbox of a type, or null for a type the presets do not use.</summary>
+    public static SandboxPolicy? SandboxOf(string type) => type switch
     {
         "readOnly" => new ReadOnlySandboxPolicy(),
         "workspaceWrite" => new WorkspaceWriteSandboxPolicy(),
         "dangerFullAccess" => new DangerFullAccessSandboxPolicy(),
-        _ => throw new ArgumentException(type),
+        _ => null,
     };
 
     /// <summary>The ACP config options of a thread: its permission mode, model and reasoning effort.</summary>
@@ -254,7 +281,7 @@ static class CodexMap
             modes.Add(new SessionConfigSelectOption
             {
                 Value = "custom", Name = "Your Codex settings",
-                Description = $"approval {s.ApprovalPolicy}, sandbox {s.Sandbox}, reviewer {s.Reviewer}",
+                Description = $"approval {s.Policy}, sandbox {s.SandboxType}, reviewer {s.Reviewer}",
             });
         var options = new List<SessionConfigOption>
         {

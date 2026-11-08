@@ -239,8 +239,8 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 | `session/list` | `thread/list {cwd, cursor, limit 50, archived: false, sortKey: updated_at, useStateDbOnly: true}`; `title` is the thread's `name` (none until a name is set or generated: the service shows its provisional title), `updatedAt` from unix seconds |
 | `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}` |
 | `session/load` | the same, then the history from `thread/items/list`, page by page, as the updates below (only for a thread the journal has not seen: one made in Codex's own apps) |
-| `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), then `thread/unsubscribe`, which unloads an idle thread at once |
-| `session/delete` | `thread/delete`; a thread Codex no longer has answers `-32002` |
+| `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), up to 5 s for the turn to end, then `thread/unsubscribe`, which unloads an idle thread at once. A turn that has not ended by then ends `cancelled`: Codex sends nothing more of an unsubscribed thread |
+| `session/delete` | stops a running turn as `session/close` does, then `thread/delete`; a thread Codex no longer has answers `-32002` |
 | `_gorynych/set_title` | `thread/name/set` (works before the first turn too) |
 
 - **The `gorynych` server** goes in `config.mcp_servers` of `thread/start` and of every
@@ -286,6 +286,13 @@ over app-server's JSON-RPC. The design and the probes behind it are in
   `failed` → the prompt fails with Codex's message (a context-window error → `max_tokens`).
   `session/cancel` is `turn/interrupt`; Codex then settles a pending approval itself
   (`serverRequest/resolved`), and the adapter withdraws it from the client.
+- **A cancel is never lost.** One that comes before Codex has named the turn (while
+  `turn/start` is on its way, or before the prompt's handler has run: the adapter compares the
+  cancel's place in the ACP stream with the prompt's) interrupts the turn as soon as
+  `turn/started` or `turn/start`'s answer names it. `turn/start` is always waited for, so no
+  turn runs on that the adapter does not know.
+- **Every turn ends.** When Codex unloads the thread mid-turn (`thread/closed`, status
+  `notLoaded`), the turn ends `cancelled`; when app-server stops, the prompt fails.
 - Codex's own user message items are not echoed (ACP).
 
 | Codex | ACP `session/update` |
@@ -320,6 +327,15 @@ All approvals are `session/request_permission` on the item's tool call:
   `<tool> (<server>)`, which the service does not answer itself. Codex can also allow a
   server's tools without asking (`default_tools_approval_mode: "approve"`, verified per thread),
   and whether to use it is left for a pass over the permissions of all harnesses.
+- **Only what was offered.** An `optionId` the adapter did not offer counts as the first "deny"
+  option (`decline`, or deny for a permissions request), never as an approval.
+- **Withdrawn**, each request answers its own "nothing granted": `{decision: cancel}` for a
+  command or file change, `{permissions: {}, scope: turn}` for permissions, `{action: cancel}`
+  for an MCP elicitation, `{answers: {}}` for Codex's questions.
+- **Titles.** A command's approval is titled from the request's own `commandActions`. A file
+  change's request names only its item, and an MCP tool's approval names no item; app-server's
+  requests are handled apart from its notifications, so the adapter waits up to a second for
+  the item's `item/started` before falling back to a generic title.
 - `item/tool/requestUserInput` (Codex's own questions) and an MCP server's form elicitation are
   `elicitation/create` forms; a URL elicitation is declined.
 
@@ -340,6 +356,14 @@ ACP config options, applied with the next `turn/start`, which Codex keeps for la
 - `reasoning_effort`: the selected model's efforts.
 - A new thread takes the user's own defaults (here `gpt-6.1-sol`, effort `xhigh`); the adapter
   overrides nothing until the person changes an option.
+- **Only what the person changed** goes with the next `turn/start`: a model or an effort alone,
+  or a mode's approval policy, sandbox and reviewer. The adapter keeps Codex's own values: a
+  granular approval policy or an external sandbox is never sent back as a name, and a mode
+  whose sandbox type the thread already has sends the thread's own sandbox, with its writable
+  roots and network access (or the one it had before, when switching back).
+- A model or effort Codex does not list is refused at once. Should Codex still refuse a turn
+  carrying a change, the change is dropped and the options are reset, so it cannot fail the
+  turns after it.
 
 ### Not done yet
 

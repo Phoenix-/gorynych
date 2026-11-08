@@ -9,23 +9,220 @@ using static Gorynych.Adapters.Codex.CodexMap;
 
 namespace Gorynych.Adapters.Codex;
 
-/// <summary>A Codex thread as the adapter knows it in this app-server process.</summary>
-sealed class CodexThread(string id, CodexSettings settings)
+/// <summary>
+/// A Codex thread as the adapter knows it in this app-server process. The ACP side and
+/// app-server's notifications and requests touch it from different tasks, so its state is under
+/// one lock; the private helpers expect it held.
+/// </summary>
+sealed class CodexThread
 {
-    public string Id { get; } = id;
-    public volatile bool Loaded = true;
-
-    /// <summary>The thread's settings, and those changed since its last turn, which go with the next one.</summary>
-    public CodexSettings Settings = settings;
-    public CodexSettings? Pending;
-
-    /// <summary>The running turn: its ID and its end.</summary>
-    public string? TurnId;
-    public TaskCompletionSource<Turn>? Turn;
-
     readonly Lock gate = new();
+
+    CodexSettings settings;
+    CodexChange? pending;
+    readonly Dictionary<string, SandboxPolicy> sandboxes = new(StringComparer.Ordinal);
+
+    TaskCompletionSource<Turn>? turn;
+    string? turnId;
+    bool stopAsked;
+    long cancelledAt;
+
     readonly HashSet<string> streamed = [];
     readonly Dictionary<string, ThreadItem> tools = [];
+    readonly HashSet<string> claimed = [];
+    TaskCompletionSource itemStarted = Signal();
+
+    public CodexThread(string id, CodexSettings settings)
+    {
+        Id = id;
+        this.settings = settings;
+        Remember(settings.Sandbox);
+    }
+
+    public string Id { get; }
+    public volatile bool Loaded = true;
+
+    static TaskCompletionSource Signal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    // ---------------------------------------------------------------- settings
+
+    /// <summary>The thread's settings as Codex last reported them.</summary>
+    public CodexSettings Settings
+    {
+        get { lock (gate) return settings; }
+    }
+
+    /// <summary>What a client changed since the last turn, which goes with the next one.</summary>
+    public CodexChange? Pending
+    {
+        get { lock (gate) return pending; }
+    }
+
+    /// <summary>The settings as the client sees them: Codex's, with the pending change.</summary>
+    public CodexSettings Effective
+    {
+        get { lock (gate) return Apply(settings, pending); }
+    }
+
+    public void Reported(CodexSettings s)
+    {
+        lock (gate)
+        {
+            settings = s;
+            Remember(s.Sandbox);
+        }
+    }
+
+    /// <summary>
+    /// A client's change, edited from the settings it sees and the pending change; what the
+    /// thread's own settings already are is left out of it. Returns the settings it now sees.
+    /// </summary>
+    public CodexSettings Change(Func<CodexSettings, CodexChange, CodexChange> edit)
+    {
+        lock (gate)
+        {
+            var next = edit(Apply(settings, pending), pending ?? new CodexChange());
+            if (next.Model == settings.Model) next = next with { Model = null };
+            if (next.Effort == settings.Effort) next = next with { Effort = null };
+            if (next.Mode is { } m && ModeOf(settings) == m.Id) next = next with { Mode = null };
+            pending = next.IsEmpty ? null : next;
+            return Apply(settings, pending);
+        }
+    }
+
+    /// <summary>A turn carrying this change started: Codex keeps a turn's overrides for the turns after it.</summary>
+    public void Applied(CodexChange change)
+    {
+        lock (gate)
+        {
+            settings = Apply(settings, change);
+            Remember(settings.Sandbox);
+            if (ReferenceEquals(pending, change)) pending = null;
+        }
+    }
+
+    /// <summary>Codex refused a turn carrying this change: it is dropped, so it cannot fail every turn after.</summary>
+    public void Refused(CodexChange change)
+    {
+        lock (gate)
+            if (ReferenceEquals(pending, change)) pending = null;
+    }
+
+    /// <summary>
+    /// The sandbox a mode sends: the thread's own when it is of that type, so its writable roots
+    /// and network access stay; else one this thread had before; else Codex's default.
+    /// </summary>
+    public SandboxPolicy? SandboxFor(string type)
+    {
+        lock (gate) return SandboxForCore(type);
+    }
+
+    SandboxPolicy? SandboxForCore(string type) =>
+        settings.Sandbox?.Tag == type ? settings.Sandbox : sandboxes.GetValueOrDefault(type) ?? SandboxOf(type);
+
+    CodexSettings Apply(CodexSettings s, CodexChange? c) => c is null ? s : s with
+    {
+        Model = c.Model ?? s.Model,
+        Effort = c.Effort ?? s.Effort,
+        ApprovalPolicy = c.Mode is { } m ? JsonValue.Create(m.Policy) : s.ApprovalPolicy,
+        Sandbox = c.Mode is { } mode ? SandboxForCore(mode.Sandbox) : s.Sandbox,
+        Reviewer = c.Mode?.Reviewer ?? s.Reviewer,
+    };
+
+    void Remember(SandboxPolicy? sandbox)
+    {
+        if (sandbox?.Tag is { } tag) sandboxes[tag] = sandbox;
+    }
+
+    // ---------------------------------------------------------------- the running turn
+
+    public TaskCompletionSource<Turn>? Turn
+    {
+        get { lock (gate) return turn; }
+    }
+
+    /// <summary>
+    /// Starts the turn of a prompt the ACP connection received as message <paramref name="sequence"/>;
+    /// null while another runs. A <c>session/cancel</c> received after the prompt but handled before
+    /// this (requests run apart from notifications) stops the turn as soon as Codex names it.
+    /// </summary>
+    public TaskCompletionSource<Turn>? Begin(long sequence)
+    {
+        lock (gate)
+        {
+            if (turn is not null) return null;
+            turn = new TaskCompletionSource<Turn>(TaskCreationOptions.RunContinuationsAsynchronously);
+            turnId = null;
+            stopAsked = cancelledAt > sequence;
+            streamed.Clear();
+            tools.Clear();
+            claimed.Clear();
+            return turn;
+        }
+    }
+
+    /// <summary>Codex named the running turn (<c>turn/started</c> or <c>turn/start</c>'s answer); true when a stop was asked before.</summary>
+    public bool Named(string id)
+    {
+        lock (gate)
+        {
+            if (turn is null || turnId is not null) return false;
+            turnId = id;
+            return stopAsked;
+        }
+    }
+
+    /// <summary>
+    /// A stop is asked (a cancel the ACP connection received as message <paramref name="sequence"/>,
+    /// a close, a delete). Returns whether a turn runs, and its ID to interrupt now; with no ID yet
+    /// it is interrupted when Codex names it.
+    /// </summary>
+    public (bool Running, string? TurnId) Stop(long sequence = 0)
+    {
+        lock (gate)
+        {
+            cancelledAt = Math.Max(cancelledAt, sequence);
+            if (turn is null) return (false, null);
+            stopAsked = true;
+            return (true, turnId);
+        }
+    }
+
+    public void Completed(Turn ended)
+    {
+        TaskCompletionSource<Turn>? done;
+        lock (gate) done = turnId is null || turnId == ended.Id ? turn : null;
+        done?.TrySetResult(ended);
+    }
+
+    /// <summary>Ends the running turn as interrupted: the thread was unloaded, closed or deleted, and no <c>turn/completed</c> will come.</summary>
+    public void Abandon()
+    {
+        TaskCompletionSource<Turn>? done;
+        string? id;
+        lock (gate) (done, id) = (turn, turnId);
+        done?.TrySetResult(new Turn { Id = id ?? "", Status = TurnStatus.Interrupted });
+    }
+
+    public void Fail(Exception e)
+    {
+        TaskCompletionSource<Turn>? done;
+        lock (gate) done = turn;
+        done?.TrySetException(e);
+    }
+
+    public void End(TaskCompletionSource<Turn> done)
+    {
+        lock (gate)
+        {
+            if (turn != done) return;
+            turn = null;
+            turnId = null;
+            stopAsked = false;
+        }
+    }
+
+    // ---------------------------------------------------------------- items
 
     /// <summary>Notes that an item's text came as deltas, so its completed text is not sent again; true the first time.</summary>
     public bool Streamed(string itemId)
@@ -38,25 +235,56 @@ sealed class CodexThread(string id, CodexSettings settings)
         lock (gate) return streamed.Contains(itemId);
     }
 
+    /// <summary>A tool-like item started; its approval may ask about it.</summary>
     public void Started(ThreadItem item, string id)
     {
-        lock (gate) tools[id] = item;
+        TaskCompletionSource signal;
+        lock (gate)
+        {
+            tools[id] = item;
+            (signal, itemStarted) = (itemStarted, Signal());
+        }
+        signal.TrySetResult();
     }
 
-    public ThreadItem? Tool(string id)
+    public void Finished(string id)
     {
-        lock (gate) return tools.GetValueOrDefault(id);
+        lock (gate) tools.Remove(id);
     }
 
-    /// <summary>The MCP tool call of this server and tool started last, for its approval.</summary>
-    public string? LastMcpCall(string server, string tool)
-    {
-        lock (gate) return tools.Values.OfType<McpToolCallThreadItem>().LastOrDefault(m => m.Server == server && m.Tool == tool)?.Id;
-    }
+    /// <summary>A started item, waiting up to <paramref name="wait"/> for it: app-server's requests are handled apart from its notifications, so its approval can come first.</summary>
+    public Task<ThreadItem?> ToolAsync(string id, TimeSpan wait, CancellationToken ct) =>
+        WaitAsync(() => tools.GetValueOrDefault(id), wait, ct);
 
-    public void NewTurn()
+    /// <summary>The running MCP call of this server and tool that no approval has named yet, waiting for it as <see cref="ToolAsync"/> does.</summary>
+    public Task<string?> McpCallAsync(string server, string tool, TimeSpan wait, CancellationToken ct) => WaitAsync(() =>
     {
-        lock (gate) { streamed.Clear(); tools.Clear(); }
+        var call = tools.Values.OfType<McpToolCallThreadItem>().FirstOrDefault(m => m.Server == server && m.Tool == tool && !claimed.Contains(m.Id));
+        if (call is not null) claimed.Add(call.Id);
+        return call?.Id;
+    }, wait, ct);
+
+    async Task<T?> WaitAsync<T>(Func<T?> find, TimeSpan wait, CancellationToken ct) where T : class
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(wait);
+        while (true)
+        {
+            Task signal;
+            lock (gate)
+            {
+                if (find() is { } found) return found;
+                signal = itemStarted.Task;
+            }
+            try
+            {
+                await signal.WaitAsync(timeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                return null;
+            }
+        }
     }
 }
 
@@ -177,14 +405,14 @@ sealed class CodexAgent : IAsyncDisposable
             {
                 var p = request.ParamsAs<ResumeSessionRequest>();
                 var t = await OpenAsync(p.SessionId, p.McpServers ?? [], p.SystemPrompt, ct);
-                return AcpJson.ToNode(new ResumeSessionResponse { ConfigOptions = ConfigOptions(t.Settings, models) });
+                return AcpJson.ToNode(new ResumeSessionResponse { ConfigOptions = ConfigOptions(t.Effective, models) });
             }
             case AcpMethods.Agent.SessionLoad:
             {
                 var p = request.ParamsAs<LoadSessionRequest>();
                 var t = await OpenAsync(p.SessionId, p.McpServers, p.SystemPrompt, ct);
                 await ReplayAsync(p.SessionId, ct);
-                return AcpJson.ToNode(new LoadSessionResponse { ConfigOptions = ConfigOptions(t.Settings, models) });
+                return AcpJson.ToNode(new LoadSessionResponse { ConfigOptions = ConfigOptions(t.Effective, models) });
             }
             case AcpMethods.Agent.SessionList:
                 return await ListAsync(request.ParamsAs<ListSessionsRequest>(), ct);
@@ -195,7 +423,7 @@ sealed class CodexAgent : IAsyncDisposable
                 await DeleteAsync(RequireId(request), ct);
                 return new JsonObject();
             case AcpMethods.Agent.SessionPrompt:
-                return await PromptAsync(request.ParamsAs<PromptRequest>(), ct);
+                return await PromptAsync(request, ct);
             case AcpMethods.Agent.SessionSetConfigOption:
                 return SetConfigOption(request.ParamsAs<SetSessionConfigOptionRequest>());
             case GorynychProtocol.MethodSetTitle:
@@ -213,8 +441,11 @@ sealed class CodexAgent : IAsyncDisposable
 
     async Task OnNotificationAsync(string method, JsonNode? @params)
     {
+        // Notifications are handled in order of arrival, prompts on their own tasks: the cancel's
+        // place in the stream tells which prompts it reaches (CodexThread.Begin).
+        var sequence = rpc.NotificationSequence;
         if (method == AcpMethods.Agent.SessionCancel && (string?)@params?["sessionId"] is { } id && threads.TryGetValue(id, out var t))
-            await InterruptAsync(t);
+            await StopAsync(t, sequence);
     }
 
     static string RequireId(JsonRpcRequest request) =>
@@ -329,19 +560,30 @@ sealed class CodexAgent : IAsyncDisposable
         });
     }
 
-    /// <summary>Closing stops the thread's turn (ACP), then unloads it from app-server.</summary>
+    /// <summary>
+    /// Closing stops the thread's turn (ACP), gives it a moment to end, then unloads the thread
+    /// from app-server. A turn that has not ended by then ends as cancelled: after unsubscribing,
+    /// no <c>turn/completed</c> comes for it.
+    /// </summary>
     async Task CloseAsync(string id, CancellationToken ct)
     {
         if (!threads.TryGetValue(id, out var t) || !t.Loaded) return;
-        await InterruptAsync(t);
+        await StopAsync(t);
+        await TurnEndAsync(t);
         await app.SendRequestAsync(CodexMethods.Client.ThreadUnsubscribe, ToNode(new ThreadUnsubscribeParams { ThreadId = id },
             CodexJsonContext.Default.ThreadUnsubscribeParams), ct);
         t.Loaded = false;
+        t.Abandon();
     }
 
     async Task DeleteAsync(string id, CancellationToken ct)
     {
-        if (threads.TryGetValue(id, out var t)) await InterruptAsync(t);
+        threads.TryGetValue(id, out var t);
+        if (t is not null)
+        {
+            await StopAsync(t);
+            await TurnEndAsync(t);
+        }
         try
         {
             await app.SendRequestAsync(CodexMethods.Client.ThreadDelete, ToNode(new ThreadDeleteParams { ThreadId = id },
@@ -352,51 +594,80 @@ sealed class CodexAgent : IAsyncDisposable
             throw Explain(e, id);
         }
         threads.TryRemove(id, out _);
+        if (t is not null)
+        {
+            t.Loaded = false;
+            t.Abandon();
+        }
     }
 
-    async Task<JsonNode?> PromptAsync(PromptRequest p, CancellationToken ct)
+    /// <summary>Waits a little for a stopped turn to end (<see cref="CodexAdapterOptions.TurnEndWait"/>).</summary>
+    async Task TurnEndAsync(CodexThread t)
     {
-        if (!threads.TryGetValue(p.SessionId, out var t) || !t.Loaded)
-            throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Codex has not loaded session {p.SessionId}; resume it first.");
-        if (t.Turn is not null) throw new JsonRpcException(JsonRpcException.InvalidRequest, "A turn of this session is still running.");
-        var input = p.Prompt.Select(InputOf).OfType<UserInput>().ToList();
-        if (input.Count == 0) throw new JsonRpcException(JsonRpcException.InvalidParams, "The prompt has no text.");
-        var start = new TurnStartParams
-        {
-            ThreadId = t.Id,
-            Input = input,
-            // The ID the service journals the text under: Codex keeps it with the message (clientId).
-            ClientUserMessageId = (string?)p.Meta?[GorynychProtocol.MetaMessageId],
-        };
-        var changed = t.Pending;
-        if (changed is not null)
-        {
-            start.ApprovalPolicy = JsonValue.Create(changed.ApprovalPolicy);
-            start.SandboxPolicy = SandboxOf(changed.Sandbox);
-            start.ApprovalsReviewer = ApprovalsReviewer.Create(changed.Reviewer);
-            start.Model = changed.Model;
-            start.Effort = changed.Effort;
-        }
-        var done = new TaskCompletionSource<Turn>(TaskCreationOptions.RunContinuationsAsynchronously);
-        t.NewTurn();
-        t.Turn = done;
+        if (t.Turn is not { } running) return;
         try
         {
-            var started = From(await app.SendRequestAsync(CodexMethods.Client.TurnStart, ToNode(start, CodexJsonContext.Default.TurnStartParams), ct),
-                CodexJsonContext.Default.TurnStartResponse);
-            t.TurnId ??= started.Turn.Id;
-            if (changed is not null)
+            await running.Task.WaitAsync(options.TurnEndWait);
+        }
+        catch (TimeoutException)
+        {
+            Log($"codex {t.Id}: the stopped turn did not end in {options.TurnEndWait.TotalSeconds:0.#} s; it ends as cancelled");
+        }
+        catch (Exception e) when (e is JsonRpcException or OperationCanceledException)
+        {
+            // it ended, failed
+        }
+    }
+
+    async Task<JsonNode?> PromptAsync(JsonRpcRequest request, CancellationToken ct)
+    {
+        var p = request.ParamsAs<PromptRequest>();
+        if (!threads.TryGetValue(p.SessionId, out var t) || !t.Loaded)
+            throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Codex has not loaded session {p.SessionId}; resume it first.");
+        var input = p.Prompt.Select(InputOf).OfType<UserInput>().ToList();
+        if (input.Count == 0) throw new JsonRpcException(JsonRpcException.InvalidParams, "The prompt has no text.");
+        var done = t.Begin(request.Sequence) ?? throw new JsonRpcException(JsonRpcException.InvalidRequest, "A turn of this session is still running.");
+        try
+        {
+            // A cancel during turn/start is applied once Codex names the turn; turn/start itself is
+            // always waited for, so no turn runs on that the adapter does not know.
+            await using var stop = ct.Register(() => _ = StopAsync(t));
+            var change = t.Pending;
+            var start = new TurnStartParams
             {
-                t.Settings = changed; // Codex keeps a turn's overrides for the turns after it
-                t.Pending = null;
+                ThreadId = t.Id,
+                Input = input,
+                // The ID the service journals the text under: Codex keeps it with the message (clientId).
+                ClientUserMessageId = (string?)p.Meta?[GorynychProtocol.MetaMessageId],
+                // Only what the client changed: the rest stays as the thread has it.
+                Model = change?.Model,
+                Effort = change?.Effort,
+            };
+            if (change?.Mode is { } mode)
+            {
+                start.ApprovalPolicy = JsonValue.Create(mode.Policy);
+                start.SandboxPolicy = t.SandboxFor(mode.Sandbox);
+                start.ApprovalsReviewer = ApprovalsReviewer.Create(mode.Reviewer);
             }
-            await using var stop = ct.Register(() => _ = InterruptAsync(t));
+            TurnStartResponse started;
+            try
+            {
+                started = From(await app.SendRequestAsync(CodexMethods.Client.TurnStart, ToNode(start, CodexJsonContext.Default.TurnStartParams), CancellationToken.None),
+                    CodexJsonContext.Default.TurnStartResponse);
+            }
+            catch (JsonRpcException e) when (change is not null)
+            {
+                t.Refused(change);
+                await Update(t.Id, new ConfigOptionUpdate { ConfigOptions = ConfigOptions(t.Effective, models) });
+                throw new JsonRpcException(e.Code, $"{e.Message} (Codex did not start the turn; the settings changed since the last turn were reset.)");
+            }
+            if (change is not null) t.Applied(change);
+            Named(t, started.Turn.Id);
             return AcpJson.ToNode(new PromptResponse { StopReason = StopOf(await done.Task) });
         }
         finally
         {
-            t.Turn = null;
-            t.TurnId = null;
+            t.End(done);
         }
     }
 
@@ -415,43 +686,67 @@ sealed class CodexAgent : IAsyncDisposable
         _ => throw new JsonRpcException(JsonRpcException.InternalError, turn.Error?.Message is { Length: > 0 } m ? m : "Codex failed the turn."),
     };
 
-    async Task InterruptAsync(CodexThread t)
+    /// <summary>
+    /// Stops the thread's running turn: interrupts it now when Codex has named it, else as soon as
+    /// it does. <paramref name="sequence"/> is the place of a <c>session/cancel</c> in the ACP stream.
+    /// </summary>
+    async Task StopAsync(CodexThread t, long sequence = 0)
     {
-        if (t.TurnId is not { } turnId || t.Turn is null) return;
+        var (running, turnId) = t.Stop(sequence);
+        if (turnId is not null) await InterruptAsync(t.Id, turnId);
+        else if (running) Log($"codex {t.Id}: stop asked before Codex named the turn; it is interrupted once named");
+    }
+
+    /// <summary>Codex named the running turn; interrupts it when a stop came first. Never waits: app-server's notifications call it.</summary>
+    void Named(CodexThread t, string turnId)
+    {
+        if (t.Named(turnId)) _ = InterruptAsync(t.Id, turnId);
+    }
+
+    async Task InterruptAsync(string threadId, string turnId)
+    {
         try
         {
-            await app.SendRequestAsync(CodexMethods.Client.TurnInterrupt, ToNode(new TurnInterruptParams { ThreadId = t.Id, TurnId = turnId },
+            await app.SendRequestAsync(CodexMethods.Client.TurnInterrupt, ToNode(new TurnInterruptParams { ThreadId = threadId, TurnId = turnId },
                 CodexJsonContext.Default.TurnInterruptParams));
         }
-        catch (Exception e) when (e is JsonRpcException or IOException)
+        catch (Exception e) when (e is JsonRpcException or IOException or ObjectDisposedException or OperationCanceledException)
         {
-            Log($"codex {t.Id}: interrupt: {e.Message}");
+            Log($"codex {threadId}: interrupt: {e.Message}");
         }
     }
 
+    /// <summary>
+    /// A client's choice. It is held for the next turn and sent alone: a model or effort sends
+    /// only that, a mode its approval policy, sandbox and reviewer. Values are checked against
+    /// what Codex offers, so a held change cannot fail the turns after it.
+    /// </summary>
     JsonNode? SetConfigOption(SetSessionConfigOptionRequest p)
     {
         if (p is not SetSessionConfigOptionRequestValueId { Value: var value })
             throw new JsonRpcException(JsonRpcException.InvalidParams, "Codex's options are selects.");
         if (!threads.TryGetValue(p.SessionId, out var t)) throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Unknown session {p.SessionId}");
-        var s = t.Pending ?? t.Settings;
-        s = p.ConfigId switch
+        var seen = t.Change((s, change) => p.ConfigId switch
         {
-            "mode" when value == "custom" => s,
-            "mode" => Modes.FirstOrDefault(m => m.Id == value) is { Id: not null } m
-                ? s with { ApprovalPolicy = m.Policy, Sandbox = m.Sandbox, Reviewer = m.Reviewer }
-                : throw new JsonRpcException(JsonRpcException.InvalidParams, $"No mode {value}"),
-            "model" => s with
+            // back to the thread's own settings
+            "mode" when value == "custom" => change with { Mode = null },
+            "mode" => change with { Mode = Modes.FirstOrDefault(m => m.Id == value) ?? throw new JsonRpcException(JsonRpcException.InvalidParams, $"No mode {value}") },
+            "model" => change with
             {
-                Model = value,
+                Model = models.Count == 0 || models.Any(m => m.Id == value) || value == s.Model
+                    ? value : throw new JsonRpcException(JsonRpcException.InvalidParams, $"Codex has no model {value}"),
                 Effort = models.FirstOrDefault(x => x.Id == value) is { } model && model.SupportedReasoningEfforts.All(e => e.ReasoningEffort != s.Effort)
-                    ? model.DefaultReasoningEffort : s.Effort,
+                    ? model.DefaultReasoningEffort : change.Effort,
             },
-            "reasoning_effort" => s with { Effort = value },
+            "reasoning_effort" => change with
+            {
+                Effort = value == s.Effort || models.FirstOrDefault(m => m.Id == s.Model) is not { } current
+                    || current.SupportedReasoningEfforts.Any(e => e.ReasoningEffort == value)
+                    ? value : throw new JsonRpcException(JsonRpcException.InvalidParams, $"{s.Model} has no reasoning effort {value}"),
+            },
             _ => throw new JsonRpcException(JsonRpcException.InvalidParams, $"No option {p.ConfigId}"),
-        };
-        t.Pending = s == t.Settings ? null : s;
-        return AcpJson.ToNode(new SetSessionConfigOptionResponse { ConfigOptions = ConfigOptions(s, models) });
+        });
+        return AcpJson.ToNode(new SetSessionConfigOptionResponse { ConfigOptions = ConfigOptions(seen, models) });
     }
 
     /// <summary>
@@ -500,6 +795,13 @@ sealed class CodexAgent : IAsyncDisposable
 
     CodexThread? Thread(string id) => threads.GetValueOrDefault(id);
 
+    void Unloaded(CodexThread t)
+    {
+        t.Loaded = false;
+        if (t.Turn is not null) Log($"codex {t.Id}: Codex unloaded the thread during a turn; the turn ends as cancelled");
+        t.Abandon();
+    }
+
     Task Update(string threadId, SessionUpdate update) => rpc.SendUpdateAsync(threadId, update);
 
     async Task OnServerNotificationAsync(string method, JsonNode? p)
@@ -522,13 +824,13 @@ sealed class CodexAgent : IAsyncDisposable
             case CodexMethods.Notification.TurnStarted:
             {
                 var n = From(p, ctx.TurnStartedNotification);
-                if (Thread(n.ThreadId) is { } t) t.TurnId = n.Turn.Id;
+                if (Thread(n.ThreadId) is { } t) Named(t, n.Turn.Id);
                 break;
             }
             case CodexMethods.Notification.TurnCompleted:
             {
                 var n = From(p, ctx.TurnCompletedNotification);
-                Thread(n.ThreadId)?.Turn?.TrySetResult(n.Turn);
+                Thread(n.ThreadId)?.Completed(n.Turn);
                 break;
             }
             case CodexMethods.Notification.ItemStarted:
@@ -556,7 +858,11 @@ sealed class CodexAgent : IAsyncDisposable
                         await Update(n.ThreadId, new SessionUpdateAgentThoughtChunk { Content = new TextContent { Text = text }, MessageId = r.Id });
                         break;
                     default:
-                        if (ToolCallDoneOf(n.Item) is { } done) await Update(n.ThreadId, done);
+                        if (ToolCallDoneOf(n.Item) is { } done)
+                        {
+                            t?.Finished(done.ToolCallId);
+                            await Update(n.ThreadId, done);
+                        }
                         break;
                 }
                 break;
@@ -635,20 +941,21 @@ sealed class CodexAgent : IAsyncDisposable
                 var n = From(p, ctx.ThreadSettingsUpdatedNotification);
                 if (Thread(n.ThreadId) is not { } t) break;
                 var s = n.ThreadSettings;
-                t.Settings = SettingsOf(s.Model, s.Effort, s.ApprovalPolicy, s.SandboxPolicy, s.ApprovalsReviewer);
-                await Update(n.ThreadId, new ConfigOptionUpdate { ConfigOptions = ConfigOptions(t.Pending ?? t.Settings, models) });
+                t.Reported(SettingsOf(s.Model, s.Effort, s.ApprovalPolicy, s.SandboxPolicy, s.ApprovalsReviewer));
+                await Update(n.ThreadId, new ConfigOptionUpdate { ConfigOptions = ConfigOptions(t.Effective, models) });
                 break;
             }
             case CodexMethods.Notification.ThreadStatusChanged:
             {
+                // Codex unloaded the thread: a turn still running ends, as no turn/completed comes for it.
                 var n = From(p, ctx.ThreadStatusChangedNotification);
-                if (n.Status is NotLoadedThreadStatus && Thread(n.ThreadId) is { } t) t.Loaded = false;
+                if (n.Status is NotLoadedThreadStatus && Thread(n.ThreadId) is { } t) Unloaded(t);
                 break;
             }
             case CodexMethods.Notification.ThreadClosed:
             {
                 var n = From(p, ctx.ThreadClosedNotification);
-                if (Thread(n.ThreadId) is { } t) t.Loaded = false;
+                if (Thread(n.ThreadId) is { } t) Unloaded(t);
                 break;
             }
             case CodexMethods.Notification.ServerRequestResolved:
@@ -688,9 +995,14 @@ sealed class CodexAgent : IAsyncDisposable
         }
         catch (OperationCanceledException) when (resolved.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            return request.Method == CodexMethods.Server.McpServerElicitationRequest || request.Method == CodexMethods.Server.ItemToolRequestUserInput
-                ? new JsonObject { ["action"] = "cancel", ["answers"] = new JsonObject() }
-                : new JsonObject { ["decision"] = "cancel" };
+            // Withdrawn: each request's own "nothing granted".
+            return request.Method switch
+            {
+                CodexMethods.Server.McpServerElicitationRequest => new JsonObject { ["action"] = "cancel" },
+                CodexMethods.Server.ItemToolRequestUserInput => new JsonObject { ["answers"] = new JsonObject() },
+                CodexMethods.Server.ItemPermissionsRequestApproval => NoPermissions(),
+                _ => new JsonObject { ["decision"] = "cancel" },
+            };
         }
         finally
         {
@@ -698,25 +1010,40 @@ sealed class CodexAgent : IAsyncDisposable
         }
     }
 
+    /// <summary>How long an approval waits for the item it is about (<see cref="CodexThread.ToolAsync"/>).</summary>
+    static readonly TimeSpan ItemWait = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Asks the client. Returns the option chosen, null when the client cancelled, and the first
+    /// "reject once" option for an option that was not offered.
+    /// </summary>
     async Task<string?> AskAsync(string threadId, ToolCallUpdate call, List<PermissionOption> options, CancellationToken ct)
     {
         var answer = await rpc.RequestAsync<RequestPermissionRequest, RequestPermissionResponse>(AcpMethods.Client.SessionRequestPermission,
             new RequestPermissionRequest { SessionId = threadId, ToolCall = call, Options = options }, ct);
-        return answer.Outcome is SelectedPermissionOutcome s ? s.OptionId : null;
+        if (answer.Outcome is not SelectedPermissionOutcome s) return null;
+        if (options.Any(o => o.OptionId == s.OptionId)) return s.OptionId;
+        var reject = options.FirstOrDefault(o => o.Kind == PermissionOptionKind.RejectOnce)?.OptionId;
+        Log($"codex {threadId}: the client chose {s.OptionId}, which was not offered; answered {reject ?? "as cancelled"}");
+        return reject;
     }
 
     async Task<JsonNode?> CommandApprovalAsync(JsonNode? @params, CancellationToken ct)
     {
         var p = From(@params, CodexJsonContext.Default.CommandExecutionRequestApprovalParams);
         var options = DecisionOptions(PlainDecisions(@params?["availableDecisions"] as JsonArray));
-        var started = Thread(p.ThreadId)?.Tool(p.ItemId) is CommandExecutionThreadItem c ? ToolCallOf(c, done: false) : null;
+        // The request carries the command as Codex parsed it, as its item does; the item only when it does not.
+        var item = p.CommandActions is null && Thread(p.ThreadId) is { } t ? await t.ToolAsync(p.ItemId, ItemWait, ct) as CommandExecutionThreadItem : null;
+        var command = p.Command ?? item?.Command;
+        var actions = p.CommandActions ?? item?.CommandActions ?? [];
         var chosen = await AskAsync(p.ThreadId, new ToolCallUpdate
         {
             ToolCallId = p.ItemId,
-            Title = started?.Title ?? p.Command ?? "Run a command",
-            Kind = started?.Kind ?? ToolKind.Execute,
+            Title = command is null && actions.Count == 0 ? "Run a command" : CommandTitle(command ?? "", actions),
+            Kind = CommandKind(actions),
             Status = ToolCallStatus.Pending,
-            RawInput = new JsonObject { ["command"] = p.Command, ["cwd"] = p.Cwd, ["reason"] = p.Reason },
+            RawInput = new JsonObject { ["command"] = command, ["cwd"] = p.Cwd, ["reason"] = p.Reason },
+            Locations = p.Cwd is { Length: > 0 } cwd ? [new ToolCallLocation { Path = cwd }] : null,
         }, options, ct);
         return new JsonObject { ["decision"] = chosen ?? (options.Any(o => o.OptionId == "cancel") ? "cancel" : "decline") };
     }
@@ -725,7 +1052,8 @@ sealed class CodexAgent : IAsyncDisposable
     {
         var p = From(@params, CodexJsonContext.Default.FileChangeRequestApprovalParams);
         var options = DecisionOptions(["accept", "acceptForSession", "decline", "cancel"]);
-        var change = Thread(p.ThreadId)?.Tool(p.ItemId) as FileChangeThreadItem;
+        // The request names only the item, which says what changes.
+        var change = Thread(p.ThreadId) is { } t ? await t.ToolAsync(p.ItemId, ItemWait, ct) as FileChangeThreadItem : null;
         var chosen = await AskAsync(p.ThreadId, new ToolCallUpdate
         {
             ToolCallId = p.ItemId,
@@ -756,8 +1084,11 @@ sealed class CodexAgent : IAsyncDisposable
         ], ct);
         return chosen is "turn" or "session"
             ? new JsonObject { ["permissions"] = @params?["permissions"]?.DeepClone() ?? new JsonObject(), ["scope"] = chosen }
-            : new JsonObject { ["permissions"] = new JsonObject(), ["scope"] = "turn" };
+            : NoPermissions();
     }
+
+    /// <summary>A permissions request's answer that grants nothing.</summary>
+    static JsonObject NoPermissions() => new() { ["permissions"] = new JsonObject(), ["scope"] = "turn" };
 
     /// <summary>
     /// An MCP elicitation: Codex's approval of an MCP tool call (<c>codex_approval_kind:
@@ -778,9 +1109,10 @@ sealed class CodexAgent : IAsyncDisposable
             var options = new List<PermissionOption> { Option("accept", "Allow", PermissionOptionKind.AllowOnce) };
             if (persist.Contains("session")) options.Add(Option("session", "Allow for this session", PermissionOptionKind.AllowAlways));
             options.Add(Option("decline", "Deny", PermissionOptionKind.RejectOnce));
+            var call = Thread(threadId) is { } t ? await t.McpCallAsync(server, tool, ItemWait, ct) : null;
             var chosen = await AskAsync(threadId, new ToolCallUpdate
             {
-                ToolCallId = Thread(threadId)?.LastMcpCall(server, tool) ?? $"mcp-{server}-{tool}",
+                ToolCallId = call ?? $"mcp-{server}-{tool}",
                 Title = McpTitle(server, tool),
                 Kind = ToolKind.Other,
                 Status = ToolCallStatus.Pending,
@@ -799,7 +1131,11 @@ sealed class CodexAgent : IAsyncDisposable
                 new ElicitationFormMode { SessionId = threadId, Message = (string?)@params?["message"] ?? "", RequestedSchema = schema }, ct);
             return answer switch
             {
-                ElicitationAcceptAction a => new JsonObject { ["action"] = "accept", ["content"] = AcpJson.ToNode(a.Content ?? []) },
+                ElicitationAcceptAction a => new JsonObject
+                {
+                    ["action"] = "accept",
+                    ["content"] = new JsonObject((a.Content ?? []).Select(kv => KeyValuePair.Create(kv.Key, kv.Value?.DeepClone()))),
+                },
                 CreateElicitationResponseDecline => new JsonObject { ["action"] = "decline" },
                 _ => new JsonObject { ["action"] = "cancel" },
             };
@@ -842,7 +1178,7 @@ sealed class CodexAgent : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         foreach (var t in threads.Values)
-            t.Turn?.TrySetException(new JsonRpcException(JsonRpcException.InternalError, "Codex's app-server stopped during the turn."));
+            t.Fail(new JsonRpcException(JsonRpcException.InternalError, "Codex's app-server stopped during the turn."));
         foreach (var cts in asking.Values)
             try { cts.Cancel(); } catch (ObjectDisposedException) { }
         await rpc.DisposeAsync();

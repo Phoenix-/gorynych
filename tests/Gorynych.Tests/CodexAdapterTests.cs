@@ -19,13 +19,44 @@ public sealed class CodexAdapterTests
     static readonly TimeSpan Wait = TimeSpan.FromSeconds(10);
     const string NotForThisAgent = "codex";
 
-    static Conductor Conductor(FakeAppServer fake, ManualTime? time = null, params IAgentAdapter[] more) => new(new ConductorOptions
+    static Conductor Conductor(FakeAppServer fake, ManualTime? time = null, IAgentAdapter[]? more = null, CodexAdapterOptions? codex = null) => new(new ConductorOptions
     {
         DataDirectory = TestDirs.New(),
         ServiceId = "t",
         PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"],
         Time = (TimeProvider?)time ?? TimeProvider.System,
-    }, [new CodexAdapter(new CodexAdapterOptions { Launch = fake.StartAsync, ClientVersion = "test" }), .. more]);
+    }, [new CodexAdapter(codex ?? Options(fake)), .. more ?? []]);
+
+    static CodexAdapterOptions Options(FakeAppServer fake, List<string>? log = null) => new()
+    {
+        Launch = fake.StartAsync,
+        ClientVersion = "test",
+        TurnEndWait = TimeSpan.FromMilliseconds(200),
+        Log = log is null ? null : m => { lock (log) log.Add(m); },
+    };
+
+    /// <summary>The adapter alone, without the service: an ACP connection straight to it.</summary>
+    static async Task<(AgentInstance Agent, JsonRpcConnection Acp)> DirectAsync(FakeAppServer fake, List<string>? log = null)
+    {
+        var agent = await new CodexAdapter(Options(fake, log)).StartAsync(CancellationToken.None);
+        var acp = new JsonRpcConnection(agent.Input, agent.Output, "direct-client") { NotificationHandler = (_, _) => Task.CompletedTask };
+        acp.Start();
+        return (agent, acp);
+    }
+
+    static async Task<string> NewDirectAsync(JsonRpcConnection acp) =>
+        (string)(await acp.SendRequestAsync(AcpMethods.Agent.SessionNew, new JsonObject { ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() }))!["sessionId"]!;
+
+    static Task<JsonNode?> PromptDirectAsync(JsonRpcConnection acp, string sessionId, string text) =>
+        acp.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject
+        {
+            ["sessionId"] = sessionId, ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
+        });
+
+    static bool Logged(List<string> log, string text)
+    {
+        lock (log) return log.Any(l => l.Contains(text, StringComparison.Ordinal));
+    }
 
     static Task<TestClient> ZedAsync(Conductor conductor, string name = "zed") => TestClient.ConnectAsync(conductor, name, agent: NotForThisAgent);
 
@@ -407,7 +438,7 @@ public sealed class CodexAdapterTests
     {
         var fake = new FakeAppServer();
         var kimi = new LifecycleAgent("kimi", canDelete: true);
-        await using var conductor = Conductor(fake, null, kimi.Adapter);
+        await using var conductor = Conductor(fake, more: [kimi.Adapter]);
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var parent = (await zed.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
         {
@@ -425,5 +456,239 @@ public sealed class CodexAdapterTests
         Assert.AreEqual(("Release notes", child), ((string?)fake.Last("thread/name/set")["name"], (string?)fake.Last("thread/name/set")["threadId"]));
         Assert.AreEqual("Release notes", fake.Threads[child].Name);
         Assert.AreEqual(2, fake.Last("turn/start")["input"]!.AsArray().Count, "the task and where it came from, as two inputs");
+    }
+
+    [TestMethod]
+    public async Task AHugeIdleTimeFromAnAdapter_IsCappedAtADay()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake, codex: new CodexAdapterOptions { Launch = fake.StartAsync, UnloadAfter = TimeSpan.MaxValue });
+        var host = conductor.Agents["codex"];
+        await host.GetAsync(CancellationToken.None);
+        Assert.AreEqual(TimeSpan.FromDays(1), host.UnloadAfter);
+    }
+
+    // ---------------------------------------------------------------- settings Codex has and Gorynych has no preset for
+
+    static JsonObject OwnSettings(JsonNode approvalPolicy, JsonObject sandbox) => new()
+    {
+        ["approvalPolicy"] = approvalPolicy, ["approvalsReviewer"] = "user", ["model"] = "gpt-fake", ["modelProvider"] = "openai",
+        ["reasoningEffort"] = "medium", ["sandbox"] = sandbox,
+    };
+
+    [TestMethod]
+    public async Task AModelOrEffortChange_OnAThreadWithItsOwnSettings_SendsOnlyThat()
+    {
+        var fake = new FakeAppServer();
+        fake.Existing("t-own", Cwd, settings: OwnSettings(
+            new JsonObject { ["granular"] = new JsonObject { ["sandbox_approval"] = true, ["rules"] = false } },
+            new JsonObject { ["type"] = "externalSandbox", ["networkAccess"] = "enabled" }));
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        var resumed = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = "t-own", ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
+        var mode = resumed!["configOptions"]!.AsArray().First(o => (string?)o!["id"] == "mode")!;
+        Assert.AreEqual("custom", (string?)mode["currentValue"]);
+        StringAssert.Contains(mode["options"]!.AsArray().Last()!["description"]!.ToString(), "approval granular, sandbox externalSandbox");
+
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption, new JsonObject { ["sessionId"] = "t-own", ["configId"] = "reasoning_effort", ["value"] = "low" });
+        var nope = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
+            new JsonObject { ["sessionId"] = "t-own", ["configId"] = "model", ["value"] = "gpt-imaginary" }));
+        Assert.AreEqual(JsonRpcException.InvalidParams, nope.Code, "a model Codex does not offer is not held for the next turn");
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, "t-own", "hello")).StopReason);
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, "t-own", "again")).StopReason);
+
+        var first = fake.All("turn/start")[0];
+        Assert.AreEqual("low", (string?)first["effort"]);
+        foreach (var key in new[] { "model", "approvalPolicy", "sandboxPolicy", "approvalsReviewer" })
+            Assert.IsNull(first[key], $"{key} is the thread's own and is not sent");
+        Assert.IsNull(fake.All("turn/start")[1]["effort"], "sent once: Codex keeps it");
+    }
+
+    [TestMethod]
+    public async Task AModeChange_KeepsTheThreadsOwnSandbox_WithItsWritableRootsAndNetwork()
+    {
+        var fake = new FakeAppServer();
+        var roots = new JsonObject { ["type"] = "workspaceWrite", ["writableRoots"] = new JsonArray("D:\\shared"), ["networkAccess"] = true };
+        fake.Existing("t-roots", Cwd, settings: OwnSettings("untrusted", roots));
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = "t-roots", ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
+        Task SetMode(string value) => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption, new JsonObject { ["sessionId"] = "t-roots", ["configId"] = "mode", ["value"] = value });
+
+        await SetMode("auto");
+        await PromptAsync(zed, "t-roots", "hello");
+        await SetMode("read-only");
+        await PromptAsync(zed, "t-roots", "again");
+        await SetMode("auto");
+        await PromptAsync(zed, "t-roots", "and again");
+
+        var starts = fake.All("turn/start");
+        Assert.AreEqual(("on-request", "user"), ((string?)starts[0]["approvalPolicy"], (string?)starts[0]["approvalsReviewer"]));
+        Assert.IsTrue(JsonNode.DeepEquals(roots, starts[0]["sandboxPolicy"]), starts[0]["sandboxPolicy"]?.ToJsonString());
+        Assert.AreEqual("readOnly", (string?)starts[1]["sandboxPolicy"]!["type"]);
+        Assert.IsTrue(JsonNode.DeepEquals(roots, starts[2]["sandboxPolicy"]), "back to Auto, the thread's own roots come back");
+        Assert.IsNull(starts[0]["model"]);
+    }
+
+    // ---------------------------------------------------------------- the end of a turn, whatever happens
+
+    [TestMethod]
+    public async Task ACancel_BeforeCodexNamesTheTurn_InterruptsItOnceNamed()
+    {
+        var fake = new FakeAppServer { HoldTurnStart = new TaskCompletionSource() };
+        var log = new List<string>();
+        await using var conductor = Conductor(fake, codex: Options(fake, log));
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+
+        var turn = PromptAsync(zed, id, "wait");
+        await Until(() => fake.Methods().Contains("turn/start"), "turn/start");
+        await zed.Rpc.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
+        await Until(() => Logged(log, "stop asked before Codex named the turn"), "the cancel to reach the adapter");
+        fake.HoldTurnStart.SetResult();
+
+        Assert.AreEqual(StopReason.Cancelled, (await turn.WaitAsync(Wait)).StopReason);
+        Assert.IsNotNull(fake.Last("turn/interrupt")["turnId"]);
+    }
+
+    [TestMethod]
+    public async Task ACancel_RightBehindThePrompt_StopsIt()
+    {
+        var fake = new FakeAppServer();
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+
+        // The prompt runs on its own task and the cancel in the read loop, so the cancel may be handled first.
+        var turn = PromptDirectAsync(acp, id, "wait");
+        await acp.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
+
+        Assert.AreEqual("cancelled", (string?)(await turn.WaitAsync(Wait))!["stopReason"]);
+    }
+
+    [TestMethod]
+    public async Task Close_DuringATurnCodexDoesNotEnd_EndsThePromptAsCancelled()
+    {
+        var fake = new FakeAppServer();
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+
+        var turn = PromptDirectAsync(acp, id, "stuck");
+        await Until(() => fake.Methods().Contains("turn/start"), "turn/start");
+        await acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+
+        Assert.AreEqual("cancelled", (string?)(await turn.WaitAsync(Wait))!["stopReason"]);
+        await Until(() => fake.Methods().Contains("turn/interrupt") && fake.Methods().Contains("thread/unsubscribe"), "the interrupt and the unload");
+        var again = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptDirectAsync(acp, id, "hello"));
+        StringAssert.Contains(again.Message, "resume it first", "unloaded, not a turn still running");
+    }
+
+    [TestMethod]
+    public async Task CodexUnloadingTheThreadMidTurn_EndsThePromptAsCancelled()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+
+        Assert.AreEqual(StopReason.Cancelled, (await PromptAsync(zed, id, "closed").WaitAsync(Wait)).StopReason);
+    }
+
+    [TestMethod]
+    public async Task TheAppServerDyingMidTurn_FailsThePrompt_AndTheAdapterExits()
+    {
+        var fake = new FakeAppServer();
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+
+        var turn = PromptDirectAsync(acp, id, "wait");
+        await Until(() => fake.Methods().Contains("turn/start"), "turn/start");
+        await fake.Rpc!.DisposeAsync();
+
+        Exception? failed = null;
+        try { await turn.WaitAsync(Wait); }
+        catch (Exception e) when (e is not TimeoutException) { failed = e; }
+        Assert.IsNotNull(failed, "the prompt fails, not hangs");
+        await agent.Exited.WaitAsync(Wait);
+    }
+
+    // ---------------------------------------------------------------- approvals: what is offered, and only that
+
+    [TestMethod]
+    public async Task AnOptionThatWasNotOffered_IsADecline()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+
+        zed.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = "acceptWithExecpolicyAmendment" });
+        await PromptAsync(zed, id, "run");
+        zed.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = "always" });
+        await PromptAsync(zed, id, "mcp");
+
+        Assert.AreEqual("decline", (string?)fake.Answers[0].Answer!["decision"]);
+        Assert.AreEqual("decline", (string?)fake.Answers[1].Answer!["action"]);
+        Assert.IsNull(fake.Answers[1].Answer!["_meta"], "nothing persisted");
+    }
+
+    [TestMethod]
+    public async Task AWithdrawnPermissionsQuestion_GrantsNothing()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        zed.Approve = r => new TaskCompletionSource<RequestPermissionOutcome>().Task;
+        var id = await NewAsync(zed);
+
+        var turn = PromptAsync(zed, id, "perm");
+        await Until(() => zed.Approvals.Count == 1, "the question");
+        Assert.AreEqual("Allow more access: Fetch the docs", zed.Approvals[0].ToolCall.Title);
+        CollectionAssert.AreEqual(new[] { "turn", "session", "deny" }, zed.Approvals[0].Options.Select(o => o.OptionId).ToArray());
+        await zed.Rpc.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
+
+        Assert.AreEqual(StopReason.Cancelled, (await turn.WaitAsync(Wait)).StopReason);
+        await Until(() => { lock (fake.Answers) return fake.Answers.Count == 1; }, "the withdrawn question's answer");
+        Assert.IsTrue(JsonNode.DeepEquals(new JsonObject { ["permissions"] = new JsonObject(), ["scope"] = "turn" }, fake.Answers[0].Answer),
+            fake.Answers[0].Answer?.ToJsonString());
+        await Until(() => zed.Withdrawn == 1, "the question withdrawn from the client");
+    }
+
+    [TestMethod]
+    public async Task AnApprovalThatOvertakesItsItem_StillSaysWhatChanges()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        zed.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = "decline" });
+        var id = await NewAsync(zed);
+
+        await PromptAsync(zed, id, "patch late");
+
+        var asked = zed.Approvals.Single();
+        Assert.AreEqual("Create note.txt", asked.ToolCall.Title);
+        Assert.AreEqual(Path.Combine(Cwd, "note.txt"), asked.ToolCall.Locations![0].Path);
+    }
+
+    [TestMethod]
+    public async Task AnMcpServersOwnForm_IsAnAcpForm_AndItsAnswerGoesBack()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        zed.Fill = form => new ElicitationAcceptAction { Content = new() { ["branch"] = "main" } };
+        var id = await NewAsync(zed);
+
+        await PromptAsync(zed, id, "form");
+
+        Assert.AreEqual("Which branch?", zed.Forms.Single().Message);
+        Assert.IsTrue(JsonNode.DeepEquals(new JsonObject { ["action"] = "accept", ["content"] = new JsonObject { ["branch"] = "main" } }, fake.Answers.Single().Answer),
+            fake.Answers.Single().Answer?.ToJsonString());
+        Assert.AreEqual("branch main", zed.Text());
     }
 }

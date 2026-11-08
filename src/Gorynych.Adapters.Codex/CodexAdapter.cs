@@ -25,6 +25,12 @@ public sealed class CodexAdapterOptions
     /// </summary>
     public TimeSpan UnloadAfter { get; init; } = TimeSpan.FromMinutes(2);
 
+    /// <summary>
+    /// How long closing or deleting a thread waits for its interrupted turn to end before going on.
+    /// A turn still running then ends as cancelled: once unsubscribed, Codex sends nothing more of it.
+    /// </summary>
+    public TimeSpan TurnEndWait { get; init; } = TimeSpan.FromSeconds(5);
+
     /// <summary>The name of the MCP server the user registers for agents outside Gorynych; turned off in Gorynych's threads.</summary>
     public string OutsideServerName { get; init; } = "gorynych-outside";
 
