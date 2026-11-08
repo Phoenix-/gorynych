@@ -152,6 +152,34 @@ public static class GorynychProtocol
     /// </summary>
     public const string MethodArchive = "_gorynych/archive";
 
+    /// <summary>
+    /// Sets a session's native title in its agent: <c>{sessionId, title}</c> → <c>{}</c>. The
+    /// service calls it only on an adapter that advertises <see cref="CapSetTitle"/>
+    /// (docs/adapter-contract.md, §9).
+    /// </summary>
+    public const string MethodSetTitle = "_gorynych/set_title";
+
+    /// <summary>In <c>agentCapabilities._meta</c>: <c>true</c> when the adapter takes <see cref="MethodSetTitle"/>.</summary>
+    public const string CapSetTitle = "gorynych/setTitle";
+
+    /// <summary>
+    /// In <c>agentCapabilities._meta</c>: seconds; the agent's sessions are unloaded after this
+    /// idle time when it is shorter than the service's own (docs/adapter-contract.md, §7).
+    /// </summary>
+    public const string CapUnloadAfter = "gorynych/unloadAfter";
+
+    /// <summary>
+    /// In <c>agentCapabilities._meta</c>: <c>true</c> when the agent keeps nothing durable before a
+    /// session's first prompt, so a draft it does not list was never durable (docs/adapter-contract.md, §3).
+    /// </summary>
+    public const string CapDraftsNotDurable = "gorynych/draftsNotDurable";
+
+    /// <summary>
+    /// On a <c>session/prompt</c> the service sends: the <c>messageId</c> under which the service
+    /// journals the prompt's text, for an agent that can keep it with the message (docs/adapter-contract.md, §5).
+    /// </summary>
+    public const string MetaMessageId = "gorynych/messageId";
+
     /// <summary>Returns service status: ID, process, adapters, sessions.</summary>
     public const string MethodStatus = "_gorynych/status";
 

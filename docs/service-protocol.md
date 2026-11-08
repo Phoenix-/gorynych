@@ -22,7 +22,7 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   service ID), `sessions.json` (the overlay), `journal/`, `claude/` (the Claude adapter's
   session list and `channels.json`, the person's answer about development channels), `logs/`.
 
-Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi]
+Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex]
 [--claude-model <model>] [--unload-after <minutes>] [--claude-channels ask|accept|decline]
 [--no-channel] [--no-peers] [--console]`.
 `--unload-after` is how long a session stays loaded in its agent once it is idle with no
@@ -33,7 +33,7 @@ the service otherwise asks the person once ([adapters.md](adapters.md#consent-to
 The same executable is
 also the `gorynych` MCP server agents start over stdio:
 `peers [--pipe … --token …] [--channel-url …]` (see Opinions below), and the stdio bridge
-for external ACP clients: `acp --agent claude|kimi` (see [external-clients.md](external-clients.md)).
+for external ACP clients: `acp --agent claude|kimi|codex` (see [external-clients.md](external-clients.md)).
 Agents outside Gorynych use a separate small executable, `Gorynych.Outside.exe`, as their MCP
 server ([Agents outside Gorynych](#agents-outside-gorynych)).
 
@@ -120,6 +120,10 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/outside` | `_meta` of `_gorynych/mcp_message`, and of the opinion request an agent outside Gorynych asked | the host: `client` (MCP `clientInfo`), `folder`, `hostSessionId` (see [Agents outside Gorynych](#agents-outside-gorynych)) |
 | `gorynych/fromSessionId` | `user_message_chunk._meta` of an opinion request or a report delivered as a turn | the session that asked, or the child that reports |
 | `gorynych/opinion` | `_meta` of the request message and of every update of its turn | the request's `message_id`, so a GUI can show the exchange apart from the user's own turns |
+| `gorynych/messageId` | `session/prompt` params `_meta`, service → adapter | the `messageId` the service journals the prompt's text under, for a harness that keeps it with the message (Codex) |
+| `gorynych/setTitle` | an adapter's `agentCapabilities._meta` | `true`: the adapter takes `_gorynych/set_title {sessionId, title}` → `{}`, and the service writes a `spawn_session` name natively ([Child sessions](#child-sessions)) |
+| `gorynych/unloadAfter` | an adapter's `agentCapabilities._meta` | seconds: its sessions' idle time when shorter than `--unload-after` ([Unloading idle sessions](#unloading-idle-sessions)); read as at most a day |
+| `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards, and to the agent adds `_meta` with `gorynych/sender`, `gorynych/fromSessionId` and `gorynych/outside` as the journal keeps them on a request in a turn, for the user message the agent reports for it. An agent that answers method not found, or `-32600` because it is not running, is asked in a turn instead ([adapter-contract.md](adapter-contract.md#64-the-live-note-path)) |
@@ -127,6 +131,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
+| `_gorynych/set_title` | method, service → adapter, `{sessionId, title}` → `{}` | writes a session's native title; only for an adapter that advertises `gorynych/setTitle` (Codex), for a `spawn_session` name |
 | `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?, _meta}` → `{}` | tells a session's agent something that needs no answer (a child's report), with `gorynych/sender` and `gorynych/fromSessionId` in `_meta` for the user message the agent reports for it; the Claude adapter pushes it through the channel, an agent that answers method not found, or `-32600` because it is not running, gets it as a turn |
 | `_gorynych/mcp_message` | method, outside server → service, `{serverId, requestId, method, params}` → `{result}` or `{error}`; as a notification from the service, a notification of that request | an MCP request of `gorynych-outside`, in the shape of `mcp/message` from ACP's MCP-over-ACP RFD (see [`_gorynych/mcp_message`](#agents-outside-gorynych)) |
 | `_gorynych/read` | method, `{sessionId, cursor?, limit?, thoughts?}` → `{updates, nextCursor?, total, inProgress, trimmed}` | a page of a session's history from the journal (see [Reading a session](#reading-a-session)) |
@@ -371,10 +376,11 @@ June 2026. A client that does not support it keeps showing the question; answeri
 changes nothing, since nothing is waiting for the answer.
 
 A spawned session is not a draft once it is listed, so it is listed and kept like any
-prompted session. A `title` names it: no agent lets the service set a title natively, so the name lives in the
-overlay (source `spawn`) and the agents' generated titles (Kimi's first prompt, Claude's
-`ai-title`) do not replace it, neither in the lists nor in the session's own
-`session_info_update`. Without a title the first prompt is the provisional title as usual.
+prompted session. A `title` names it. The name lives in the overlay (source `spawn`), and the
+agents' generated titles (Kimi's first prompt, Claude's `ai-title`) do not replace it, neither
+in the lists nor in the session's own `session_info_update`. An adapter that can set a native
+title (`gorynych/setTitle`: Codex) also gets it with `_gorynych/set_title` right after the
+session is created, so the harness's own apps show it too. Without a title the first prompt is the provisional title as usual.
 Deleting a parent leaves its children; their `parentSessionId` then names a session that no
 longer exists.
 
@@ -913,7 +919,9 @@ every agent, and the service never writes an agent's own files for it.
 A session stays loaded in its agent while a client has it open or something uses it. Once it is
 **idle**, with no turn running and no operation registered, and no client is attached, the
 service closes it in its agent (`session/close`) after `--unload-after` minutes (10 by
-default; `0` unloads at once). The agent then frees what it holds (Kimi's session in memory,
+default; `0` unloads at once), or after its adapter's own shorter time
+(`agentCapabilities._meta["gorynych/unloadAfter"]`: Codex asks for 2 minutes, since a thread
+loaded here cannot be continued in Codex's own apps). The agent then frees what it holds (Kimi's session in memory,
 Claude's process), and the lists show the session `saved`. The time counts from the later of
 the last client letting go and the session going idle, in either order: a client that
 attaches, a turn that starts or an operation that registers stops it, and the end of each
@@ -989,7 +997,9 @@ A native delete cannot be undone, so a discard keeps the session whenever it is 
    kept, and its mark cleared.
 3. An agent that can delete must list the session without a title. Kimi titles a session from
    its first prompt and lists an empty one with `title: null` (Kimi Code 2.4.1). A titled
-   session is kept; one the agent does not list is hidden with a tombstone, not deleted.
+   session is kept; one the agent does not list is hidden with a tombstone, not deleted. An
+   adapter whose agent keeps nothing durable before the first prompt says so
+   (`gorynych/draftsNotDurable`: Codex), and its draft is closed and dropped without a delete.
 4. Only then is the session closed in its agent and deleted there. An agent that cannot
    delete (Claude) has nothing native to delete: the Claude adapter records a session at its
    first prompt. The record and the journal go.

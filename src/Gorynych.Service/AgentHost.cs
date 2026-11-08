@@ -118,6 +118,22 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// <summary>The agent takes <c>systemPrompt</c> in append mode on new, load and resume.</summary>
     public bool TakesSystemPrompt => Info?.AgentCapabilities?.SessionCapabilities?.SystemPrompt is not null;
 
+    /// <summary>The adapter sets native titles (<c>_gorynych/set_title</c>).</summary>
+    public bool CanSetTitle => Flag(GorynychProtocol.CapSetTitle);
+
+    /// <summary>The agent keeps nothing durable before a session's first prompt.</summary>
+    public bool DraftsNotDurable => Flag(GorynychProtocol.CapDraftsNotDurable);
+
+    /// <summary>The idle time the adapter asks for its sessions (at most a day), or null for the service's own.</summary>
+    public TimeSpan? UnloadAfter =>
+        Info?.AgentCapabilities?.Meta?[GorynychProtocol.CapUnloadAfter] is JsonValue v && v.TryGetValue<double>(out var seconds) && seconds >= 0
+            ? TimeSpan.FromSeconds(Math.Min(seconds, MaxUnloadAfter.TotalSeconds))
+            : null;
+
+    static readonly TimeSpan MaxUnloadAfter = TimeSpan.FromDays(1);
+
+    bool Flag(string key) => Info?.AgentCapabilities?.Meta?[key] is JsonValue v && v.TryGetValue<bool>(out var on) && on;
+
     public JsonObject Describe() => new()
     {
         ["name"] = Name,

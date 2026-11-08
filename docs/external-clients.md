@@ -24,7 +24,7 @@ outside that job.
 Checked by `BridgeTests` (a client that sends no `_meta` and declares no forms, fs or
 terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real Claude:
 
-- `initialize`: agent `gorynych`, title `Gorynych: Claude Code` or `Gorynych: Kimi Code`,
+- `initialize`: agent `gorynych`, title `Gorynych: Claude Code`, `Gorynych: Kimi Code` or `Gorynych: Codex`,
   `loadSession`, `sessionCapabilities.list/resume/close/delete`, no auth methods, text
   prompts only.
 - The feed is standard `session/update`: message and thought chunks, `tool_call`,
@@ -131,6 +131,12 @@ Zed registers custom agents under `agent_servers` in its `settings.json`
       "type": "custom",
       "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
       "args": ["acp", "--agent", "kimi"],
+      "env": {}
+    },
+    "Gorynych: Codex": {
+      "type": "custom",
+      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
+      "args": ["acp", "--agent", "codex"],
       "env": {}
     }
   }

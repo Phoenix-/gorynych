@@ -573,13 +573,26 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
-            response = await rpc.StartRequestAsync(request.Method, request.Params?.DeepClone(), CancellationToken.None);
+            response = await rpc.StartRequestAsync(request.Method, WithMessageId(request.Params, messageId), CancellationToken.None);
         }
         finally
         {
             feed.ForwardGate.Release();
         }
         return await response;
+    }
+
+    /// <summary>
+    /// A prompt's params with <c>_meta["gorynych/messageId"]</c>: the ID the service journals its
+    /// text under, for an agent that keeps it with the message (Codex's <c>clientUserMessageId</c>).
+    /// </summary>
+    static JsonNode WithMessageId(JsonNode? @params, string messageId)
+    {
+        var copy = @params?.DeepClone() as JsonObject ?? [];
+        var meta = copy["_meta"] as JsonObject ?? [];
+        meta[GorynychProtocol.MetaMessageId] = messageId;
+        copy["_meta"] = meta;
+        return copy;
     }
 
     /// <summary>Uses the first prompt as the session's title until the harness provides one.</summary>
@@ -848,9 +861,10 @@ public sealed class Conductor : IAsyncDisposable
     {
         var id = record.SessionId;
         var rpc = await host.GetAsync(ct);
-        if (!host.CanDelete)
+        if (!host.CanDelete || host.DraftsNotDurable)
         {
-            // Nothing native to delete: the Claude adapter records a session at its first prompt.
+            // Nothing native to delete: the Claude adapter records a session at its first prompt, and
+            // Codex writes a thread at its first turn.
             await CloseInAgentAsync(host, rpc, id, ct);
             return DraftFate.Dropped;
         }
@@ -1206,6 +1220,7 @@ public sealed class Conductor : IAsyncDisposable
             await feed.PublishAsync(info, except: null, () => { });
             // Listed from here: announced as added, with its parent and name in the one change.
             record = store.Update(id, host.Name, rec => rec.Draft = false) ?? throw NotFound(id);
+            if (title is not null && host.CanSetTitle) await SetNativeTitleAsync(host, rpc, id, title);
         }
         catch
         {
@@ -1215,6 +1230,23 @@ public sealed class Conductor : IAsyncDisposable
         }
         Track(Task.Run(() => SpawnedTurnAsync(feed, record, parent, prompt)));
         return id;
+    }
+
+    /// <summary>
+    /// Writes a name the service was given (a <c>spawn_session</c> title) as the session's native
+    /// title, for an adapter that can (<c>_gorynych/set_title</c>), so the harness's own apps show it
+    /// too. The overlay keeps it either way, so a failure is only logged.
+    /// </summary>
+    static async Task SetNativeTitleAsync(AgentHost host, JsonRpcConnection rpc, string sessionId, string title)
+    {
+        try
+        {
+            await rpc.SendRequestAsync(GorynychProtocol.MethodSetTitle, new JsonObject { ["sessionId"] = sessionId, ["title"] = title });
+        }
+        catch (Exception e) when (e is JsonRpcException or IOException)
+        {
+            ServiceLog.Warn($"{host.Name} {sessionId}: the native title was not set: {e.Message}");
+        }
     }
 
     /// <summary>
@@ -1270,9 +1302,10 @@ public sealed class Conductor : IAsyncDisposable
                 [GorynychProtocol.MetaParentSessionId] = parent.SessionId,
             };
             var shown = new TextContent { Text = $"{task.Text}\n\n{context.Text}" };
+            var messageId = SessionFeed.NewMessageId();
             var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
             {
-                Content = shown, MessageId = SessionFeed.NewMessageId(), Meta = meta,
+                Content = shown, MessageId = messageId, Meta = meta,
             })!.AsObject();
             await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
             await ProvisionalTitleAsync(feed, use.Record, [task]);
@@ -1282,7 +1315,8 @@ public sealed class Conductor : IAsyncDisposable
             try
             {
                 response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt,
-                    AcpJson.ToNode(new PromptRequest { SessionId = record.SessionId, Prompt = [task, context] }), CancellationToken.None);
+                    WithMessageId(AcpJson.ToNode(new PromptRequest { SessionId = record.SessionId, Prompt = [task, context] }), messageId),
+                    CancellationToken.None);
             }
             finally
             {
@@ -1409,7 +1443,8 @@ public sealed class Conductor : IAsyncDisposable
         if (!feeds.TryGetValue(sessionId, out var feed) || feed.Retired || feed.Users > 0 || feed.Clients().Length > 0) return null;
         if (store.Get(sessionId) is not { Draft: false } record || !agents.TryGetValue(record.Agent, out var host) || !host.IsLive(sessionId))
             return null; // a draft goes by its own rule (DiscardDraftAsync)
-        if (options.UnloadAfter <= TimeSpan.Zero)
+        var idle = IdleTimeOf(host);
+        if (idle <= TimeSpan.Zero)
         {
             var now = feed.StopIdle(); // a timer started earlier no longer counts
             return () => UnloadIfIdleAsync(feed, now);
@@ -1418,7 +1453,7 @@ public sealed class Conductor : IAsyncDisposable
         {
             // One wait per session: starting one cancels the one before (SessionFeed.StartIdle).
             var (timer, stop) = feed.StartIdle(cleanupStop.Token);
-            _ = Task.Delay(wait ?? options.UnloadAfter, options.Time, stop).ContinueWith(t =>
+            _ = Task.Delay(wait ?? idle, options.Time, stop).ContinueWith(t =>
             {
                 if (t.IsCompletedSuccessfully) RunCleanup(() => UnloadIfIdleAsync(feed, timer));
             }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
@@ -1429,6 +1464,14 @@ public sealed class Conductor : IAsyncDisposable
         }
         return null;
     }
+
+    /// <summary>
+    /// How long an idle session of <paramref name="host"/>'s agent stays loaded: the service's
+    /// <see cref="ConductorOptions.UnloadAfter"/>, or the adapter's own shorter time
+    /// (<c>gorynych/unloadAfter</c>: Codex, whose loaded threads its own apps cannot write).
+    /// </summary>
+    TimeSpan IdleTimeOf(AgentHost host) =>
+        host.UnloadAfter is { } own && own < options.UnloadAfter ? own : options.UnloadAfter;
 
     /// <summary>
     /// The idle timer <paramref name="timer"/> of a session ran out: the session is closed in its
@@ -1445,17 +1488,18 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             if (feed.IdleTimer != timer || feed.Retired || feed.Users > 0 || feed.Clients().Length > 0) return;
+            var idle = agents.TryGetValue(store.Get(sessionId)?.Agent ?? "", out var owner) ? IdleTimeOf(owner) : options.UnloadAfter;
             var quiet = options.Time.GetUtcNow() - feed.LastActivity;
-            if (quiet < options.UnloadAfter)
+            if (quiet < idle)
             {
-                StartIdle(sessionId, options.UnloadAfter - quiet);
+                StartIdle(sessionId, idle - quiet);
                 return;
             }
             if (store.Get(sessionId) is not { } record || !agents.TryGetValue(record.Agent, out var host)) return;
             if (!host.IsRunning || !host.IsLive(sessionId) || !host.CanClose) return;
             var rpc = await host.GetAsync(cleanupStop.Token);
             await CloseInAgentAsync(host, rpc, sessionId, cleanupStop.Token);
-            ServiceLog.Info($"{record.Agent} {sessionId}: unloaded from its agent, idle with no client for {options.UnloadAfter}");
+            ServiceLog.Info($"{record.Agent} {sessionId}: unloaded from its agent, idle with no client for {IdleTimeOf(host)}");
         }
         finally
         {
@@ -1482,21 +1526,22 @@ public sealed class Conductor : IAsyncDisposable
                 [GorynychProtocol.MetaFromSessionId] = childId,
             };
             var block = new TextContent { Text = text };
+            var messageId = SessionFeed.NewMessageId();
             var told = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
             {
-                Content = block, MessageId = SessionFeed.NewMessageId(), Meta = meta,
+                Content = block, MessageId = messageId, Meta = meta,
             })!.AsObject();
             await feed.PublishAsync(told, except: null, () => store.Touch(use.Record.SessionId));
             Task<JsonNode?> response;
             await feed.ForwardGate.WaitAsync(CancellationToken.None);
             try
             {
-                response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, AcpJson.ToNode(new PromptRequest
+                response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, WithMessageId(AcpJson.ToNode(new PromptRequest
                 {
                     SessionId = use.Record.SessionId,
                     Prompt = [block],
                     Meta = meta.DeepClone().AsObject(),
-                }), CancellationToken.None);
+                }), messageId), CancellationToken.None);
             }
             finally
             {
@@ -2013,9 +2058,10 @@ public sealed class Conductor : IAsyncDisposable
                 };
                 if (asker.From is not null) meta[GorynychProtocol.MetaFromSessionId] = asker.From;
                 if (asker.Outside is not null) meta[GorynychProtocol.MetaOutside] = asker.Outside.DeepClone();
+                var askedId = SessionFeed.NewMessageId();
                 var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
                 {
-                    Content = new TextContent { Text = text }, MessageId = SessionFeed.NewMessageId(), Meta = meta,
+                    Content = new TextContent { Text = text }, MessageId = askedId, Meta = meta,
                 })!.AsObject();
                 await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
                 feed.BeginOpinionTurn(messageId);
@@ -2023,12 +2069,12 @@ public sealed class Conductor : IAsyncDisposable
                 await feed.ForwardGate.WaitAsync(CancellationToken.None);
                 try
                 {
-                    response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, AcpJson.ToNode(new PromptRequest
+                    response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, WithMessageId(AcpJson.ToNode(new PromptRequest
                     {
                         SessionId = record.SessionId,
                         Prompt = [new TextContent { Text = text }],
                         Meta = meta.DeepClone().AsObject(),
-                    }), CancellationToken.None);
+                    }), askedId), CancellationToken.None);
                 }
                 finally
                 {

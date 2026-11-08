@@ -11,6 +11,7 @@
     <ProjectReference Include="..\Gorynych.Acp\Gorynych.Acp.csproj" />
     <ProjectReference Include="..\Gorynych.Adapters.Kimi\Gorynych.Adapters.Kimi.csproj" />
     <ProjectReference Include="..\Gorynych.Adapters.Claude\Gorynych.Adapters.Claude.csproj" />
+    <ProjectReference Include="..\Gorynych.Adapters.Codex\Gorynych.Adapters.Codex.csproj" />
   </ItemGroup>
   <ItemGroup>
     <!-- Shared with Gorynych.Outside: the outside tools, the ancestry walk, the detached start. -->

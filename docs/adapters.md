@@ -232,3 +232,172 @@ nothing of it.
 - Listing Claude sessions the adapter did not start (`~/.claude/projects`).
 - Subagent events, `/rename` from the GUI (and so a spawn name written as Claude's own
   `custom-title`), resizing the pseudo console.
+
+## Codex
+
+Codex does not speak ACP (0.167 has no `codex acp`), so the adapter is a translator, like
+Claude's. It is an in-process ACP agent that drives one `codex app-server`, the service's child,
+over app-server's JSON-RPC. The design and the probes behind it are in
+[research/codex-adapter-spec.md](../research/codex-adapter-spec.md); the probes are in
+`research/probes/codex`. Built and checked against Codex 0.167.0 on 8 November 2026.
+
+- **Types** are generated from the app-server schema that `codex app-server
+  generate-json-schema` writes, kept in `schema/codex/0.167.0`, by `tools/Gorynych.CodexGen`.
+  It works the way `Gorynych.AcpGen` does for ACP: open enums, tagged unions with an `Unknown`
+  variant, and a source-generated `CodexJsonContext` for Native AOT. Only the types the adapter
+  uses and those they reach are generated (the list is `Roots` in the generator). To move to a
+  new Codex, generate the schema into a new folder and run the generator with its version.
+- **Process.** `codex` is found on PATH. On Windows the native `codex.exe` that npm's
+  `codex.cmd` shim would start through node is used directly. The adapter starts it as
+  `codex app-server` (stdio), and app-server starts the threads' MCP servers as its own
+  children, so they are inside Gorynych for the `gorynych-outside` walk. The shared daemon
+  (`codex app-server daemon`) is not used: it starts MCP servers outside the service's process
+  tree. When app-server exits, the adapter stops, the service starts it again on the next
+  use, and every session is not loaded. Starting and initializing app-server takes about
+  0.4 s.
+- **Identity.** `initialize` sends `clientInfo {name: "gorynych", title: "Gorynych"}`. Codex
+  records the name as the thread's `originator` and puts it in its user agent and OpenAI's
+  compliance logs. The thread's `source` is `vscode`, as for Codex Desktop's threads, so
+  Codex's own apps list Gorynych's threads too. The adapter turns off the notifications it
+  does not use (`optOutNotificationMethods`): hooks, rate limits, MCP startup and the like.
+
+### Sessions
+
+| ACP | Codex |
+| --- | --- |
+| `session/new` | `thread/start {cwd, config, developerInstructions}`. Nothing is on disk before the first turn, and the thread is not listed until then (`gorynych/draftsNotDurable`: the service drops an unused draft instead of hiding it) |
+| `session/list` | `thread/list {cwd, cursor, limit 50, archived: false, sortKey: updated_at, useStateDbOnly: true}`; `title` is the thread's `name` (none until a name is set or generated: the service shows its provisional title), `updatedAt` from unix seconds |
+| `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}` |
+| `session/load` | the same, then the history from `thread/items/list`, page by page, as the updates below (only for a thread the journal has not seen: one made in Codex's own apps) |
+| `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), up to 5 s for the turn to end, then `thread/unsubscribe`, which unloads an idle thread at once. A turn that has not ended by then ends `cancelled`: Codex sends nothing more of an unsubscribed thread |
+| `session/delete` | stops a running turn as `session/close` does, then `thread/delete`; a thread Codex no longer has answers `-32002` |
+| `_gorynych/set_title` | `thread/name/set` (works before the first turn too) |
+
+- **The `gorynych` server** goes in `config.mcp_servers` of `thread/start` and of every
+  `thread/resume`. Codex keeps that config only while the thread is loaded, and ignores it for
+  a thread that is already loaded. A stdio server is `{command, args, env}`, an HTTP one
+  `{url, http_headers}`; SSE servers are left out.
+- **`gorynych-outside` is off** in Gorynych's threads when the user's Codex config registers
+  it (`config/read`): `config.mcp_servers["gorynych-outside"] = {enabled: false}`. Turning off
+  a server the config does not have fails the thread (`invalid transport`), so it is checked
+  first. Together with the ancestry walk this hides the outside tools on every OS. The user's
+  other MCP servers, hooks (`~/.codex/hooks.json`) and `AGENTS.md` apply to Gorynych's threads
+  as to any other.
+- **The appended system prompt** is `developerInstructions` (`sessionCapabilities.systemPrompt`,
+  append only; any other mode or a non-text block fails with `-32602`). Codex keeps the
+  instructions a thread was created with: sending others on `thread/resume` does not replace
+  them (checked live), so a thread keeps the text of the service that created it.
+- **One writer.** A thread has one writer process. While Gorynych's app-server has a thread
+  loaded, Codex Desktop, the CLI or VS Code cannot continue it, and Gorynych cannot resume a
+  thread one of them has open. The adapter turns app-server's `thread <id> already has an
+  active writer` into `This Codex thread is open in another Codex app (Codex Desktop, the CLI
+  or VS Code); close it there, then try again.` Within its own process the adapter drives
+  every turn, so there are no turns of Codex's own to mark (`gorynych/agentTurn`).
+- **Idle time: 2 minutes** (`gorynych/unloadAfter: 120`; the service takes the shorter of it and
+  `--unload-after`). A loaded thread locks Codex's own apps out, so it should go back soon after
+  a conversation moves on. Loading it again is cheap (probe of 8 November 2026): `thread/resume`
+  took 0.4 s, and the user's nine MCP servers were up 1.7 s after it, or up to about 11 s when
+  one of them fails slowly. Two minutes still covers a quick follow-up question, which then
+  finds the thread loaded.
+- **Archive.** Codex refuses to resume an archived thread (`session <id> is archived`), while
+  Gorynych's archive keeps a session usable, so the archive stays in the service's overlay.
+  The list leaves Codex-archived threads out (as Kimi's does), so an archive made in Codex
+  Desktop is not mirrored. A thread archived there after Gorynych knew it fails to open with
+  `This Codex thread is archived in Codex. Unarchive it there (codex unarchive <id>), then try
+  again.`
+
+### Prompts and turns
+
+- `session/prompt` is `turn/start {threadId, input}`, one `text` input per text block (a
+  resource link as `@<uri>`). Its `clientUserMessageId` is the service's `messageId` for the
+  prompt (`_meta["gorynych/messageId"]`), which Codex keeps as the message's `clientId`, so
+  history replayed from Codex carries the journal's IDs.
+- The turn ends with `turn/completed`: `completed` → `end_turn`, `interrupted` → `cancelled`,
+  `failed` → the prompt fails with Codex's message (a context-window error → `max_tokens`).
+  `session/cancel` is `turn/interrupt`; Codex then settles a pending approval itself
+  (`serverRequest/resolved`), and the adapter withdraws it from the client.
+- **A cancel is never lost.** One that comes before Codex has named the turn (while
+  `turn/start` is on its way, or before the prompt's handler has run: the adapter compares the
+  cancel's place in the ACP stream with the prompt's) interrupts the turn as soon as
+  `turn/started` or `turn/start`'s answer names it. `turn/start` is always waited for, so no
+  turn runs on that the adapter does not know.
+- **Every turn ends.** When Codex unloads the thread mid-turn (`thread/closed`, status
+  `notLoaded`), the turn ends `cancelled`; when app-server stops, the prompt fails.
+- Codex's own user message items are not echoed (ACP).
+
+| Codex | ACP `session/update` |
+| --- | --- |
+| `item/agentMessage/delta` | `agent_message_chunk`, `messageId` = the item ID (`msg_…`); the completed item's text only when no delta came |
+| `item/reasoning/summaryTextDelta`, `textDelta`, `summaryPartAdded` | `agent_thought_chunk`, `messageId` = the item ID (`rs_…`); a new summary part starts a paragraph |
+| `commandExecution` | `tool_call` titled from `commandActions` (`Read <file>`, `Search …`, else the command without Codex's shell wrapper), kind `read`, `search` or `execute`; on completion its output as text and `rawOutput {exitCode, output}` |
+| `fileChange` | `tool_call` kind `edit` (`Create`, `Delete` or `Edit <file>`), locations, each file's diff as text |
+| `mcpToolCall` | `tool_call` titled `<tool> (<server>)`, `rawInput` = its arguments, the result's text |
+| `webSearch`, `imageView`, `dynamicToolCall`, `collabAgentToolCall`, `imageGeneration` | `tool_call` kinds `fetch`, `read`, `other` |
+| `turn/plan/updated` | `plan` |
+| `thread/tokenUsage/updated` | `usage_update {used: the last request's input + output tokens, size: the model's context window}` |
+| `thread/name/updated` | `session_info_update {title}` |
+| `thread/settings/updated` | `config_option_update` |
+
+### Approvals and forms
+
+All approvals are `session/request_permission` on the item's tool call:
+
+| Codex | Options |
+| --- | --- |
+| `item/commandExecution/requestApproval` | of its `availableDecisions`: `accept` (allow once), `acceptForSession` (allow for this session), `decline` (deny), `cancel` (deny and stop the turn) |
+| `item/fileChange/requestApproval` | the same four |
+| `item/permissions/requestApproval` | allow for this turn, allow for this session, deny |
+| `mcpServer/elicitation/request` with `_meta.codex_approval_kind: mcp_tool_call` | allow once, allow for this session (`_meta.persist: session`), deny |
+
+- **No option writes Codex's configuration.** `acceptWithExecpolicyAmendment` and
+  `applyNetworkPolicyAmendment` add rules to `~/.codex/rules/default.rules`, and MCP's
+  `persist: always` keeps an approval beyond the session. Codex offers them; the adapter does
+  not (adapter-contract §8).
+- **The gorynych tools ask the person** like any other MCP tool: their approvals are titled
+  `<tool> (<server>)`, which the service does not answer itself. Codex can also allow a
+  server's tools without asking (`default_tools_approval_mode: "approve"`, verified per thread),
+  and whether to use it is left for a pass over the permissions of all harnesses.
+- **Only what was offered.** An `optionId` the adapter did not offer counts as the first "deny"
+  option (`decline`, or deny for a permissions request), never as an approval.
+- **Withdrawn**, each request answers its own "nothing granted": `{decision: cancel}` for a
+  command or file change, `{permissions: {}, scope: turn}` for permissions, `{action: cancel}`
+  for an MCP elicitation, `{answers: {}}` for Codex's questions.
+- **Titles.** A command's approval is titled from the request's own `commandActions`. A file
+  change's request names only its item, and an MCP tool's approval names no item; app-server's
+  requests are handled apart from its notifications, so the adapter waits up to a second for
+  the item's `item/started` before falling back to a generic title.
+- `item/tool/requestUserInput` (Codex's own questions) and an MCP server's form elicitation are
+  `elicitation/create` forms; a URL elicitation is declined.
+
+### Modes, models and effort
+
+ACP config options, applied with the next `turn/start`, which Codex keeps for later turns:
+
+- `mode`: Codex's permission presets.
+  - `read-only`: approval `on-request`, sandbox `read-only`.
+  - `auto`: `on-request`, `workspace-write`.
+  - `auto-review` ("Approve for me"): as `auto`, with Codex's automatic reviewer
+    (`approvalsReviewer: auto_review`), a standard per-thread setting of app-server, so nothing
+    is written to `~/.codex`. Its decisions were not seen live: the probe's command needed no
+    approval.
+  - `full-access`: `never`, `danger-full-access`.
+  - Settings that match none of these (the user's own config) show as `custom` until changed.
+- `model`: `model/list`'s visible models.
+- `reasoning_effort`: the selected model's efforts.
+- A new thread takes the user's own defaults (here `gpt-6.1-sol`, effort `xhigh`); the adapter
+  overrides nothing until the person changes an option.
+- **Only what the person changed** goes with the next `turn/start`: a model or an effort alone,
+  or a mode's approval policy, sandbox and reviewer. The adapter keeps Codex's own values: a
+  granular approval policy or an external sandbox is never sent back as a name, and a mode
+  whose sandbox type the thread already has sends the thread's own sandbox, with its writable
+  roots and network access (or the one it had before, when switching back).
+- A model or effort Codex does not list is refused at once. Should Codex still refuse a turn
+  carrying a change, the change is dropped and the options are reset, so it cannot fail the
+  turns after it.
+
+### Not done yet
+
+- Images and embedded resources in prompts.
+- A live-note path through `turn/steer` (a child's report into the parent's running turn).
+- Pre-allowing tools, for every harness at once.
+- `thread/settings/update` (experimental) to apply an option before the next turn.
