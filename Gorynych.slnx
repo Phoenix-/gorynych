@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/Gorynych.Acp/Gorynych.Acp.csproj" />
     <Project Path="src/Gorynych.Adapters.Claude/Gorynych.Adapters.Claude.csproj" />
+    <Project Path="src/Gorynych.Adapters.Codex/Gorynych.Adapters.Codex.csproj" />
     <Project Path="src/Gorynych.Adapters.Kimi/Gorynych.Adapters.Kimi.csproj" />
     <Project Path="src/Gorynych.Outside/Gorynych.Outside.csproj" />
     <Project Path="src/Gorynych.Service/Gorynych.Service.csproj" />
@@ -12,6 +13,7 @@
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/Gorynych.AcpGen/Gorynych.AcpGen.csproj" />
+    <Project Path="tools/Gorynych.CodexGen/Gorynych.CodexGen.csproj" />
     <Project Path="tools/Gorynych.TestClient/Gorynych.TestClient.csproj" />
   </Folder>
 </Solution>

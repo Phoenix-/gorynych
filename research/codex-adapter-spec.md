@@ -1,4 +1,17 @@
-# Codex adapter: specification (draft for review)
+# Codex adapter: specification
+
+Approved 8 November 2026 and built on branch `claude/codex-adapter`. The adapter as built is
+described in [docs/adapters.md](../docs/adapters.md#codex), and the contract changes are in
+[docs/adapter-contract.md](../docs/adapter-contract.md). This file keeps the design and the
+probe results it rests on, with the build-phase answers at the end. Changes made when it was
+approved:
+
+- Codex's idle time is 2 minutes, measured (answer 8).
+- Only explicit names are written natively, never the provisional title.
+- The gorynych tools are not pre-allowed; they ask the person until a pass over the permissions
+  of all harnesses decides.
+
+## Draft as reviewed
 
 How Gorynych drives Codex, mapped feature by feature onto
 [adapter-contract.md](../docs/adapter-contract.md). Nothing is built yet. Written 8 November 2026
@@ -362,6 +375,8 @@ Where adapter-contract.md describes Claude or Kimi rather than ACP, or misses wh
 
 ## To check in the build phase
 
+(Answered below, in [Build-phase answers](#build-phase-answers).)
+
 1. Whether resending `developerInstructions` on `thread/resume` replaces or adds (D6, C2). One
    turn.
 2. Whether `thread/unsubscribe` during a running turn stops it. The adapter interrupts first
@@ -380,6 +395,61 @@ Where adapter-contract.md describes Claude or Kimi rather than ACP, or misses wh
 10. Whether `config` overrides with dotted keys (`mcp_servers.gorynych-outside.enabled`) and
     nested objects behave the same, and what a nested override does to a server the user's
     config does not have.
+
+## Build-phase answers
+
+`research/probes/codex/build_checks_probe.py`, 8 November 2026, Codex 0.167.0, about seven
+short turns, every thread deleted.
+
+1. **Resending `developerInstructions` on `thread/resume`** replaces nothing. A thread created
+   with "PONG-1111" still answered PONG-1111 after a resume that sent "PONG-2222". So a thread
+   keeps the instructions it was created with (contract C2).
+2. **`thread/unsubscribe` during a running turn** does not stop it. The turn ran on and
+   completed, and the thread stayed loaded. So the adapter's close interrupts the turn first.
+3. **How Codex Desktop shows a thread with `originator gorynych`**: not checked. It needs the
+   desktop app and a person looking. `serviceName` and `threadSource` are not set.
+4. **A file-change approval live**: `item/fileChange/requestApproval {threadId, turnId, itemId,
+   startedAtMs, reason, grantRoot}`, with no `availableDecisions`. The item's change is `{path,
+   kind: {type: add}, diff: "hi
+"}`; for a new file, the diff is its content. Declined, the
+   item ends `declined`.
+5. **An MCP approval answered "for this session"** is `{action: "accept", content: {}, _meta:
+   {persist: "session"}}`. Two calls of the tool in one turn asked once.
+6. **A per-server approval setting exists**: `default_tools_approval_mode: "approve"` in a
+   thread's `config.mcp_servers.<name>` ran the tool without asking. Codex's config reference
+   also lists `tools.<tool>.approval_mode`. Not used: pre-allowing waits for the permissions
+   pass.
+7. **`workspace-write` on Windows**: `windowsSandbox/readiness` answered `ready` here, and a
+   thread started with it.
+8. **The cost of a load**:
+   - `codex app-server` starts and initializes in 0.3–0.4 s.
+   - `thread/resume` of a written thread takes 0.4 s, and the user's MCP servers (nine) are up
+     1.7 s after it.
+   - Listing their status, which waits for every server, took about 11 s. Two of the user's
+     servers fail to start, one of them over HTTP with a timeout.
+   - A thread that never had a turn cannot be resumed at all (`no rollout found`).
+
+   So a reload costs about two seconds, or up to about ten with a slow server. Codex's idle
+   time is 2 minutes (`gorynych/unloadAfter: 120`).
+9. **Where the "always" options go**: Codex's docs and source say exec-policy and network
+   amendments are appended to `~/.codex/rules/default.rules`. Where MCP's `persist: always` is
+   kept is not documented. Neither is offered (D3).
+10. **Config overrides**:
+    - Dotted keys (`mcp_servers.<name>.enabled`) and nested objects both work for a server the
+      user's config has.
+    - For one it does not have, both fail `thread/start` with `invalid transport in
+      mcp_servers.<name>`. So `gorynych-outside` is turned off only when `config/read` lists it.
+
+Also checked:
+
+- **The automatic reviewer.** `approvalsReviewer: "auto_review"` is a standard field of
+  `thread/start` and `turn/start`, not an experimental one, and the thread took it. It is the
+  "Approve for me" mode of Codex Desktop (docs: `approvals_reviewer = "auto_review"` with an
+  interactive policy such as `on-request`). So it is a value of the adapter's `mode` option. Its
+  decisions were not seen: the probe's command needed no approval.
+- **The wire.** App-server accepts messages with `"jsonrpc": "2.0"`, so the service's own
+  JSON-RPC connection is used.
+- **Names.** `thread/name/set` works before the first turn, and the name stays after it.
 
 ## Leftovers
 

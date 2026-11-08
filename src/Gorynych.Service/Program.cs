@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Gorynych.Acp.Hosting;
 using Gorynych.Adapters.Claude;
+using Gorynych.Adapters.Codex;
 using Gorynych.Adapters.Kimi;
 using Gorynych.Service;
 
@@ -56,6 +57,7 @@ var adapters = new List<IAgentAdapter>
         Log = ServiceLog.Info,
     }),
     new KimiAdapter(new KimiAdapterOptions { Log = ServiceLog.Info }),
+    new CodexAdapter(new CodexAdapterOptions { Log = ServiceLog.Info, ClientVersion = AgentHost.Version }),
 };
 
 await using var conductor = new Conductor(new ConductorOptions

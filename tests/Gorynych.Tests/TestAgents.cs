@@ -130,6 +130,11 @@ sealed class TestClient : IAsyncDisposable
 
     public JsonRpcConnection Rpc { get; }
 
+    int withdrawn;
+
+    /// <summary>The agent's requests (approvals, forms) withdrawn from this client before it answered.</summary>
+    public int Withdrawn => Volatile.Read(ref withdrawn);
+
     /// <param name="agent">Scopes the connection to one agent, as the stdio bridge does.</param>
     public static async Task<TestClient> ConnectAsync(Conductor conductor, string name = "test-client", bool forms = true, string? agent = null)
     {
@@ -148,6 +153,7 @@ sealed class TestClient : IAsyncDisposable
         };
         client.Rpc.RequestHandler = async (req, ct) =>
         {
+            await using var withdrawn = ct.Register(() => Interlocked.Increment(ref client.withdrawn));
             if (req.Method == AcpMethods.Client.ElicitationCreate)
             {
                 var form = (ElicitationFormMode)req.ParamsAs<CreateElicitationRequest>();
