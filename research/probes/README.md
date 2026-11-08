@@ -5,8 +5,9 @@ without editing its configuration. They ran on 6 November 2026 on Windows 11 wit
 Claude Code 2.1.302 (Haiku 5.5), Codex 0.167 and Kimi 2.4.1. After every Claude probe
 the hashes of `~/.claude/settings.json`, `CLAUDE.md` and `~/.claude/.claude.json` were
 unchanged. The C# files are .NET 10 file-based apps (`dotnet run file.cs`). Paths inside
-`channel/mcp.json` and `pty/run.ps1` point to the original temporary folder and are kept
-as a record, not as something to run as is.
+`channel/mcp.json` and `pty/run.ps1` point to the probe's working folder, written here as
+`C:\work\probe` (as in the recorded fixtures under `tests/Gorynych.Tests/Fixtures`); they are
+kept as a record, not as something to run as is.
 
 The production code that grew from them lives in `src/Gorynych.Adapters.Claude`.
 

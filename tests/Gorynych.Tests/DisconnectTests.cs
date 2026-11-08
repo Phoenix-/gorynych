@@ -35,6 +35,8 @@ public sealed class DisconnectTests
         PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"],
         UnloadAfter = time is null ? TimeSpan.Zero : Idle,
         Time = (TimeProvider?)time ?? TimeProvider.System,
+        // Activity is announced at once, so the clock's only timers are the idle ones these tests count.
+        ActivityNoticeInterval = TimeSpan.Zero,
     }, adapters);
 
     static async Task<string> NewPromptedAsync(TestClient client, string agent, string text)

@@ -3,6 +3,7 @@
 // to the URL in --settings, turns on bracketed paste, and treats a pasted line followed by
 // Enter as the next user turn. A prompt containing "write" asks for a Write approval; one
 // containing "on your own" is followed by a turn of Claude's own, for a channel message.
+// Launched with development channels, it first shows Claude's notice and waits for Enter.
 using System.Net.Http.Json;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -24,9 +25,24 @@ var turns = 0;
 var tools = 0;
 
 Console.OutputEncoding = Encoding.UTF8;
+RawInput();
+var stdin = Console.OpenStandardInput();
+if (args.Contains("--dangerously-load-development-channels"))
+{
+    // Real Claude shows a full-screen notice at every launch with development channels and goes
+    // on only after Enter; nothing else may confirm it for the person.
+    Console.Out.Write("WARNING: Loading development channels\r\n--dangerously-load-development-channels is for local channel development only.\r\nEnter to confirm · Esc to cancel\r\n");
+    Console.Out.Flush();
+    var key = new byte[1];
+    while (true)
+    {
+        if (stdin.Read(key, 0, 1) <= 0) return 1;
+        if (key[0] == '\r') break;
+    }
+    File.AppendAllText(Path.ChangeExtension(transcript, ".notice.txt"), "confirmed\n");
+}
 Console.Out.Write("\x1b[?2004h fake claude ready\r\n");
 Console.Out.Flush();
-RawInput();
 
 // "hang" stands for a launch stuck on a dialog nobody answers: no hooks ever arrive.
 if (firstPrompt?.Contains("hang", StringComparison.OrdinalIgnoreCase) == true)
@@ -36,7 +52,6 @@ if (firstPrompt?.Contains("hang", StringComparison.OrdinalIgnoreCase) == true)
 }
 if (firstPrompt is not null) await TurnAsync(firstPrompt);
 
-var stdin = Console.OpenStandardInput();
 var buffer = new byte[4096];
 var pending = new StringBuilder();
 var decoder = Encoding.UTF8.GetDecoder();

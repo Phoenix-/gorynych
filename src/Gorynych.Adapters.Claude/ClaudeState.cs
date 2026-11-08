@@ -17,6 +17,7 @@ public sealed class ClaudeSessionRecord
 [JsonSourceGenerationOptions(WriteIndented = true, PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(List<ClaudeSessionRecord>))]
+[JsonSerializable(typeof(ChannelConsentRecord))]
 internal sealed partial class ClaudeJsonContext : JsonSerializerContext;
 
 /// <summary>The adapter's list of sessions, for <c>session/list</c> and <c>session/resume</c>.</summary>

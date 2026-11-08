@@ -208,7 +208,11 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         }
         id = id.DeepClone();
         var request = new JsonRpcRequest(id, method, @params) { Sequence = sequence };
-        _ = Task.Run(() => HandleRequestAsync(request));
+        // Registered here, before the next message is read, so a cancel right behind the request finds it.
+        var requestKey = id.ToJsonString();
+        var requestCts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        incoming[requestKey] = requestCts;
+        _ = Task.Run(() => HandleRequestAsync(request, requestKey, requestCts));
     }
 
     void CompleteResponse(JsonNode? id, JsonObject message)
@@ -233,11 +237,9 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         else Log?.Invoke($"{Name}: response with unknown id {id?.ToJsonString()}");
     }
 
-    async Task HandleRequestAsync(JsonRpcRequest request)
+    async Task HandleRequestAsync(JsonRpcRequest request, string key, CancellationTokenSource cts)
     {
-        var key = request.Id.ToJsonString();
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-        incoming[key] = cts;
+        using var owned = cts;
         JsonObject response;
         try
         {

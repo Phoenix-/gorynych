@@ -189,6 +189,7 @@ public sealed class SessionLifecycleTests
     }
 
     [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "fails a write by holding the file open, which only Windows refuses")]
     public async Task ADraftMarkThatCannotBeSaved_RefusesThePrompt_AndKeepsTheSession()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);
@@ -459,15 +460,19 @@ public sealed class SessionLifecycleTests
         store.Update("a", "kimi", r => r.Title = "first");
         // An antivirus scanner or the indexer opens the file for a moment without delete sharing.
         var held = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        var released = Task.Delay(120).ContinueWith(_ => held.Dispose(), TaskScheduler.Default);
+        // Released by a thread of its own: a pool callback can come late in a busy parallel run,
+        // after the store's retries (about 0.4 s) are over.
+        var releaser = new Thread(() => { Thread.Sleep(120); held.Dispose(); }) { IsBackground = true };
+        releaser.Start();
 
         store.Update("a", "kimi", r => r.Title = "second");
 
-        released.Wait();
+        releaser.Join();
         Assert.AreEqual("second", new SessionStore(path).Get("a")!.Title);
     }
 
     [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "fails a write by holding the file open, which only Windows refuses")]
     public void Store_KeepsAChangeItCouldNotWrite_AndWritesItWithTheNext()
     {
         var path = Path.Combine(TestDirs.New(), "sessions.json");
@@ -550,6 +555,7 @@ public sealed class SessionLifecycleTests
         var write = JsonNode.Parse("""{"hook_event_name":"PermissionRequest","tool_name":"Write","tool_input":{"file_path":"C:\\w\\a.txt","content":"hi"}}""")!.AsObject();
         ZedRules.CheckPermission(ClaudeHooks.Permission("s", "t", write));
         ZedRules.CheckPermission(ClaudeHooks.TrustFolder("s", @"C:\w"));
+        ZedRules.CheckPermission(ClaudeHooks.ChannelConsentQuestion("s"));
     }
 
     [TestMethod]

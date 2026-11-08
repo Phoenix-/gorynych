@@ -91,9 +91,38 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
 - Environment: `CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_AGENT_SDK*` and, when started from
   inside another Claude Code session, `ANTHROPIC_BASE_URL` and the desktop MCP variables
   are removed, so the child uses the user's own login.
-- Screens that need a key: the development-channels notice is accepted with Enter. The
-  folder-trust question is relayed to the client as an approval and answered with Enter
-  only if the person allows it.
+- Screens that need a key: the development-channels notice is confirmed with Enter, only
+  for a launch with the channel, which the person agreed to
+  ([below](#consent-to-development-channels)). The folder-trust question is relayed to the
+  client as an approval and answered with Enter only if the person allows it.
+
+### Consent to development channels
+
+Claude Code loads the service's channel only with `--dangerously-load-development-channels`, a
+research preview, and then shows a notice at every launch that needs Enter. Gorynych confirms
+that notice for the person, so it asks first:
+
+- The first time a launch would load the channel, the adapter asks the person once with a
+  `session/request_permission` on that session, before Claude starts: tool call
+  `development-channels` (kind `other`), a title, a text that explains the preview and what
+  each answer does, and the options `allow` ("Allow", `allow_always`) and `deny`
+  ("Don't allow", `reject_always`). A `tool_call_update` then marks it `completed` (allowed)
+  or `failed`.
+- The answer is kept in the service's own data, `claude/channels.json`
+  (`{"accepted": …, "answeredAt": …, "sessionId": …}`), never in Claude's configuration, and
+  holds for every later launch, after a restart too. To be asked again, delete the file.
+- Allowed: Claude starts with the channel, and the adapter confirms the notice on each launch.
+  Declined: Claude starts without the channel and without its part of
+  `--append-system-prompt`, as with `--no-channel`; opinion requests and reports go in as
+  service turns ([adapter-contract.md](adapter-contract.md#61-waking-a-session-and-closing-it-again)).
+- A question left unanswered (the client answers `cancelled`, or no client can take it) runs
+  that launch without the channel, keeps nothing and asks again at a later launch. Like
+  every approval, it waits for a client while none has the session open. A cancelled prompt
+  withdraws its question (the tool call ends `failed`) and starts nothing.
+- One question at a time, and it holds up no other session: while it is open, other sessions
+  launch without the channel and are not asked; launches after the answer follow it.
+- `--claude-channels accept|decline` answers up front, for a service nobody watches; `ask` is
+  the default. `--no-channel` is the same as `decline`.
 
 ### Prompts and turns
 
@@ -143,7 +172,8 @@ is denied with a note so Claude asks in plain text.
 
 The `mcpServers` of `session/new` and `session/resume` go into the per-launch
 `--mcp-config` (stdio, http and sse), so Claude gets the client's servers and the
-service's `gorynych` server. With a channel (the default; `--no-channel` turns it off) the
+service's `gorynych` server. With a channel (the default once the person agreed,
+[above](#consent-to-development-channels); `--no-channel` turns it off) the
 adapter adds `--channel-url …/channel/<session>/<token>` to that `gorynych` server and starts
 Claude with `--dangerously-load-development-channels server:gorynych`: the one server then
 declares `capabilities.experimental["claude/channel"]`, long-polls the adapter for opinion
@@ -180,7 +210,7 @@ as a prompt (`UserPromptSubmit`, `<channel … message_id="c1">` and the content
 that `message_id`, or a report by its text, and puts those keys on the `user_message_chunk`
 with `gorynych/origin: channel` and, for a request, `gorynych/opinion` = its `message_id`. So
 the journal names the sender, a session or an agent outside Gorynych, as for a request in a
-turn. It keeps at most 64 pushed messages that Claude has not reported yet. Without a channel the adapter answers method not found; while Claude's process is not
+turn. It keeps at most 64 pushed messages that Claude has not reported yet. Without a channel (for the service, or for a session whose launch did not load it) the adapter answers method not found; while Claude's process is not
 running (`session/resume` registers a session without starting one) it answers `-32600`, to
 `_gorynych/opinion` as well. Either way the service sends the request or report as a turn
 instead, which starts Claude, and closes the session again (ending the process) once its

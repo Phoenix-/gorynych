@@ -33,7 +33,7 @@ public sealed class LiveSmokeTests
     static string ServiceExe(string root)
     {
         var bin = Path.Combine(root, "src", "Gorynych.Service", "bin");
-        return Directory.EnumerateFiles(bin, "Gorynych.Service.exe", SearchOption.AllDirectories).OrderByDescending(File.GetLastWriteTimeUtc).First();
+        return Directory.EnumerateFiles(bin, TestDirs.Exe("Gorynych.Service"), SearchOption.AllDirectories).OrderByDescending(File.GetLastWriteTimeUtc).First();
     }
 
     [TestMethod]
@@ -50,6 +50,7 @@ public sealed class LiveSmokeTests
             DataDirectory = Path.Combine(dir, "claude"),
             Model = "haiku",
             ChannelServerCommand = [ServiceExe(root), "peers"],
+            Channels = ChannelConsent.Accept, // a live run answers up front
         });
         await using var conductor = TestDirs.Conductor(dir, adapter);
         string sessionId;
@@ -124,7 +125,7 @@ public sealed class LiveSmokeTests
             DataDirectory = dir,
             ServiceId = "live",
             PeerServerCommand = [exe, "peers", "--pipe", pipe],
-        }, [new ClaudeAdapter(new ClaudeAdapterOptions { DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "peers"] })]);
+        }, [new ClaudeAdapter(new ClaudeAdapterOptions { DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "peers"], Channels = ChannelConsent.Accept })]);
         using var stop = new CancellationTokenSource();
         var listening = Gorynych.Service.PipeListener.RunAsync(conductor, pipe, stop.Token);
         try
@@ -180,7 +181,7 @@ public sealed class LiveSmokeTests
             ServiceId = "live",
             PeerServerCommand = [exe, "peers", "--pipe", pipe],
         }, [
-            new ClaudeAdapter(new ClaudeAdapterOptions { DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "peers"] }),
+            new ClaudeAdapter(new ClaudeAdapterOptions { DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "peers"], Channels = ChannelConsent.Accept }),
             new KimiAdapter(new KimiAdapterOptions()),
         ]);
         using var stop = new CancellationTokenSource();

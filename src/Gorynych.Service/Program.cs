@@ -5,7 +5,7 @@ using Gorynych.Adapters.Kimi;
 using Gorynych.Service;
 
 // Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi] [--claude-model <m>] [--unload-after <minutes>]
-//   [--no-channel] [--no-peers] [--console]
+//   [--claude-channels ask|accept|decline] [--no-channel] [--no-peers] [--console]
 // Gorynych.Service peers [--pipe <name> --token <t>] [--channel-url <url>]
 //   the gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel
 if (args.Length > 0 && args[0] == "peers")
@@ -16,7 +16,7 @@ if (args.Length > 0 && args[0] == "acp")
 {
     var agent = Arg(args, "--agent") ?? throw new ArgumentException("--agent is required");
     var forwarded = new List<string>();
-    foreach (var option in new[] { "--data", "--claude-model", "--default-agent", "--unload-after" })
+    foreach (var option in new[] { "--data", "--claude-model", "--default-agent", "--unload-after", "--claude-channels" })
         if (Arg(args, option) is { } value) forwarded.AddRange([option, value]);
     foreach (var flag in new[] { "--no-channel", "--no-peers" })
         if (args.Contains(flag)) forwarded.Add(flag);
@@ -24,6 +24,7 @@ if (args.Length > 0 && args[0] == "acp")
 }
 
 var pipeName = Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName;
+var channels = Channels(Arg(args, "--claude-channels"));
 var dataDirectory = Path.GetFullPath(Arg(args, "--data")
     ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gorynych"));
 Directory.CreateDirectory(dataDirectory);
@@ -53,6 +54,7 @@ var adapters = new List<IAgentAdapter>
         DataDirectory = Path.Combine(dataDirectory, "claude"),
         Model = Arg(args, "--claude-model"),
         ChannelServerCommand = args.Contains("--no-channel") ? null : [Environment.ProcessPath!, "peers"],
+        Channels = channels,
         Log = ServiceLog.Info,
     }),
     new KimiAdapter(new KimiAdapterOptions { Log = ServiceLog.Info }),
@@ -102,6 +104,17 @@ static string? Arg(string[] args, string name)
     var i = Array.IndexOf(args, name);
     return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
 }
+
+// --claude-channels ask|accept|decline: whether Claude may be started with development channels, a Claude Code
+// research preview whose notice the adapter then confirms on each launch. ask (the default) asks the person once
+// and keeps the answer in <data>\claude\channels.json; accept and decline answer up front, for headless use.
+static ChannelConsent Channels(string? value) => value switch
+{
+    null or "ask" => ChannelConsent.Ask,
+    "accept" => ChannelConsent.Accept,
+    "decline" => ChannelConsent.Decline,
+    _ => throw new ArgumentException($"--claude-channels takes ask, accept or decline; got '{value}'"),
+};
 
 // --unload-after <minutes>: how long an idle session with no client stays loaded in its agent; 0 unloads at once.
 static TimeSpan UnloadAfter(string? minutes)

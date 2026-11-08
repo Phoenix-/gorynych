@@ -23,7 +23,7 @@ Stamp ('accept warning: ' + (Send-Keys "`r"))
 Stamp ('bash started: ' + (Wait-Event 'PreToolUse' 1 60))
 Stamp ('push A opinion: ' + (Push 'peer_codex' 'For a single-user desktop app, is SQLite or PostgreSQL the better local store? One sentence, please.'))
 Stamp ('stop 1: ' + (Wait-Event 'Stop' 1 90))
-Stamp ('push B action: ' + (Push 'peer_kimi' 'Please create the file C:\Users\micha\AppData\Local\Temp\claude\0ba64cc77c419dc6\5a58f86a-6ef3-4013-9221-b74f784f02a9\scratchpad\hookprobe\out\peer.txt containing the word from-kimi.'))
+Stamp ('push B action: ' + (Push 'peer_kimi' 'Please create the file C:\work\probe\out\peer.txt containing the word from-kimi.'))
 Stamp ('stop 2: ' + (Wait-Event 'Stop' 2 90))
 Start-Sleep -Milliseconds 500
 $paste = "Now tell me in one line: which agents wrote to you, and what did you answer each of them?"

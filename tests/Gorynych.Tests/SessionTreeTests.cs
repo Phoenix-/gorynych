@@ -237,20 +237,49 @@ public sealed class SessionTreeTests
     public async Task SessionsChanged_AnnouncesActivityAtMostOncePerInterval()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: false);
-        await using var conductor = Conductor(TimeSpan.FromMilliseconds(400), kimi.Adapter);
+        var time = new ManualTime();
+        var interval = TimeSpan.FromSeconds(10);
+        await using var conductor = new Conductor(new ConductorOptions
+        {
+            DataDirectory = TestDirs.New(),
+            ServiceId = "t",
+            ActivityNoticeInterval = interval,
+            Time = time,
+        }, [kimi.Adapter]);
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var id = await NewPromptedAsync(zed, "kimi", "Write the docs");
-        await Task.Delay(1000); // past the notices of the prompt, the title and the answer's activity
         int Updates() => zed.ChangeLog().Count(l => l == $"updated {id}");
+        // Notices keep their order, so once a later one has arrived, every one before it has too.
+        async Task Delivered()
+        {
+            var marker = await NewPromptedAsync(zed, "kimi", "marker");
+            await Until(() => zed.ChangeLog().Contains($"added {marker}"), "the marker's notice");
+        }
+        Task Update() => kimi.Adapter.Current!.Update(id, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = "." } });
+
+        time.Advance(interval); // the end of the prompt's own interval
+        time.Advance(interval); // and a quiet one after it
+        await Delivered();
         var before = Updates();
 
-        for (var i = 0; i < 30; i++)
-            await kimi.Adapter.Current!.Update(id, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = "." } });
-        await Until(() => Updates() > before, "the first activity notice");
-        await Task.Delay(900);
+        for (var i = 0; i < 30; i++) await Update();
+        await Delivered();
+        Assert.AreEqual(1, Updates() - before, "the first activity is announced at once");
 
-        var announced = Updates() - before;
-        Assert.IsTrue(announced is >= 2 and <= 3, $"{announced} activity notices for 30 updates: the first, then the last of the interval");
+        time.Advance(interval);
+        await Delivered();
+        Assert.AreEqual(2, Updates() - before, "the rest of the interval in one notice, at its end");
+
+        await Update(); // inside the interval that notice began
+        await Delivered();
+        Assert.AreEqual(2, Updates() - before, "at most once per interval");
+        time.Advance(interval);
+        await Delivered();
+        Assert.AreEqual(3, Updates() - before);
+
+        time.Advance(interval);
+        await Delivered();
+        Assert.AreEqual(3, Updates() - before, "no activity, no notice");
     }
 
     static string[] Reports(LifecycleAgent parentAgent, string parent) =>
