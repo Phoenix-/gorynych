@@ -114,7 +114,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards, and to the agent adds `_meta` with `gorynych/sender`, `gorynych/fromSessionId` and `gorynych/outside` as the journal keeps them on a request in a turn, for the user message the agent reports for it. An agent that answers method not found, or `-32600` because it is not running, is asked in a turn instead ([adapter-contract.md](adapter-contract.md#64-the-live-note-path)) |
-| `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `status` (`open` when its agent has it loaded now, `saved` when not, the words of ACP's draft session-status RFD), `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")`. Without `includeArchived`, `hiddenArchived` counts the archived sessions left out (never the caller) |
+| `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `status` (`open` when its agent has it loaded now, `saved` when not, the words of ACP's draft session-status RFD), `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")`, and `callerParent` the session that started it with `spawn_session`, when there is one. Without `includeArchived`, `hiddenArchived` counts the archived sessions left out (never the caller) |
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
@@ -256,7 +256,7 @@ takes for the session itself). `archive_session` and `restore_session` say what 
 
 | Case | Text |
 | --- | --- |
-| `list_agents` | first line `You are session_id <id> (<agent>, "<title>").`; then, when the list is not empty, what `status` means: `status "open": the session's agent has it loaded right now. status "saved": it is saved but not loaded; asking it starts it, so it answers more slowly, and it is closed again after it answers.`; then the list as JSON, each entry with `session_id`, `agent`, `title`, `cwd`, `status`, `updated_at` and `parent_session_id`. The `status` line repeats the schema because an agent whose conversation was resumed may hold an older schema |
+| `list_agents` | first line `You are session_id <id> (<agent>, "<title>").`, or for a session started with `spawn_session` `You are session_id <id> (<agent>, "<title>"), started by session_id <parent> (<agent>, "<title>") with spawn_session.` (the list leaves out the caller's own entry, so its `parent_session_id` would not show); then, when the list is not empty, what `status` means: `status "open": the session's agent has it loaded right now. status "saved": it is saved but not loaded; asking it starts it, so it answers more slowly, and it is closed again after it answers.`; then the list as JSON, each entry with `session_id`, `agent`, `title`, `cwd`, `status`, `updated_at` and `parent_session_id`, written without `\uXXXX` escapes (a Cyrillic title and the `+` of a time stay as they are; all JSON Gorynych writes uses `AcpJson.TextOptions`). The `status` line repeats the schema because an agent whose conversation was resumed may hold an older schema. An empty list reads `No other sessions to ask. spawn_session starts one.` |
 | `list_agents` without `include_archived`, leaving N > 0 archived sessions out (the caller not counted) | a last line `N archived sessions are not shown; pass include_archived: true to list them.`, or for one `1 archived session is not shown; pass include_archived: true to list it.`; nothing when none is left out. The hint is in the result as well as in the schema, because an agent whose conversation was resumed may hold an older schema |
 | archived now | `Archived session_id <id> (<agent>, "<title>"). It is now hidden from list_agents and from the user's session list; nothing in it is lost. ask_agent still reaches it, and restore_session brings it back.` |
 | already archived | `session_id <id> (<agent>, "<title>") was already archived, so nothing changed. ask_agent still reaches it, and restore_session brings it back.` |
@@ -316,14 +316,18 @@ What follows the task in the child's first prompt:
 
 ```
 [About this session · started by session_id <parent> (<agent>, "<title>") with spawn_session, approved by the user]
-The task above comes from that session. When each of your turns ends, Gorynych sends your
-final message to that session automatically, so you need not send it yourself. To ask it
-something, use ask_agent with session_id "<parent>". The user can also prompt you here
-directly.
+Answer in your final message: when your turn ends, Gorynych sends that message to session_id
+<parent> as a report by itself. Do not use reply or ask_agent for it. The report carries only
+that last message, your text after your last tool call, and is cut at 2000 characters, so put
+anything longer into a file and name the file in that message. To ask it something, use
+ask_agent with session_id "<parent>". The user can also prompt you here directly.
 ```
 
-With `report: false` the sentence about reports reads `Your turns are not reported to it.`
-It follows the task rather than preceding it because Kimi titles a session with its first
+With `report: false` the sentences about the answer read `Your turns are not reported to that
+session; it asks you with ask_agent when it wants to know something.` The header says where
+the task came from, so no sentence repeats it. How to answer comes first, because an agent
+otherwise wonders whether to answer with `reply`, with `ask_agent` or by ending its turn.
+The text follows the task rather than preceding it because Kimi titles a session with its first
 prompt (cut at 200 characters): the task stays the title. The provisional title is the task
 alone.
 
@@ -590,7 +594,7 @@ What the service returns for `tools/list`, outside Gorynych.
 - `include_archived`: `also list archived sessions, marked archived: true; default false`.
 - Result: the entries of `_gorynych/peers`, rendered as `list_agents` renders them, with all
   sessions and no `You are …` line: what `status` means (when the list is not empty), the
-  list, and the same archived line.
+  list, and the same archived line. An empty list reads `There is no session in Gorynych now.`
 
 **`read_session {session_id, before?, limit?, thoughts?}`**
 

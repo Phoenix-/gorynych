@@ -1,3 +1,4 @@
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -29,6 +30,17 @@ public sealed class OpenEnumJsonConverter<T> : JsonConverter<T> where T : struct
 /// <summary>Helpers shared by the generated union converters and by protocol code.</summary>
 public static class AcpJson
 {
+    /// <summary>
+    /// How Gorynych writes JSON text everywhere: on the wire, in the journal, and in what agents
+    /// read. Non-ASCII letters and characters such as <c>+</c>, <c>&lt;</c> or <c>&amp;</c> stay as
+    /// they are, instead of <c>\uXXXX</c> escapes that an agent reads verbatim. Safe because the text
+    /// never goes into HTML.
+    /// </summary>
+    public static readonly JsonSerializerOptions TextOptions = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+
+    /// <summary><see cref="TextOptions"/>, indented: JSON an agent reads in a tool's result.</summary>
+    public static readonly JsonSerializerOptions IndentedTextOptions = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping, WriteIndented = true };
+
     public static string? GetTag(JsonObject obj, string discriminator) =>
         obj[discriminator] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
 

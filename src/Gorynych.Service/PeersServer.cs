@@ -134,7 +134,7 @@ public static class PeersServer
                     if (channelUrl is not null)
                     {
                         using var response = await http.PostAsync($"{channelUrl}/reply",
-                            new StringContent(new JsonObject { ["message_id"] = messageId, ["text"] = text }.ToJsonString(), Encoding.UTF8, "application/json"), ct);
+                            new StringContent(new JsonObject { ["message_id"] = messageId, ["text"] = text }.ToJsonString(AcpJson.TextOptions), Encoding.UTF8, "application/json"), ct);
                         if (response.IsSuccessStatusCode)
                             delivered = (bool?)(await response.Content.ReadFromJsonAsync(PeersJsonContext.Default.JsonObject, ct))?["delivered"] ?? true;
                         else
@@ -212,7 +212,7 @@ public static class PeersServer
                     if (args?["report"] is JsonValue report && report.TryGetValue<bool>(out var reports)) spawn["report"] = reports;
                     await using var service = await ConnectAsync(pipe, ct);
                     var started = await service.SendRequestAsync(GorynychProtocol.MethodSpawn, spawn, ct);
-                    return Text(new JsonObject { ["session_id"] = (string?)started?["sessionId"] }.ToJsonString());
+                    return Text(new JsonObject { ["session_id"] = (string?)started?["sessionId"] }.ToJsonString(AcpJson.TextOptions));
                 }
                 default:
                     return Text($"unknown tool {tool}", error: true);
@@ -240,18 +240,25 @@ public static class PeersServer
 
     /// <summary>
     /// What <c>list_agents</c> shows, from the service's <c>_gorynych/peers</c> result: the caller
-    /// (which the list leaves out), the list, and how many archived sessions it leaves out. The
-    /// hints are in the result as well as in the schema, since an agent may hold an older schema.
+    /// (which the list leaves out) and the session that started it, the list, and how many archived
+    /// sessions it leaves out. The hints are in the result as well as in the schema, since an agent
+    /// may hold an older schema. The JSON keeps non-ASCII titles and the <c>+</c> of a time as they are.
     /// </summary>
-    internal static string ListAgentsText(JsonNode? peers)
+    /// <param name="empty">What stands for an empty list.</param>
+    internal static string ListAgentsText(JsonNode? peers, string empty = NoOtherSession)
     {
         var text = new StringBuilder();
-        if ((string?)peers?["caller"] is { } caller) text.Append(YouAre(caller)).Append('\n');
-        if (peers?["sessions"] is JsonArray { Count: > 0 }) text.Append(StatusLegend).Append('\n');
-        text.Append(peers?["sessions"]?.ToJsonString(new() { WriteIndented = true }) ?? "[]");
+        if ((string?)peers?["caller"] is { } caller) text.Append(YouAre(caller, (string?)peers?["callerParent"])).Append('\n');
+        if (peers?["sessions"] is JsonArray { Count: > 0 } sessions)
+            text.Append(StatusLegend).Append('\n').Append(sessions.ToJsonString(AcpJson.IndentedTextOptions));
+        else
+            text.Append(empty);
         if ((int?)peers?["hiddenArchived"] is int hidden and > 0) text.Append('\n').Append(ArchivedNotShown(hidden));
         return text.ToString();
     }
+
+    /// <summary>What <c>list_agents</c> shows instead of an empty list.</summary>
+    internal const string NoOtherSession = "No other sessions to ask. spawn_session starts one.";
 
     /// <summary>
     /// What an entry's <c>status</c> means (ACP session-status's words), in the <c>list_agents</c>
@@ -263,7 +270,9 @@ public static class PeersServer
         "starts it, so it answers more slowly, and it is closed again after it answers.";
 
     /// <summary>The first line of <c>list_agents</c>: the calling session, named as the service names sessions to agents.</summary>
-    internal static string YouAre(string caller) => $"You are {caller}.";
+    /// <param name="parent">The session that started the caller with <c>spawn_session</c>, named the same way.</param>
+    internal static string YouAre(string caller, string? parent = null) =>
+        parent is null ? $"You are {caller}." : $"You are {caller}, started by {parent} with spawn_session.";
 
     /// <summary>The last line of <c>list_agents</c> when it leaves archived sessions out.</summary>
     internal static string ArchivedNotShown(int count) => count == 1

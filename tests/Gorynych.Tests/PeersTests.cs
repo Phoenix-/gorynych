@@ -124,6 +124,28 @@ public sealed class PeersTests
     }
 
     [TestMethod]
+    public void ListAgents_KeepsTitlesAndTimesAsTheyAre_AndSaysWhenTheListIsEmpty()
+    {
+        var text = PeersServer.ListAgentsText(new JsonObject
+        {
+            ["caller"] = "session_id s1 (claude, \"Ревью\")",
+            ["sessions"] = new JsonArray(new JsonObject
+            {
+                ["session_id"] = "k1", ["title"] = "Обзор + план <ok> & done", ["updated_at"] = "2026-11-08T10:00:00.0000000+00:00",
+            }),
+        });
+        StringAssert.Contains(text, "\"title\": \"Обзор + план <ok> & done\"");
+        StringAssert.Contains(text, "\"updated_at\": \"2026-11-08T10:00:00.0000000+00:00\"");
+        Assert.IsFalse(text.Contains("\\u", StringComparison.Ordinal), "no \\u escapes for an agent to read: " + text);
+
+        Assert.AreEqual("You are session_id s1 (claude).\nNo other sessions to ask. spawn_session starts one.",
+            PeersServer.ListAgentsText(new JsonObject { ["caller"] = "session_id s1 (claude)", ["sessions"] = new JsonArray(), ["hiddenArchived"] = 0 }));
+        Assert.AreEqual("You are session_id s1 (claude).\nNo other sessions to ask. spawn_session starts one.\n" +
+            "2 archived sessions are not shown; pass include_archived: true to list them.",
+            PeersServer.ListAgentsText(new JsonObject { ["caller"] = "session_id s1 (claude)", ["sessions"] = new JsonArray(), ["hiddenArchived"] = 2 }));
+    }
+
+    [TestMethod]
     public void ToolDescriptions_SayWhenToUseWhich()
     {
         var tools = PeersServer.Tools(peers: true).ToDictionary(t => (string)t["name"]!);

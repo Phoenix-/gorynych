@@ -14,6 +14,9 @@ namespace Gorynych.Service;
 /// </summary>
 internal sealed class OutsideService(Conductor conductor, TimeSpan progressInterval)
 {
+    /// <summary>What <c>list_sessions</c> shows instead of an empty list.</summary>
+    internal const string NoSession = "There is no session in Gorynych now.";
+
     /// <summary>About how many characters of text one <c>read_session</c> result shows.</summary>
     public const int ReadBudget = 20_000;
 
@@ -99,7 +102,7 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
     string ListSessions(JsonObject args)
     {
         var includeArchived = args["include_archived"] is JsonValue v && v.TryGetValue<bool>(out var b) && b;
-        return PeersServer.ListAgentsText(conductor.PeerList(self: null, includeArchived));
+        return PeersServer.ListAgentsText(conductor.PeerList(self: null, includeArchived), empty: NoSession);
     }
 
     async Task<string> ReadSessionAsync(JsonObject args, CancellationToken ct)

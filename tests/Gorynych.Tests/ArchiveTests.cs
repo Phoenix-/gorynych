@@ -272,12 +272,13 @@ public sealed class ArchiveTests
 
         await ArchiveAsync(zed, sessions[1], true);
         await ArchiveAsync(zed, sessions[2], true);
-        StringAssert.EndsWith(await ListAgents(), "]\n3 archived sessions are not shown; pass include_archived: true to list them.");
+        StringAssert.EndsWith(await ListAgents(), $"\n{PeersServer.NoOtherSession}\n3 archived sessions are not shown; pass include_archived: true to list them.",
+            "all three archived: no list, and how many it leaves out");
         StringAssert.EndsWith(await ListAgents(includeArchived: true), "]", "nothing when the archived ones are listed");
 
         // The caller itself is not in the list, so it is not counted either.
         await ArchiveAsync(zed, asker, true);
-        StringAssert.EndsWith(await ListAgents(), "]\n3 archived sessions are not shown; pass include_archived: true to list them.");
+        StringAssert.EndsWith(await ListAgents(), $"\n{PeersServer.NoOtherSession}\n3 archived sessions are not shown; pass include_archived: true to list them.");
         await ArchiveAsync(zed, sessions[1], false);
         await ArchiveAsync(zed, sessions[2], false);
         StringAssert.EndsWith(await ListAgents(), "]\n" + One);

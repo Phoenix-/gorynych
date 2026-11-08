@@ -585,13 +585,24 @@ public sealed class SessionTreeTests
 
         var context =
             $"[About this session · started by session_id {parent} (claude, \"Coordinate the release\") with spawn_session, approved by the user]\n" +
-            "The task above comes from that session. When each of your turns ends, Gorynych sends your final message to that session " +
-            $"automatically, so you need not send it yourself. To ask it something, use ask_agent with session_id \"{parent}\". " +
-            "The user can also prompt you here directly.";
+            $"Answer in your final message: when your turn ends, Gorynych sends that message to session_id {parent} as a report by itself. " +
+            "Do not use reply or ask_agent for it. The report carries only that last message, your text after your last tool call, " +
+            "and is cut at 2000 characters, so put anything longer into a file and name the file in that message. " +
+            $"To ask it something, use ask_agent with session_id \"{parent}\". The user can also prompt you here directly.";
         CollectionAssert.AreEqual(new[] { "Fix the flaky test", context }, kimi.FirstBlocks(child), "the task first, then where it came from");
         var quietContext = kimi.FirstBlocks(quiet)[1];
-        StringAssert.Contains(quietContext, "Your turns are not reported to it.");
-        Assert.IsFalse(quietContext.Contains("automatically", StringComparison.Ordinal), quietContext);
+        Assert.AreEqual(
+            $"[About this session · started by session_id {parent} (claude, \"Coordinate the release\") with spawn_session, approved by the user]\n" +
+            "Your turns are not reported to that session; it asks you with ask_agent when it wants to know something. " +
+            $"To ask it something, use ask_agent with session_id \"{parent}\". The user can also prompt you here directly.", quietContext);
+        Assert.IsFalse(context.Contains("The task above", StringComparison.Ordinal), "the header already says where the task came from");
+
+        // The list leaves out the child's own entry and so its parent_session_id: the first line names the parent instead.
+        var listing = PeersServer.ListAgentsText(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodPeers, new JsonObject { ["token"] = kimi.Tokens[child] }));
+        StringAssert.StartsWith(listing, $"You are session_id {child} (kimi, \"Fix the flaky test\"), started by session_id {parent} " +
+            "(claude, \"Coordinate the release\") with spawn_session.\n");
+        StringAssert.StartsWith(PeersServer.ListAgentsText(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodPeers, new JsonObject { ["token"] = token })),
+            $"You are session_id {parent} (claude, \"Coordinate the release\").\n", "without a parent the line stays as it was");
         Assert.AreEqual("Fix the flaky test", conductor.Store.Get(child)!.Title, "the task titles the session, not what follows it");
 
         // The journal keeps what the agent got, as one message; the label for GUIs stays.

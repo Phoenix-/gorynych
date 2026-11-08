@@ -194,19 +194,19 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
             ?? throw new JsonRpcException(JsonRpcException.InternalError, "claude was not found on PATH");
         Directory.CreateDirectory(Folder);
         var settingsPath = Path.Combine(Folder, "settings.json");
-        File.WriteAllText(settingsPath, ClaudeHooks.Settings(agent.HookUrl(Id, Token)).ToJsonString());
+        File.WriteAllText(settingsPath, ClaudeHooks.Settings(agent.HookUrl(Id, Token)).ToJsonString(AcpJson.TextOptions));
 
         var args = new List<string> { "--settings", settingsPath, "--permission-mode", options.PermissionMode };
         if (options.Model is { Length: > 0 } model) args.AddRange(["--model", model]);
         var mcpPath = Path.Combine(Folder, "mcp.json");
         if (agent.Channel is { } channel)
         {
-            File.WriteAllText(mcpPath, channel.McpConfig(Id, Token, McpServers).ToJsonString());
+            File.WriteAllText(mcpPath, channel.McpConfig(Id, Token, McpServers).ToJsonString(AcpJson.TextOptions));
             args.AddRange(["--mcp-config", mcpPath, "--dangerously-load-development-channels", "server:" + ChannelHost.ServerName]);
         }
         else if (McpServers.Count > 0)
         {
-            File.WriteAllText(mcpPath, Claude.McpServers.Config(McpServers).ToJsonString());
+            File.WriteAllText(mcpPath, Claude.McpServers.Config(McpServers).ToJsonString(AcpJson.TextOptions));
             args.AddRange(["--mcp-config", mcpPath]);
         }
         var appended = string.Join("\n\n", new[] { agent.Channel is null ? null : ChannelHost.SystemPrompt, SystemPrompt }

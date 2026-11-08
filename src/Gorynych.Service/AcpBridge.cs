@@ -1,7 +1,6 @@
 using System.ComponentModel;
 using System.IO.Pipes;
 using System.Text;
-using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Gorynych.Acp.Hosting;
@@ -17,7 +16,7 @@ namespace Gorynych.Service;
 /// </summary>
 public static class AcpBridge
 {
-    static readonly JsonSerializerOptions Wire = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+    static readonly JsonSerializerOptions Wire = Acp.AcpJson.TextOptions;
 
     /// <param name="serviceArgs">Arguments for the service if the bridge has to start it.</param>
     public static async Task<int> RunAsync(string agent, string pipe, IReadOnlyList<string> serviceArgs)

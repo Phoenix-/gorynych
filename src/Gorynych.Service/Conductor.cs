@@ -1399,16 +1399,19 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
-    /// What a spawned session is told after its task: who started it, that its turns are reported
-    /// there by themselves, and the ID to ask that session by. It follows the task, so an agent
-    /// that titles a session from its first prompt (Kimi) takes the task as the title.
+    /// What a spawned session is told after its task: who started it, how its answer reaches that
+    /// session (its final message, reported by itself, and what of it), and the ID to ask that
+    /// session by. It follows the task, so an agent that titles a session from its first prompt
+    /// (Kimi) takes the task as the title.
     /// </summary>
-    static string SpawnContext(SessionRecord parent, bool report) =>
+    internal static string SpawnContext(SessionRecord parent, bool report) =>
         $"[About this session · started by {Who(parent)} with spawn_session, approved by the user]\n" +
-        "The task above comes from that session. " +
         (report
-            ? "When each of your turns ends, Gorynych sends your final message to that session automatically, so you need not send it yourself. "
-            : "Your turns are not reported to it. ") +
+            ? $"Answer in your final message: when your turn ends, Gorynych sends that message to session_id {parent.SessionId} as a " +
+              "report by itself. Do not use reply or ask_agent for it. The report carries only that last message, your text after " +
+              $"your last tool call, and is cut at {ReportLimit} characters, so put anything longer into a file and name the file " +
+              "in that message. "
+            : "Your turns are not reported to that session; it asks you with ask_agent when it wants to know something. ") +
         $"To ask it something, use ask_agent with session_id \"{parent.SessionId}\". The user can also prompt you here directly.";
 
     // ---------------------------------------------------------------- archive
@@ -2035,7 +2038,12 @@ public sealed class Conductor : IAsyncDisposable
             sessions.Add((JsonNode)entry);
         }
         var result = new JsonObject { ["sessions"] = sessions };
-        if (self is not null && store.Get(self) is { } caller) result["caller"] = Who(caller);
+        if (self is not null && store.Get(self) is { } caller)
+        {
+            result["caller"] = Who(caller);
+            // The list leaves the caller out, so a spawned session would not find its parent there.
+            if (caller.ParentSessionId is { } parentId && store.Get(parentId) is { Deleted: false } parent) result["callerParent"] = Who(parent);
+        }
         if (!includeArchived) result["hiddenArchived"] = Askable(self, includeArchived: true).Count(c => c.Record.Archived);
         return result;
     }

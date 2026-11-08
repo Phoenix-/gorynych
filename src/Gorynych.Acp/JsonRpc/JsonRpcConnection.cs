@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Text;
-using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -39,7 +38,7 @@ public sealed class JsonRpcException(int code, string message, JsonNode? data = 
 /// </summary>
 public sealed class JsonRpcConnection : IAsyncDisposable
 {
-    static readonly JsonSerializerOptions WireOptions = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+    static readonly JsonSerializerOptions WireOptions = AcpJson.TextOptions;
     static readonly byte[] NewLine = [(byte)'\n'];
 
     readonly Stream input;

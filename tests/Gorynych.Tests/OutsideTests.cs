@@ -424,6 +424,22 @@ public sealed class OutsideTests
     }
 
     [TestMethod]
+    public async Task ListSessions_KeepsTitlesAsTheyAre_AndSaysWhenThereIsNone()
+    {
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        Assert.AreEqual(OutsideService.NoSession, ToolText(await McpAsync(zed, "tools/call", Call("list_sessions", []))).Text);
+        Assert.AreEqual("There is no session in Gorynych now.", OutsideService.NoSession);
+
+        await NewPromptedAsync(zed, "kimi", "Почини тест + обнови план");
+        var (list, _) = ToolText(await McpAsync(zed, "tools/call", Call("list_sessions", [])));
+        StringAssert.Contains(list, "\"title\": \"Почини тест + обнови план\"");
+        StringAssert.Contains(list, "+00:00\"", "the time's offset as it is");
+        Assert.IsFalse(list.Contains("\\u", StringComparison.Ordinal), list);
+    }
+
+    [TestMethod]
     public async Task OnTheLiveNotePath_TheRequestCarriesTheMetaItIsJournaledWith()
     {
         var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };

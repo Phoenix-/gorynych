@@ -1,6 +1,5 @@
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -14,7 +13,7 @@ namespace Gorynych.Service;
 /// </summary>
 public sealed class SessionJournal
 {
-    static readonly JsonSerializerOptions LineOptions = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+    static readonly JsonSerializerOptions LineOptions = Gorynych.Acp.AcpJson.TextOptions;
     static readonly HashSet<string> ChunkKinds = ["agent_message_chunk", "agent_thought_chunk", "user_message_chunk"];
 
     /// <summary>Updates that only a turn produces; the rest (commands, modes, config) also come with an empty session.</summary>

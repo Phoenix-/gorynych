@@ -52,7 +52,7 @@ internal sealed class HookServer : IAsyncDisposable
             catch (OperationCanceledException) { return; }
             if (reply is null) { ctx.Response.StatusCode = 404; return; }
             ctx.Response.ContentType = "application/json";
-            await ctx.Response.WriteAsync(reply.ToJsonString(), ctx.RequestAborted);
+            await ctx.Response.WriteAsync(reply.ToJsonString(Gorynych.Acp.AcpJson.TextOptions), ctx.RequestAborted);
         };
 
         app.MapPost("/hook/{sid}/{token}", Route("hook"));
