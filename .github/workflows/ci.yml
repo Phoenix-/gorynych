@@ -62,6 +62,8 @@ jobs:
       - name: Publish
         shell: pwsh
         run: |
+          # Native AOT finds the MSVC linker through vswhere.
+          $env:PATH += ";${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
           dotnet publish src/Gorynych.Service -c Release -r win-x64 -p:PublishAot=true -o publish/Gorynych
           dotnet publish src/Gorynych.Outside -c Release -r win-x64 -p:PublishAot=true -o publish/Gorynych/outside
           Get-ChildItem publish/Gorynych -Recurse -Include *.pdb | Remove-Item
