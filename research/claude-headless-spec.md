@@ -59,6 +59,7 @@ It rests on:
 | `AskUserQuestion` | Absent from `-p` unless a permission host is declared: neither the PermissionRequest hook nor `CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL=1` brought it back. With `--permission-prompt-tool=stdio` it comes as `can_use_tool` with `requires_user_interaction: true`, and `updatedInput.answers` (`{question: label}`) answers it, as with the hook. |
 | A message while Claude works | Default priority (and `next`): merged into the running turn after the current tool, one `result` for both. `later`: waits for the turn to end, then runs as its own turn with its own `result`. `now`: ends the running turn after the current tool (`terminal_reason: aborted_tools`, empty result), then runs as a new turn. |
 | Message IDs | A `uuid` the client puts on a user message comes back on its replay (`--replay-user-messages`, `isReplay: true`) and in `system/status.user_message_uuids`. Assistant messages carry the API's `msg_…` ID (`stream_event message_start`, `assistant.message.id`). |
+| Interrupt with a message queued | Probed with A running a tool and B written meanwhile. `interrupt` alone answers `{still_queued: [B]}`, and B runs as the next turn; with `cancel_queued: true` it answers `{still_queued: [], cancelled: [B]}`, and B never runs. |
 | Interrupt | `control_request {subtype: "interrupt"}` answers `{still_queued: []}` at once; the turn ends with `result` `error_during_execution`, `terminal_reason: aborted_tools`; the next message runs normally. A pending `can_use_tool` is withdrawn with `control_cancel_request`. |
 | `origin` on a user message | `{kind: "peer", …}` is accepted but the model sees no wrapper and the transcript keeps no `origin`; not useful to us. |
 | Titles | No `ai-title` in the transcript a minute after the first answer. `rename_session {title, source: "host"}` writes `custom-title` and `agent-name`, as `/rename` does in the TUI. |
@@ -280,9 +281,23 @@ hit exactly `-p` and the SDK, and `--bare` is to become the default for `-p`. So
 
 ## Build-phase answers
 
-- **Tests.** `ClaudeHeadlessTests` (12 cases, on `Gorynych.FakeClaude -p`) and `StreamJsonTests`
-  (7); the TUI's `ClaudeAdapterTests` run pinned to `Transport = Tui`. The whole suite: 245 tests,
-  236 passed, 9 live skipped.
+- **The coordinator's review** found four more defects, fixed with tests that fail without the
+  fix (checked by undoing each):
+  - a cancel whose interrupt waited for the input could interrupt the next prompt; it now sends
+    nothing once its turn is over;
+  - lines of a process the session gave up could still open a turn or answer an approval; reading
+    now starts only after the process is registered, and only the current process's lines count;
+  - an update the client could not take could leave the prompt unfinished; the prompt is now
+    completed in a `finally`, and emitting catches what a gone client throws;
+  - the `interrupt` answer was only assumed; it is probed now (above), and FakeClaude matches it.
+  Also: the plan check requires a plan on `firstParty` (an auth token, a gateway or another
+  provider fails), headless Claude gets no `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`, closing a
+  session whose Claude stopped reading kills it instead of waiting on the stuck write, a control
+  request sent as Claude exits fails at once, open approvals are withdrawn on cancel and on each
+  result, and stdout is read on a dedicated blocking thread.
+- **Tests.** `ClaudeHeadlessTests` (17 cases, on `Gorynych.FakeClaude -p`) and `StreamJsonTests`
+  (8); the TUI's `ClaudeAdapterTests` run pinned to `Transport = Tui`. The whole suite: 251 tests,
+  242 passed, 9 live skipped.
 - **Live, headless** (Haiku 5.5, Claude Code 2.1.302, each on its own pipe and temp data):
   first prompt, Write approval, reload and a live-note opinion answered through `reply`
   (`Claude_FirstPrompt_Approval_Title_Reload_AndOpinion`); a session the service woke for a

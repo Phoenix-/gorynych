@@ -30,6 +30,8 @@ internal sealed class ClaudeProcess : IAsyncDisposable
     const int StderrTailChars = 2000;
     const long StderrLogLimit = 1024 * 1024;
 
+    readonly TaskCompletionSource begin = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     ClaudeProcess(Process process, Func<JsonObject, Task> onMessage, Action<string> log, string? stderrLog)
     {
         this.process = process;
@@ -64,12 +66,17 @@ internal sealed class ClaudeProcess : IAsyncDisposable
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { stderrLog = null; }
         var process = Process.Start(info) ?? throw new InvalidOperationException($"{exe} did not start");
         var claude = new ClaudeProcess(process, onMessage, log, stderrLog);
-        // Blocking reads for the life of the process: threads of their own, so sessions never starve the pool.
-        var reading = Task.Factory.StartNew(claude.ReadOutputAsync, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        // Blocking reads for the life of the process, on threads of their own (as the ConPTY host
+        // does), so sessions never starve the pool. Stdout is read only after BeginReading, so the
+        // session can register the process before its first line is handled.
+        var reading = Task.Factory.StartNew(claude.ReadOutput, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         _ = Task.Factory.StartNew(claude.ReadErrors, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         _ = claude.WatchExitAsync(reading);
         return claude;
     }
+
+    /// <summary>Starts handling stdout; until then lines wait in the pipe.</summary>
+    public void BeginReading() => begin.TrySetResult();
 
     public int Id => process.Id;
 
@@ -82,12 +89,13 @@ internal sealed class ClaudeProcess : IAsyncDisposable
         get { lock (stderrGate) return stderrTail.ToString().Trim(); }
     }
 
-    async Task ReadOutputAsync()
+    void ReadOutput()
     {
+        begin.Task.Wait();
         try
         {
             using var reader = process.StandardOutput;
-            while (await reader.ReadLineAsync() is { } line)
+            while (reader.ReadLine() is { } line)
             {
                 if (line.Length == 0) continue;
                 JsonObject? message;
@@ -104,7 +112,8 @@ internal sealed class ClaudeProcess : IAsyncDisposable
                     waiting.TrySetResult(response);
                     continue;
                 }
-                try { await onMessage(message); }
+                // One line at a time, in Claude's order: the next is read once this one is handled.
+                try { onMessage(message).GetAwaiter().GetResult(); }
                 catch (Exception e) { log($"claude {process.Id}: handling {(string?)message["type"]} failed: {e.Message}"); }
             }
         }
@@ -168,6 +177,7 @@ internal sealed class ClaudeProcess : IAsyncDisposable
             await stdin.WriteAsync(bytes, ct);
             await stdin.FlushAsync(ct);
         }
+        catch (ObjectDisposedException e) { throw new IOException("Claude's input is closed", e); }
         finally { writeGate.Release(); }
     }
 
@@ -183,7 +193,10 @@ internal sealed class ClaudeProcess : IAsyncDisposable
         try
         {
             await WriteAsync(new JsonObject { ["type"] = "control_request", ["request_id"] = id, ["request"] = request }, ct);
-            var response = await waiting.Task.WaitAsync(timeout, ct);
+            // An exit after the sweep of pending requests would otherwise leave this to its timeout.
+            if (await Task.WhenAny(waiting.Task, exited.Task).WaitAsync(timeout, ct) != waiting.Task && !waiting.Task.IsCompleted)
+                throw new IOException($"Claude exited with code {exited.Task.Result}");
+            var response = await waiting.Task;
             if ((string?)response["subtype"] == "error")
                 throw new ClaudeControlException($"{(string?)request["subtype"]}: {(string?)response["error"] ?? "failed"}");
             return response["response"] as JsonObject ?? [];
@@ -207,16 +220,17 @@ internal sealed class ClaudeProcess : IAsyncDisposable
             ["response"] = new JsonObject { ["subtype"] = "error", ["request_id"] = requestId, ["error"] = error },
         });
 
-    /// <summary>Closes stdin, which ends Claude once its turn is over.</summary>
-    public async Task CloseInputAsync()
+    /// <summary>Closes stdin, which ends Claude once its turn is over; false when a stuck write held the input past <paramref name="wait"/>.</summary>
+    public async Task<bool> CloseInputAsync(TimeSpan wait)
     {
-        await writeGate.WaitAsync();
+        if (!await writeGate.WaitAsync(wait)) return false;
         try
         {
-            if (inputClosed) return;
+            if (inputClosed) return true;
             inputClosed = true;
             try { stdin.Close(); }
             catch (IOException) { }
+            return true;
         }
         finally { writeGate.Release(); }
     }
@@ -231,7 +245,8 @@ internal sealed class ClaudeProcess : IAsyncDisposable
     /// <summary>Closes stdin, gives Claude <paramref name="grace"/> to exit, then kills its process tree.</summary>
     public async Task StopAsync(TimeSpan grace)
     {
-        await CloseInputAsync();
+        // A write stuck on a full pipe (Claude not reading) must not keep Claude alive: it is killed instead.
+        if (!await CloseInputAsync(grace)) Kill();
         if (await Task.WhenAny(exited.Task, Task.Delay(grace)) != exited.Task)
         {
             Kill();
@@ -241,6 +256,7 @@ internal sealed class ClaudeProcess : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        begin.TrySetResult(); // a reader that never began is let go
         if (!exited.Task.IsCompleted) await StopAsync(TimeSpan.FromSeconds(5));
         process.Dispose();
     }

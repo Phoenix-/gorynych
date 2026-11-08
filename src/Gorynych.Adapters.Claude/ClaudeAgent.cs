@@ -57,6 +57,9 @@ public sealed class ClaudeAdapterOptions
     /// <summary>Headless: how long Claude may stay silent with messages waiting and no turn running before they count as dropped.</summary>
     public int StallMs { get; init; } = 30_000;
 
+    /// <summary>Headless, for tests: awaited before a cancel's interrupt takes the input.</summary>
+    public Func<Task>? BeforeInterrupt { get; init; }
+
     /// <summary>Claude's <c>projects</c> folder, where transcripts are; null for Claude's own default. For tests.</summary>
     public string? ProjectsDirectory { get; init; }
 

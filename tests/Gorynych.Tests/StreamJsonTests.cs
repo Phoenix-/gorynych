@@ -76,8 +76,28 @@ public sealed class StreamJsonTests
         Assert.IsFalse(StreamJson.SignedOut(apiKey));
         Assert.AreEqual("ANTHROPIC_API_KEY", StreamJson.ApiKeySource(apiKey));
         Assert.IsNull(StreamJson.ApiKeySource(J("""{"account":{"subscriptionType":"Claude Max"}}""")));
+        Assert.IsNull(StreamJson.PlanProblem(J("""{"account":{"subscriptionType":"Claude Max","apiProvider":"firstParty"}}""")));
+        StringAssert.Contains(StreamJson.PlanProblem(J("""{"account":{"tokenSource":"ANTHROPIC_AUTH_TOKEN","apiProvider":"firstParty"}}""")), "reports no plan");
+        StringAssert.Contains(StreamJson.PlanProblem(J("""{"account":{"subscriptionType":"Claude Max","apiProvider":"vertex"}}""")), "vertex");
+        StringAssert.Contains(StreamJson.PlanProblem(J("""{"account":{"subscriptionType":"Claude Max"}}""")), "unknown provider", "fails closed without a provider");
+        StringAssert.Contains(StreamJson.PlanProblem(J("""{"models":[]}""")), "did not report its account");
+        Assert.AreEqual("ANTHROPIC_API_KEY", StreamJson.ApiKeySourceOfInit(J("""{"type":"system","subtype":"init","apiKeySource":"ANTHROPIC_API_KEY"}""")));
+        Assert.IsNull(StreamJson.ApiKeySourceOfInit(J("""{"type":"system","subtype":"init","apiKeySource":"none"}""")));
         Assert.AreEqual("billing_error", StreamJson.PlanError(J("""{"type":"assistant","error":"billing_error","message":{"content":[]}}""")));
         Assert.IsNull(StreamJson.PlanError(J("""{"type":"assistant","error":"rate_limit","message":{"content":[]}}""")));
+    }
+
+    [TestMethod]
+    public void HeadlessClaude_GetsNoApiKeyOrAuthToken_TheTuiKeepsItsEnvironment()
+    {
+        var source = new System.Collections.Hashtable
+        {
+            ["ANTHROPIC_API_KEY"] = "sk-x", ["ANTHROPIC_AUTH_TOKEN"] = "t", ["CLAUDE_CODE_SESSION_ID"] = "s", ["PATH"] = "p",
+        };
+        var headless = ClaudeEnvironment.Clean(headless: true, source: source);
+        CollectionAssert.AreEquivalent(new[] { "PATH" }, headless.Keys.ToArray());
+        var tui = ClaudeEnvironment.Clean(headless: false, source: source);
+        CollectionAssert.AreEquivalent(new[] { "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "PATH" }, tui.Keys.ToArray());
     }
 
     [TestMethod]

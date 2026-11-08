@@ -44,11 +44,18 @@ internal static class ClaudeEnvironment
     /// started from inside one (the desktop app, say), the child would otherwise attach to that
     /// session instead of the user's own login.
     /// </summary>
-    public static Dictionary<string, string> Clean()
+    /// <param name="headless">Also leave out the API key and auth token variables: in <c>claude -p</c> they win over
+    /// the person's plan login, so headless Claude never sees them (the TUI is left as it was).</param>
+    /// <param name="source">The variables to start from; this process's environment when null.</param>
+    public static Dictionary<string, string> Clean(bool headless = false, System.Collections.IDictionary? source = null)
     {
         var env = new Dictionary<string, string>(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
-        foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables())
+        foreach (System.Collections.DictionaryEntry e in source ?? Environment.GetEnvironmentVariables())
             env[(string)e.Key] = (string?)e.Value ?? "";
+        if (headless)
+            foreach (var key in env.Keys.Where(k => k.Equals("ANTHROPIC_API_KEY", StringComparison.OrdinalIgnoreCase)
+                         || k.Equals("ANTHROPIC_AUTH_TOKEN", StringComparison.OrdinalIgnoreCase)).ToList())
+                env.Remove(key);
         var nested = env.ContainsKey("CLAUDECODE");
         foreach (var key in env.Keys.ToList())
         {

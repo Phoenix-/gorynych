@@ -258,9 +258,10 @@ writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
 - **"Claude Code started without your login …"**. Run `claude` in a terminal and sign in. If you
   are signed in, `claude -p` may have started to run bare by default, which ignores the login:
   start the service with `--claude-transport tui`.
-- **"Claude Code would run on ANTHROPIC_API_KEY, billed outside your plan"**. An API key in the
-  service's environment wins over your login in `claude -p`. Remove it from the environment Zed
-  (and so the service) starts with, then restart the service.
+- **"Claude Code would run on …, billed outside your plan"** or **"Claude Code reports no plan"**.
+  Claude Code found a key or token other than your plan login, such as an `apiKeyHelper` in its
+  settings (Gorynych already leaves `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` out). Remove
+  it, or sign in with your plan, then prompt again.
 - **"Claude cannot run on your plan (…)"**. Claude Code reported an auth or billing error. If
   Anthropic no longer lets `claude -p` run on your plan, start the service with
   `--claude-transport tui`.

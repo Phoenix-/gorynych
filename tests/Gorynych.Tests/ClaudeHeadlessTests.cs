@@ -24,8 +24,9 @@ public sealed class ClaudeHeadlessTests
 
     static readonly string FakeRoot = Path.Combine(Path.GetTempPath(), "gorynych-fake-claude");
 
-    static ClaudeAdapterOptions Options(string dir, List<string>? log = null, bool liveNotes = false) => new()
+    static ClaudeAdapterOptions Options(string dir, List<string>? log = null, bool liveNotes = false, Func<Task>? beforeInterrupt = null) => new()
     {
+        BeforeInterrupt = beforeInterrupt,
         DataDirectory = Path.Combine(dir, "claude"),
         Executable = FakeClaude(),
         ProjectsDirectory = Path.Combine(FakeRoot, "projects"),
@@ -297,6 +298,8 @@ public sealed class ClaudeHeadlessTests
     [DataRow("no-account", "--claude-transport tui")]
     [DataRow("api-key", "remove ANTHROPIC_API_KEY")]
     [DataRow("api-key-init", "remove ANTHROPIC_API_KEY")]
+    [DataRow("auth-token", "reports no plan")]
+    [DataRow("bedrock", "runs through bedrock")]
     public async Task ALaunchOffThePlan_FailsLoudly_AndRunsNothing(string marker, string hint)
     {
         var dir = TestDirs.New();
@@ -309,6 +312,90 @@ public sealed class ClaudeHeadlessTests
         Assert.AreEqual("", client.Text(), "no answer came");
         // Still off the plan: the next prompt fails the same way instead of running unchecked.
         StringAssert.Contains((await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "again"))).Message, hint);
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ACancelThatArrivesLate_DoesNotInterruptTheNextPrompt()
+    {
+        var dir = TestDirs.New();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, beforeInterrupt: () => release.Task)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+        await PromptAsync(client, sessionId, "warm up");
+
+        static bool Sleeping(TestClient c, int n) =>
+            c.Snapshot().Count(u => (string?)u["sessionUpdate"] == "tool_call" && (string?)u["title"] is { } t && t.Contains("sleep", StringComparison.Ordinal)) >= n;
+        var first = PromptAsync(client, sessionId, "slow work");
+        await Until(() => Sleeping(client, 1));
+        // The cancel's interrupt is held back until the first turn is over and the next prompt runs.
+        await client.Rpc.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId });
+        Assert.AreEqual(StopReason.Cancelled, (await first).StopReason, "it ended by itself, as cancelled");
+        var second = PromptAsync(client, sessionId, "slow again");
+        await Until(() => Sleeping(client, 2));
+        release.TrySetResult();
+
+        Assert.AreEqual(StopReason.EndTurn, (await second).StopReason, "the late interrupt left the next prompt alone");
+        Assert.IsFalse(Controls(sessionId).Any(c => (string?)c["subtype"] == "interrupt"), "no interrupt was sent for a turn that was over");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task AStoppedClaude_LeavesNothingBehind_AndTheNextLaunchStartsClean()
+    {
+        var dir = TestDirs.New();
+        var marker = Path.Combine(dir, "api-key-init");
+        File.WriteAllText(marker, "");
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+        // The fake goes on with its turn after the system/init the adapter stops it for: those lines must be dropped.
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "first try"));
+        File.Delete(marker);
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "second try")).StopReason);
+        StringAssert.Contains(client.Text(), "echo: second try");
+        Assert.IsFalse(client.Text().Contains("echo: first try", StringComparison.Ordinal), "nothing of the stopped process reached the feed");
+        Assert.AreEqual(0, client.Snapshot().Count(u => Mark(u) is not null), "no turn of Claude's own was opened by its leftovers");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ClosingASessionWhoseClaudeStoppedReading_KillsIt_InsteadOfHanging()
+    {
+        var dir = TestDirs.New();
+        File.WriteAllText(Path.Combine(dir, "deaf"), "");
+        var agent = await new ClaudeAdapter(Options(dir)).StartAsync(CancellationToken.None);
+        var acp = new JsonRpcConnection(agent.Input, agent.Output, "direct-client")
+        {
+            NotificationHandler = (_, _) => Task.CompletedTask,
+            RequestHandler = (_, _) => Task.FromResult<JsonNode?>(AcpJson.ToNode(new RequestPermissionResponse
+            {
+                Outcome = new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId },
+            })),
+        };
+        acp.Start();
+        try
+        {
+            var sessionId = (await acp.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest { Cwd = dir, McpServers = [] })).SessionId;
+            // Far more than a pipe holds: the write blocks, with the input held.
+            var prompt = acp.SendRequestAsync(AcpMethods.Agent.SessionPrompt, AcpJson.ToNode(new PromptRequest
+            {
+                SessionId = sessionId, Prompt = [new TextContent { Text = new string('x', 4 * 1024 * 1024) }],
+            }));
+            await Task.Delay(1500);
+            Assert.IsFalse(prompt.IsCompleted);
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            await acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = sessionId }).WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.IsTrue(watch.Elapsed < TimeSpan.FromSeconds(15), $"close took {watch.Elapsed}");
+            try { await prompt.WaitAsync(TimeSpan.FromSeconds(10)); }
+            catch (JsonRpcException) { } // cancelled or failed: either way it ended
+        }
+        finally
+        {
+            await acp.DisposeAsync();
+            await agent.DisposeAsync();
+        }
     }
 
     [TestMethod]

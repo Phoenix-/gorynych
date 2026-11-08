@@ -93,7 +93,11 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   hooks.
 - The process starts with the session's first prompt, not at `session/new` or
   `session/resume`, and lives until `session/close` or the service's idle unload. It gets the
-  same cleaned environment as the TUI.
+  TUI's cleaned environment without `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`, which in
+  `-p` would win over the plan login.
+- The session handles only the lines of its current process: a process it gave up (stopped off
+  the plan, or after an interrupt without a result) may still have output in the pipe, which is
+  dropped, so it can neither open a turn nor answer an approval.
 - Right after the start the adapter sends the `initialize` control request (no fields). Its
   answer brings the model catalog and the account, which the adapter checks
   ([below](#failing-loudly)).
@@ -118,7 +122,9 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   gate orders them), so a prompt Claude has not started yet is dropped too. The turn ends with
   its `result`; without one within 5 s it ends as `cancelled` and Claude's process is stopped, so
   the next prompt resumes the conversation in a new one. Live notes the interrupt cancelled go
-  back to the service ([below](#live-notes-opinions-and-reports-on-stdin)).
+  back to the service ([below](#live-notes-opinions-and-reports-on-stdin)), and approvals still
+  open are withdrawn. A cancel whose interrupt comes only after its turn ended sends nothing, so
+  it never stops the next prompt.
 - Messages that wait with no turn running while Claude stays silent for 30 s are let go: a
   prompt among them fails ("Claude did not take the prompt"), so nothing waits for ever.
 - Claude exiting during a turn fails the prompt with the exit code and the end of stderr; the
@@ -216,8 +222,10 @@ deny fails the prompt.
 #### Failing loudly
 
 The transport never runs on silently when Claude is not on the person's plan. The check fails
-closed: a launch whose `initialize` fails, times out or is cancelled is stopped, as is one whose
-answer has no `account`.
+closed: a launch runs only when `initialize` answers with an `account` that has a plan
+(`subscriptionType`) on `apiProvider: "firstParty"`; one whose `initialize` fails, times out or is
+cancelled, or shows a token without a plan (an auth token, a gateway) or another provider, is
+stopped.
 
 - `initialize` shows no login (no plan, `tokenSource: "none"`), which is what `--bare` looks
   like: Claude is stopped and the prompt fails, telling the person to sign in or to start the

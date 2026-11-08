@@ -11,7 +11,8 @@
 // An opinion request (its text names `message_id "…"`) is answered through the reply route the
 // --mcp-config gives the gorynych server, as the peers server would. Files in the folder change
 // the account: `signed-out` (no login, as `--bare` gives), `no-account`, `api-key` (initialize
-// shows ANTHROPIC_API_KEY) and `api-key-init` (only system/init shows it).
+// shows ANTHROPIC_API_KEY), `api-key-init` (only system/init shows it), `auth-token` (a token but
+// no plan) and `bedrock` (another provider); `deaf` stops reading stdin after initialize.
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -65,6 +66,9 @@ static partial class FakeHeadless
                     case "control_request":
                         File.AppendAllText(controls, m["request"]!.ToJsonString() + "\n");
                         await OnControlAsync(m, cwd, transcript, sessionId);
+                        // A Claude that stops reading its input: writes to it block once the pipe is full.
+                        if ((string?)m["request"]?["subtype"] == "initialize" && File.Exists(Path.Combine(cwd, "deaf")))
+                            await Task.Delay(Timeout.Infinite);
                         break;
                     case "user":
                         await Inbox.Writer.WriteAsync(m);
@@ -95,6 +99,10 @@ static partial class FakeHeadless
                     : File.Exists(Path.Combine(cwd, "api-key"))
                         ? new JsonObject { ["tokenSource"] = "claude.ai", ["apiKeySource"] = "ANTHROPIC_API_KEY", ["apiProvider"] = "firstParty" }
                         : new JsonObject { ["email"] = "fake@example.com", ["subscriptionType"] = "Claude Max", ["apiProvider"] = "firstParty" };
+                if (File.Exists(Path.Combine(cwd, "auth-token")))
+                    account = new JsonObject { ["tokenSource"] = "ANTHROPIC_AUTH_TOKEN", ["apiProvider"] = "firstParty" };
+                if (File.Exists(Path.Combine(cwd, "bedrock")))
+                    account = new JsonObject { ["subscriptionType"] = "Claude Max", ["apiProvider"] = "bedrock" };
                 if (File.Exists(Path.Combine(cwd, "no-account"))) account = null;
                 await RespondAsync(id, new JsonObject
                 {

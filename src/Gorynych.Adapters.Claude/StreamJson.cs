@@ -101,7 +101,7 @@ public static class StreamJson
 
     public static string ApiKeyProblem(string apiKey) =>
         $"Claude Code would run on {apiKey}, billed outside your plan. Gorynych runs Claude on your own plan login only: " +
-        $"remove {apiKey} from the environment the Gorynych service starts with.";
+        $"remove {apiKey} from Claude Code's settings or from the environment the Gorynych service starts with.";
 
     /// <summary>
     /// Why a launch must not run, from its <c>initialize</c> answer, or null when it runs on the
@@ -109,13 +109,20 @@ public static class StreamJson
     /// </summary>
     public static string? PlanProblem(JsonObject initialize)
     {
-        if (initialize["account"] is not JsonObject)
+        if (initialize["account"] is not JsonObject account)
             return "Claude Code did not report its account, so Gorynych cannot tell whether it runs on your plan, and does not run it. " + TuiHint;
+        if ((string?)account["apiProvider"] is var provider && provider != "firstParty")
+            return $"Claude Code runs through {provider ?? "an unknown provider"}, not on your Anthropic plan; Gorynych runs Claude on your own plan login only.";
         if (SignedOut(initialize))
             return "Claude Code started without your login (its account shows no plan and no token). Sign in with `claude` in a " +
                 "terminal; if you are signed in, `claude -p` may now run bare by default, which ignores the login, so start the " +
                 "Gorynych service with --claude-transport tui.";
-        return ApiKeySource(initialize) is { } apiKey ? ApiKeyProblem(apiKey) : null;
+        if (ApiKeySource(initialize) is { } apiKey) return ApiKeyProblem(apiKey);
+        // Anything but a plan (an auth token, a gateway) is billed elsewhere.
+        if ((string?)account["subscriptionType"] is not { Length: > 0 })
+            return $"Claude Code reports no plan (its token comes from {(string?)account["tokenSource"] ?? "nowhere known"}), so it would " +
+                "not run on your subscription; Gorynych runs Claude on your own plan login only. " + TuiHint;
+        return null;
     }
 
     /// <summary>The assistant errors that mean Claude cannot run on the person's plan (<c>SDKAssistantMessageError</c>).</summary>
