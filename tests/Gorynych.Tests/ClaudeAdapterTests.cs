@@ -267,12 +267,77 @@ public sealed class ClaudeAdapterTests
         Assert.AreEqual(StopReason.Cancelled, (await prompt.WaitAsync(TimeSpan.FromSeconds(20))).StopReason);
         Assert.IsFalse(File.Exists(FakeFile(session, ".args.json")), "Claude was not started");
         Assert.IsNull(KeptAnswer(dir));
+        // The question's tool call is closed, so the client does not keep showing it pending.
+        await Until(() => client.Snapshot().Any(u => (string?)u["toolCallId"] == ClaudeHooks.ChannelConsentToolCallId
+            && (string?)u["status"] == "failed"
+            && ((string?)u["content"]?[0]?["content"]?["text"] ?? "").StartsWith("Withdrawn", StringComparison.Ordinal)));
 
         // The next prompt asks again.
         client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId });
         Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, session, "hello")).StopReason);
         Assert.AreEqual(2, ChannelQuestions(client).Length);
         Assert.IsTrue(File.Exists(NoticeFile(session)));
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task AnOpenChannelQuestion_HoldsUpNoOtherSession_AndLaterLaunchesFollowTheAnswer()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, ChannelAdapter(dir));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var asked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var answer = new TaskCompletionSource<RequestPermissionOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Approve = r =>
+        {
+            asked.TrySetResult();
+            return answer.Task; // the person answers only later
+        };
+        var first = await NewClaudeSessionAsync(client, dir);
+        var firstPrompt = PromptAsync(client, first, "hello");
+        await asked.Task.WaitAsync(TimeSpan.FromSeconds(20));
+
+        // While the question is open, other sessions start at once, without the channel, and nobody asks again.
+        var second = await NewClaudeSessionAsync(client, dir);
+        var third = await NewClaudeSessionAsync(client, dir);
+        var others = await Task.WhenAll(PromptAsync(client, second, "a"), PromptAsync(client, third, "b")).WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.IsTrue(others.All(r => r.StopReason == StopReason.EndTurn));
+        Assert.AreEqual(1, ChannelQuestions(client).Length, "one question at a time");
+        CollectionAssert.DoesNotContain(LaunchArgs(second), "--dangerously-load-development-channels");
+        CollectionAssert.DoesNotContain(LaunchArgs(third), "--dangerously-load-development-channels");
+        Assert.IsFalse(firstPrompt.IsCompleted, "the asking session waits for the person");
+
+        answer.SetResult(new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId });
+        Assert.AreEqual(StopReason.EndTurn, (await firstPrompt.WaitAsync(TimeSpan.FromSeconds(30))).StopReason);
+        CollectionAssert.Contains(LaunchArgs(first), "--dangerously-load-development-channels");
+
+        // Launches after the answer follow it without asking.
+        var fourth = await NewClaudeSessionAsync(client, dir);
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, fourth, "c")).StopReason);
+        Assert.AreEqual(1, ChannelQuestions(client).Length);
+        CollectionAssert.Contains(LaunchArgs(fourth), "--dangerously-load-development-channels");
+    }
+
+    [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "holds the file open to make it unreadable, which only Windows refuses")]
+    public void AChannelsFileThatCannotBeRead_CountsAsNotAskedYet()
+    {
+        var path = Path.Combine(TestDirs.New(), "channels.json");
+        File.WriteAllText(path, """{"accepted":true}""");
+        using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            Assert.IsNull(new ChannelConsentStore(path).Answer);
+        Assert.AreEqual(true, new ChannelConsentStore(path).Answer);
+    }
+
+    static async Task Until(Func<bool> condition, int timeoutMs = 10_000)
+    {
+        var deadline = Environment.TickCount64 + timeoutMs;
+        while (!condition())
+        {
+            if (Environment.TickCount64 > deadline) Assert.Fail("the condition did not hold in time");
+            await Task.Delay(25);
+        }
     }
 
     [TestMethod]

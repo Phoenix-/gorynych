@@ -60,7 +60,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     readonly ConcurrentDictionary<string, ClaudeSession> sessions = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, long> cancelledAt = new(StringComparer.Ordinal);
     readonly ChannelConsentStore consent;
-    readonly SemaphoreSlim consentGate = new(1, 1);
+    readonly Lock consentGate = new();
+    string? consentAsking; // the session whose development-channels question is open
     HookServer? hooks;
 
     public ClaudeAgent(ClaudeAdapterOptions options, JsonRpcConnection rpc)
@@ -238,20 +239,28 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     /// <summary>
     /// Whether this launch of the session loads the channel. Never without a channel server; the
-    /// answer given up front or kept from before when there is one; otherwise the person is asked
-    /// once, on this session, while other sessions' launches wait for that answer. A question
-    /// left unanswered (dismissed, or no client could take it) runs this launch without the
-    /// channel and is asked again at the next one.
+    /// answer given up front or kept from before when there is one; otherwise the person is asked,
+    /// on this session. One question at a time, and it holds up no other session: while it is
+    /// open, other launches go without the channel and ask nothing. A question left unanswered
+    /// (dismissed, or no client could take it) runs this launch without the channel and is asked
+    /// again at a later one. Cancelling <paramref name="ct"/> withdraws the question.
     /// </summary>
     public async Task<bool> UseChannelAsync(string sessionId, CancellationToken ct)
     {
         if (Channel is null) return false;
         if (options.Channels != ChannelConsent.Ask) return options.Channels == ChannelConsent.Accept;
-        if (consent.Answer is { } known) return known;
-        await consentGate.WaitAsync(ct);
+        lock (consentGate)
+        {
+            if (consent.Answer is { } known) return known;
+            if (consentAsking is { } other)
+            {
+                Log($"claude {sessionId}: starts without the channel while the development-channels question on {other} is open");
+                return false;
+            }
+            consentAsking = sessionId;
+        }
         try
         {
-            if (consent.Answer is { } decided) return decided;
             Log($"claude {sessionId}: asking the person about development channels");
             bool? accepted;
             try
@@ -264,28 +273,41 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 Log($"claude {sessionId}: the development-channels question failed: {e.Message}");
                 accepted = null;
             }
+            catch (OperationCanceledException)
+            {
+                Log($"claude {sessionId}: the development-channels question was withdrawn");
+                await CloseChannelQuestionAsync(sessionId, ToolCallStatus.Failed,
+                    "Withdrawn: the prompt was cancelled. Gorynych asks again at the next launch.");
+                throw;
+            }
             if (accepted is { } answer)
             {
+                // Saved before the question counts as closed, so a launch that finds none open finds the answer.
                 consent.Save(answer, sessionId);
                 Log($"claude {sessionId}: development channels {(answer ? "allowed" : "declined")} by the person; kept in {consent.Path}");
             }
-            try
-            {
-                await EmitAsync(sessionId, ClaudeHooks.ToolCallStatusUpdate(ClaudeHooks.ChannelConsentToolCallId,
-                    accepted == true ? ToolCallStatus.Completed : ToolCallStatus.Failed,
-                    accepted switch
-                    {
-                        true => "Allowed. Gorynych starts Claude with development channels and confirms the notice on each launch.",
-                        false => "Not allowed. Claude runs without the channel; other agents' messages reach it as turns.",
-                        null => "Not answered. This launch runs without the channel; Gorynych asks again at the next one.",
-                    }));
-            }
-            catch (IOException) { }
+            await CloseChannelQuestionAsync(sessionId, accepted == true ? ToolCallStatus.Completed : ToolCallStatus.Failed,
+                accepted switch
+                {
+                    true => "Allowed. Gorynych starts Claude with development channels and confirms the notice on each launch.",
+                    false => "Not allowed. Claude runs without the channel; other agents' messages reach it as turns.",
+                    null => "Not answered. This launch runs without the channel; Gorynych asks again at the next one.",
+                });
             return accepted ?? false;
         }
         finally
         {
-            consentGate.Release();
+            lock (consentGate) consentAsking = null;
+        }
+    }
+
+    /// <summary>Ends the <c>development-channels</c> tool call the question opened; best effort.</summary>
+    async Task CloseChannelQuestionAsync(string sessionId, ToolCallStatus status, string text)
+    {
+        try { await EmitAsync(sessionId, ClaudeHooks.ToolCallStatusUpdate(ClaudeHooks.ChannelConsentToolCallId, status, text)); }
+        catch (Exception e) when (e is IOException or ObjectDisposedException or JsonRpcException)
+        {
+            Log($"claude {sessionId}: the development-channels tool call was not closed: {e.Message}");
         }
     }
 

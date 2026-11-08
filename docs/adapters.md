@@ -116,10 +116,11 @@ that notice for the person, so it asks first:
   `--append-system-prompt`, as with `--no-channel`; opinion requests and reports go in as
   service turns ([adapter-contract.md](adapter-contract.md#61-waking-a-session-and-closing-it-again)).
 - A question left unanswered (the client answers `cancelled`, or no client can take it) runs
-  that launch without the channel, keeps nothing and asks again at the next launch. Like
+  that launch without the channel, keeps nothing and asks again at a later launch. Like
   every approval, it waits for a client while none has the session open. A cancelled prompt
-  withdraws its question and starts nothing. While one session's question is open, the
-  launches of other sessions wait for its answer.
+  withdraws its question (the tool call ends `failed`) and starts nothing.
+- One question at a time, and it holds up no other session: while it is open, other sessions
+  launch without the channel and are not asked; launches after the answer follow it.
 - `--claude-channels accept|decline` answers up front, for a service nobody watches; `ask` is
   the default. `--no-channel` is the same as `decline`.
 

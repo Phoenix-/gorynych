@@ -51,7 +51,11 @@ internal sealed class ChannelConsentStore
         this.log = log;
         if (!File.Exists(path)) return;
         try { record = JsonSerializer.Deserialize(File.ReadAllText(path), ClaudeJsonContext.Default.ChannelConsentRecord); }
-        catch (JsonException e) { log?.Invoke($"claude adapter: {path} is not readable, the person is asked again: {e.Message}"); }
+        catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
+        {
+            // Treated as not asked yet, like an answer that could not be saved.
+            log?.Invoke($"claude adapter: {path} is not readable, the person is asked again: {e.Message}");
+        }
     }
 
     public string Path => path;
