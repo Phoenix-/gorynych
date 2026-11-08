@@ -550,6 +550,7 @@ public sealed class SessionLifecycleTests
         var write = JsonNode.Parse("""{"hook_event_name":"PermissionRequest","tool_name":"Write","tool_input":{"file_path":"C:\\w\\a.txt","content":"hi"}}""")!.AsObject();
         ZedRules.CheckPermission(ClaudeHooks.Permission("s", "t", write));
         ZedRules.CheckPermission(ClaudeHooks.TrustFolder("s", @"C:\w"));
+        ZedRules.CheckPermission(ClaudeHooks.ChannelConsentQuestion("s"));
     }
 
     [TestMethod]

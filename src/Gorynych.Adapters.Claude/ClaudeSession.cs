@@ -72,6 +72,9 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
 
     public bool IsRunning => pty is { Exited.IsCompleted: false };
 
+    /// <summary>Whether the latest launch loaded the channel; without it messages for Claude go in as turns.</summary>
+    public bool ChannelLoaded { get; private set; }
+
     string Folder => Path.Combine(options.DataDirectory, "sessions", Id);
 
     // ---------------------------------------------------------------- prompts
@@ -99,8 +102,9 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
             Task<int> exited;
             if (!IsRunning) // not started yet, or it ended while we waited
             {
+                if (await ChannelForLaunchAsync(cancelled, ct) is not { } withChannel) return StopReason.Cancelled;
                 lock (stateGate) { turn = current; idle = NewSignal(); turnCount++; }
-                Launch(text);
+                Launch(text, withChannel);
                 exited = pty!.Exited;
                 // A launch that never reaches the prompt (a dialog nobody answers) must not hang forever.
                 _ = WatchStartupAsync(current, pty);
@@ -127,6 +131,31 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         {
             lock (stateGate) turn = null;
             promptGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Whether the next launch loads the channel (<see cref="ClaudeAgent.UseChannelAsync"/>, which
+    /// may ask the person); null when the client cancelled this prompt meanwhile, which withdraws
+    /// the question.
+    /// </summary>
+    async Task<bool?> ChannelForLaunchAsync(Func<bool> cancelled, CancellationToken ct)
+    {
+        using var withdraw = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var asking = agent.UseChannelAsync(Id, withdraw.Token);
+        while (true)
+        {
+            Task wake;
+            lock (stateGate) wake = Task.WhenAny(asking, cancelSignal.Task);
+            if (cancelled())
+            {
+                withdraw.Cancel();
+                try { await asking; }
+                catch (OperationCanceledException) { }
+                return null;
+            }
+            if (asking.IsCompleted) return await asking;
+            await wake.WaitAsync(ct);
         }
     }
 
@@ -188,7 +217,8 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
 
     // ---------------------------------------------------------------- launch
 
-    void Launch(string prompt)
+    /// <param name="withChannel">Load the channel: the person agreed (<see cref="ClaudeAgent.UseChannelAsync"/>).</param>
+    void Launch(string prompt, bool withChannel)
     {
         var exe = options.Executable ?? ExecutableLocator.Find("claude")
             ?? throw new JsonRpcException(JsonRpcException.InternalError, "claude was not found on PATH");
@@ -199,7 +229,8 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         var args = new List<string> { "--settings", settingsPath, "--permission-mode", options.PermissionMode };
         if (options.Model is { Length: > 0 } model) args.AddRange(["--model", model]);
         var mcpPath = Path.Combine(Folder, "mcp.json");
-        if (agent.Channel is { } channel)
+        var channel = withChannel ? agent.Channel : null;
+        if (channel is not null)
         {
             File.WriteAllText(mcpPath, channel.McpConfig(Id, Token, McpServers).ToJsonString(AcpJson.TextOptions));
             args.AddRange(["--mcp-config", mcpPath, "--dangerously-load-development-channels", "server:" + ChannelHost.ServerName]);
@@ -209,7 +240,7 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
             File.WriteAllText(mcpPath, Claude.McpServers.Config(McpServers).ToJsonString(AcpJson.TextOptions));
             args.AddRange(["--mcp-config", mcpPath]);
         }
-        var appended = string.Join("\n\n", new[] { agent.Channel is null ? null : ChannelHost.SystemPrompt, SystemPrompt }
+        var appended = string.Join("\n\n", new[] { channel is null ? null : ChannelHost.SystemPrompt, SystemPrompt }
             .Where(t => !string.IsNullOrEmpty(t)));
         if (appended.Length > 0) args.AddRange(["--append-system-prompt", appended]);
         args.AddRange(resume ? ["--resume", Id] : ["--session-id", Id]);
@@ -217,6 +248,7 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         var commandLine = TerminalText.Quote(exe) + " " + TerminalText.JoinArguments(args);
 
         sawPrompt = false;
+        ChannelLoaded = channel is not null;
         acceptedChannelWarning = false;
         screen.Clear();
         var previous = pty;
@@ -312,10 +344,11 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
     {
         if (sawPrompt) return;
         var text = screen.Text;
-        if (agent.Channel is not null && !acceptedChannelWarning && ChannelWarning().IsMatch(text))
+        // Shown only for a launch with the channel, which the person agreed to (UseChannelAsync).
+        if (ChannelLoaded && !acceptedChannelWarning && ChannelWarning().IsMatch(text))
         {
             acceptedChannelWarning = true;
-            agent.Log($"claude {Id}: accepting the development-channels notice");
+            agent.Log($"claude {Id}: confirming the development-channels notice, as the person agreed");
             _ = Task.Delay(300).ContinueWith(_ => pty?.Write("\r"), TaskScheduler.Default);
             return;
         }

@@ -190,6 +190,42 @@ public static class ClaudeHooks
         ],
     };
 
+    /// <summary>The tool call ID of the development-channels question (<see cref="ChannelConsentQuestion"/>).</summary>
+    public const string ChannelConsentToolCallId = "development-channels";
+
+    /// <summary>What the development-channels question tells the person.</summary>
+    public const string ChannelConsentText =
+        "Gorynych passes other agents' questions and child sessions' reports to a running Claude Code session through a channel. " +
+        "Channels are a Claude Code research preview: Claude loads Gorynych's channel only when started with " +
+        "--dangerously-load-development-channels, and then shows a notice at every launch.\n\n" +
+        "Allow: Gorynych starts Claude with that flag and confirms the notice for you on each launch.\n" +
+        "Don't allow: Claude runs without the channel; those messages reach it as ordinary turns once it is idle.\n\n" +
+        "Gorynych asks once and keeps your answer in its own data (claude\\channels.json), never in Claude's configuration. " +
+        "To give the answer up front, start the service with --claude-channels accept or --claude-channels decline.";
+
+    /// <summary>
+    /// The one question whether Gorynych may start Claude with development channels and confirm
+    /// Claude Code's notice for them on each launch. Its answer is kept, so the options are the
+    /// <c>always</c> kinds.
+    /// </summary>
+    public static RequestPermissionRequest ChannelConsentQuestion(string sessionId) => new()
+    {
+        SessionId = sessionId,
+        ToolCall = new ToolCallUpdate
+        {
+            ToolCallId = ChannelConsentToolCallId,
+            Title = "Start Claude Code with development channels and confirm its notice on each launch?",
+            Kind = ToolKind.Other,
+            Status = ToolCallStatus.Pending,
+            Content = [new Content { ContentValue = new TextContent { Text = ChannelConsentText } }],
+        },
+        Options =
+        [
+            new PermissionOption { OptionId = AllowOptionId, Name = "Allow", Kind = PermissionOptionKind.AllowAlways },
+            new PermissionOption { OptionId = DenyOptionId, Name = "Don't allow", Kind = PermissionOptionKind.RejectAlways },
+        ],
+    };
+
     /// <summary>
     /// AskUserQuestion is a question, not an approval: it becomes one ACP form
     /// (<c>elicitation/create</c>, form mode, scoped to the session and the tool call) with a

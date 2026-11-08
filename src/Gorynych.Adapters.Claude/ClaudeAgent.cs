@@ -31,6 +31,13 @@ public sealed class ClaudeAdapterOptions
     /// <summary>The command that runs the channel server, or null to start Claude without a channel.</summary>
     public IReadOnlyList<string>? ChannelServerCommand { get; init; }
 
+    /// <summary>
+    /// Whether Claude may be started with development channels, which makes Claude Code show a
+    /// notice the adapter confirms on each launch. <see cref="ChannelConsent.Ask"/> asks the person
+    /// once and keeps the answer in <c>channels.json</c> of <see cref="DataDirectory"/>.
+    /// </summary>
+    public ChannelConsent Channels { get; init; } = ChannelConsent.Ask;
+
     public int StartupTimeoutSeconds { get; init; } = 90;
     public int PasteEnterDelayMs { get; init; } = 400;
 
@@ -52,6 +59,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     readonly ClaudeStateStore state;
     readonly ConcurrentDictionary<string, ClaudeSession> sessions = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, long> cancelledAt = new(StringComparer.Ordinal);
+    readonly ChannelConsentStore consent;
+    readonly SemaphoreSlim consentGate = new(1, 1);
     HookServer? hooks;
 
     public ClaudeAgent(ClaudeAdapterOptions options, JsonRpcConnection rpc)
@@ -59,6 +68,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         this.options = options;
         this.rpc = rpc;
         state = new ClaudeStateStore(Path.Combine(options.DataDirectory, "sessions.json"), options.Log);
+        consent = new ChannelConsentStore(Path.Combine(options.DataDirectory, "channels.json"), options.Log);
         Channel = options.ChannelServerCommand is { Count: > 0 } command ? new ChannelHost(command) : null;
         rpc.RequestHandler = HandleAsync;
         rpc.NotificationHandler = OnNotificationAsync;
@@ -190,6 +200,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         var text = (string?)request.Params?["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
         var session = Session(id, null);
         if (!session.IsRunning) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running; prompt it first.");
+        if (!session.ChannelLoaded) throw new JsonRpcException(JsonRpcException.MethodNotFound, "This Claude session runs without a channel.");
         var reply = await Channel.AskAsync(id, text, request.Params?["_meta"] as JsonObject, ct);
         return new JsonObject { ["text"] = reply };
     }
@@ -206,6 +217,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         var text = (string?)request.Params?["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
         var session = Session(id, null);
         if (!session.IsRunning) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running.");
+        if (!session.ChannelLoaded) throw new JsonRpcException(JsonRpcException.MethodNotFound, "This Claude session runs without a channel.");
         await Channel.NotifyAsync(id, text, request.Params?["_meta"] as JsonObject, ct);
         return new JsonObject();
     }
@@ -223,6 +235,59 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     }
 
     public Task EmitAsync(string sessionId, SessionUpdate update) => rpc.SendUpdateAsync(sessionId, update);
+
+    /// <summary>
+    /// Whether this launch of the session loads the channel. Never without a channel server; the
+    /// answer given up front or kept from before when there is one; otherwise the person is asked
+    /// once, on this session, while other sessions' launches wait for that answer. A question
+    /// left unanswered (dismissed, or no client could take it) runs this launch without the
+    /// channel and is asked again at the next one.
+    /// </summary>
+    public async Task<bool> UseChannelAsync(string sessionId, CancellationToken ct)
+    {
+        if (Channel is null) return false;
+        if (options.Channels != ChannelConsent.Ask) return options.Channels == ChannelConsent.Accept;
+        if (consent.Answer is { } known) return known;
+        await consentGate.WaitAsync(ct);
+        try
+        {
+            if (consent.Answer is { } decided) return decided;
+            Log($"claude {sessionId}: asking the person about development channels");
+            bool? accepted;
+            try
+            {
+                var response = await RequestPermissionAsync(ClaudeHooks.ChannelConsentQuestion(sessionId), ct);
+                accepted = response.Outcome is SelectedPermissionOutcome ? ClaudeHooks.IsAllowed(response.Outcome) : null;
+            }
+            catch (Exception e) when (e is IOException or JsonRpcException)
+            {
+                Log($"claude {sessionId}: the development-channels question failed: {e.Message}");
+                accepted = null;
+            }
+            if (accepted is { } answer)
+            {
+                consent.Save(answer, sessionId);
+                Log($"claude {sessionId}: development channels {(answer ? "allowed" : "declined")} by the person; kept in {consent.Path}");
+            }
+            try
+            {
+                await EmitAsync(sessionId, ClaudeHooks.ToolCallStatusUpdate(ClaudeHooks.ChannelConsentToolCallId,
+                    accepted == true ? ToolCallStatus.Completed : ToolCallStatus.Failed,
+                    accepted switch
+                    {
+                        true => "Allowed. Gorynych starts Claude with development channels and confirms the notice on each launch.",
+                        false => "Not allowed. Claude runs without the channel; other agents' messages reach it as turns.",
+                        null => "Not answered. This launch runs without the channel; Gorynych asks again at the next one.",
+                    }));
+            }
+            catch (IOException) { }
+            return accepted ?? false;
+        }
+        finally
+        {
+            consentGate.Release();
+        }
+    }
 
     public Task<RequestPermissionResponse> RequestPermissionAsync(RequestPermissionRequest request, CancellationToken ct) =>
         rpc.RequestAsync<RequestPermissionRequest, RequestPermissionResponse>(AcpMethods.Client.SessionRequestPermission, request, ct);

@@ -13,8 +13,8 @@ agent. New sessions then go to that agent and `session/list` shows only its sess
 client needs no Gorynych extensions. `codex app-server proxy` follows the same idea.
 
 Service options after `--agent` (`--data`, `--claude-model`, `--default-agent`,
-`--unload-after <minutes>`, `--no-channel`, `--no-peers`) apply only when the bridge has to
-start the service; a running
+`--unload-after <minutes>`, `--claude-channels ask|accept|decline`, `--no-channel`,
+`--no-peers`) apply only when the bridge has to start the service; a running
 service keeps its own. The service outlives the bridge and the client: it is started
 without inherited handles, without a console and, when the client's job object allows it,
 outside that job.
@@ -31,6 +31,13 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
   `tool_call_update`, `plan`, `usage_update`, `session_info_update`. Gorynych's own
   `_meta` keys can be ignored.
 - Approvals are `session/request_permission`.
+- Once, before the first Claude launch that would load Gorynych's channel, the person is asked
+  on that session whether Gorynych may start Claude Code with development channels (a Claude
+  Code research preview) and confirm the notice Claude shows for them on each launch
+  (tool call `development-channels`, options "Allow" and "Don't allow"). The answer is kept in
+  the service's data; declining runs Claude without the channel, and other agents' questions
+  reach it as turns. `--claude-channels accept|decline` gives the answer up front
+  ([adapters.md](adapters.md#consent-to-development-channels)).
 - Questions (Claude's `AskUserQuestion`) are forms (`elicitation/create`) for clients that
   declare `elicitation.form`; for others the service asks each choice field as a
   `session/request_permission` whose options are the answers plus `Skip`. A form with free

@@ -97,6 +97,7 @@ public sealed class ClaudeAdapterTests
             DataDirectory = Path.Combine(dir, "claude"),
             Executable = FakeClaude(),
             ChannelServerCommand = [@"C:\svc\Gorynych.Service.exe", "peers"],
+            Channels = ChannelConsent.Accept, // given up front: no question, and the notice is confirmed
             StartupTimeoutSeconds = 30,
         })]);
         await using var client = await TestClient.ConnectAsync(conductor);
@@ -116,6 +117,7 @@ public sealed class ClaudeAdapterTests
         var args = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", sessionId + ".args.json")))!
             .AsArray().Select(a => (string)a!).ToList();
         CollectionAssert.Contains(args, "server:gorynych");
+        Assert.IsTrue(File.Exists(NoticeFile(sessionId)), "the adapter confirmed Claude's development-channels notice");
         Assert.AreEqual(ChannelHost.SystemPrompt + "\n\n" + Gorynych.Service.PeersServer.SystemPrompt, args[args.IndexOf("--append-system-prompt") + 1],
             "the channel's authorization, then the service's systemPrompt (append), which the adapter advertises");
         Assert.AreEqual(1, args.Count(a => a == "--append-system-prompt"));
@@ -127,6 +129,150 @@ public sealed class ClaudeAdapterTests
         Assert.AreEqual(@"C:\svc\Gorynych.Service.exe", (string?)mcp["gorynych"]!["command"]);
         Assert.AreEqual("other.exe", (string?)mcp["other"]!["command"], "the client's own MCP servers reach Claude too");
         Assert.AreEqual("V", (string?)mcp["other"]!["env"]!["K"]);
+    }
+
+    static string FakeFile(string sessionId, string extension) =>
+        Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", sessionId + extension);
+
+    /// <summary>Written by the fake when the adapter confirmed its development-channels notice with Enter.</summary>
+    static string NoticeFile(string sessionId) => FakeFile(sessionId, ".notice.txt");
+
+    static List<string> LaunchArgs(string sessionId) =>
+        System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(FakeFile(sessionId, ".args.json")))!.AsArray().Select(a => (string)a!).ToList();
+
+    static ClaudeAdapter ChannelAdapter(string dir, ChannelConsent channels = ChannelConsent.Ask) => new(new ClaudeAdapterOptions
+    {
+        DataDirectory = Path.Combine(dir, "claude"),
+        Executable = FakeClaude(),
+        ChannelServerCommand = [@"C:\svc\Gorynych.Service.exe", "peers"],
+        Channels = channels,
+        StartupTimeoutSeconds = 30,
+    });
+
+    static async Task<string> NewClaudeSessionAsync(TestClient client, string dir) =>
+        (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+        {
+            Cwd = dir,
+            McpServers = [],
+            Meta = new System.Text.Json.Nodes.JsonObject { ["gorynych/agent"] = "claude" },
+        })).SessionId;
+
+    static Task<PromptResponse> PromptAsync(TestClient client, string sessionId, string text) =>
+        client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = sessionId, Prompt = [new TextContent { Text = text }] });
+
+    static RequestPermissionRequest[] ChannelQuestions(TestClient client)
+    {
+        lock (client.Approvals) return client.Approvals.Where(a => a.ToolCall.ToolCallId == ClaudeHooks.ChannelConsentToolCallId).ToArray();
+    }
+
+    static bool? KeptAnswer(string dir)
+    {
+        var path = Path.Combine(dir, "claude", "channels.json");
+        return File.Exists(path) ? (bool?)System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))!["accepted"] : null;
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task DevelopmentChannels_AreAskedOnce_AndTheNoticeIsConfirmedOnlyAfterTheAllow()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var dir = TestDirs.New();
+        await using (var conductor = TestDirs.Conductor(dir, ChannelAdapter(dir)))
+        await using (var client = await TestClient.ConnectAsync(conductor))
+        {
+            var first = await NewClaudeSessionAsync(client, dir);
+            Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, first, "hello")).StopReason);
+            var question = ChannelQuestions(client).Single();
+            Assert.AreEqual(first, question.SessionId, "asked on the session that launches");
+            Assert.AreEqual(ClaudeHooks.AllowOptionId, question.Options[0].OptionId);
+            StringAssert.Contains(question.ToolCall.Title, "development channels");
+            StringAssert.Contains(((TextContent)((Content)question.ToolCall.Content!.Single()).ContentValue).Text, "research preview");
+            ZedRules.CheckPermission(question);
+
+            CollectionAssert.Contains(LaunchArgs(first), "--dangerously-load-development-channels");
+            Assert.IsTrue(File.Exists(NoticeFile(first)), "the notice is confirmed once the person allowed it");
+            Assert.AreEqual(true, KeptAnswer(dir), "kept in the service's own data");
+            Assert.IsTrue(client.Snapshot().Any(u => (string?)u["toolCallId"] == ClaudeHooks.ChannelConsentToolCallId && (string?)u["status"] == "completed"));
+
+            var second = await NewClaudeSessionAsync(client, dir);
+            Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, second, "hello again")).StopReason);
+            Assert.AreEqual(1, ChannelQuestions(client).Length, "asked once");
+            CollectionAssert.Contains(LaunchArgs(second), "--dangerously-load-development-channels");
+        }
+
+        // The answer outlives the service.
+        await using var restarted = TestDirs.Conductor(dir, ChannelAdapter(dir));
+        await using var later = await TestClient.ConnectAsync(restarted, "later");
+        var third = await NewClaudeSessionAsync(later, dir);
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(later, third, "after restart")).StopReason);
+        Assert.AreEqual(0, ChannelQuestions(later).Length);
+        Assert.IsTrue(File.Exists(NoticeFile(third)));
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task UnansweredChannelQuestion_IsAskedAgain_AndADeclineRunsClaudeWithoutTheChannel()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, ChannelAdapter(dir));
+        await using var client = await TestClient.ConnectAsync(conductor);
+
+        // Dismissed: this launch runs without the channel, and nothing is kept.
+        client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new RequestPermissionOutcomeCancelled());
+        var first = await NewClaudeSessionAsync(client, dir);
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, first, "hello")).StopReason);
+        CollectionAssert.DoesNotContain(LaunchArgs(first), "--dangerously-load-development-channels");
+        Assert.IsNull(KeptAnswer(dir));
+
+        // Asked again at the next launch; declined.
+        client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = ClaudeHooks.DenyOptionId });
+        var second = await NewClaudeSessionAsync(client, dir);
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, second, "hello")).StopReason);
+        Assert.AreEqual(2, ChannelQuestions(client).Length);
+        var args = LaunchArgs(second);
+        CollectionAssert.DoesNotContain(args, "--dangerously-load-development-channels");
+        CollectionAssert.DoesNotContain(args, "--append-system-prompt", "no channel authorization without the channel");
+        Assert.IsFalse(File.Exists(NoticeFile(second)));
+        Assert.AreEqual(false, KeptAnswer(dir));
+        Assert.IsTrue(client.Snapshot().Any(u => (string?)u["toolCallId"] == ClaudeHooks.ChannelConsentToolCallId && (string?)u["status"] == "failed"));
+
+        // A decline is kept too: the next session is not asked.
+        var third = await NewClaudeSessionAsync(client, dir);
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, third, "hello")).StopReason);
+        Assert.AreEqual(2, ChannelQuestions(client).Length);
+        CollectionAssert.DoesNotContain(LaunchArgs(third), "--dangerously-load-development-channels");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task CancellingThePrompt_WithdrawsTheChannelQuestion_AndLaunchesNothing()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, ChannelAdapter(dir));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var asked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Approve = r =>
+        {
+            asked.TrySetResult();
+            return new TaskCompletionSource<RequestPermissionOutcome>().Task; // the person never answers
+        };
+        var session = await NewClaudeSessionAsync(client, dir);
+        var prompt = PromptAsync(client, session, "hello");
+        await asked.Task.WaitAsync(TimeSpan.FromSeconds(20));
+        await client.Rpc.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new System.Text.Json.Nodes.JsonObject { ["sessionId"] = session });
+
+        Assert.AreEqual(StopReason.Cancelled, (await prompt.WaitAsync(TimeSpan.FromSeconds(20))).StopReason);
+        Assert.IsFalse(File.Exists(FakeFile(session, ".args.json")), "Claude was not started");
+        Assert.IsNull(KeptAnswer(dir));
+
+        // The next prompt asks again.
+        client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId });
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, session, "hello")).StopReason);
+        Assert.AreEqual(2, ChannelQuestions(client).Length);
+        Assert.IsTrue(File.Exists(NoticeFile(session)));
     }
 
     [TestMethod]

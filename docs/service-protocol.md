@@ -19,12 +19,17 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   user's login). The GUI, the test client or a logon task starts it; it keeps running
   after clients disconnect.
 - Data: `%LOCALAPPDATA%\Gorynych` (`--data` overrides): `service.json` (the persistent
-  service ID), `sessions.json` (the overlay), `journal/`, `claude/`, `logs/`.
+  service ID), `sessions.json` (the overlay), `journal/`, `claude/` (the Claude adapter's
+  session list and `channels.json`, the person's answer about development channels), `logs/`.
 
 Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi]
-[--claude-model <model>] [--unload-after <minutes>] [--no-channel] [--no-peers] [--console]`.
+[--claude-model <model>] [--unload-after <minutes>] [--claude-channels ask|accept|decline]
+[--no-channel] [--no-peers] [--console]`.
 `--unload-after` is how long a session stays loaded in its agent once it is idle with no
 client: 10 minutes by default, `0` at once ([Unloading idle sessions](#unloading-idle-sessions)).
+`--claude-channels` answers up front whether Claude may run with development channels, which
+the service otherwise asks the person once ([adapters.md](adapters.md#consent-to-development-channels));
+`--no-channel` is the same as `decline`.
 The same executable is
 also the `gorynych` MCP server agents start over stdio:
 `peers [--pipe … --token …] [--channel-url …]` (see Opinions below), and the stdio bridge
