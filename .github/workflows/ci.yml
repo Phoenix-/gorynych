@@ -1,8 +1,12 @@
 name: CI
 
 # GitHub-hosted runners only. The live tests (GORYNYCH_LIVE=1) need logged-in agents and stay skipped.
+# Actions are pinned to commit SHAs; the comment names the release.
 on:
   push:
+    # Other branches run through their pull request, not twice.
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -26,8 +30,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: 10.0.x
       - run: dotnet build Gorynych.slnx -c Release
@@ -38,8 +42,8 @@ jobs:
     name: Build (macos-latest)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: 10.0.x
       - run: dotnet build Gorynych.slnx -c Release
@@ -55,8 +59,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: 10.0.x
       - name: Publish
@@ -69,7 +73,7 @@ jobs:
           Get-ChildItem publish/Gorynych -Recurse -Include *.pdb | Remove-Item
           Copy-Item LICENSE, README.md publish/Gorynych/
           Compress-Archive -Path publish/Gorynych/* -DestinationPath gorynych-win-x64.zip
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gorynych-win-x64
           path: gorynych-win-x64.zip
@@ -78,4 +82,5 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" gorynych-win-x64.zip --draft --generate-notes --title "Gorynych ${{ github.ref_name }}"
+          TAG: ${{ github.ref_name }} # through the environment, never pasted into the script
+        run: gh release create "$env:TAG" gorynych-win-x64.zip --draft --generate-notes --title "Gorynych $env:TAG"
