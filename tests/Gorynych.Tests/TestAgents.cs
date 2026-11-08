@@ -26,7 +26,51 @@ sealed class ScriptedAdapter(string name, Func<ScriptedAgent, JsonRpcRequest, Ca
         agent.Rpc.Start();
         Current = agent;
         var (ci, co) = link.ClientEnd;
-        return Task.FromResult(new AgentInstance(ci, co, agent.Rpc.Completion, () => agent.Rpc.DisposeAsync()));
+        toAgent = new BreakableStream(co);
+        return Task.FromResult(new AgentInstance(ci, toAgent, agent.Rpc.Completion, () => agent.Rpc.DisposeAsync()));
+    }
+
+    BreakableStream? toAgent;
+
+    /// <summary>From now on every write of the service to the agent fails, while the agent's own messages still arrive.</summary>
+    public void BreakWritesToAgent() => toAgent!.Broken = true;
+}
+
+/// <summary>A write-only stream whose writes start failing with <see cref="IOException"/> once it is broken.</summary>
+sealed class BreakableStream(Stream inner) : Stream
+{
+    public volatile bool Broken;
+
+    public override bool CanRead => false;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        if (Broken) throw new IOException("the link to the agent is broken");
+        inner.Write(buffer, offset, count);
+    }
+
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default) =>
+        Broken ? ValueTask.FromException(new IOException("the link to the agent is broken")) : inner.WriteAsync(buffer, ct);
+
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) =>
+        WriteAsync(buffer.AsMemory(offset, count), ct).AsTask();
+
+    public override void Flush() => inner.Flush();
+
+    public override Task FlushAsync(CancellationToken ct) =>
+        Broken ? Task.FromException(new IOException("the link to the agent is broken")) : inner.FlushAsync(ct);
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) inner.Dispose();
+        base.Dispose(disposing);
     }
 }
 

@@ -276,10 +276,18 @@ in the middle of one.
   disconnecting without it (Zed when it quits), and one the service woke for service turns
   ([§6.1](#61-waking-a-session-and-closing-it-again)). It sends it at once only before a
   delete. It never sends it while a turn of the session runs, or while a request of the agent
-  waits for a client (an approval or a form). A client's `session/close` cancels the running
-  turn with `session/cancel` instead. The service cannot see a turn the adapter runs on its own
-  (Claude's channel): an unload stops that one if it lasts longer than the idle time
+  waits for a client (an approval or a form). A client's `session/close` cancels a running turn
+  that a client's prompt started with `session/cancel` instead, and nothing else
   ([service-protocol.md](service-protocol.md#unloading-idle-sessions)).
+- **Turns of the agent's own.** An adapter whose agent can run a turn the service did not start
+  (a message through the agent's own channel, the person typing in its terminal) SHOULD mark
+  it: `_meta["gorynych/agentTurn"]: "started"` on the turn's first `session/update` (Claude:
+  the `user_message_chunk` of the prompt), and `"ended"` on an update when it ends (Claude: a
+  `session_info_update` after `Stop`, `StopFailure` or the process exiting). The service holds
+  the session loaded in between. A start marked again before its end counts once; a missed end
+  keeps the session loaded until the agent's connection closes. Fallback without the marks: the
+  service unloads a session only once the idle time has passed since the agent's last update,
+  so only a turn quiet for longer than that can be stopped.
 - Fallback without it: before a delete the service sends `session/cancel` instead, and nothing
   is ever unloaded until the adapter restarts.
 
@@ -367,6 +375,7 @@ own JSON-RPC, not ACP, so its adapter translates, like Claude's.
 | … on Linux and macOS | only the deny rule would hide it; the adapter itself runs on Windows only yet (ConPTY) | not hidden: the parent walk is Windows only yet, so every caller counts as outside | not hidden, as for Kimi | not hidden, as for Kimi |
 | Message IDs ([§5](#5-prompts-and-turns)) | answers: `MessageDisplay`'s `message_id`; typed and channel messages: the hook's `prompt_id` (the transcript's `promptId`), a new UUID for a channel message within a turn; texts Claude gives no ID: a new UUID | none sent by 2.5.2: the service assigns them | unknown; expected from its item IDs | its own store's IDs |
 | Live-note path ([§6.4](#64-the-live-note-path)) | development channel; `-32600` while not running | none (`-32601`) | none planned; `turn/steer` appends only to an active turn | none |
+| Turns of its own marked ([§7](#7-closing-and-unloading)) | yes: channel and terminal turns, from `UserPromptSubmit` to `Stop` or exit | none to mark: Kimi runs no turn of its own | expected none | none |
 | Approvals ([§8](#8-approvals-and-forms)) | PermissionRequest hook; pre-allows the three tools | Kimi's own `session/request_permission`; the service pre-allows | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval` | unknown |
 | Forms | `AskUserQuestion` as `elicitation/create` | none seen | `tool/requestUserInput` (experimental), `mcpServer/elicitation/request` | unknown |
 | Titles ([§9](#9-titles)) | `ai-title` / `custom-title` from the transcript; no way to set one | the first prompt, cut at 200 characters; no way to set one | `thread/name/set`, `thread/name/updated`; the first user message otherwise | its own |

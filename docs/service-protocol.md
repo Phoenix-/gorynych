@@ -43,7 +43,7 @@ server ([Agents outside Gorynych](#agents-outside-gorynych)).
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. Returns the session state (below). |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
-| `session/close` | Detaches the client. When no other client has the session open, a draft is discarded (see below); any other session has its running turn cancelled, as ACP asks of a close, and is unloaded from its agent once it has been idle for `--unload-after` minutes ([Unloading idle sessions](#unloading-idle-sessions)). A client that disconnects without it lets go of its sessions all the same, but cancels nothing. |
+| `session/close` | Detaches the client. When no other client has the session open, a draft is discarded (see below); any other session has a running turn that a client's prompt started cancelled, as ACP asks of a close (a service turn and a turn of the agent's own go on), and is unloaded from its agent once it has been idle for `--unload-after` minutes ([Unloading idle sessions](#unloading-idle-sessions)). A client that disconnects without it lets go of its sessions all the same, but cancels nothing. |
 | `session/delete` | Closes the session in its agent if it is open, then deletes it there if the agent can (`sessionCapabilities.delete`); otherwise the overlay keeps a tombstone. Drops the journal. A session only the agent knows is found through its list; an unknown or already deleted session succeeds. |
 | anything else with a `sessionId` | Forwarded to the session's agent. |
 
@@ -927,23 +927,35 @@ What keeps a session from being idle:
 - **A request of its agent waits for a client** (an approval or a form, see above). The session
   stays loaded however long that takes, so a client that comes back can answer it and the turn
   can go on.
+- **A turn of the agent's own is running**: one the service did not start, such as a message
+  through Claude's channel or the person typing in Claude's terminal. The adapter marks its
+  start and end (`_meta["gorynych/agentTurn"]`,
+  [adapter-contract.md](adapter-contract.md#7-closing-and-unloading)); a missed end keeps the
+  session loaded until its agent stops.
+- **Its agent sent an update** within the idle time. An agent that marks no turn of its own is
+  still not idle while it talks: when the timer runs out, it runs again for what is left of the
+  idle time since the agent's last update.
 
 A client lets go of a session with `session/close`, or by disconnecting without it: Zed quits
 without closing anything ([external-clients.md](external-clients.md#what-zed-does-with-sessions)),
 and a client that stops reading is disconnected. A disconnect stops nothing. It counts for
 every session the client attached to and has not closed, also one it was detached from on the
-way because a request or an update to it failed first. `session/close` from the last client
-does what ACP asks of a close: it cancels the running turn (`session/cancel` to the agent),
-and the unload still waits for the idle time. With two clients on a session, one that goes
-leaves the session with the other. A draft is discarded at once instead
-([Drafts and deletion](#drafts-and-deletion)), and `session/delete` closes and deletes at once.
+way because a request or an update to it failed first, and any detach that leaves the
+session with no client starts its idle timer. `session/close` from the last client does what
+ACP asks of a close for the work a client started: a running turn that a client's prompt
+started (any client's: no other one has the session open) is cancelled (`session/cancel` to
+the agent). A service turn (an opinion request, a report), a spawned session's first turn and a
+turn of the agent's own go on, since a client's close stops no work it did not start. The
+unload waits for the idle time either way; a cancel that does not reach the agent is logged and
+changes nothing else. With two clients on a session, one that goes leaves the session with the
+other. A draft is discarded at once instead ([Drafts and deletion](#drafts-and-deletion)), and
+`session/delete` closes and deletes at once.
 
 The unload checks all this again under the session's gate (the one a discard holds,
 [Drafts and deletion](#drafts-and-deletion) step 1), so a client that loads, resumes or prompts
 the session before it keeps the session loaded, and one that comes while it is under way waits
-for it and opens the session again. A turn the service does not run is not seen: one that
-Claude's channel starts for a report delivered through it can be stopped by an unload if it
-lasts longer than the idle time.
+for it and opens the session again. Each session has one timer: starting it again cancels the
+wait before, so a session read over and over keeps a single wait.
 
 ## Drafts and deletion
 

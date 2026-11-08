@@ -115,14 +115,14 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
 
 | Hook | ACP |
 | --- | --- |
-| `UserPromptSubmit` | nothing for the client's own prompt (ACP does not echo it); otherwise `user_message_chunk` with `_meta["gorynych/origin"]` = `channel` or `terminal` and `messageId` = the hook's `prompt_id` (below) |
+| `UserPromptSubmit` | nothing for the client's own prompt (ACP does not echo it); otherwise `user_message_chunk` with `_meta["gorynych/origin"]` = `channel` or `terminal` and `messageId` = the hook's `prompt_id` (below); the first of a turn of Claude's own also carries `_meta["gorynych/agentTurn"]: "started"` |
 | `PreToolUse` | `tool_call` (`pending`), `toolCallId` = `tool_use_id`, title and kind from the tool, locations from `file_path` |
 | `PermissionRequest` | `session/request_permission` with Allow / Deny; the hook replies `allow` or `deny`. A denial also marks the tool call `failed`. |
 | `PermissionRequest` for `AskUserQuestion` | one `elicitation/create` form (scoped to the session and tool call) with a property `q1`, `q2`, … per question: a string with `oneOf` for a single choice, an array of titled items for `multiSelect`; an accepted form makes the hook reply `allow` with `updatedInput.answers` (`{question: label}`, several labels joined by ", "), anything else `deny` |
 | `PostToolUse` / `PostToolUseFailure` | `tool_call_update` `completed` / `failed`, `rawOutput`, Bash output as content |
 | `MessageDisplay` | `agent_message_chunk` (`messageId` = `message_id`, the same for all pieces of one message) |
-| `Stop` | ends the turn; if no `MessageDisplay` came, `last_assistant_message` is sent as the answer, with a new `messageId` |
-| `StopFailure` | ends the turn after a note with the error, with a new `messageId` |
+| `Stop` | ends the turn; if no `MessageDisplay` came, `last_assistant_message` is sent as the answer, with a new `messageId`; a turn of Claude's own ends with a `session_info_update` carrying `_meta["gorynych/agentTurn"]: "ended"`, which the exit of Claude's process sends too |
+| `StopFailure` | ends the turn after a note with the error, with a new `messageId`, and marks a turn of Claude's own ended, as `Stop` does |
 | transcript `ai-title` / `custom-title` | `session_info_update` with the title (a chosen name wins) |
 
 **Message IDs** are Claude's own where it has them. An answer's is `MessageDisplay`'s

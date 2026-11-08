@@ -91,6 +91,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         ServiceLog.Warn($"{Name}: connection closed");
         connection = null;
         lock (liveGate) live.Clear();
+        conductor.OnAgentStopped(this);
     }
 
     public bool IsLive(string sessionId)

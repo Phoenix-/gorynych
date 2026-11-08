@@ -53,17 +53,89 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     }
     public void ExitUse() => Interlocked.Decrement(ref users);
 
+    volatile bool clientTurn;
+
+    /// <summary>
+    /// True while the turn that holds <see cref="TurnGate"/> is a client's prompt; false for a
+    /// service turn (an opinion request, a report) and a spawned session's first turn. A client's
+    /// <c>session/close</c> cancels only a client's turn.
+    /// </summary>
+    public bool ClientTurn
+    {
+        get => clientTurn;
+        set => clientTurn = value;
+    }
+
+    int agentTurn;
+
+    /// <summary>
+    /// Marks the start of a turn the agent runs that the service did not start; false when one was
+    /// already marked, so a turn counts as one operation (<see cref="EnterUse"/>) however often
+    /// its start is marked.
+    /// </summary>
+    public bool BeginAgentTurn() => Interlocked.Exchange(ref agentTurn, 1) == 0;
+
+    /// <summary>Marks the end of the agent's own turn; false when none was marked.</summary>
+    public bool EndAgentTurn() => Interlocked.Exchange(ref agentTurn, 0) == 1;
+
+    long lastActivity = DateTimeOffset.MinValue.UtcTicks;
+
+    /// <summary>When the agent last sent an update for the session, on the conductor's clock.</summary>
+    public DateTimeOffset LastActivity => new(Interlocked.Read(ref lastActivity), TimeSpan.Zero);
+
+    public void Active(DateTimeOffset now) => Interlocked.Exchange(ref lastActivity, now.UtcTicks);
+
+    readonly Lock idleGate = new();
+    CancellationTokenSource? idleStop;
     long idleTimer;
 
     /// <summary>
-    /// The session's idle timer: the conductor starts one with the value this returns, and the
-    /// timer counts only while it is still the current one. Called when a client attaches or an
-    /// operation registers, it stops the running timer.
+    /// Stops the session's idle timer (a client attached, an operation registered): cancels its
+    /// wait, and makes it no longer the current one. Returns the new current number.
     /// </summary>
-    public long StopIdle() => Interlocked.Increment(ref idleTimer);
+    public long StopIdle() => SwapIdle(null);
+
+    /// <summary>
+    /// Starts a new idle timer, stopping the one before: its number, and the token that stops its
+    /// wait (with <paramref name="shutdown"/> too).
+    /// </summary>
+    public (long Timer, CancellationToken Stop) StartIdle(CancellationToken shutdown)
+    {
+        var stop = CancellationTokenSource.CreateLinkedTokenSource(shutdown);
+        return (SwapIdle(stop), stop.Token);
+    }
+
+    long SwapIdle(CancellationTokenSource? next)
+    {
+        CancellationTokenSource? stopped;
+        long timer;
+        lock (idleGate)
+        {
+            stopped = idleStop;
+            idleStop = next;
+            timer = ++idleTimer;
+        }
+        if (stopped is not null)
+        {
+            try { stopped.Cancel(); }
+            catch (ObjectDisposedException) { }
+            stopped.Dispose();
+        }
+        return timer;
+    }
 
     /// <summary>The current idle timer (see <see cref="StopIdle"/>).</summary>
-    public long IdleTimer => Interlocked.Read(ref idleTimer);
+    public long IdleTimer
+    {
+        get { lock (idleGate) return idleTimer; }
+    }
+
+    /// <summary>
+    /// Runs when a detach leaves the session with no client attached (a client that stopped
+    /// answering, a send that failed), so the conductor can start its idle timer. A close or a
+    /// disconnect detaches without it and starts the timer itself.
+    /// </summary>
+    public Action? LastClientLeft { get; init; }
 
     bool retired;
 
@@ -84,6 +156,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             signal = clientAttached;
         }
         signal.TrySetResult();
+        StopIdle();
     }
 
     readonly Lock stateGate = new();
@@ -238,10 +311,19 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         signal.TrySetResult();
     }
 
+    /// <param name="notify">False for a close or a disconnect, which deal with the session themselves; otherwise
+    /// <see cref="LastClientLeft"/> runs when this detach leaves no client attached.</param>
     /// <returns>True when the client was attached.</returns>
-    public bool Detach(ClientConnection client)
+    public bool Detach(ClientConnection client, bool notify = true)
     {
-        lock (clientsGate) return clients.Remove(client);
+        bool detached, none;
+        lock (clientsGate)
+        {
+            detached = clients.Remove(client);
+            none = !clients.Any(c => !c.Rpc.IsClosed);
+        }
+        if (detached && none && notify) LastClientLeft?.Invoke();
+        return detached;
     }
 
     /// <summary>

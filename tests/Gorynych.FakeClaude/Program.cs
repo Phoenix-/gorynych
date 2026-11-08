@@ -1,7 +1,8 @@
 // A stand-in for the interactive `claude` binary, for adapter tests without a live agent.
 // It takes the same per-launch flags, posts hook payloads shaped like Claude Code 2.1.302's
 // to the URL in --settings, turns on bracketed paste, and treats a pasted line followed by
-// Enter as the next user turn. A prompt containing "write" asks for a Write approval.
+// Enter as the next user turn. A prompt containing "write" asks for a Write approval; one
+// containing "on your own" is followed by a turn of Claude's own, for a channel message.
 using System.Net.Http.Json;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -111,6 +112,8 @@ async Task TurnAsync(string prompt)
     }));
     if (turns == 1) File.AppendAllText(transcript, $$"""{"type":"ai-title","aiTitle":"Fake title","sessionId":"{{sessionId}}"}""" + "\n");
     await PostAsync(Hook("Stop", promptId, new JsonObject { ["stop_hook_active"] = false, ["last_assistant_message"] = answer }));
+    if (prompt.Contains("on your own", StringComparison.OrdinalIgnoreCase))
+        await TurnAsync("<channel source=\"gorynych\" kind=\"report\">\n[Report · from session_id k9 (kimi) · your child session · its turn ended]\ndone\n</channel>");
 }
 
 JsonObject Hook(string name, string promptId, JsonObject fields)

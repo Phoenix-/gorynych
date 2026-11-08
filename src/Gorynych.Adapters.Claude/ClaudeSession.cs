@@ -257,6 +257,32 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
             if (!ReferenceEquals(pty, source)) return;
             idle.TrySetResult();
         }
+        _ = EndOwnTurnAsync(); // no Stop comes from a process that is gone
+    }
+
+    bool ownTurn;
+
+    /// <summary>
+    /// Marks the end of a turn Claude ran that the service did not start (a channel message, the
+    /// person at the terminal), whose start <c>UserPromptSubmit</c> marked: a
+    /// <c>session_info_update</c> with <c>_meta["gorynych/agentTurn"]: "ended"</c>.
+    /// </summary>
+    async Task EndOwnTurnAsync()
+    {
+        lock (stateGate)
+        {
+            if (!ownTurn) return;
+            ownTurn = false;
+        }
+        try
+        {
+            await agent.EmitAsync(Id, new SessionInfoUpdate
+            {
+                UpdatedAt = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+                Meta = new JsonObject { [Gorynych.Acp.Hosting.GorynychProtocol.MetaAgentTurn] = "ended" },
+            });
+        }
+        catch (IOException) { }
     }
 
     Dictionary<string, string> LaunchEnvironment()
@@ -358,11 +384,17 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
                 {
                     current.Confirmed = true; // the client's own prompt: ACP does not echo it back
                     UserMessageId(promptId);  // its prompt_id is taken, even though the service names that message
+                    await EndOwnTurnAsync();  // a turn of Claude's own before it is over, whatever became of its Stop
                 }
                 else
                 {
                     var meta = ClaudeHooks.IsChannelMessage(prompt) ? agent.Channel?.MetaFor(Id, prompt) : null;
-                    await agent.EmitAsync(Id, ClaudeHooks.ForeignPrompt(prompt, UserMessageId(promptId), meta));
+                    var told = ClaudeHooks.ForeignPrompt(prompt, UserMessageId(promptId), meta);
+                    bool starts;
+                    lock (stateGate) { starts = !ownTurn; ownTurn = true; }
+                    // A turn the service did not start: it keeps the session loaded until the end is marked.
+                    if (starts) told.Meta![Gorynych.Acp.Hosting.GorynychProtocol.MetaAgentTurn] = "started";
+                    await agent.EmitAsync(Id, told);
                 }
                 break;
             }
@@ -400,6 +432,7 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
                 // Only a turn Claude has started ends here; a late Stop of an interrupted turn
                 // must not end the prompt pasted after it.
                 if (current is { Confirmed: true }) current.TryComplete(StopReason.EndTurn);
+                await EndOwnTurnAsync();
                 break;
             }
             default:

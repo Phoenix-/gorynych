@@ -172,6 +172,44 @@ public sealed class ClaudeAdapterTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ATurnClaudeRunsOnItsOwn_IsMarked_FromItsPromptToItsStop()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var dir = TestDirs.New();
+        var adapter = new ClaudeAdapter(new ClaudeAdapterOptions
+        {
+            DataDirectory = Path.Combine(dir, "claude"),
+            Executable = FakeClaude(),
+            StartupTimeoutSeconds = 30,
+        });
+        await using var conductor = TestDirs.Conductor(dir, adapter);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var created = await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+        {
+            Cwd = dir,
+            McpServers = [],
+            Meta = new System.Text.Json.Nodes.JsonObject { ["gorynych/agent"] = "claude" },
+        });
+
+        // The fake follows this turn with one of its own, as for a message through its channel.
+        await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = created.SessionId, Prompt = [new TextContent { Text = "answer, then go on on your own" }] });
+        static string? Mark(System.Text.Json.Nodes.JsonObject u) => (string?)u["_meta"]?["gorynych/agentTurn"];
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (DateTime.UtcNow < deadline && !client.Snapshot().Any(u => Mark(u) == "ended")) await Task.Delay(100);
+
+        var updates = client.Snapshot().ToList();
+        var started = updates.FindIndex(u => Mark(u) == "started");
+        var ended = updates.FindIndex(u => Mark(u) == "ended");
+        Assert.IsTrue(started >= 0 && ended > started, "the turn of Claude's own is marked from its prompt to its Stop");
+        Assert.AreEqual(1, updates.Count(u => Mark(u) is not null) / 2, "one turn of its own; the client's prompt is not marked");
+        Assert.AreEqual(("user_message_chunk", "channel"), ((string?)updates[started]["sessionUpdate"], (string?)updates[started]["_meta"]!["gorynych/origin"]));
+        Assert.AreEqual("session_info_update", (string?)updates[ended]["sessionUpdate"]);
+        Assert.AreEqual(0, conductor.Feed(created.SessionId).Users, "the service holds the session no longer");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task Session_FromFirstPrompt_Approval_Paste_AndTitle()
     {
         if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");

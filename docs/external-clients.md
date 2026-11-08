@@ -75,7 +75,8 @@ and what the service does about it:
 - `session/close` is sent, because the service advertises `close`, when Zed drops a thread:
   a thread or draft removed or replaced, idle threads beyond the five it keeps, an
   abandoned new or load. Archiving and quitting send nothing. When no other client has the
-  session open, the service cancels its running turn, as ACP asks of a close, and unloads it
+  session open, the service cancels a running turn that a client's prompt started, as ACP asks
+  of a close (another agent's question or a child's report in it goes on), and unloads it
   from its agent once it has been idle for `--unload-after` minutes (10 by default). Quitting
   sends nothing, so the service takes the bridge going away as letting go of every session Zed
   had open: each is unloaded after the same idle time, counted from the end of its running

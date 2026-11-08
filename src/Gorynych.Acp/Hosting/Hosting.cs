@@ -128,6 +128,14 @@ public static class GorynychProtocol
     public const string MetaOutside = "gorynych/outside";
 
     /// <summary>
+    /// On a <c>session/update</c> from an adapter: <c>"started"</c> on the first update of a turn
+    /// the agent runs that the service did not start (a message through the agent's own channel,
+    /// the person typing in its terminal), <c>"ended"</c> on an update when it ends. The service
+    /// keeps the session loaded in between (docs/adapter-contract.md, §7).
+    /// </summary>
+    public const string MetaAgentTurn = "gorynych/agentTurn";
+
+    /// <summary>
     /// A short random tag for one run, in the message IDs a component counts in memory (the
     /// service's <c>m…</c>, Claude's channel <c>c…</c>): after a restart the count starts again, and the
     /// tag keeps a late reply to a request of an earlier run from answering a new one. Four letters

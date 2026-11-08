@@ -130,7 +130,7 @@ public sealed class Conductor : IAsyncDisposable
         finally
         {
             clients.TryRemove(client, out _);
-            foreach (var feed in feeds.Values) feed.Detach(client);
+            foreach (var feed in feeds.Values) feed.Detach(client, notify: false);
             await client.Rpc.DisposeAsync();
             ServiceLog.Info($"{name}: disconnected");
             // A client that goes away lets go of its sessions, as session/close would: a GUI that
@@ -144,7 +144,10 @@ public sealed class Conductor : IAsyncDisposable
     internal SessionFeed Feed(string sessionId)
     {
         if (!removed.ContainsKey(sessionId))
-            return feeds.GetOrAdd(sessionId, id => new SessionFeed(id, new SessionJournal(JournalPath(id), options.JournalMaxEntries)));
+            return feeds.GetOrAdd(sessionId, id => new SessionFeed(id, new SessionJournal(JournalPath(id), options.JournalMaxEntries))
+            {
+                LastClientLeft = () => IdleFromNow(id),
+            });
         var retired = new SessionFeed(sessionId, new SessionJournal(JournalPath(sessionId), options.JournalMaxEntries));
         retired.Retire();
         return retired;
@@ -176,6 +179,8 @@ public sealed class Conductor : IAsyncDisposable
         {
             if (@params!["update"] is not JsonObject update) return;
             feed.ApplyStateUpdate(update);
+            feed.Active(options.Time.GetUtcNow()); // an agent that sends something is not idle (UnloadIfIdleAsync)
+            AgentTurn(feed, update);
             if (feed.SuppressReplay > 0) return; // the agent is replaying history we already journal
             KeepSpawnTitle(sessionId, update);
             if (feed.IsRepeatedTitle(update)) return;
@@ -185,6 +190,35 @@ public sealed class Conductor : IAsyncDisposable
         }
         foreach (var c in feed.Clients())
             await feed.SendAsync(c, method, @params!.DeepClone());
+    }
+
+    /// <summary>
+    /// A turn the agent runs that the service did not start (a message through Claude's channel,
+    /// the person typing in its terminal), as the adapter marks it with
+    /// <c>_meta["gorynych/agentTurn"]</c>: an operation on the session from <c>started</c> to
+    /// <c>ended</c>, so the idle timer never unloads the session under it. A missed end keeps the
+    /// session loaded until the agent stops (<see cref="OnAgentStopped"/>). Never waits for the
+    /// session's gate: the agent's notifications must keep flowing while a close waits for it.
+    /// </summary>
+    void AgentTurn(SessionFeed feed, JsonObject update)
+    {
+        var mark = update["_meta"] is JsonObject meta && meta[GorynychProtocol.MetaAgentTurn] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+        if (mark == "started" && feed.BeginAgentTurn())
+        {
+            feed.EnterUse();
+        }
+        else if (mark == "ended" && feed.EndAgentTurn())
+        {
+            feed.ExitUse();
+            IdleFromNow(feed.SessionId);
+        }
+    }
+
+    /// <summary>An agent's connection closed: the turns of its own it marked are over.</summary>
+    internal void OnAgentStopped(AgentHost host)
+    {
+        foreach (var feed in feeds.Values)
+            if (store.Get(feed.SessionId)?.Agent == host.Name && feed.EndAgentTurn()) feed.ExitUse();
     }
 
     void Remember(AgentHost host, string sessionId, JsonObject update)
@@ -230,8 +264,11 @@ public sealed class Conductor : IAsyncDisposable
         }
         var feed = Feed(sessionId);
         // A use of the session from the first wait for a client to the answer: while a client may
-        // still answer, the session is not idle, so it stays loaded (IdleFromNow).
-        feed.EnterUse();
+        // still answer, the session is not idle, so it stays loaded (IdleFromNow). Registered under
+        // the session's gate, as UseAsync does, so an unload under way finishes first.
+        await feed.LifeGate.WaitAsync(ct);
+        try { feed.EnterUse(); }
+        finally { feed.LifeGate.Release(); }
         try
         {
             while (true)
@@ -488,6 +525,7 @@ public sealed class Conductor : IAsyncDisposable
         // One turn at a time: an opinion request delivered as a turn waits for this one, and
         // this one for it.
         await feed.TurnGate.WaitAsync(CancellationToken.None);
+        feed.ClientTurn = true; // what a client's session/close cancels
         try
         {
             if (feed.Retired) throw NotFound(record.SessionId); // deleted while this prompt waited for the turn before it
@@ -509,6 +547,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         finally
         {
+            feed.ClientTurn = false;
             feed.TurnGate.Release();
         }
     }
@@ -589,17 +628,19 @@ public sealed class Conductor : IAsyncDisposable
 
     /// <summary>
     /// <c>session/close</c>: the client lets go of the session. Another client that has it open
-    /// keeps it as it is. For the last one, a draft is discarded; otherwise, as ACP asks of a
-    /// close, the session's running turn is cancelled (<c>session/cancel</c> to its agent), and
-    /// the session is closed in its agent after its idle timer (<see cref="IdleFromNow"/>), like
-    /// one a client left without closing it (<see cref="LetGo"/>).
+    /// keeps it as it is. For the last one, a draft is discarded; otherwise the session is closed
+    /// in its agent after its idle timer (<see cref="StartIdle"/>), like one a client left without
+    /// closing it (<see cref="LetGo"/>), and, as ACP asks of a close, a running turn a client's
+    /// prompt started (any client's: this is the last one) is cancelled with <c>session/cancel</c>.
+    /// A service turn (an opinion request, a report), a spawned session's first turn and a turn
+    /// the agent runs on its own go on: a client's close stops no work it did not start.
     /// </summary>
     internal async Task<JsonNode?> CloseAsync(ClientConnection client, string sessionId, CancellationToken ct)
     {
         client.Release(sessionId);
         if (feeds.TryGetValue(sessionId, out var feed))
         {
-            feed.Detach(client);
+            feed.Detach(client, notify: false);
             if (feed.Clients().Length > 0) return new JsonObject();
         }
         if (store.Get(sessionId) is not { Deleted: false } record) return new JsonObject();
@@ -608,12 +649,22 @@ public sealed class Conductor : IAsyncDisposable
             await DiscardDraftAsync(sessionId, ct);
             return new JsonObject();
         }
-        if (feed is { TurnGate.CurrentCount: 0 })
+        // The timer first: a failed cancel must not leave the session loaded. A running turn keeps it from
+        // being idle, and the turn's end starts the timer.
+        var unload = StartIdle(sessionId);
+        if (feed is { ClientTurn: true })
         {
-            ServiceLog.Info($"{record.Agent} {sessionId}: closed by its last client during a turn; cancelling the turn");
-            await ForwardNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId }, sessionId);
+            ServiceLog.Info($"{record.Agent} {sessionId}: closed by its last client during a client's turn; cancelling the turn");
+            try
+            {
+                await ForwardNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId }, sessionId);
+            }
+            catch (Exception e) when (e is IOException or JsonRpcException or ObjectDisposedException)
+            {
+                ServiceLog.Warn($"{record.Agent} {sessionId}: the cancel did not reach the agent: {e.Message}");
+            }
         }
-        if (StartIdle(sessionId) is { } unload) await unload();
+        if (unload is not null) await unload();
         return new JsonObject();
     }
 
@@ -1351,19 +1402,26 @@ public sealed class Conductor : IAsyncDisposable
     /// so the time counts from the later of the last client leaving and the session going idle.
     /// Nothing is cancelled. With no wait configured, returns the unload for the caller to run now.
     /// </summary>
-    Func<Task>? StartIdle(string sessionId)
+    /// <param name="wait">How long; the configured idle time unless the timer runs again for what is left of it.</param>
+    Func<Task>? StartIdle(string sessionId, TimeSpan? wait = null)
     {
         if (shutdown.IsCancellationRequested || Volatile.Read(ref disposed) != 0) return null; // the agents stop anyway
         if (!feeds.TryGetValue(sessionId, out var feed) || feed.Retired || feed.Users > 0 || feed.Clients().Length > 0) return null;
-        if (store.Get(sessionId) is not { } record || !agents.TryGetValue(record.Agent, out var host) || !host.IsLive(sessionId)) return null;
-        var timer = feed.StopIdle(); // a timer started earlier no longer counts
-        if (options.UnloadAfter <= TimeSpan.Zero) return () => UnloadIfIdleAsync(feed, timer);
+        if (store.Get(sessionId) is not { Draft: false } record || !agents.TryGetValue(record.Agent, out var host) || !host.IsLive(sessionId))
+            return null; // a draft goes by its own rule (DiscardDraftAsync)
+        if (options.UnloadAfter <= TimeSpan.Zero)
+        {
+            var now = feed.StopIdle(); // a timer started earlier no longer counts
+            return () => UnloadIfIdleAsync(feed, now);
+        }
         try
         {
-            _ = Task.Delay(options.UnloadAfter, options.Time, cleanupStop.Token).ContinueWith(t =>
+            // One wait per session: starting one cancels the one before (SessionFeed.StartIdle).
+            var (timer, stop) = feed.StartIdle(cleanupStop.Token);
+            _ = Task.Delay(wait ?? options.UnloadAfter, options.Time, stop).ContinueWith(t =>
             {
                 if (t.IsCompletedSuccessfully) RunCleanup(() => UnloadIfIdleAsync(feed, timer));
-            }, TaskScheduler.Default);
+            }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         }
         catch (ObjectDisposedException)
         {
@@ -1376,6 +1434,8 @@ public sealed class Conductor : IAsyncDisposable
     /// The idle timer <paramref name="timer"/> of a session ran out: the session is closed in its
     /// agent, unless the timer was stopped since (a client attached, an operation registered) or
     /// something holds it now. Checked under the session's gate, which a client's load takes too.
+    /// An agent that sent an update within the idle time is not idle either, even if it marked no
+    /// turn of its own (<see cref="AgentTurn"/>): the timer runs again for the rest of that time.
     /// An agent that cannot close sessions keeps it loaded.
     /// </summary>
     async Task UnloadIfIdleAsync(SessionFeed feed, long timer)
@@ -1385,6 +1445,12 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             if (feed.IdleTimer != timer || feed.Retired || feed.Users > 0 || feed.Clients().Length > 0) return;
+            var quiet = options.Time.GetUtcNow() - feed.LastActivity;
+            if (quiet < options.UnloadAfter)
+            {
+                StartIdle(sessionId, options.UnloadAfter - quiet);
+                return;
+            }
             if (store.Get(sessionId) is not { } record || !agents.TryGetValue(record.Agent, out var host)) return;
             if (!host.IsRunning || !host.IsLive(sessionId) || !host.CanClose) return;
             var rpc = await host.GetAsync(cleanupStop.Token);
