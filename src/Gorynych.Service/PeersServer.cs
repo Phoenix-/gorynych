@@ -35,7 +35,7 @@ public static class PeersServer
     /// the capability (Kimi) learns the same from this server's instructions and the requests' texts.
     /// </summary>
     public const string SystemPrompt =
-        "The gorynych MCP server connects you with my other coding agents, such as Claude, Codex and Kimi. You can ask them " +
+        "The gorynych MCP server connects you with my other coding agents, such as Claude, Codex, Kimi and DeepSeek. You can ask them " +
         "for their opinion: its tool list_agents shows their sessions and ask_agent asks one, by its exact session_id, and " +
         "waits for its answer; reply only answers a request you received. Use them when I ask you to, or when a second " +
         "opinion would clearly help. spawn_session starts a new session of one of them with a task, as your child; I approve " +
@@ -325,7 +325,7 @@ public static class PeersServer
                 "The result's first line names this session, which the list leaves out: \"You are session_id ...\", the ID for this " +
                 "session itself, for example for archive_session. Each entry has session_id, agent, title, cwd, status, updated_at and " +
                 "parent_session_id (set when another session started it with spawn_session). " +
-                "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's and Codex's are a bare UUID, Kimi's start with session_. " +
+                "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's, Codex's and DeepSeek's are a bare UUID, Kimi's start with session_. " +
                 StatusLegend + " status has nothing to do with archived. " +
                 "Archived sessions are left out unless include_archived is true; when some are left out, the result's last line " +
                 "says how many. With include_archived " +
@@ -376,7 +376,7 @@ public static class PeersServer
                 ["type"] = "object",
                 ["properties"] = new JsonObject
                 {
-                    ["agent"] = new JsonObject { ["type"] = "string", ["description"] = "the agent to run: claude, codex or kimi" },
+                    ["agent"] = new JsonObject { ["type"] = "string", ["description"] = "the agent to run: claude, codex, kimi or dsh (DeepSeek Harness)" },
                     ["prompt"] = new JsonObject { ["type"] = "string", ["description"] = "the first prompt: the task, with the context the agent needs" },
                     ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "the folder to work in; default: this session's folder; a relative path is taken from it" },
                     ["title"] = new JsonObject { ["type"] = "string", ["description"] = "a short name for the session in the user's list" },
