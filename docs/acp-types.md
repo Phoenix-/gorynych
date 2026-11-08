@@ -20,6 +20,19 @@ dotnet run --project tools/Gorynych.AcpGen -- . v1.29.1
 
 The output, `src/Gorynych.Acp/Generated/Acp.g.cs`, is checked in.
 
+**For now the types come from ACP's main branch, not a release.** The client-system-prompt
+RFD (`systemPrompt` on `session/new`, `session/load` and `session/resume`, and
+`sessionCapabilities.systemPrompt`) was completed on 2026-11-06 and is in the stable
+`schema/v1/schema.json` on main, but no schema release after v1.29.1 carries it yet
+(checked 2026-11-08). So `schema/acp/main-7441d10/` holds `schema/v1/schema.json` and
+`meta.json` from commit
+[7441d106a853682cce61d2dd7db54123e4b9a477](https://github.com/agentclientprotocol/agent-client-protocol/tree/7441d106a853682cce61d2dd7db54123e4b9a477/schema/v1),
+unchanged, and the generator's default is that folder. Against v1.29.1 it adds only the
+system prompt types (`SystemPrompt`, `SystemPromptMode`, `SessionSystemPromptCapabilities`
+and its mode objects, the `systemPrompt` fields); `meta.json` is identical. This is
+temporary: when a schema release carries `systemPrompt`, add its folder, regenerate from it,
+and remove `main-7441d10`.
+
 ## Mapping rules
 
 - An object definition becomes a sealed class; required properties are non-nullable,

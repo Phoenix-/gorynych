@@ -8,7 +8,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 
 var root = args.Length > 0 ? Path.GetFullPath(args[0]) : FindRepoRoot();
-var version = args.Length > 1 ? args[1] : "v1.29.1";
+var version = args.Length > 1 ? args[1] : "main-7441d10";
 var schemaDir = Path.Combine(root, "schema", "acp", version);
 var schema = JsonNode.Parse(File.ReadAllText(Path.Combine(schemaDir, "schema.json")))!.AsObject();
 var meta = JsonNode.Parse(File.ReadAllText(Path.Combine(schemaDir, "meta.json")))!.AsObject();
