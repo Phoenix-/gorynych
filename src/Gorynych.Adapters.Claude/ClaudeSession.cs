@@ -257,7 +257,8 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         agent.Log($"claude {Id}: launching in {Cwd} ({(resume ? "resume" : "new")})");
         pty = ConPty.Start(commandLine, Cwd, LaunchEnvironment());
         var current = pty;
-        _ = Task.Run(() => PumpOutput(current));
+        // A blocking read for the life of the process: a thread of its own, so Claude sessions never starve the pool.
+        _ = Task.Factory.StartNew(() => PumpOutput(current), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         _ = current.Exited.ContinueWith(t => OnExited(current, t.Result), TaskScheduler.Default);
         transcript ??= new TranscriptWatcher(TranscriptTitles.ExpectedPath(Cwd, Id), title => _ = agent.OnTitleAsync(Id, title));
     }

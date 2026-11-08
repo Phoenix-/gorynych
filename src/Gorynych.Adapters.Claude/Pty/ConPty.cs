@@ -31,7 +31,8 @@ public sealed unsafe partial class ConPty : IDisposable
         ProcessId = processId;
         this.input = input;
         this.output = output;
-        Exited = Task.Run(WaitForExit);
+        // Blocks for the life of the process, so on a thread of its own, never one of the pool's.
+        Exited = Task.Factory.StartNew(WaitForExit, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
     public int ProcessId { get; }
