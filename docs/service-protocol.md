@@ -167,7 +167,7 @@ Each description says when to use the tool rather than its neighbour: `ask_agent
 question and points to `reply` for answering one; `reply` only answers and points to
 `ask_agent`; `session_id` is the exact value from `list_agents` or a header, never an agent
 name, a title or a sender label; `list_agents` says its first line names this session, the ID
-to pass for it, that IDs differ by agent (Claude's a bare UUID, Kimi's `session_…`) and are
+to pass for it, that IDs differ by agent (Claude's and Codex's a bare UUID, Kimi's `session_…`) and are
 passed exactly as listed, and what `status` means: `open`, the agent has the session loaded
 right now; `saved`, it is saved but not loaded, so asking it starts it, it answers more slowly
 and it is unloaded again once it has been idle with no client for some minutes (for every
@@ -615,12 +615,12 @@ What the service returns for `tools/list`, outside Gorynych.
 
 **`list_sessions {include_archived?}`**
 
-> List the user's coding-agent sessions in Gorynych, which runs Claude and Kimi sessions on
-> this machine. Pass a session_id to read_session to see what that session said, or to
-> ask_agent to ask it something. Each entry has session_id, agent, title, cwd, status,
+> List the user's coding-agent sessions in Gorynych, which runs Claude, Codex and Kimi
+> sessions on this machine. Pass a session_id to read_session to see what that session said, or
+> to ask_agent to ask it something. Each entry has session_id, agent, title, cwd, status,
 > updated_at and parent_session_id (set when another session started it with spawn_session).
-> Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare
-> UUID, Kimi's start with session_. status open means the agent has the session loaded now; a
+> Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's and Codex's
+> are a bare UUID, Kimi's start with session_. status open means the agent has the session loaded now; a
 > saved one is started when asked, so it answers more slowly, and is unloaded again once it has
 > been idle with no client for some minutes; read_session reads it without starting it.
 > Archived sessions are left out unless include_archived is true; when some are left out, the

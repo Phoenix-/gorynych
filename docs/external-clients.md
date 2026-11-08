@@ -3,7 +3,7 @@
 Any ACP client that starts an agent over stdio can use Gorynych through the bridge:
 
 ```
-Gorynych.Service acp --agent claude|kimi [--pipe <name>] [service options]
+Gorynych.Service acp --agent claude|kimi|codex [--pipe <name>] [service options]
 ```
 
 The bridge connects to the service's pipe (starting the service if it is not running) and

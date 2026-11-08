@@ -97,7 +97,7 @@ the agent the `mcpServers` it gets ([§6.2](#62-the-gorynych-mcp-server)).
 
 - A session ID MUST stay the same across adapter restarts: the service keys its overlay, its
   journal and the peer token by it. The service treats IDs as opaque and passes them on
-  exactly, so they MAY look different per agent (Claude: a bare UUID, Kimi: `session_…`).
+  exactly, so they MAY look different per agent (Claude, Codex: a bare UUID, Kimi: `session_…`).
 - Clients create sessions eagerly ([external-clients.md](external-clients.md#zed)), so the
   service keeps a session a *draft* until its first prompt and deletes unused drafts. An
   adapter SHOULD keep nothing durable before the first prompt (Claude records a session at its

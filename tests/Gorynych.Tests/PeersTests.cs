@@ -159,7 +159,7 @@ public sealed class PeersTests
         StringAssert.Contains(Description("spawn_session"), "sends this session a short report with the child's final message by itself");
         StringAssert.Contains(Description("list_agents"), "The result's first line names this session, which the list leaves out: \"You are session_id ...\"");
         StringAssert.Contains(Description("list_agents"),
-            "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare UUID, Kimi's start with session_.");
+            "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's and Codex's are a bare UUID, Kimi's start with session_.");
         StringAssert.Contains(Description("list_agents"), "Each entry has session_id, agent, title, cwd, status, updated_at and parent_session_id");
         StringAssert.Contains(Description("list_agents"), "status \"open\": the session's agent has it loaded right now.");
         StringAssert.Contains(Description("list_agents"),

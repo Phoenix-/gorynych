@@ -9,7 +9,7 @@ namespace Gorynych.Service;
 
 /// <summary>
 /// The stdio entry point for external ACP clients (Zed and the like), which spawn an agent and
-/// speak ACP over its stdin and stdout: <c>Gorynych.Service acp --agent claude|kimi [--pipe P]</c>.
+/// speak ACP over its stdin and stdout: <c>Gorynych.Service acp --agent claude|kimi|codex [--pipe P]</c>.
 /// It starts the service if needed, connects to its pipe and passes messages through. The one
 /// change it makes is to add <c>_meta["gorynych/agent"]</c> to the client's <c>initialize</c>,
 /// which scopes the connection to that agent, so the client itself stays plain ACP.
