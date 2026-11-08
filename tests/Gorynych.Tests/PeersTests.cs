@@ -136,6 +136,16 @@ public sealed class PeersTests
         StringAssert.Contains(Description("reply"), "Use it only to answer; to start a question of your own, use ask_agent.");
         StringAssert.Contains(Description("spawn_session"), "sends this session a short report with the child's final message by itself");
         StringAssert.Contains(Description("list_agents"), "session_id (pass it exactly)");
+        StringAssert.Contains(Description("list_agents"), "Archived sessions are left out unless include_archived is true");
+        Assert.AreEqual("boolean", (string?)tools["list_agents"]["inputSchema"]!["properties"]!["include_archived"]!["type"]);
+        StringAssert.Contains(Description("archive_session"), "this one included");
+        StringAssert.Contains(Description("archive_session"), "Archiving is not deleting: the session keeps all its history, ask_agent still reaches it");
+        StringAssert.Contains(Description("restore_session"), "To ask an archived session something, use ask_agent: it need not be restored first.");
+        foreach (var tool in new[] { "archive_session", "restore_session" })
+        {
+            StringAssert.Contains(Description(tool), "The user approves each call.");
+            CollectionAssert.AreEqual(new[] { "session_id" }, tools[tool]["inputSchema"]!["required"]!.AsArray().Select(r => (string?)r).ToArray());
+        }
     }
 
     [TestMethod]
@@ -173,7 +183,8 @@ public sealed class PeersTests
             var init = await mcp.SendRequestAsync("initialize", new JsonObject { ["protocolVersion"] = "2025-06-18", ["capabilities"] = new JsonObject() });
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "ask_agent", "spawn_session", "reply" }, tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
+            CollectionAssert.AreEqual(new[] { "list_agents", "ask_agent", "spawn_session", "archive_session", "restore_session", "reply" },
+                tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
 
             var listed = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_agents", ["arguments"] = new JsonObject() });
             StringAssert.Contains((string?)listed!["content"]![0]!["text"], "answering");
@@ -215,6 +226,29 @@ public sealed class PeersTests
             var approval = client.Approvals.Single();
             Assert.AreEqual("asking", approval.SessionId, "asked on the calling session");
             StringAssert.Contains(approval.ToolCall.Title, "Tests");
+
+            // Archive and restore, and list_agents with and without the archived ones.
+            async Task<JsonNode> Call(string tool, JsonObject arguments)
+            {
+                var result = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = tool, ["arguments"] = arguments });
+                Assert.IsFalse((bool)result!["isError"]!, (string?)result["content"]![0]!["text"]);
+                return result["content"]![0]!["text"]!;
+            }
+            async Task<string[]> Listed(bool includeArchived) =>
+                JsonNode.Parse((string)(await Call("list_agents", new JsonObject { ["include_archived"] = includeArchived }))!)!.AsArray()
+                    .Select(s => $"{(string?)s!["session_id"]}{((bool?)s["archived"] == true ? " archived" : "")}").ToArray();
+            var who = "session_id answering (answerer, \"Pick a database for the cockpit\")";
+            Assert.AreEqual($"Archived {who}. It is now hidden from list_agents and from the user's session list; nothing in it is lost. " +
+                "ask_agent still reaches it, and restore_session brings it back.", (string?)await Call("archive_session", new JsonObject { ["session_id"] = "answering" }));
+            CollectionAssert.AreEquivalent(new[] { "child-2" }, await Listed(includeArchived: false));
+            CollectionAssert.AreEquivalent(new[] { "child-2", "answering archived" }, await Listed(includeArchived: true));
+            Assert.AreEqual("SQLite, for one user.", (string?)await Call("ask_agent", new JsonObject { ["session_id"] = "answering", ["question"] = "Still SQLite?" }));
+            Assert.AreEqual($"Restored {who}. It is back in list_agents and in the user's session list.",
+                (string?)await Call("restore_session", new JsonObject { ["session_id"] = "answering" }));
+            var unknown = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "restore_session", ["arguments"] = new JsonObject { ["session_id"] = "answerer" } });
+            Assert.IsTrue((bool)unknown!["isError"]!);
+            Assert.AreEqual("Gorynych could not do that: No session \"answerer\". Pass an exact session_id from list_agents with include_archived: true. " +
+                "No session is archived now.", (string?)unknown["content"]![0]!["text"]);
             await mcp.DisposeAsync();
         }
         finally

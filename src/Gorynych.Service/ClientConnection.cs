@@ -84,6 +84,8 @@ internal sealed class ClientConnection
                 return conductor.Reply(request);
             case GorynychProtocol.MethodSpawn:
                 return await conductor.SpawnAsync(request, ct);
+            case GorynychProtocol.MethodArchive:
+                return await conductor.ArchiveAsync(request, ct);
             case GorynychProtocol.MethodShutdown:
                 ServiceLog.Info($"{Rpc.Name}: asked the service to exit");
                 _ = Task.Delay(200).ContinueWith(_ => conductor.RequestShutdown(), TaskScheduler.Default);
@@ -132,6 +134,7 @@ internal sealed class ClientConnection
             [GorynychProtocol.MetaAgents] = new JsonArray(conductor.Agents.Values
                 .Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["displayName"] = a.DisplayName }).ToArray()),
             [GorynychProtocol.MetaSessionsChanged] = true,
+            [GorynychProtocol.MetaArchive] = true,
         },
     };
 

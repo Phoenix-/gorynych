@@ -53,6 +53,12 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
 - `_gorynych/sessions_changed` tells a client that a session appeared, changed or went
   away; a plain client ignores it and sees new sessions the next time it lists them
   ([service-protocol.md](service-protocol.md#list-changes)).
+- `session/list` leaves out sessions archived in the service (by an agent's
+  `archive_session`, or by a client's `_gorynych/archive`), as Codex and Kimi leave theirs out.
+  A client that sends `_meta["gorynych/includeArchived"]: true` gets them too, each with
+  `_meta["gorynych/archived"]: true` ([service-protocol.md](service-protocol.md#archive)). A
+  plain client sends no `_meta`, so it never sees them in a list; it can still open one whose
+  ID it already holds.
 
 ## Zed
 
@@ -69,7 +75,10 @@ and what the service does about it:
   a thread or draft removed or replaced, idle threads beyond the five it keeps, an
   abandoned new or load. Archiving and quitting send nothing. The service closes a session in
   its agent only when no other client has it open.
-- Archiving is local to Zed. Deleting a thread from its history sends `session/delete` only
+- Archiving is local to Zed: stock Zed sends nothing, so the service and its agents see the
+  session as merely closed and keep listing it (`list_agents` too). A client that wants the
+  service to know calls `_gorynych/archive` ([service-protocol.md](service-protocol.md#archive)).
+  Deleting a thread from its history sends `session/delete` only
   if the agent advertises `sessionCapabilities.delete`, which the service does; a
   "not found" error (`-32002`) counts as success. Kimi itself answers `-32602` for a session
   it no longer has; the service turns that into success when Kimi no longer lists it.

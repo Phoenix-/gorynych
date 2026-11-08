@@ -40,6 +40,14 @@ public sealed class SessionRecord
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool ReportToParent { get; set; }
 
+    /// <summary>
+    /// Archived: out of sight, not locked. Left out of <c>session/list</c> and <c>list_agents</c>
+    /// unless asked for, but asked, prompted and opened like any other. Only <c>_gorynych/archive</c>
+    /// changes it. No harness offers an archive through ACP, so it lives here for every agent.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool Archived { get; set; }
+
     /// <summary>Shown in client lists: neither a draft nor deleted.</summary>
     [JsonIgnore]
     public bool Listed => !Draft && !Deleted;
@@ -238,6 +246,6 @@ public sealed class SessionStore
     {
         SessionId = r.SessionId, Agent = r.Agent, Cwd = r.Cwd, Title = r.Title, TitleSource = r.TitleSource,
         CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt, Draft = r.Draft, Deleted = r.Deleted,
-        ParentSessionId = r.ParentSessionId, ReportToParent = r.ReportToParent,
+        ParentSessionId = r.ParentSessionId, ReportToParent = r.ReportToParent, Archived = r.Archived,
     };
 }

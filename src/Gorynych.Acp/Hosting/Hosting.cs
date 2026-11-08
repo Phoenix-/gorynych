@@ -92,6 +92,24 @@ public static class GorynychProtocol
     /// <summary>In the <c>initialize</c> result: the service sends <see cref="MethodSessionsChanged"/>.</summary>
     public const string MetaSessionsChanged = "gorynych/sessionsChanged";
 
+    /// <summary>In the <c>initialize</c> result: the service keeps an archive flag per session (<see cref="MethodArchive"/>).</summary>
+    public const string MetaArchive = "gorynych/archive";
+
+    /// <summary>
+    /// <c>true</c> in <c>SessionInfo._meta</c> for an archived session (absent otherwise), and an
+    /// explicit <c>true</c> or <c>false</c> in a <c>session_info_update._meta</c> when the flag changes.
+    /// </summary>
+    public const string MetaArchived = "gorynych/archived";
+
+    /// <summary>In <c>session/list</c> params <c>_meta</c>: <c>true</c> lists archived sessions too.</summary>
+    public const string MetaIncludeArchived = "gorynych/includeArchived";
+
+    /// <summary>
+    /// Sets a session's archive flag: <c>{sessionId, archived}</c> → <c>{}</c>. Only a flag: it
+    /// closes, cancels and unloads nothing. A call with a peer token also gets <c>text</c>, what the agent is told.
+    /// </summary>
+    public const string MethodArchive = "_gorynych/archive";
+
     /// <summary>Returns service status: ID, process, adapters, sessions.</summary>
     public const string MethodStatus = "_gorynych/status";
 

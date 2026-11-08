@@ -30,8 +30,8 @@ for external ACP clients: `acp --agent claude|kimi` (see [external-clients.md](e
 
 | Method | What the service does |
 | --- | --- |
-| `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`, and `_meta["gorynych/sessionsChanged"]: true` (see [List changes](#list-changes)). |
-| `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`, and a spawned session also `_meta["gorynych/parentSessionId"]` (absent for a session a client created). A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out. |
+| `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`, `_meta["gorynych/sessionsChanged"]: true` (see [List changes](#list-changes)) and `_meta["gorynych/archive"]: true` (see [Archive](#archive)). |
+| `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`, and a spawned session also `_meta["gorynych/parentSessionId"]` (absent for a session a client created). A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out, and so are archived sessions unless the request has `_meta["gorynych/includeArchived"]: true`; then an archived one carries `_meta["gorynych/archived"]: true`. |
 | `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers`, forwards, records the session as a draft, attaches the client. |
 | `session/load` | Opens the session in the agent (`session/resume`, or `session/load` with the agent's replay dropped), replays the service journal as `session/update`, then attaches the client. A session the journal has never seen is loaded from the agent instead, and journaled. Returns the session state (below). |
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. Returns the session state (below). |
@@ -87,6 +87,9 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `gorynych/serviceId` | `initialize` result `_meta` | the service's persistent ID; a GUI keys sessions as service/session |
 | `gorynych/agents` | `initialize` result `_meta` | the adapters this service offers (`name`, `displayName`) |
 | `gorynych/sessionsChanged` | `initialize` result `_meta` | `true`: the service sends `_gorynych/sessions_changed` |
+| `gorynych/archive` | `initialize` result `_meta` | `true`: the service keeps an archive flag per session, with everything in [Archive](#archive) |
+| `gorynych/archived` | `SessionInfo._meta` in `session/list`; `session_info_update._meta` | `true` for an archived session in a list (absent otherwise); in a `session_info_update`, `true` or `false` whenever the flag changes |
+| `gorynych/includeArchived` | `session/list` params `_meta` | `true` lists archived sessions too |
 | `gorynych/parentSessionId` | `SessionInfo._meta` in `session/list`; `session_info_update._meta`; the `_meta` of a spawned session's first `user_message_chunk` | the session that started this one with `spawn_session`; absent for a session a client created |
 | `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel), `spawn` (a spawned session's first prompt), `report` (a child's report delivered as a turn) or `terminal` |
 | `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, `parent_claude` for a spawn, `child_kimi` for a report: a label for GUIs only; the text the agent gets names the session by its ID instead (see [What agents are told](#what-agents-are-told)) |
@@ -95,12 +98,13 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards |
-| `_gorynych/peers` | method, `{token}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open`, `parent_session_id` |
+| `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open`, `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived` |
+| `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
 | `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?}` → `{}` | tells a session's agent something that needs no answer (a child's report); the Claude adapter pushes it through the channel, an agent that answers method not found gets it as a turn |
 | `_gorynych/sessions_changed` | notification to clients, `{sessionId, change}` | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
-| `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply` and `_gorynych/spawn` | which session's `gorynych` MCP server is calling |
+| `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply`, `_gorynych/spawn` and `_gorynych/archive` | which session's `gorynych` MCP server is calling |
 
 ## Opinions between agents
 
@@ -108,11 +112,15 @@ Every session gets, in `mcpServers` (the ACP way to give an agent tools), a stdi
 named `gorynych`: `Gorynych.Service peers --pipe <pipe> --token <token>`. The token is
 random per session and tells the service who is calling. Its tools:
 
-- `list_agents` — the user's other sessions (`_gorynych/peers`);
+- `list_agents {include_archived?}` — the user's other sessions (`_gorynych/peers`), archived
+  ones only with `include_archived: true`, marked `archived`;
 - `ask_agent {session_id, question}` — starts a new question to one, by its exact
-  `session_id`, and waits for the answer (`_gorynych/opinion`);
+  `session_id`, and waits for the answer (`_gorynych/opinion`); archived sessions too;
 - `spawn_session {agent, prompt, cwd?, title?, report?}` — starts a child session
   (`_gorynych/spawn`, see [Child sessions](#child-sessions)) and returns `{"session_id": …}`;
+- `archive_session {session_id}` and `restore_session {session_id}` — set or clear a
+  session's archive flag (`_gorynych/archive`, see [Archive](#archive)), any session's, the
+  caller's own included;
 - `reply {message_id, text}` — only answers a request this session was asked, by the
   `message_id` in its header. Nothing waiting for that ID fails with how to recover (below).
 
@@ -120,7 +128,9 @@ Each description says when to use the tool rather than its neighbour: `ask_agent
 question and points to `reply` for answering one; `reply` only answers and points to
 `ask_agent`; `session_id` is the exact value from `list_agents` or a header, never an agent
 name, a title or a sender label; `spawn_session` says the child's turns are reported back by
-themselves.
+themselves; `archive_session` says archiving is not deleting (the history stays, `ask_agent`
+still reaches it), and `restore_session` that it only changes where the session is shown, so
+asking an archived session needs no restore.
 
 How a request reaches the asked agent depends on what it has:
 
@@ -178,9 +188,24 @@ Errors from the peer tools say how to recover. The peers server returns them to 
 | `reply` with a `message_id` nothing waits for (the tool's own error) | `No open request with message_id "<x>" for this session; it may have been answered already or withdrawn. reply only answers a request you received, by the message_id in its header. To ask a session something, use ask_agent with its session_id.` |
 | `spawn_session` with an unknown agent (`-32602`) | `No agent "<x>". Pass one of: claude, kimi.` |
 | `spawn_session` with a folder that does not exist (`-32602`) | `No such folder: <path>. Pass an existing folder, or leave cwd out to work in this session's folder, <folder>.` |
+| `archive_session` with an unknown or deleted `session_id` (`-32002`) | `No session "<x>". Pass an exact session_id from list_agents.` and the first five sessions it can archive, the caller's own first and marked `(this session)`, under `Sessions you can archive:`, or `There is no session to archive now.` |
+| `restore_session` with an unknown or deleted `session_id` (`-32002`) | `No session "<x>". Pass an exact session_id from list_agents with include_archived: true.` and the first five archived sessions under `Archived sessions:`, or `No session is archived now.` |
 
-A client calling `_gorynych/opinion` without a peer token gets the plain `Unknown session
-<id>`, since it has no `list_agents`.
+The hint lists of `ask_agent` and `archive_session` leave archived sessions out, as
+`list_agents` does.
+
+`archive_session` and `restore_session` succeed in every other case, and say what happened
+(`(this session)` follows the session when it is the caller's own):
+
+| Case | Text |
+| --- | --- |
+| archived now | `Archived session_id <id> (<agent>, "<title>"). It is now hidden from list_agents and from the user's session list; nothing in it is lost. ask_agent still reaches it, and restore_session brings it back.` |
+| already archived | `session_id <id> (<agent>, "<title>") was already archived, so nothing changed. ask_agent still reaches it, and restore_session brings it back.` |
+| restored now | `Restored session_id <id> (<agent>, "<title>"). It is back in list_agents and in the user's session list.` |
+| not archived | `session_id <id> (<agent>, "<title>") is not archived, so nothing changed. It is in list_agents and in the user's session list.` |
+
+A client calling `_gorynych/opinion` or `_gorynych/archive` without a peer token gets the
+plain `Unknown session <id>`, since it has no `list_agents`.
 
 Approvals are the same for every agent: `list_agents` (read only) and `reply` (an answer the
 user's own agent was asked for) run without asking — the Claude adapter allows them in its
@@ -188,6 +213,8 @@ PermissionRequest hook, the service answers Kimi's `session/request_permission` 
 while `ask_agent` always asks the person, because it hands context to another agent and
 spends its turns. `spawn_session` is also allowed without the agent's own approval, because
 the service itself asks the person before every spawn (below), so it is asked once.
+`archive_session` and `restore_session` go through the agent's normal approval, with no
+card of the service's own: both can be undone.
 
 Verified live on 7 November 2026: Claude called `list_agents` and, after approval,
 `ask_agent`; Kimi got the marked turn, answered with `reply`, and Claude used the answer.
@@ -296,6 +323,10 @@ parent already holds the child's ID. A longer message is cut at 2000 characters 
   `gorynych/sender` (`child_claude`) and `gorynych/fromSessionId`, after the parent's
   running turn. A report turn is itself never reported further up.
 
+A report to an archived parent is dropped and only logged: it would start a turn there, and
+a channel note would wake Claude too. That holds also when the parent is archived while the
+report waits for the parent's running turn. Nothing is kept to send after a restore.
+
 
 ## List changes
 
@@ -308,10 +339,12 @@ reflects what `session/list` shows:
 
 - `added`: a session appears: spawned, a draft's first prompt (or an opinion it answered),
   or a session the service finds in an agent's own list for the first time;
-- `updated`: a listed session's title or parent changed, or its `updatedAt` (at most once per
-  10 seconds per session, the `added` counting as the interval's first notice; a change
-  inside an interval is announced at its end, unless the session is gone by then);
-- `removed`: a listed session was deleted.
+- `updated`: a listed session's title, parent or archive flag changed (announced at once), or
+  its `updatedAt` (at most once per 10 seconds per session, the `added` counting as the
+  interval's first notice; a change inside an interval is announced at its end, unless the
+  session is gone by then);
+- `removed`: a listed session was deleted. Archiving is `updated`, not `removed`: a client
+  that lists archived sessions still shows it.
 
 Drafts are never announced: neither when created nor when discarded. Notifications keep the
 order of the changes, and nothing about a session follows its `removed`. Each client has its
@@ -319,6 +352,36 @@ own queue, so a client that stops reading delays only its own notifications. The
 data beyond the ID; a client reads the session again with `session/list`. In a rare race a
 list that runs while a session is spawned can find it in its agent first; it is then
 `added` without its parent and `updated` with it a moment later.
+
+## Archive
+
+An archived session is out of sight, not locked: it is left out of the lists but works as
+before, so the archive can serve as a knowledge base that agents still ask. ACP has no archive
+(no method, no field on `SessionInfo`), so this is Gorynych's extension, advertised by
+`_meta["gorynych/archive"]: true` in the `initialize` result. Neither agent offers one through
+ACP either: Claude Code has no archive, and Kimi has one in its own UI that `kimi acp` does not
+expose ([adapters.md](adapters.md#kimi-code)). The flag therefore lives in the overlay for
+every agent, and the service never writes an agent's own files for it.
+
+- `_gorynych/archive {sessionId, archived}` → `{}` sets or clears it. It is idempotent, and an
+  unknown or deleted session fails with `-32002`. It is only a flag: nothing is closed,
+  cancelled or unloaded, and a turn under way goes on.
+- Nothing clears it on its own: not a prompt from the user, not a question from another
+  session, not a new title from the agent. Only `_gorynych/archive` (from a client, or from the
+  peer tools `archive_session` and `restore_session`) changes it.
+- `session/list` leaves archived sessions out, as Codex and Kimi do in their own lists; with
+  `_meta["gorynych/includeArchived"]: true` in the request it includes them, each with
+  `_meta["gorynych/archived"]: true`. The key is absent for a session that is not archived.
+- A change is announced at once, outside the activity throttle, as
+  `_gorynych/sessions_changed {sessionId, change: "updated"}`, and published to the session's
+  clients as a `session_info_update` whose `_meta["gorynych/archived"]` is `true` or `false`.
+  The update is journaled, so a later `session/load` replays it, except for a session the
+  service has never journaled: its first load takes the history from its agent, which a
+  journal holding only this update would prevent.
+- An archived session is asked, prompted, opened and spawned from as before. `list_agents`
+  leaves it out unless `include_archived` is true, and so do the hint lists in the peer tools'
+  errors; `ask_agent` reaches it all the same and leaves it archived.
+- A report to an archived parent is dropped ([Reports](#reports)).
 
 ## Drafts and deletion
 
@@ -381,7 +444,7 @@ when the journal is read back.
 `sessions.json` holds, per session: the owning adapter, `cwd`, `title` and its source
 (`agent` when the harness gave it, `prompt` for the provisional first-prompt title, `spawn`
 for a name given to `spawn_session`), `createdAt`, `updatedAt`, `parentSessionId` and
-`reportToParent` for a spawned session, and `draft` or `deleted` when set. Native state wins:
+`reportToParent` for a spawned session, and `draft`, `deleted` or `archived` when set. Native state wins:
 a title or `updatedAt` from the harness replaces the overlay's, except a `spawn` name, which
 no harness can store yet.
 

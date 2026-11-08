@@ -271,13 +271,14 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     }
 
     /// <summary>Journals an update, runs <paramref name="remember"/>, and sends it to the attached clients.</summary>
-    public async Task PublishAsync(JsonObject update, ClientConnection? except, Action remember)
+    /// <param name="journal">False sends it without journaling it.</param>
+    public async Task PublishAsync(JsonObject update, ClientConnection? except, Action remember, bool journal = true)
     {
         await gate.WaitAsync();
         try
         {
             if (Retired) return; // a late update of a deleted session must not bring its journal back
-            Journal.Append(update);
+            if (journal) Journal.Append(update);
             remember();
             foreach (var client in Clients())
                 if (!ReferenceEquals(client, except))

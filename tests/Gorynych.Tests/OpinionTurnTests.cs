@@ -177,13 +177,14 @@ public sealed partial class OpinionTurnTests
     }
 
     [TestMethod]
-    public async Task ListAgentsAndReply_AreAllowedWithoutAsking_AskAgentIsNot()
+    public async Task ListAgentsAndReply_AreAllowedWithoutAsking_AskAgentArchiveAndRestoreAreNot()
     {
         var kimi = new TurnAgent { Name = "kimi", SessionId = "kimi-1" };
         var outcomes = new List<string>();
+        var asked = new[] { "mcp__gorynych__ask_agent", "mcp__gorynych__archive_session", "mcp__gorynych__restore_session" };
         kimi.OnPrompt = async (agent, p, _) =>
         {
-            foreach (var tool in new[] { "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent" })
+            foreach (var tool in new[] { "mcp__gorynych__list_agents", "mcp__gorynych__reply" }.Concat(asked))
             {
                 var r = await agent.Rpc.RequestAsync<RequestPermissionRequest, RequestPermissionResponse>(AcpMethods.Client.SessionRequestPermission,
                     new RequestPermissionRequest
@@ -207,8 +208,8 @@ public sealed partial class OpinionTurnTests
         await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
             new PromptRequest { SessionId = "kimi-1", Prompt = [new TextContent { Text = "go" }] });
 
-        CollectionAssert.AreEqual(new[] { "approve", "approve", "reject" }, outcomes);
-        Assert.AreEqual("mcp__gorynych__ask_agent", client.Approvals.Single().ToolCall.Title);
+        CollectionAssert.AreEqual(new[] { "approve", "approve", "reject", "reject", "reject" }, outcomes);
+        CollectionAssert.AreEqual(asked, client.Approvals.Select(a => a.ToolCall.Title).ToArray(), "the user approves these");
     }
 
     [TestMethod]

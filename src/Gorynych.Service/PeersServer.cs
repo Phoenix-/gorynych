@@ -13,9 +13,9 @@ namespace Gorynych.Service;
 /// The <c>gorynych</c> stdio MCP server agents start from their <c>mcpServers</c>:
 /// <c>Gorynych.Service peers [--pipe P --token T] [--channel-url U]</c>.
 /// <list type="bullet">
-/// <item>With a pipe and token it offers <c>list_agents</c>, <c>ask_agent</c> and
-/// <c>spawn_session</c>, which go to the service; the token tells the service which session is
-/// asking.</item>
+/// <item>With a pipe and token it offers <c>list_agents</c>, <c>ask_agent</c>,
+/// <c>spawn_session</c>, <c>archive_session</c> and <c>restore_session</c>, which go to the
+/// service; the token tells the service which session is asking.</item>
 /// <item>With a channel URL (Claude Code) it is also a development channel: it declares
 /// <c>claude/channel</c>, long-polls the Claude adapter and pushes
 /// <c>notifications/claude/channel</c>.</item>
@@ -70,7 +70,8 @@ public static class PeersServer
             instructions.Append("list_agents shows the user's other coding-agent sessions and ask_agent asks one for its opinion, by " +
                 "its exact session_id; they only give opinions, they do not act on your behalf. spawn_session starts a new child session " +
                 "of one of these agents with a task, after the user approves it; each turn the child finishes is reported back to you " +
-                "automatically.");
+                "automatically. archive_session hides a session from the lists without deleting it, and restore_session brings it back; " +
+                "the user approves each.");
         return new JsonObject
         {
             ["protocolVersion"] = req.Params?["protocolVersion"]?.DeepClone() ?? "2025-06-18",
@@ -135,9 +136,25 @@ public static class PeersServer
                 }
                 case "list_agents" when pipe is not null && token is not null:
                 {
+                    var query = new JsonObject { ["token"] = token };
+                    if (args?["include_archived"] is JsonValue all && all.TryGetValue<bool>(out var include) && include) query["includeArchived"] = true;
                     await using var service = await ConnectAsync(pipe, ct);
-                    var peers = await service.SendRequestAsync(GorynychProtocol.MethodPeers, new JsonObject { ["token"] = token }, ct);
+                    var peers = await service.SendRequestAsync(GorynychProtocol.MethodPeers, query, ct);
                     return Text(peers?["sessions"]?.ToJsonString(new() { WriteIndented = true }) ?? "[]");
+                }
+                case "archive_session" or "restore_session" when pipe is not null && token is not null:
+                {
+                    var target = (string?)args?["session_id"];
+                    if (string.IsNullOrWhiteSpace(target)) return Text("session_id is required", error: true);
+                    var archive = tool == "archive_session";
+                    await using var service = await ConnectAsync(pipe, ct);
+                    var result = await service.SendRequestAsync(GorynychProtocol.MethodArchive, new JsonObject
+                    {
+                        ["sessionId"] = target,
+                        ["archived"] = archive,
+                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token },
+                    }, ct);
+                    return Text((string?)result?["text"] ?? (archive ? "archived" : "restored"));
                 }
                 case "ask_agent" when pipe is not null && token is not null:
                 {
@@ -236,8 +253,17 @@ public static class PeersServer
         {
             ["name"] = "list_agents",
             ["description"] = "List the user's other coding-agent sessions in Gorynych that you can ask with ask_agent: session_id (pass it " +
-                "exactly), agent, title, folder, whether it is open, and parent_session_id for a session another session started with spawn_session.",
-            ["inputSchema"] = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject() },
+                "exactly), agent, title, folder, whether it is open, and parent_session_id for a session another session started with spawn_session. " +
+                "Archived sessions are left out unless include_archived is true; then every entry says whether it is archived. " +
+                "ask_agent reaches archived sessions too.",
+            ["inputSchema"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["include_archived"] = new JsonObject { ["type"] = "boolean", ["description"] = "also list archived sessions, marked archived: true; default false" },
+                },
+            },
         };
         var ask = new JsonObject
         {
@@ -285,7 +311,48 @@ public static class PeersServer
                 ["required"] = new JsonArray("agent", "prompt"),
             },
         };
-        return [list, ask, spawn, reply];
+        var archive = new JsonObject
+        {
+            ["name"] = "archive_session",
+            ["description"] = "Archive one of the user's coding-agent sessions, this one included: Gorynych hides it from list_agents and " +
+                "from the user's session list. Archiving is not deleting: the session keeps all its history, ask_agent still reaches it, " +
+                "and the user can still open and prompt it; restore_session brings it back. The user approves each call. " +
+                "Use it when the user asks you to archive or tidy up sessions.",
+            ["inputSchema"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["session_id"] = new JsonObject
+                    {
+                        ["type"] = "string",
+                        ["description"] = "the exact session_id of the session to archive, from list_agents or from a header that says \"session_id ...\"",
+                    },
+                },
+                ["required"] = new JsonArray("session_id"),
+            },
+        };
+        var restore = new JsonObject
+        {
+            ["name"] = "restore_session",
+            ["description"] = "Bring an archived session back into list_agents and the user's session list. It only changes where the " +
+                "session is shown and sends it nothing. To ask an archived session something, use ask_agent: it need not be restored " +
+                "first. list_agents with include_archived: true shows the archived sessions. The user approves each call.",
+            ["inputSchema"] = new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["session_id"] = new JsonObject
+                    {
+                        ["type"] = "string",
+                        ["description"] = "the exact session_id of the archived session, from list_agents with include_archived: true",
+                    },
+                },
+                ["required"] = new JsonArray("session_id"),
+            },
+        };
+        return [list, ask, spawn, archive, restore, reply];
     }
 }
 

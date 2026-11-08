@@ -33,6 +33,20 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   The service answers Kimi's approval of `spawn_session` itself, since it asks the person
   before it spawns ([service-protocol.md](service-protocol.md#child-sessions)). Kimi does not
   know `_gorynych/note`, so a child's report reaches a Kimi parent as a marked turn.
+- **Archive: not mirrored.** Kimi Code 2.5.2 has a native archive (`"archived"` in a
+  session's `state.json`, `kimi session list --archived`, set from Kimi's own UI), but
+  `kimi acp` offers no method for it. Its `session/list` leaves natively archived sessions out:
+  read from the 2.5.2 code (not tried, so as not to archive any of the user's sessions), it
+  asks Kimi's engine for the session list with an empty query, which excludes archived ones,
+  and its `SessionInfo` has no archive field. So the service's archive flag lives in its
+  overlay for Kimi too ([service-protocol.md](service-protocol.md#archive)) and never touches
+  Kimi's files. A session archived in Kimi's own UI is not seen as archived: while Kimi is
+  running, the service takes it for a session Kimi no longer has and leaves it out of
+  `session/list`, even with `includeArchived`; its ID still works for `session/load` and
+  `ask_agent` as far as the service goes (whether Kimi resumes a natively archived session is
+  not checked). Restoring it in Kimi brings it back.
+- Also seen in the 2.5.2 code, not tried: Kimi's ACP `session/list` ignores the request's
+  `cursor`, so if it ever returned a `nextCursor`, following it would repeat the first page.
 - Verified live on 7 November 2026 after logging in: first prompt, a Write approval, the
   title, replay through the service journal, and `ask_agent` to a Claude session. Before
   the login every turn failed with `-32000 Authentication required: 403`, which the service
@@ -127,8 +141,8 @@ their behalf, says each channel message names the asking session by its `session
 when the peer tools are there, tells Claude about `list_agents`, `ask_agent` (by exact
 `session_id`; `reply` only answers) and `spawn_session`. The PermissionRequest hook allows `mcp__gorynych__reply`,
 `mcp__gorynych__list_agents` and `mcp__gorynych__spawn_session` without asking (the service
-asks the person before every spawn); `mcp__gorynych__ask_agent` becomes an ACP approval like
-any tool.
+asks the person before every spawn); `mcp__gorynych__ask_agent`, `archive_session` and
+`restore_session` become ACP approvals like any tool.
 
 `_gorynych/note` (a child's report to its parent) becomes a channel message with
 `meta: {kind: "report"}` and no `message_id`; the system prompt says it needs no reply. The
@@ -140,6 +154,10 @@ Either way the service sends the report as a turn instead, which starts Claude.
 A name given to `spawn_session` stays in the service's overlay: the adapter cannot write
 Claude's own `custom-title` yet (that needs `/rename` through the PTY), and Claude's
 generated `ai-title` does not replace the name.
+
+Claude Code has no archive of its own, so the archive flag of a Claude session lives in the
+service's overlay ([service-protocol.md](service-protocol.md#archive)); the adapter knows
+nothing of it.
 
 ### Not done yet
 

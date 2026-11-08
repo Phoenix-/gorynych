@@ -54,6 +54,7 @@ public sealed class Conductor : IAsyncDisposable
     readonly ConcurrentDictionary<string, long> lastUpdateNotice = new(StringComparer.Ordinal); // session -> tick of its last "added" or "updated"
     readonly ConcurrentDictionary<string, byte> trailingUpdateNotice = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<Task, byte> backgroundTurns = new();
+    readonly SemaphoreSlim archiveGate = new(1, 1); // archive changes, so their session_info_updates keep the flag's order
     long opinionCount;
     long spawnCount;
 
@@ -225,6 +226,8 @@ public sealed class Conductor : IAsyncDisposable
     /// <param name="agentScope">Only this adapter's sessions (a client scoped to one agent), or all.</param>
     internal async Task<ListSessionsResponse> ListAsync(ListSessionsRequest request, CancellationToken ct, string? agentScope = null)
     {
+        // Archived sessions are left out unless the client asks for them, as Codex and Kimi do.
+        var includeArchived = request.Meta?[GorynychProtocol.MetaIncludeArchived] is JsonValue all && all.TryGetValue<bool>(out var include) && include;
         var found = new Dictionary<string, SessionInfo>(StringComparer.Ordinal);
         foreach (var host in agents.Values)
         {
@@ -248,7 +251,7 @@ public sealed class Conductor : IAsyncDisposable
                             if (s.Title is { Length: > 0 } t && rec.TitleSource != SpawnTitle) { rec.Title = t; rec.TitleSource = "agent"; }
                             if (ParseTime(s.UpdatedAt) is { } at && (discovered || at > rec.UpdatedAt)) rec.UpdatedAt = at;
                         });
-                        if (record is not null) found[s.SessionId] = Describe(record, s);
+                        if (record is not null && (includeArchived || !record.Archived)) found[s.SessionId] = Describe(record, s);
                     }
                     cursor = r.NextCursor;
                     if (cursor is null) break;
@@ -261,7 +264,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         foreach (var r in store.All())
         {
-            if (found.ContainsKey(r.SessionId) || r.Draft || r.Deleted) continue;
+            if (found.ContainsKey(r.SessionId) || r.Draft || r.Deleted || (r.Archived && !includeArchived)) continue;
             if (agentScope is not null && r.Agent != agentScope) continue;
             if (request.Cwd is not null && !string.Equals(Path.GetFullPath(r.Cwd), Path.GetFullPath(request.Cwd), StringComparison.OrdinalIgnoreCase)) continue;
             if (agents.TryGetValue(r.Agent, out var host) && host.IsRunning && host.CanList) continue; // the agent no longer has it
@@ -279,6 +282,7 @@ public sealed class Conductor : IAsyncDisposable
         var meta = native?.Meta?.DeepClone().AsObject() ?? [];
         meta[GorynychProtocol.MetaAgent] = r.Agent;
         if (r.ParentSessionId is not null) meta[GorynychProtocol.MetaParentSessionId] = r.ParentSessionId;
+        if (r.Archived) meta[GorynychProtocol.MetaArchived] = true;
         return new SessionInfo
         {
             SessionId = r.SessionId,
@@ -1187,7 +1191,8 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>
     /// After a turn of a spawned session (its first one, or one a client prompted; not opinion
     /// or report turns): unless its spawn said otherwise, tells its parent in the background
-    /// that the turn ended, with the child's ID, title and final message.
+    /// that the turn ended, with the child's ID, title and final message. A report to an archived
+    /// parent is dropped (logged): it would start a turn there.
     /// </summary>
     void ReportTurnEnd(string childId, string outcome, string finalMessage)
     {
@@ -1212,7 +1217,13 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             if (store.Get(childId) is not { ParentSessionId: { } parentId } child || child.Deleted) return;
-            if (store.Get(parentId) is not { Deleted: false }) return;
+            if (store.Get(parentId) is not { Deleted: false } parent) return;
+            if (parent.Archived)
+            {
+                // Out of sight: a report would start a turn, and a channel note would wake Claude as well.
+                ServiceLog.Info($"report: {childId} -> {parentId} dropped: the parent is archived");
+                return;
+            }
             var text = ReportText(child, outcome, finalMessage);
             var sender = $"child_{child.Agent}";
             using var use = await UseAsync(parentId, cleanupStop.Token);
@@ -1244,6 +1255,11 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             if (feed.Retired) return;
+            if (store.Get(use.Record.SessionId) is { Archived: true })
+            {
+                ServiceLog.Info($"report: {childId} -> {use.Record.SessionId} dropped: the parent was archived while the report waited for its turn");
+                return;
+            }
             var meta = new JsonObject
             {
                 [GorynychProtocol.MetaOrigin] = "report",
@@ -1300,14 +1316,92 @@ public sealed class Conductor : IAsyncDisposable
             : "Your turns are not reported to it. ") +
         $"To ask it something, use ask_agent with session_id \"{parent.SessionId}\". The user can also prompt you here directly.";
 
+    // ---------------------------------------------------------------- archive
+
+    /// <summary>
+    /// <c>_gorynych/archive {sessionId, archived}</c>, from a client or from the peers server's
+    /// <c>archive_session</c> and <c>restore_session</c>: sets the session's archive flag in the
+    /// overlay. Idempotent. Only a flag: nothing is closed, cancelled or unloaded, and nothing
+    /// else ever clears it. A change is announced as <c>updated</c> at once and published to the
+    /// session's clients as a <c>session_info_update</c> with the flag in <c>_meta</c>. A call
+    /// with a peer token also gets <c>text</c> for the agent.
+    /// </summary>
+    internal async Task<JsonNode?> ArchiveAsync(JsonRpcRequest request, CancellationToken ct)
+    {
+        var target = (string?)request.Params?["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
+        if (request.Params?["archived"] is not JsonValue flag || !flag.TryGetValue<bool>(out var archived))
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "archived is required: true or false");
+        string? from = null;
+        if ((string?)request.Params?["_meta"]?[GorynychProtocol.MetaPeerToken] is { } token)
+            from = peerTokens.TryGetValue(token, out var sid) ? sid : throw new JsonRpcException(JsonRpcException.InvalidRequest, "Unknown peer token");
+        SessionUse use;
+        try
+        {
+            use = await UseAsync(target, ct);
+        }
+        catch (JsonRpcException e) when (from is not null && e.Code == JsonRpcException.ResourceNotFound)
+        {
+            throw new JsonRpcException(JsonRpcException.ResourceNotFound, archived
+                ? $"No session \"{target}\". Pass an exact session_id from list_agents." + ArchivableHint(from)
+                : $"No session \"{target}\". Pass an exact session_id from list_agents with include_archived: true." + ArchivedHint(from));
+        }
+        using (use)
+        {
+            SessionRecord record;
+            bool changed;
+            await archiveGate.WaitAsync(ct);
+            try
+            {
+                record = store.Get(target) is { Deleted: false } now ? now : throw NotFound(target);
+                changed = record.Archived != archived;
+                if (changed)
+                {
+                    record = store.Update(target, record.Agent, r => r.Archived = archived) ?? throw NotFound(target);
+                    var info = new JsonObject
+                    {
+                        ["sessionUpdate"] = "session_info_update",
+                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaArchived] = archived },
+                    };
+                    // A session the service has never journaled gets its history from its agent at its
+                    // first load (LoadAsync); a journal holding only this would hide that history.
+                    await use.Feed.PublishAsync(info, except: null, () => { }, journal: use.Feed.Journal.Count > 0);
+                }
+            }
+            finally
+            {
+                archiveGate.Release();
+            }
+            if (changed) ServiceLog.Info($"{record.Agent} {target}: {(archived ? "archived" : "restored")}{(from is null ? "" : $" by {from}")}");
+            var result = new JsonObject();
+            if (from is not null) result["text"] = ArchiveText(record, archived, changed, self: from == target);
+            return result;
+        }
+    }
+
+    /// <summary>What <c>archive_session</c> and <c>restore_session</c> tell the agent: which session, and what it means now.</summary>
+    static string ArchiveText(SessionRecord r, bool archived, bool changed, bool self)
+    {
+        var who = Who(r) + (self ? " (this session)" : "");
+        return (archived, changed) switch
+        {
+            (true, true) => $"Archived {who}. It is now hidden from list_agents and from the user's session list; nothing in it is lost. " +
+                "ask_agent still reaches it, and restore_session brings it back.",
+            (true, false) => $"{who} was already archived, so nothing changed. ask_agent still reaches it, and restore_session brings it back.",
+            (false, true) => $"Restored {who}. It is back in list_agents and in the user's session list.",
+            (false, false) => $"{who} is not archived, so nothing changed. It is in list_agents and in the user's session list.",
+        };
+    }
+
     // ---------------------------------------------------------------- list changes
 
     /// <summary>
     /// Turns a change of the overlay into <c>_gorynych/sessions_changed</c>, by what clients list:
     /// a session that becomes listed (spawned, a draft's first prompt, found in an agent's list)
     /// is <c>added</c>, one that stops being listed (deleted) is <c>removed</c>, and a listed one
-    /// whose title or parent changes is <c>updated</c>; so is its activity, throttled. Drafts are
-    /// never announced. Runs under the store's lock, so changes are queued in their order.
+    /// whose title, parent or archive flag changes is <c>updated</c> at once; so is its activity,
+    /// throttled. An archived session stays listed for clients that ask for archived ones, so
+    /// archiving it is <c>updated</c>, not <c>removed</c>. Drafts are never announced. Runs under
+    /// the store's lock, so changes are queued in their order.
     /// </summary>
     void OnRecordChanged(SessionRecord? before, SessionRecord after)
     {
@@ -1315,7 +1409,8 @@ public sealed class Conductor : IAsyncDisposable
         if (!listed && after.Listed) AnnounceList(after.SessionId, after.Agent, "added");
         else if (listed && !after.Listed) AnnounceList(after.SessionId, after.Agent, "removed");
         else if (!after.Listed) return;
-        else if (before!.Title != after.Title || before.ParentSessionId != after.ParentSessionId) AnnounceList(after.SessionId, after.Agent, "updated");
+        else if (before!.Title != after.Title || before.ParentSessionId != after.ParentSessionId || before.Archived != after.Archived)
+            AnnounceList(after.SessionId, after.Agent, "updated");
         else if (before.UpdatedAt != after.UpdatedAt) AnnounceActivity(after.SessionId, after.Agent);
     }
 
@@ -1437,21 +1532,40 @@ public sealed class Conductor : IAsyncDisposable
     static string Who(SessionRecord r) =>
         $"session_id {r.SessionId} ({r.Agent}" + (r.Title is { Length: > 0 } title ? $", \"{Shorten(title).Replace('"', '\'')}\"" : "") + ")";
 
-    /// <summary>The sessions <paramref name="self"/> can ask: the others with history, open ones first, then the newest.</summary>
-    IEnumerable<(SessionRecord Record, bool Live)> Askable(string? self) => store.All()
-        .Where(r => r.SessionId != self && HasHistory(r))
+    /// <summary>The sessions with history, open ones first, then the newest.</summary>
+    IEnumerable<(SessionRecord Record, bool Live)> WithHistory() => store.All()
+        .Where(HasHistory)
         .Select(r => (Record: r, Live: agents.TryGetValue(r.Agent, out var host) && host.IsLive(r.SessionId)))
         .OrderByDescending(c => c.Live).ThenByDescending(c => c.Record.UpdatedAt);
 
+    /// <summary>
+    /// The sessions <paramref name="self"/> lists with <c>list_agents</c>: the others with history,
+    /// archived ones only when asked for (<c>ask_agent</c> reaches those too).
+    /// </summary>
+    IEnumerable<(SessionRecord Record, bool Live)> Askable(string? self, bool includeArchived = false) =>
+        WithHistory().Where(c => c.Record.SessionId != self && (includeArchived || !c.Record.Archived));
+
     /// <summary>For a peer tool's error: the first sessions the caller can ask, so it can retry with an exact ID.</summary>
-    string AskableHint(string self)
+    string AskableHint(string self) => Hint(" Sessions you can ask:", Askable(self).Select(c => c.Record), self,
+        "\n- and more: list_agents shows them all", " There is no other session to ask now.");
+
+    /// <summary>For <c>archive_session</c>'s error: the sessions it can archive, the caller's own first.</summary>
+    string ArchivableHint(string self) => Hint(" Sessions you can archive:",
+        WithHistory().Where(c => !c.Record.Archived).OrderByDescending(c => c.Record.SessionId == self).Select(c => c.Record), self,
+        "\n- and more: list_agents shows them all", " There is no session to archive now.");
+
+    /// <summary>For <c>restore_session</c>'s error: the archived sessions.</summary>
+    string ArchivedHint(string self) => Hint(" Archived sessions:", WithHistory().Where(c => c.Record.Archived).Select(c => c.Record), self,
+        "\n- and more: list_agents with include_archived: true shows them all", " No session is archived now.");
+
+    static string Hint(string label, IEnumerable<SessionRecord> candidates, string self, string more, string none)
     {
         const int Shown = 5;
-        var askable = Askable(self).Take(Shown + 1).Select(c => c.Record).ToList();
-        if (askable.Count == 0) return " There is no other session to ask now.";
-        var hint = new StringBuilder(" Sessions you can ask:");
-        foreach (var r in askable.Take(Shown)) hint.Append("\n- ").Append(Who(r));
-        if (askable.Count > Shown) hint.Append("\n- and more: list_agents shows them all");
+        var list = candidates.Take(Shown + 1).ToList();
+        if (list.Count == 0) return none;
+        var hint = new StringBuilder(label);
+        foreach (var r in list.Take(Shown)) hint.Append("\n- ").Append(Who(r)).Append(r.SessionId == self ? " (this session)" : "");
+        if (list.Count > Shown) hint.Append(more);
         return hint.ToString();
     }
 
@@ -1564,15 +1678,19 @@ public sealed class Conductor : IAsyncDisposable
         public Exception? TurnError { get; set; }
     }
 
-    /// <summary><c>_gorynych/peers</c>: the sessions the session behind <c>token</c> can ask.</summary>
+    /// <summary>
+    /// <c>_gorynych/peers {token, includeArchived?}</c>: the sessions the session behind <c>token</c>
+    /// can ask; archived ones only with <c>includeArchived</c>, and then every entry says whether it is.
+    /// </summary>
     internal JsonObject Peers(JsonRpcRequest request)
     {
         var token = (string?)request.Params?["token"];
         var self = token is not null && peerTokens.TryGetValue(token, out var sid) ? sid : null;
+        var includeArchived = request.Params?["includeArchived"] is JsonValue all && all.TryGetValue<bool>(out var include) && include;
         var sessions = new JsonArray();
-        foreach (var (r, live) in Askable(self))
+        foreach (var (r, live) in Askable(self, includeArchived))
         {
-            sessions.Add((JsonNode)new JsonObject
+            var entry = new JsonObject
             {
                 ["session_id"] = r.SessionId,
                 ["agent"] = r.Agent,
@@ -1581,7 +1699,9 @@ public sealed class Conductor : IAsyncDisposable
                 ["open"] = live,
                 ["updated_at"] = r.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
                 ["parent_session_id"] = r.ParentSessionId,
-            });
+            };
+            if (includeArchived) entry["archived"] = r.Archived;
+            sessions.Add((JsonNode)entry);
         }
         return new JsonObject { ["sessions"] = sessions };
     }
