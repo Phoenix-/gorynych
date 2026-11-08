@@ -174,7 +174,7 @@ answers still come from the new service. Its log is
   docs. *Unverified:* the docs also name a TUI command, `/mcp-config`, that edits that file.
   Neither has been tried with Kimi Code 2.5.2.
   ```json
-  { "mcpServers": { "gorynych-outside": { "command": "C:\Users\<you>\AppData\Local\Programs\Gorynych\outside\Gorynych.Outside.exe" } } }
+  { "mcpServers": { "gorynych-outside": { "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\outside\\Gorynych.Outside.exe" } } }
   ```
 - Keep the name `gorynych-outside`: the Claude adapter's deny rule matches it. Any other name
   still works, and the server still hides itself inside Gorynych.
