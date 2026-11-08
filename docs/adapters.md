@@ -639,9 +639,16 @@ with icacls. Gorynych's DSH sessions never let that happen:
 - New sessions run in DSH's `read-only` mode (DSH pins the mode into a session at its first
   turn; sessions made in `dsh web` keep their own). Reads, searches and commands that only read
   run without asking.
-- DSH asks only to escalate a denied call, never otherwise. The proxy refuses every shell
-  escalation itself, with `reject-once`, without asking the person. It also refuses an
-  escalation for a call it did not see announced. So the ACL never changes.
+- DSH asks only to escalate a denied call, never otherwise. Only an allowlist reaches the
+  person: a running call of DSH's `write` or `edit` (by the tool name DSH announced, ignoring
+  case) whose arguments are a file tool's, a `file_path` and no `command`. The proxy refuses every
+  other permission request itself, with `reject-once`, without asking anyone:
+  - a shell command's;
+  - an unknown or renamed tool's;
+  - an MCP tool's (DSH runs those unasked, so a request for one is unexpected);
+  - a call it did not see announced, or one that has already ended.
+
+  So the ACL never changes.
   - The model's tool result says `the user rejected escalating this command …; stop and explain`.
     ACP has no way to give another reason, so the appended prompt says in advance that this
     text comes from Gorynych's policy, not from a person.
@@ -698,6 +705,15 @@ with icacls. Gorynych's DSH sessions never let that happen:
 - **Withdrawn questions.** On a cancel DSH drops its own pending approval without
   `$/cancel_request`. The proxy withdraws it from the service when the call ends or the prompt
   does, and drops a late answer.
+- **Malformed output.** A message from DSH the proxy cannot read is logged and fails closed:
+  - a permission request is refused;
+  - another request gets `-32603`;
+  - an answer passes on unchanged, so the service's request does not hang;
+  - a notification is dropped.
+
+  The proxy keeps reading either way. Everything for DSH's stdin goes through one queue and one
+  writer, so reading never waits on DSH reading its input. A session DSH says it does not have
+  (`unknown session`), or one whose close was answered at all, is no longer added to the list.
 - No forms: the acp profile has no ask tool and no elicitation. No plans, no titles over ACP,
   no live-note path (`-32601`).
 

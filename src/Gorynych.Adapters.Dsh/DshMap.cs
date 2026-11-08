@@ -11,11 +11,11 @@ internal sealed record DshTool(string SessionId, string ToolCallId, string Name,
 /// </summary>
 internal static class DshMap
 {
-    /// <summary>DSH's file tools, the only ones whose sandbox escalation reaches the person.</summary>
-    static readonly HashSet<string> FileTools = ["write", "edit"];
-
-    /// <summary>DSH's shell tools: their escalation is always refused, so the workspace's ACL never changes.</summary>
-    static readonly HashSet<string> ShellTools = ["pwsh", "bash"];
+    /// <summary>
+    /// DSH's file tools, the only ones whose sandbox escalation reaches the person. They write
+    /// through DSH's in-process file sandbox, which changes no ACL.
+    /// </summary>
+    static readonly HashSet<string> FileTools = new(["write", "edit"], StringComparer.OrdinalIgnoreCase);
 
     public static string KindOf(string name) => name switch
     {
@@ -75,15 +75,18 @@ internal static class DshMap
 
     /// <summary>
     /// Whether the proxy refuses a permission request itself instead of asking the person. Every
-    /// request DSH sends is a sandbox escalation; a shell command's would write a standing ACE and a
-    /// Low integrity label onto the workspace tree, so it is always refused. A file tool's goes to
-    /// the person. A request for a call the proxy did not see, or another tool's escalation, is
-    /// refused too, so no escalation it cannot attribute changes an ACL.
+    /// request DSH sends is a sandbox escalation, and a shell command's would write a standing ACE
+    /// and a Low integrity label onto the workspace tree. So only an allowlist reaches the person:
+    /// a running call of one of DSH's file tools (by its name, ignoring case) whose arguments are
+    /// a file tool's (a <c>file_path</c>, no <c>command</c>). Everything else is refused: a shell
+    /// call, an unknown or renamed tool, an MCP tool (DSH runs those without asking, so a request
+    /// for one is unexpected), and a call the proxy did not see or that has already ended.
     /// </summary>
     public static bool Refused(DshTool? tool) =>
         tool is null
-        || ShellTools.Contains(tool.Name)
-        || (!FileTools.Contains(tool.Name) && tool.Input?["sandbox_permissions"] is not null);
+        || !FileTools.Contains(tool.Name)
+        || Str(tool.Input, "file_path") is null
+        || tool.Input?["command"] is not null;
 
     /// <summary>What an escalation asks for, for the person: the wider mode and the model's justification.</summary>
     public static string? Escalation(JsonNode? input) =>

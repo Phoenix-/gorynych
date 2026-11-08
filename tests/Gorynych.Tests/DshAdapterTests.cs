@@ -28,12 +28,31 @@ sealed class FakeDsh
     /// <summary>Sessions another DSH process (dsh web) holds.</summary>
     public HashSet<string> OwnedElsewhere { get; } = [];
 
+    Stream? output;
+
+    /// <summary>Sessions DSH does not have (any more): a prompt for one fails as DSH's does.</summary>
+    public HashSet<string> Unknown { get; } = [];
+
+    /// <summary>Writes one line as it is, for output that is not well-formed ACP.</summary>
+    public async Task SendRawAsync(string line)
+    {
+        await output!.WriteAsync(System.Text.Encoding.UTF8.GetBytes(line + "\n"));
+        await output.FlushAsync();
+    }
+
     public Task<AgentInstance> LaunchAsync(string patch, CancellationToken ct)
     {
         PatchPath = patch;
         var link = new DuplexLink();
         var (ai, ao) = link.AgentEnd;
+        output = ao;
         Rpc = new JsonRpcConnection(ai, ao, "fake-dsh");
+        // Answers to requests written raw (SendRawAsync) are not the connection's own: kept here.
+        Rpc.Trace = (direction, line) =>
+        {
+            if (direction != "<" || JsonNode.Parse(line) is not JsonObject m || m["method"] is not null) return;
+            if (m["id"] is JsonValue v && v.TryGetValue<string>(out var rawId)) lock (Calls) Calls.Add(("response " + rawId, m));
+        };
         Rpc.RequestHandler = HandleAsync;
         Rpc.NotificationHandler = (method, p) => { lock (Calls) Calls.Add((method, p?.DeepClone())); return Task.CompletedTask; };
         Rpc.Start();
@@ -75,6 +94,7 @@ sealed class FakeDsh
                 lock (cwds) open.Remove(sessionId!);
                 return new JsonObject();
             case AcpMethods.Agent.SessionPrompt:
+                if (Unknown.Contains(sessionId!)) throw new JsonRpcException(JsonRpcException.InvalidParams, $"Invalid params: unknown session: {sessionId}");
                 if (OnPrompt is { } run) await run(sessionId!);
                 return new JsonObject { ["stopReason"] = "end_turn" };
             default:
@@ -392,5 +412,122 @@ public sealed class DshAdapterTests
         StringAssert.Contains(patch, "- id: approval\n  config:\n    policy: ask\n");
         Assert.ThrowsExactly<ArgumentException>(() => DshPatch.Text("a {{cwd}} b"));
         Assert.IsFalse(DshPatch.Text(null).Contains("mcp__gorynych__", StringComparison.Ordinal), "no peer tools without the peers server");
+    }
+
+    [TestMethod]
+    [DataRow("bash", """{"command":"make","sandbox_permissions":"workspace-write","justification":"build"}""", false)]
+    [DataRow("PWSH", """{"command":"npm test","sandbox_permissions":"workspace-write"}""", false)]
+    [DataRow("something_new", """{"path":"a.txt","sandbox_permissions":"workspace-write"}""", false)]
+    [DataRow("move_file", """{"file_path":"a.txt","sandbox_permissions":"workspace-write","justification":"tidy"}""", false)]
+    [DataRow("mcp__gorynych__ask_agent", """{"session_id":"x","question":"y"}""", false)]
+    [DataRow("write", """{"file_path":"a.txt","command":"Set-Content a.txt x","sandbox_permissions":"workspace-write"}""", false)]
+    [DataRow("Write", """{"file_path":"a.txt","content":"x","sandbox_permissions":"workspace-write"}""", true)]
+    [DataRow("edit", """{"file_path":"a.txt","old_string":"a","new_string":"b","sandbox_permissions":"workspace-write"}""", true)]
+    public async Task OnlyAFileToolsEscalation_ReachesThePerson(string tool, string input, bool asked)
+    {
+        var (service, dsh, _) = await StartAsync();
+        await using var _ = service;
+        var id = await NewAsync(service, Work);
+        service.Answer = (_, _) => Task.FromResult<JsonNode?>(JsonNode.Parse("""{"outcome":{"outcome":"selected","optionId":"allow-once"}}"""));
+        JsonNode? answer = null;
+        dsh.OnPrompt = async s =>
+        {
+            await dsh.Update(s, $$"""{"sessionUpdate":"tool_call","toolCallId":"c1","title":"{{tool}}","kind":"other","status":"in_progress","rawInput":{{input}}}""");
+            answer = await (await dsh.AskAsync(s, "c1")).WaitAsync(Bound);
+        };
+
+        await PromptAsync(service, id);
+
+        Assert.AreEqual(asked ? 1 : 0, service.Questions.Count);
+        Assert.AreEqual(asked ? "allow-once" : "reject-once", (string?)answer?["outcome"]?["optionId"]);
+    }
+
+    [TestMethod]
+    public async Task AQuestionForACallThatHasEnded_IsRefused()
+    {
+        var (service, dsh, _) = await StartAsync();
+        await using var _ = service;
+        var id = await NewAsync(service, Work);
+        JsonNode? answer = null;
+        dsh.OnPrompt = async s =>
+        {
+            await dsh.Update(s, """{"sessionUpdate":"tool_call","toolCallId":"c1","title":"write","kind":"other","status":"in_progress","rawInput":{"file_path":"a.txt","content":"x","sandbox_permissions":"workspace-write"}}""");
+            await dsh.Update(s, """{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"completed","content":[]}""");
+            answer = await (await dsh.AskAsync(s, "c1")).WaitAsync(Bound);
+        };
+
+        await PromptAsync(service, id);
+
+        Assert.AreEqual("reject-once", (string?)answer?["outcome"]?["optionId"]);
+        Assert.AreEqual(0, service.Questions.Count);
+    }
+
+    [TestMethod]
+    public async Task MalformedOutput_FailsClosed_AndTheProxyKeepsGoing()
+    {
+        var (service, dsh, _) = await StartAsync();
+        await using var _ = service;
+        var id = await NewAsync(service, Work);
+        dsh.OnPrompt = async s =>
+        {
+            // A permission request whose tool call ID and options are not what ACP says.
+            await dsh.SendRawAsync("""{"jsonrpc":"2.0","id":"q1","method":"session/request_permission","params":{"sessionId":""" +
+                JsonValue.Create(s).ToJsonString() + ""","toolCall":{"toolCallId":7},"options":{"a":1}}}""");
+            // A notification and a request whose method is not a string.
+            await dsh.SendRawAsync("""{"jsonrpc":"2.0","method":5,"params":{}}""");
+            await dsh.SendRawAsync("""{"jsonrpc":"2.0","id":"q2","method":{"x":1},"params":{}}""");
+            await dsh.Update(s, """{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"still here"}}""");
+        };
+
+        await PromptAsync(service, id);
+
+        await Until(() => { lock (service.Updates) return service.Updates.Any(u => (string?)u["content"]?["text"] == "still here"); }, "the update after the malformed lines");
+        Assert.AreEqual(0, service.Questions.Count, "nothing malformed reached the service");
+        await Until(() => { lock (dsh.Calls) return dsh.Calls.Count(c => c.Method == "response q1" || c.Method == "response q2") == 2; }, "answers to both malformed requests");
+        JsonNode? q1, q2;
+        lock (dsh.Calls)
+        {
+            q1 = dsh.Calls.Single(c => c.Method == "response q1").Params;
+            q2 = dsh.Calls.Single(c => c.Method == "response q2").Params;
+        }
+        Assert.AreEqual("reject-once", (string?)q1?["result"]?["outcome"]?["optionId"], "a malformed permission request is refused");
+        Assert.AreEqual(-32603, (int?)q2?["error"]?["code"], "another malformed request gets an error");
+    }
+
+    [TestMethod]
+    public async Task ASessionDshDoesNotHave_IsNoLongerAddedToTheList()
+    {
+        var (service, dsh, _) = await StartAsync();
+        await using var _ = service;
+        var id = await NewAsync(service, Work);
+        CollectionAssert.Contains(await ListAsync(service), id);
+        dsh.Unknown.Add(id);
+
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(service, id));
+
+        CollectionAssert.DoesNotContain(await ListAsync(service), id);
+    }
+
+    [TestMethod]
+    public async Task DshDyingWithRequestsOpen_EndsThemAll_AndTheAdapterExits()
+    {
+        var (service, dsh, _) = await StartAsync();
+        await using var _ = service;
+        var id = await NewAsync(service, Work);
+        dsh.OnPrompt = async s =>
+        {
+            await dsh.Update(s, """{"sessionUpdate":"tool_call","toolCallId":"c1","title":"write","kind":"other","status":"in_progress","rawInput":{"file_path":"a.txt","content":"x","sandbox_permissions":"workspace-write"}}""");
+            await dsh.AskAsync(s, "c1");
+            await Until(() => service.Questions.Count == 1, "the question");
+            var dying = Task.Run(async () => await dsh.Rpc.DisposeAsync()); // DSH dies mid-turn
+            await Task.Delay(Timeout.Infinite);
+        };
+
+        var prompt = PromptAsync(service, id);
+
+        var failed = await Assert.ThrowsAsync<Exception>(() => prompt);
+        Assert.IsNotInstanceOfType<TimeoutException>(failed, "the prompt ended when DSH died");
+        await service.Instance.Exited.WaitAsync(Bound);
+        await Until(() => Volatile.Read(ref service.Withdrawn) == 1, "the open question ended");
     }
 }

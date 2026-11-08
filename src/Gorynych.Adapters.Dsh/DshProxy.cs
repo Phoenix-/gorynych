@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading.Channels;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 
@@ -14,10 +15,12 @@ namespace Gorynych.Adapters.Dsh;
 /// <item><c>session/list</c> gets back the sessions open in DSH, which DSH leaves out of its own list;</item>
 /// <item>tool calls get a kind, a title, locations and diffs;</item>
 /// <item>thoughts get IDs of their own;</item>
-/// <item>permission requests get their tool call, and a shell command's sandbox escalation is refused without asking;</item>
+/// <item>permission requests get their tool call, and only a file tool's sandbox escalation reaches the person;</item>
 /// <item>a request DSH drops on a cancel is withdrawn from the service;</item>
 /// <item>the one-writer error of <c>session/resume</c> says what to do.</item>
 /// </list>
+/// A message the proxy cannot handle is logged and fails closed: a permission request is refused,
+/// another request is answered with an error, a notification is dropped, an answer passes unchanged.
 /// </summary>
 internal sealed class DshProxy
 {
@@ -27,20 +30,29 @@ internal sealed class DshProxy
 
     static readonly JsonSerializerOptions Wire = AcpJson.TextOptions;
 
+    /// <summary>The service's requests whose answers the proxy reads, kept as little as it needs.</summary>
+    readonly record struct Asked(string Method, string? SessionId, string? Cwd, bool Cursor);
+
+    /// <summary>A permission request of DSH's forwarded to the service and not answered yet.</summary>
+    readonly record struct Question(JsonNode Id, string Session, string? Call);
+
     readonly DshAdapterOptions options;
     readonly Stream fromService, toService, fromDsh, toDsh;
-    readonly SemaphoreSlim serviceGate = new(1, 1), dshGate = new(1, 1);
+    readonly SemaphoreSlim serviceGate = new(1, 1);
+    /// <summary>
+    /// Everything for DSH's stdin goes through one queue and one writer, so neither reading loop
+    /// ever waits on DSH reading its input.
+    /// </summary>
+    readonly Channel<string> toDshQueue = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true });
     readonly Lock gate = new();
-    /// <summary>The service's requests whose answers are rewritten, by ID.</summary>
-    readonly Dictionary<string, (string Method, JsonNode? Params)> asked = [];
+    readonly Dictionary<string, Asked> asked = [];
     /// <summary>The sessions open in DSH through this proxy, with their folders.</summary>
     readonly Dictionary<string, string> live = [];
     /// <summary>Tool calls announced and not yet ended, by session and call ID.</summary>
     readonly Dictionary<(string Session, string Call), DshTool> tools = [];
-    /// <summary>DSH's permission requests the service has not answered yet, by ID.</summary>
-    readonly Dictionary<string, (JsonNode Id, string Session, string? Call)> questions = [];
-    /// <summary>Requests withdrawn from the service, whose late answers are dropped.</summary>
-    readonly HashSet<string> withdrawn = [];
+    readonly Dictionary<string, Question> questions = [];
+    /// <summary>Requests withdrawn from the service, by ID, with their session: their late answers are dropped.</summary>
+    readonly Dictionary<string, string> withdrawn = [];
     readonly TaskCompletionSource done = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public DshProxy(DshAdapterOptions options, (Stream Input, Stream Output) service, AgentInstance dsh)
@@ -58,6 +70,7 @@ internal sealed class DshProxy
     {
         _ = Task.Run(FromServiceAsync);
         _ = Task.Run(FromDshAsync);
+        _ = Task.Run(ToDshAsync);
     }
 
     // ---------------------------------------------------------------- service -> DSH
@@ -70,24 +83,15 @@ internal sealed class DshProxy
             while (await reader.ReadLineAsync() is { } line)
             {
                 if (line.Length == 0) continue;
-                if (Parse(line) is not JsonObject message) { await WriteAsync(toDsh, dshGate, line); continue; }
-                var id = message["id"];
-                if (message["method"] is JsonValue m && m.TryGetValue<string>(out var method))
+                try
                 {
-                    if (id is not null && method is AcpMethods.Agent.Initialize or AcpMethods.Agent.SessionNew or AcpMethods.Agent.SessionResume
-                        or AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionList or AcpMethods.Agent.SessionPrompt)
-                        lock (gate) asked[Key(id)] = (method, message["params"]?.DeepClone());
+                    if (!FromService(line)) continue;
                 }
-                else if (id is not null)
+                catch (Exception e) when (e is not (IOException or ObjectDisposedException or OperationCanceledException))
                 {
-                    // An answer to one of DSH's requests: one the proxy withdrew is DSH's no longer.
-                    lock (gate)
-                    {
-                        if (withdrawn.Remove(Key(id))) continue;
-                        questions.Remove(Key(id));
-                    }
+                    options.Log?.Invoke($"dsh: passed on a message from the service unread ({e.Message}): {Shorten(line)}");
                 }
-                await WriteAsync(toDsh, dshGate, line);
+                ToDsh(line);
             }
         }
         catch (Exception e) when (e is IOException or ObjectDisposedException or OperationCanceledException)
@@ -95,7 +99,57 @@ internal sealed class DshProxy
         }
         finally
         {
-            // The service let go: DSH's stdin ends, and DSH exits.
+            // The service let go: DSH's stdin ends once the queue is written, and DSH exits.
+            toDshQueue.Writer.TryComplete();
+        }
+    }
+
+    /// <summary>Notes what the proxy needs from a service message; false drops it (a withdrawn request's late answer).</summary>
+    bool FromService(string line)
+    {
+        if (Parse(line) is not JsonObject message) return true;
+        var id = message["id"];
+        if (Str(message["method"]) is { } method)
+        {
+            if (id is not null && method is AcpMethods.Agent.Initialize or AcpMethods.Agent.SessionNew or AcpMethods.Agent.SessionResume
+                or AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionList
+                or AcpMethods.Agent.SessionPrompt or AcpMethods.Agent.SessionSetConfigOption)
+            {
+                var p = message["params"];
+                lock (gate) asked[Key(id)] = new Asked(method, Str(p?["sessionId"]), Str(p?["cwd"]), p?["cursor"] is not null);
+            }
+        }
+        else if (id is not null)
+        {
+            // An answer to one of DSH's requests: one the proxy withdrew is DSH's no longer.
+            lock (gate)
+            {
+                if (withdrawn.Remove(Key(id))) return false;
+                questions.Remove(Key(id));
+            }
+        }
+        return true;
+    }
+
+    void ToDsh(string line) => toDshQueue.Writer.TryWrite(line);
+
+    void ToDsh(JsonObject message) => ToDsh(message.ToJsonString(Wire));
+
+    async Task ToDshAsync()
+    {
+        try
+        {
+            await foreach (var line in toDshQueue.Reader.ReadAllAsync())
+            {
+                await toDsh.WriteAsync(Encoding.UTF8.GetBytes(line + "\n"));
+                await toDsh.FlushAsync();
+            }
+        }
+        catch (Exception e) when (e is IOException or ObjectDisposedException or OperationCanceledException)
+        {
+        }
+        finally
+        {
             try { await toDsh.DisposeAsync(); } catch (Exception e) when (e is IOException or ObjectDisposedException) { }
         }
     }
@@ -110,13 +164,15 @@ internal sealed class DshProxy
             while (await reader.ReadLineAsync() is { } line)
             {
                 if (line.Length == 0) continue;
-                if (Parse(line) is not JsonObject message) { await WriteAsync(toService, serviceGate, line); continue; }
-                var id = message["id"];
-                var method = (string?)(message["method"] as JsonValue);
-                if (method is null && id is not null) await AnswerAsync(message, id);
-                else if (method == AcpMethods.Client.SessionUpdate) await UpdateAsync(message);
-                else if (method == AcpMethods.Client.SessionRequestPermission && id is not null) await AskAsync(message, id);
-                else await WriteAsync(toService, serviceGate, message);
+                if (Parse(line) is not JsonObject message) { await ToServiceAsync(line); continue; }
+                try
+                {
+                    await FromDshAsync(message);
+                }
+                catch (Exception e) when (e is not (IOException or ObjectDisposedException or OperationCanceledException))
+                {
+                    await FailClosedAsync(message, line, e);
+                }
             }
         }
         catch (Exception e) when (e is IOException or ObjectDisposedException or OperationCanceledException)
@@ -124,19 +180,58 @@ internal sealed class DshProxy
         }
         finally
         {
+            lock (gate) live.Clear();
             try { await toService.DisposeAsync(); } catch (Exception e) when (e is IOException or ObjectDisposedException) { }
             done.TrySetResult();
         }
     }
 
+    async Task FromDshAsync(JsonObject message)
+    {
+        var id = message["id"];
+        var method = Str(message["method"]);
+        if (message["method"] is null && id is not null) await AnswerAsync(message, id);
+        else if (method == AcpMethods.Client.SessionUpdate) await UpdateAsync(message);
+        else if (method == AcpMethods.Client.SessionRequestPermission && id is not null) await AskAsync(message, id);
+        else if (method is null && message["method"] is not null) throw new FormatException("its method is not a string");
+        else await ToServiceAsync(message);
+    }
+
+    /// <summary>
+    /// A message from DSH the proxy could not handle: a permission request is refused, so no
+    /// escalation it cannot read reaches anyone; another request is answered with an error; an
+    /// answer passes unchanged, so the service's request does not hang; a notification is dropped.
+    /// </summary>
+    async Task FailClosedAsync(JsonObject message, string line, Exception e)
+    {
+        options.Log?.Invoke($"dsh: could not read a message from DSH ({e.Message}); handled it as malformed: {Shorten(line)}");
+        var id = message["id"];
+        if (id is null or JsonObject or JsonArray) return; // a notification, or nothing anyone waits for
+        if (message["method"] is null)
+        {
+            await ToServiceAsync(line); // an answer: the service's request must not hang
+            return;
+        }
+        if (Str(message["method"]) == AcpMethods.Client.SessionRequestPermission)
+            ToDsh(Reject(id));
+        else
+            ToDsh(new JsonObject
+            {
+                ["jsonrpc"] = "2.0",
+                ["id"] = id.DeepClone(),
+                ["error"] = new JsonObject { ["code"] = -32603, ["message"] = "Gorynych could not read this request." },
+            });
+    }
+
     /// <summary>DSH's answer to a service request, rewritten where the method needs it.</summary>
     async Task AnswerAsync(JsonObject message, JsonNode id)
     {
-        (string Method, JsonNode? Params) request;
+        Asked request;
         lock (gate)
             if (!asked.Remove(Key(id), out request)) request = default;
         var result = message["result"] as JsonObject;
-        var sessionId = (string?)request.Params?["sessionId"];
+        var error = message["error"] as JsonObject;
+        var sessionId = request.SessionId;
         switch (request.Method)
         {
             case AcpMethods.Agent.Initialize when result is not null:
@@ -145,28 +240,31 @@ internal sealed class DshProxy
                 meta[GorynychProtocol.CapUnloadAfter] = (int)options.UnloadAfter.TotalSeconds;
                 meta[GorynychProtocol.CapUnaskedMcpTools] = true;
                 break;
-            case AcpMethods.Agent.SessionNew when ((string?)result?["sessionId"]) is { } created:
-                lock (gate) live[created] = (string?)request.Params?["cwd"] ?? "";
+            case AcpMethods.Agent.SessionNew when Str(result?["sessionId"]) is { } created:
+                lock (gate) live[created] = request.Cwd ?? "";
                 break;
-            case AcpMethods.Agent.SessionResume when result is not null && sessionId is not null:
-                lock (gate) live[sessionId] = (string?)request.Params?["cwd"] ?? "";
+            case AcpMethods.Agent.SessionResume or AcpMethods.Agent.SessionLoad when result is not null && sessionId is not null:
+                lock (gate) live[sessionId] = request.Cwd ?? "";
                 break;
-            case AcpMethods.Agent.SessionResume when message["error"] is JsonObject error
-                && ((string?)error["data"]?["details"] ?? "").Contains("already owned by an active write handle", StringComparison.Ordinal):
-                error["message"] = OpenElsewhere;
+            case AcpMethods.Agent.SessionResume when (Str(error?["data"]?["details"]) ?? "").Contains("already owned by an active write handle", StringComparison.Ordinal):
+                error!["message"] = OpenElsewhere;
                 break;
-            case AcpMethods.Agent.SessionClose when result is not null && sessionId is not null:
+            case AcpMethods.Agent.SessionClose when sessionId is not null:
+                // DSH lets go of the session even when its close fails.
                 await EndSessionAsync(sessionId);
                 break;
-            case AcpMethods.Agent.SessionList when (result?["sessions"]) is JsonArray sessions && (request.Params?["cursor"]) is null:
-                MergeLive(sessions, (string?)request.Params?["cwd"]);
+            case AcpMethods.Agent.SessionList when !request.Cursor && (result?["sessions"]) is JsonArray sessions:
+                MergeLive(sessions, request.Cwd);
                 break;
             case AcpMethods.Agent.SessionPrompt when sessionId is not null:
                 // The prompt is over, so no question of its turn is still DSH's.
                 await WithdrawAsync(q => q.Session == sessionId);
                 break;
         }
-        await WriteAsync(toService, serviceGate, message);
+        // A session DSH says it does not have is not open in it, whatever the proxy noted.
+        if (sessionId is not null && (Str(error?["message"]) ?? "").Contains("unknown session", StringComparison.OrdinalIgnoreCase))
+            await EndSessionAsync(sessionId);
+        await ToServiceAsync(message);
     }
 
     /// <summary>
@@ -175,7 +273,7 @@ internal sealed class DshProxy
     /// </summary>
     void MergeLive(JsonArray sessions, string? cwd)
     {
-        var listed = sessions.Select(s => (string?)s?["sessionId"]).OfType<string>().ToHashSet();
+        var listed = sessions.Select(s => Str(s?["sessionId"])).OfType<string>().ToHashSet();
         List<KeyValuePair<string, string>> open;
         lock (gate) open = [.. live];
         var at = 0;
@@ -186,12 +284,14 @@ internal sealed class DshProxy
         }
     }
 
+    /// <summary>The session is no longer open in DSH: its calls, questions and late answers are forgotten.</summary>
     async Task EndSessionAsync(string sessionId)
     {
         lock (gate)
         {
             live.Remove(sessionId);
             foreach (var key in tools.Keys.Where(k => k.Session == sessionId).ToList()) tools.Remove(key);
+            foreach (var key in withdrawn.Where(kv => kv.Value == sessionId).Select(kv => kv.Key).ToList()) withdrawn.Remove(key);
         }
         await WithdrawAsync(q => q.Session == sessionId);
     }
@@ -199,30 +299,30 @@ internal sealed class DshProxy
     /// <summary>A <c>session/update</c>: tool calls are recorded and completed, thoughts get IDs of their own.</summary>
     async Task UpdateAsync(JsonObject message)
     {
-        var sessionId = (string?)message["params"]?["sessionId"];
+        var sessionId = Str(message["params"]?["sessionId"]);
         if (message["params"]?["update"] is JsonObject update && sessionId is not null)
         {
-            switch ((string?)update["sessionUpdate"])
+            switch (Str(update["sessionUpdate"]))
             {
-                case "agent_thought_chunk" when (string?)update["messageId"] is { Length: > 0 } messageId:
+                case "agent_thought_chunk" when Str(update["messageId"]) is { Length: > 0 } messageId:
                     // DSH gives a thought and its answer one ID; in ACP they are two messages.
                     update["messageId"] = messageId + ":thought";
                     break;
-                case "tool_call" when (string?)update["toolCallId"] is { } callId && (string?)update["title"] is { } name:
+                case "tool_call" when Str(update["toolCallId"]) is { } callId && Str(update["title"]) is { } name:
                     string? cwd;
                     lock (gate) cwd = live.GetValueOrDefault(sessionId) is { Length: > 0 } folder ? folder : null;
                     var tool = new DshTool(sessionId, callId, name, update["rawInput"]?.DeepClone(), cwd);
                     lock (gate) tools[(sessionId, callId)] = tool;
                     Describe(update, tool);
                     break;
-                case "tool_call_update" when (string?)update["toolCallId"] is { } callId && (string?)update["status"] is "completed" or "failed":
+                case "tool_call_update" when Str(update["toolCallId"]) is { } callId && Str(update["status"]) is "completed" or "failed":
                     lock (gate) tools.Remove((sessionId, callId));
                     // DSH ends a call whose question it dropped (a cancel) without withdrawing the question.
                     await WithdrawAsync(q => q.Session == sessionId && q.Call == callId);
                     break;
             }
         }
-        await WriteAsync(toService, serviceGate, message);
+        await ToServiceAsync(message);
     }
 
     /// <summary>
@@ -231,37 +331,32 @@ internal sealed class DshProxy
     /// </summary>
     static void Describe(JsonObject call, DshTool tool)
     {
-        if (call["kind"] is null || (string?)call["kind"] == "other") call["kind"] = DshMap.KindOf(tool.Name);
+        if (call["kind"] is null || Str(call["kind"]) == "other") call["kind"] = DshMap.KindOf(tool.Name);
         call["title"] = DshMap.TitleOf(tool.Name, tool.Input);
         if (call["locations"] is null && DshMap.LocationsOf(tool.Name, tool.Input, tool.Cwd) is { } locations) call["locations"] = locations;
         if (call["content"] is null && DshMap.DiffOf(tool.Name, tool.Input, tool.Cwd) is { } diff) call["content"] = new JsonArray(diff);
     }
 
     /// <summary>
-    /// A permission request, which in DSH is always a sandbox escalation. A shell command's is refused
-    /// here, so the workspace's ACL never changes; any other goes to the person with its tool call.
+    /// A permission request, which in DSH is always a sandbox escalation. Only a running file tool
+    /// call's goes to the person, with its tool call; everything else is refused here, so the
+    /// workspace's ACL never changes (<see cref="DshMap.Refused"/>).
     /// </summary>
     async Task AskAsync(JsonObject message, JsonNode id)
     {
         var request = message["params"] as JsonObject;
-        var sessionId = (string?)request?["sessionId"];
-        var callId = (string?)request?["toolCall"]?["toolCallId"];
+        var sessionId = Str(request?["sessionId"]);
+        var callId = Str(request?["toolCall"]?["toolCallId"]);
         DshTool? tool = null;
         if (sessionId is not null && callId is not null)
             lock (gate) tool = tools.GetValueOrDefault((sessionId, callId));
-        if (DshMap.Refused(tool))
+        if (DshMap.Refused(tool) || request?["options"] is not JsonArray)
         {
-            var reject = request?["options"]?.AsArray().FirstOrDefault(o => (string?)o?["kind"] == "reject_once")?["optionId"]?.GetValue<string>() ?? "reject-once";
             options.Log?.Invoke($"dsh {sessionId}: refused the sandbox escalation of {tool?.Name ?? "an unknown call"} {callId} without asking (Gorynych's read-only shell)");
-            await WriteAsync(toDsh, dshGate, new JsonObject
-            {
-                ["jsonrpc"] = "2.0",
-                ["id"] = id.DeepClone(),
-                ["result"] = new JsonObject { ["outcome"] = new JsonObject { ["outcome"] = "selected", ["optionId"] = reject } },
-            });
+            ToDsh(Reject(id, request?["options"] as JsonArray));
             return;
         }
-        if (request?["toolCall"] is JsonObject call && tool is not null)
+        if (request["toolCall"] is JsonObject call && tool is not null)
         {
             Describe(call, tool);
             if (call["rawInput"] is null && tool.Input is not null) call["rawInput"] = tool.Input.DeepClone();
@@ -271,13 +366,25 @@ internal sealed class DshProxy
                 content.Insert(0, new JsonObject { ["type"] = "content", ["content"] = new JsonObject { ["type"] = "text", ["text"] = asks } });
             }
         }
-        if (sessionId is not null)
-            lock (gate) questions[Key(id)] = (id.DeepClone(), sessionId, callId);
-        await WriteAsync(toService, serviceGate, message);
+        lock (gate) questions[Key(id)] = new Question(id.DeepClone(), sessionId!, callId);
+        await ToServiceAsync(message);
+    }
+
+    /// <summary>The answer that refuses a permission request: its <c>reject_once</c> option, or DSH's <c>reject-once</c>.</summary>
+    static JsonObject Reject(JsonNode id, JsonArray? options = null)
+    {
+        var reject = options?.OfType<JsonObject>().FirstOrDefault(o => Str(o["kind"]) == "reject_once") is { } option
+            && Str(option["optionId"]) is { } optionId ? optionId : "reject-once";
+        return new JsonObject
+        {
+            ["jsonrpc"] = "2.0",
+            ["id"] = id.DeepClone(),
+            ["result"] = new JsonObject { ["outcome"] = new JsonObject { ["outcome"] = "selected", ["optionId"] = reject } },
+        };
     }
 
     /// <summary>Withdraws from the service the open questions that match, and drops their late answers.</summary>
-    async Task WithdrawAsync(Func<(JsonNode Id, string Session, string? Call), bool> which)
+    async Task WithdrawAsync(Func<Question, bool> which)
     {
         List<JsonNode> ids;
         lock (gate)
@@ -286,12 +393,12 @@ internal sealed class DshProxy
             foreach (var (key, q) in questions.Where(kv => which(kv.Value)).ToList())
             {
                 questions.Remove(key);
-                withdrawn.Add(key);
+                withdrawn[key] = q.Session;
                 ids.Add(q.Id);
             }
         }
         foreach (var requestId in ids)
-            await WriteAsync(toService, serviceGate, new JsonObject
+            await ToServiceAsync(new JsonObject
             {
                 ["jsonrpc"] = "2.0",
                 ["method"] = AcpMethods.Protocol.CancelRequest,
@@ -307,22 +414,27 @@ internal sealed class DshProxy
         catch (JsonException) { return null; }
     }
 
+    /// <summary>A string value, or null for anything else (a number, an object, nothing): DSH's output is read, never trusted.</summary>
+    static string? Str(JsonNode? node) => node is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+
     static string Key(JsonNode id) => id.ToJsonString(Wire);
 
-    static Task WriteAsync(Stream stream, SemaphoreSlim writeGate, JsonObject message) => WriteAsync(stream, writeGate, message.ToJsonString(Wire));
+    static string Shorten(string line) => line.Length > 300 ? line[..300] + "…" : line;
 
-    static async Task WriteAsync(Stream stream, SemaphoreSlim writeGate, string line)
+    Task ToServiceAsync(JsonObject message) => ToServiceAsync(message.ToJsonString(Wire));
+
+    async Task ToServiceAsync(string line)
     {
         var bytes = Encoding.UTF8.GetBytes(line + "\n");
-        await writeGate.WaitAsync();
+        await serviceGate.WaitAsync();
         try
         {
-            await stream.WriteAsync(bytes);
-            await stream.FlushAsync();
+            await toService.WriteAsync(bytes);
+            await toService.FlushAsync();
         }
         finally
         {
-            writeGate.Release();
+            serviceGate.Release();
         }
     }
 
