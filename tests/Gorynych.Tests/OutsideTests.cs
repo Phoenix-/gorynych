@@ -574,11 +574,14 @@ public sealed class OutsideTests
 
     // ---------------------------------------------------------------- the outside server (Gorynych.Outside.exe)
 
+    /// <summary>A service executable that does not exist.</summary>
+    static readonly string Nowhere = OperatingSystem.IsWindows() ? @"C:\nowhere\Gorynych.Service.exe" : "/nowhere/Gorynych.Service";
+
     static string OutsideExe()
     {
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
             if (File.Exists(Path.Combine(dir.FullName, "Gorynych.slnx")))
-                return Directory.EnumerateFiles(Path.Combine(dir.FullName, "src", "Gorynych.Outside", "bin"), "Gorynych.Outside.exe", SearchOption.AllDirectories)
+                return Directory.EnumerateFiles(Path.Combine(dir.FullName, "src", "Gorynych.Outside", "bin"), TestDirs.Exe("Gorynych.Outside"), SearchOption.AllDirectories)
                     .OrderByDescending(File.GetLastWriteTimeUtc).First();
         throw new InvalidOperationException("repository root not found");
     }
@@ -590,14 +593,14 @@ public sealed class OutsideTests
         public JsonRpcConnection Host { get; }
         public List<JsonObject> Progress { get; } = [];
 
-        public Shim(string pipe, string service = @"C:\nowhere\Gorynych.Service.exe", string? log = null)
+        public Shim(string pipe, string? service = null, string? log = null)
         {
             var psi = new ProcessStartInfo(OutsideExe())
             {
                 RedirectStandardInput = true, RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
                 StandardOutputEncoding = new UTF8Encoding(false), WorkingDirectory = Cwd,
             };
-            foreach (var a in new[] { "--pipe", pipe, "--service", service, "--log", log ?? TestDirs.New() }) psi.ArgumentList.Add(a);
+            foreach (var a in new[] { "--pipe", pipe, "--service", service ?? Nowhere, "--log", log ?? TestDirs.New() }) psi.ArgumentList.Add(a);
             process = Process.Start(psi)!;
             Host = new JsonRpcConnection(process.StandardOutput.BaseStream, process.StandardInput.BaseStream, "host")
             {
@@ -689,7 +692,7 @@ public sealed class OutsideTests
             Assert.IsNull(legacyTools!["resultType"]);
             var answer = await legacy.Host.SendRequestAsync("tools/call", Call("ask_agent", new JsonObject { ["session_id"] = target, ["question"] = "Done?" }));
             Assert.AreEqual("ok", (string?)answer!["content"]![0]!["text"]);
-            StringAssert.StartsWith(kimi.Prompts.Last().Text, $"[Opinion request · from an agent outside Gorynych (kimi-code, {Cwd.TrimEnd('\\')}",
+            StringAssert.StartsWith(kimi.Prompts.Last().Text, $"[Opinion request · from an agent outside Gorynych (kimi-code, {Path.TrimEndingDirectorySeparator(Cwd)}",
                 "a legacy host's clientInfo comes from its initialize, the folder is the server's own");
         }
         finally
@@ -714,7 +717,7 @@ public sealed class OutsideTests
         CollectionAssert.AreEqual(new[] { "list_sessions", "read_session", "ask_agent" }, tools!["tools"]!.AsArray().Select(t => (string?)t!["name"]).ToArray());
         var down = await shim.Host.SendRequestAsync("tools/call", ModernCall("list_sessions", []));
         Assert.AreEqual(true, (bool?)down!["isError"]);
-        Assert.AreEqual(@"Gorynych is not running and could not be started: C:\nowhere\Gorynych.Service.exe does not exist. Start Gorynych, then call the tool again.",
+        Assert.AreEqual($"Gorynych is not running and could not be started: {Nowhere} does not exist. Start Gorynych, then call the tool again.",
             (string?)down["content"]![0]!["text"]);
         var discover = await shim.Host.SendRequestAsync("server/discover", new JsonObject { ["_meta"] = Modern() });
         Assert.AreEqual(OutsideTools.Instructions, (string?)discover!["instructions"]);
@@ -814,7 +817,7 @@ public sealed class OutsideTests
         var logs = TestDirs.New();
         int Starts() => Directory.EnumerateFiles(logs, "outside-*.log").SelectMany(File.ReadAllLines).Count(l => l.Contains("starting the service", StringComparison.Ordinal));
         // A "service" that never opens the pipe, so the server waits for it.
-        await using var shim = new Shim(Pipe(), Path.Combine(Environment.SystemDirectory, "whoami.exe"), logs);
+        await using var shim = new Shim(Pipe(), OperatingSystem.IsWindows() ? Path.Combine(Environment.SystemDirectory, "whoami.exe") : "/bin/true", logs);
         foreach (var expected in new[] { 1, 2 })
         {
             using var cancel = new CancellationTokenSource();

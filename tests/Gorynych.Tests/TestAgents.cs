@@ -205,6 +205,9 @@ static class TestDirs
         return dir;
     }
 
+    /// <summary>The file name of a project's executable: <c>.exe</c> on Windows, none elsewhere.</summary>
+    public static string Exe(string name) => OperatingSystem.IsWindows() ? name + ".exe" : name;
+
     public static Conductor Conductor(string dir, params IAgentAdapter[] adapters) =>
         new(new ConductorOptions { DataDirectory = dir, ServiceId = "test-service" }, adapters);
 

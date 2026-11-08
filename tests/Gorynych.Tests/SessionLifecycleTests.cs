@@ -189,6 +189,7 @@ public sealed class SessionLifecycleTests
     }
 
     [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "fails a write by holding the file open, which only Windows refuses")]
     public async Task ADraftMarkThatCannotBeSaved_RefusesThePrompt_AndKeepsTheSession()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);
@@ -468,6 +469,7 @@ public sealed class SessionLifecycleTests
     }
 
     [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "fails a write by holding the file open, which only Windows refuses")]
     public void Store_KeepsAChangeItCouldNotWrite_AndWritesItWithTheNext()
     {
         var path = Path.Combine(TestDirs.New(), "sessions.json");

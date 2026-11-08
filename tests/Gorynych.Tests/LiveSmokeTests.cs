@@ -33,7 +33,7 @@ public sealed class LiveSmokeTests
     static string ServiceExe(string root)
     {
         var bin = Path.Combine(root, "src", "Gorynych.Service", "bin");
-        return Directory.EnumerateFiles(bin, "Gorynych.Service.exe", SearchOption.AllDirectories).OrderByDescending(File.GetLastWriteTimeUtc).First();
+        return Directory.EnumerateFiles(bin, TestDirs.Exe("Gorynych.Service"), SearchOption.AllDirectories).OrderByDescending(File.GetLastWriteTimeUtc).First();
     }
 
     [TestMethod]

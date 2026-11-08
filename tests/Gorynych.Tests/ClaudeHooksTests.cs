@@ -17,6 +17,7 @@ public sealed class ClaudeHooksTests
         events.First(e => ClaudeHooks.Name(e) == name && (tool is null || (string?)e["tool_name"] == tool));
 
     [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "the recorded hooks carry Windows paths")]
     public void PreToolUse_BecomesAPendingToolCall()
     {
         var events = Fixture("hooks-write-and-question.jsonl");
@@ -52,6 +53,7 @@ public sealed class ClaudeHooksTests
     }
 
     [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "the recorded hooks carry Windows paths")]
     public void PermissionRequest_BecomesAnAcpApproval_AndTheAnswerAHookDecision()
     {
         var events = Fixture("hooks-write-and-question.jsonl");
@@ -178,6 +180,7 @@ public sealed class ClaudeHooksTests
     }
 
     [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "Claude's folder naming for a Windows path")]
     public void TranscriptPath_FollowsClaudesFolderNaming()
     {
         var path = TranscriptTitles.ExpectedPath(@"D:\gorynych\.claude\worktrees\mvp-slice-42ca4b", "abc");
@@ -185,6 +188,7 @@ public sealed class ClaudeHooksTests
     }
 
     [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "Windows command-line quoting, checked with CommandLineToArgvW")]
     [DataRow("plain")]
     [DataRow("two words")]
     [DataRow("say \"hi\"")]
