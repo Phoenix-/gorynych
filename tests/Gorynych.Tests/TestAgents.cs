@@ -163,4 +163,8 @@ static class TestDirs
 
     public static Conductor Conductor(string dir, params IAgentAdapter[] adapters) =>
         new(new ConductorOptions { DataDirectory = dir, ServiceId = "test-service" }, adapters);
+
+    /// <summary>A conductor that unloads a session as soon as it is idle with no client (<c>--unload-after 0</c>).</summary>
+    public static Conductor UnloadingAtOnce(string dir, params IAgentAdapter[] adapters) =>
+        new(new ConductorOptions { DataDirectory = dir, ServiceId = "test-service", UnloadAfter = TimeSpan.Zero }, adapters);
 }

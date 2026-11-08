@@ -182,11 +182,12 @@ prompt and a spawned session's first turn are not service turns.
   and a turn whose agent is not running starts it ([§5](#5-prompts-and-turns)). An agent that
   refuses the live-note path because it is not running ([§6.4](#64-the-live-note-path)) gets
   the request as a turn instead, which starts it.
-- A session the service opened or started only for service turns is closed again
-  (`session/close`) after the last of them, unless a client opened, prompted or otherwise used
-  it meanwhile (it then stays while that client has it open), or another service turn waits
-  for it (the last one closes it). A session that was already loaded and running stays as it
-  was.
+- A session the service opened or started for service turns is closed again
+  (`session/close`) like any session with no client: once it has been idle (no turn running,
+  no operation registered, the next queued service turn included) for the service's idle time
+  (`--unload-after`, 10 minutes by default), so a follow-up turn within it finds the session
+  loaded. A client that opens it meanwhile keeps it while it has it open
+  ([service-protocol.md](service-protocol.md#unloading-idle-sessions)).
 - The adapter SHOULD implement `session/close` so this frees the agent's resources
   ([§7](#7-closing-and-unloading)). Fallback: the session stays loaded.
 - An archived session is woken the same way and stays archived.
@@ -270,13 +271,15 @@ in the middle of one.
 - The adapter SHOULD implement `session/close` (`sessionCapabilities.close`): it stops the
   session's turn and frees what the session holds (Claude's process), and the session stays
   listed and can be opened again.
-- The service sends it when the last client lets go of a session, after the service turns of
-  a session it woke ([§6.1](#61-waking-a-session-and-closing-it-again)), and before a delete.
-  A client that disconnects without `session/close` (Zed when it quits) lets go all the same;
-  then the service waits until the session's turn ends and no request of the agent waits for
-  a client (an approval or a form keeps the session loaded, so a client that comes back can
-  answer it). It cannot see a turn the adapter runs on its own (Claude's channel): closing the
-  session stops that one ([service-protocol.md](service-protocol.md#letting-go-of-a-session)).
+- The service sends it to unload a session that has been idle with no client attached for its
+  idle time (`--unload-after`): one a client let go of, with `session/close` or by
+  disconnecting without it (Zed when it quits), and one the service woke for service turns
+  ([§6.1](#61-waking-a-session-and-closing-it-again)). It sends it at once only before a
+  delete. It never sends it while a turn of the session runs, or while a request of the agent
+  waits for a client (an approval or a form). A client's `session/close` cancels the running
+  turn with `session/cancel` instead. The service cannot see a turn the adapter runs on its own
+  (Claude's channel): an unload stops that one if it lasts longer than the idle time
+  ([service-protocol.md](service-protocol.md#unloading-idle-sessions)).
 - Fallback without it: before a delete the service sends `session/cancel` instead, and nothing
   is ever unloaded until the adapter restarts.
 
@@ -357,7 +360,7 @@ own JSON-RPC, not ACP, so its adapter translates, like Claude's.
 | List | the adapter's own list of the sessions it started | Kimi's list; leaves natively archived sessions out; ignores `cursor` | `thread/list` (`cursor`, `limit`, `archived`; archived left out by default) | its own store |
 | Open not loaded ([§4](#4-opening-a-session-that-is-not-loaded)) | `session/resume` only registers; the process starts with the next prompt | `session/resume` | `thread/resume` (loads the thread) | `session/load` from its own store, which MUST keep the whole history |
 | Turns ([§5](#5-prompts-and-turns)) | bracketed paste into the TUI; `Stop` hook ends the turn | native | `turn/start`; `turn/interrupt` for `session/cancel` | API calls |
-| Service turns and waking ([§6.1](#61-waking-a-session-and-closing-it-again)) | turns start the process; closed again afterwards | turns; resumed, then closed again | expected the same | expected the same |
+| Service turns and waking ([§6.1](#61-waking-a-session-and-closing-it-again)) | turns start the process; unloaded after the idle time | turns; resumed, then unloaded after the idle time | expected the same | expected the same |
 | `gorynych` MCP server ([§6.2](#62-the-gorynych-mcp-server)) | per-launch `--mcp-config` | through ACP `mcpServers` | unknown: how to give one thread an MCP server without editing `~/.codex` | unknown: depends on its MCP client |
 | System prompt ([§6.2](#62-the-gorynych-mcp-server)) | `sessionCapabilities.systemPrompt: {}` (append only): `--append-system-prompt`, after the channel's authorization; other modes and non-text content fail with `-32602` | not advertised by 2.5.2: the MCP instructions and the requests' texts | unknown | expected: append, and override too, since the adapter writes the system message itself |
 | Hidden from `gorynych-outside` ([§1](#1-building-and-starting-an-adapter)) | yes: `claude` is the service's child and starts MCP servers as its own children (probe); the adapter's `--settings` also denies `mcp__gorynych-outside` | yes: `kimi acp` is the service's child and starts MCP servers as its own children (probe) | unknown: whether `codex app-server` starts MCP servers itself or through its daemon | unknown: depends on its MCP client |

@@ -163,7 +163,7 @@ public sealed class PeersTests
         StringAssert.Contains(Description("list_agents"), "Each entry has session_id, agent, title, cwd, status, updated_at and parent_session_id");
         StringAssert.Contains(Description("list_agents"), "status \"open\": the session's agent has it loaded right now.");
         StringAssert.Contains(Description("list_agents"),
-            "status \"saved\": it is saved but not loaded; asking it starts it, so it answers more slowly, and it is closed again after it answers.");
+            "status \"saved\": it is saved but not loaded; asking it starts it, so it answers more slowly, and it is unloaded again once it has been idle with no client for some minutes.");
         StringAssert.Contains(Description("list_agents"), "status has nothing to do with archived.");
         Assert.IsFalse(Description("list_agents").Contains("Claude session can", StringComparison.Ordinal), "every agent is started the same way now");
         StringAssert.Contains(Description("list_agents"), "Archived sessions are left out unless include_archived is true; when some are left out, the result's last line says how many.");

@@ -4,7 +4,8 @@ using Gorynych.Adapters.Claude;
 using Gorynych.Adapters.Kimi;
 using Gorynych.Service;
 
-// Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi] [--claude-model <m>] [--no-channel] [--no-peers] [--console]
+// Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi] [--claude-model <m>] [--unload-after <minutes>]
+//   [--no-channel] [--no-peers] [--console]
 // Gorynych.Service peers [--pipe <name> --token <t>] [--channel-url <url>]
 //   the gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel
 if (args.Length > 0 && args[0] == "peers")
@@ -15,7 +16,7 @@ if (args.Length > 0 && args[0] == "acp")
 {
     var agent = Arg(args, "--agent") ?? throw new ArgumentException("--agent is required");
     var forwarded = new List<string>();
-    foreach (var option in new[] { "--data", "--claude-model", "--default-agent" })
+    foreach (var option in new[] { "--data", "--claude-model", "--default-agent", "--unload-after" })
         if (Arg(args, option) is { } value) forwarded.AddRange([option, value]);
     foreach (var flag in new[] { "--no-channel", "--no-peers" })
         if (args.Contains(flag)) forwarded.Add(flag);
@@ -62,6 +63,7 @@ await using var conductor = new Conductor(new ConductorOptions
     DataDirectory = dataDirectory,
     ServiceId = state.ServiceId,
     DefaultAgent = Arg(args, "--default-agent"),
+    UnloadAfter = UnloadAfter(Arg(args, "--unload-after")),
     PeerServerCommand = args.Contains("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
 }, adapters);
 
@@ -99,4 +101,13 @@ static string? Arg(string[] args, string name)
 {
     var i = Array.IndexOf(args, name);
     return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
+}
+
+// --unload-after <minutes>: how long an idle session with no client stays loaded in its agent; 0 unloads at once.
+static TimeSpan UnloadAfter(string? minutes)
+{
+    if (minutes is null) return ConductorOptions.DefaultUnloadAfter;
+    if (double.TryParse(minutes, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var m) && m >= 0)
+        return TimeSpan.FromMinutes(m);
+    throw new ArgumentException($"--unload-after takes a number of minutes, 0 or more; got '{minutes}'");
 }

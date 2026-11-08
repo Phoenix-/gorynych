@@ -22,7 +22,10 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   service ID), `sessions.json` (the overlay), `journal/`, `claude/`, `logs/`.
 
 Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi]
-[--claude-model <model>] [--no-channel] [--no-peers] [--console]`. The same executable is
+[--claude-model <model>] [--unload-after <minutes>] [--no-channel] [--no-peers] [--console]`.
+`--unload-after` is how long a session stays loaded in its agent once it is idle with no
+client: 10 minutes by default, `0` at once ([Unloading idle sessions](#unloading-idle-sessions)).
+The same executable is
 also the `gorynych` MCP server agents start over stdio:
 `peers [--pipe … --token …] [--channel-url …]` (see Opinions below), and the stdio bridge
 for external ACP clients: `acp --agent claude|kimi` (see [external-clients.md](external-clients.md)).
@@ -40,7 +43,7 @@ server ([Agents outside Gorynych](#agents-outside-gorynych)).
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. Returns the session state (below). |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
-| `session/close` | Detaches the client. Only when no other client has the session open is it closed in its agent, or, for a draft, discarded (see below). A client that disconnects without it lets go of its sessions all the same, once nothing uses them ([Letting go of a session](#letting-go-of-a-session)). |
+| `session/close` | Detaches the client. When no other client has the session open, a draft is discarded (see below); any other session has its running turn cancelled, as ACP asks of a close, and is unloaded from its agent once it has been idle for `--unload-after` minutes ([Unloading idle sessions](#unloading-idle-sessions)). A client that disconnects without it lets go of its sessions all the same, but cancels nothing. |
 | `session/delete` | Closes the session in its agent if it is open, then deletes it there if the agent can (`sessionCapabilities.delete`); otherwise the overlay keeps a tombstone. Drops the journal. A session only the agent knows is found through its list; an unknown or already deleted session succeeds. |
 | anything else with a `sessionId` | Forwarded to the session's agent. |
 
@@ -81,7 +84,7 @@ relays or translates them. If none is attached the request waits; if
 the client disconnects before answering it goes to the next one. So an approval raised
 while the GUI is closed appears when the GUI loads the session again, right after the
 replay; meanwhile the session stays loaded in its agent
-([Letting go of a session](#letting-go-of-a-session)). When the agent withdraws the request
+([Unloading idle sessions](#unloading-idle-sessions)). When the agent withdraws the request
 (`$/cancel_request`), it is withdrawn from the client too.
 
 A client that stops reading for 15 seconds is disconnected, so one stuck GUI cannot stall
@@ -152,7 +155,8 @@ name, a title or a sender label; `list_agents` says its first line names this se
 to pass for it, that IDs differ by agent (Claude's a bare UUID, Kimi's `session_…`) and are
 passed exactly as listed, and what `status` means: `open`, the agent has the session loaded
 right now; `saved`, it is saved but not loaded, so asking it starts it, it answers more slowly
-and it is closed again after it answers (for every agent); `status` is unrelated to
+and it is unloaded again once it has been idle with no client for some minutes (for every
+agent); `status` is unrelated to
 `archived`; `spawn_session` says the child's turns are reported back by
 themselves; `archive_session` says archiving is not deleting (the history stays, `ask_agent`
 still reaches it), and `restore_session` that it only changes where the session is shown, so
@@ -176,10 +180,11 @@ How a request reaches the asked agent depends on what it has:
   got as a turn the same way.
 
 A session that is not loaded in its agent is loaded for the request, and one whose agent is
-not running is started by the turn. A session the service woke only for such turns (opinion
-requests and reports) is closed again after the last of them, unless a client has it open by
-then; a session that was loaded and running stays as it was. An archived session is woken
-the same way and stays archived. The rules for adapters are in
+not running is started by the turn. Like any session with no client, one the service woke for
+such turns (opinion requests and reports) is unloaded again once it has been idle for
+`--unload-after` minutes, so a follow-up question within that time finds it loaded
+([Unloading idle sessions](#unloading-idle-sessions)). An archived session is woken the same
+way and stays archived. The rules for adapters are in
 [adapter-contract.md](adapter-contract.md#6-service-turns-opinions-and-reports).
 
 A session that is answering a request cannot ask another agent meanwhile, so two agents
@@ -269,7 +274,7 @@ takes for the session itself). `archive_session` and `restore_session` say what 
 
 | Case | Text |
 | --- | --- |
-| `list_agents` | first line `You are session_id <id> (<agent>, "<title>").`, or for a session started with `spawn_session` `You are session_id <id> (<agent>, "<title>"), started by session_id <parent> (<agent>, "<title>") with spawn_session.` (the list leaves out the caller's own entry, so its `parent_session_id` would not show); then, when the list is not empty, what `status` means: `status "open": the session's agent has it loaded right now. status "saved": it is saved but not loaded; asking it starts it, so it answers more slowly, and it is closed again after it answers.`; then the list as JSON, each entry with `session_id`, `agent`, `title`, `cwd`, `status`, `updated_at` and `parent_session_id`, written without `\uXXXX` escapes (a Cyrillic title and the `+` of a time stay as they are; all JSON Gorynych writes uses `AcpJson.TextOptions`). The `status` line repeats the schema because an agent whose conversation was resumed may hold an older schema. An empty list reads `No other sessions to ask. spawn_session starts one.` |
+| `list_agents` | first line `You are session_id <id> (<agent>, "<title>").`, or for a session started with `spawn_session` `You are session_id <id> (<agent>, "<title>"), started by session_id <parent> (<agent>, "<title>") with spawn_session.` (the list leaves out the caller's own entry, so its `parent_session_id` would not show); then, when the list is not empty, what `status` means: `status "open": the session's agent has it loaded right now. status "saved": it is saved but not loaded; asking it starts it, so it answers more slowly, and it is unloaded again once it has been idle with no client for some minutes.`; then the list as JSON, each entry with `session_id`, `agent`, `title`, `cwd`, `status`, `updated_at` and `parent_session_id`, written without `\uXXXX` escapes (a Cyrillic title and the `+` of a time stay as they are; all JSON Gorynych writes uses `AcpJson.TextOptions`). The `status` line repeats the schema because an agent whose conversation was resumed may hold an older schema. An empty list reads `No other sessions to ask. spawn_session starts one.` |
 | `list_agents` without `include_archived`, leaving N > 0 archived sessions out (the caller not counted) | a last line `N archived sessions are not shown; pass include_archived: true to list them.`, or for one `1 archived session is not shown; pass include_archived: true to list it.`; nothing when none is left out. The hint is in the result as well as in the schema, because an agent whose conversation was resumed may hold an older schema |
 | archived now | `Archived session_id <id> (<agent>, "<title>"). It is now hidden from list_agents and from the user's session list; nothing in it is lost. ask_agent still reaches it, and restore_session brings it back.` |
 | already archived | `session_id <id> (<agent>, "<title>") was already archived, so nothing changed. ask_agent still reaches it, and restore_session brings it back.` |
@@ -394,8 +399,8 @@ parent already holds the child's ID. A longer message is cut at 2000 characters 
   opens the parent with `session/resume`, which only registers it in the adapter and starts
   no Claude process, so the parent's Claude may not be running. The adapter then refuses the
   note (`-32600`), and the report becomes a turn as below, which starts Claude with it. A
-  parent woken only for reports is closed again afterwards, as for opinion requests
-  ([Opinions between agents](#opinions-between-agents)).
+  parent woken for a report is unloaded again after its idle time, as for opinion requests
+  ([Unloading idle sessions](#unloading-idle-sessions)).
 - **Kimi** (any agent without `_gorynych/note`) gets it as an ordinary turn of the parent
   session, journaled as a `user_message_chunk` with `gorynych/origin: "report"`,
   `gorynych/sender` (`child_claude`) and `gorynych/fromSessionId`, after the parent's
@@ -600,9 +605,10 @@ What the service returns for `tools/list`, outside Gorynych.
 > updated_at and parent_session_id (set when another session started it with spawn_session).
 > Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare
 > UUID, Kimi's start with session_. status open means the agent has the session loaded now; a
-> saved one is started when asked, so it answers more slowly, and read_session reads it without
-> starting it. Archived sessions are left out unless include_archived is true; when some are
-> left out, the result's last line says how many.
+> saved one is started when asked, so it answers more slowly, and is unloaded again once it has
+> been idle with no client for some minutes; read_session reads it without starting it.
+> Archived sessions are left out unless include_archived is true; when some are left out, the
+> result's last line says how many.
 
 - `include_archived`: `also list archived sessions, marked archived: true; default false`.
 - Result: the entries of `_gorynych/peers`, rendered as `list_agents` renders them, with all
@@ -897,36 +903,47 @@ every agent, and the service never writes an agent's own files for it.
   errors; `ask_agent` reaches it all the same and leaves it archived.
 - A report to an archived parent is dropped ([Reports](#reports)).
 
-## Letting go of a session
+## Unloading idle sessions
+
+A session stays loaded in its agent while a client has it open or something uses it. Once it is
+**idle**, with no turn running and no operation registered, and no client is attached, the
+service closes it in its agent (`session/close`) after `--unload-after` minutes (10 by
+default; `0` unloads at once). The agent then frees what it holds (Kimi's session in memory,
+Claude's process), and the lists show the session `saved`. The time counts from the later of
+the last client letting go and the session going idle, in either order: a client that
+attaches, a turn that starts or an operation that registers stops it, and the end of each
+starts it again. Unloading never cancels anything. Waking brings a saved session back: a
+question from another session or from outside (`ask_agent`) and a child's report open it in
+its agent again ([Opinions between agents](#opinions-between-agents), [Reports](#reports)), and
+it is unloaded after the same idle time, so a follow-up question within it finds it loaded.
+
+What keeps a session from being idle:
+
+- **A turn is running**: the person's (it outlives its client, see `session/prompt`), an
+  opinion request's or a report's.
+- **An operation is registered** on it: a load, a prompt, an opinion request or a report
+  waiting for the running turn, a spawn waiting for the person's approval in it, an
+  `ask_agent` or `read_session` in flight.
+- **A request of its agent waits for a client** (an approval or a form, see above). The session
+  stays loaded however long that takes, so a client that comes back can answer it and the turn
+  can go on.
 
 A client lets go of a session with `session/close`, or by disconnecting without it: Zed quits
 without closing anything ([external-clients.md](external-clients.md#what-zed-does-with-sessions)),
-and a client that stops reading is disconnected. That counts for every session the client
-attached to and has not closed, also one it was detached from on the way because a request or
-an update to it failed first. When the last client attached to a session lets go of it, the
-service closes the session in its agent (`session/close`), so the agent frees what it holds
-(Kimi's session in memory, Claude's process) and the lists show it `saved`. A draft is
-discarded instead ([Drafts and deletion](#drafts-and-deletion)). With two clients on a session,
-one that goes leaves the session with the other.
+and a client that stops reading is disconnected. A disconnect stops nothing. It counts for
+every session the client attached to and has not closed, also one it was detached from on the
+way because a request or an update to it failed first. `session/close` from the last client
+does what ACP asks of a close: it cancels the running turn (`session/cancel` to the agent),
+and the unload still waits for the idle time. With two clients on a session, one that goes
+leaves the session with the other. A draft is discarded at once instead
+([Drafts and deletion](#drafts-and-deletion)), and `session/delete` closes and deletes at once.
 
-After a disconnect the close waits, in the background, until nothing uses the session:
-
-- **A turn is running**: the person's (it outlives its client, see `session/prompt`), an
-  opinion request's or a report's. The session is closed when the turn ends.
-- **An operation is registered** on it: a load, a prompt waiting for the running turn, an
-  `ask_agent` or `read_session` in flight. The session is closed when the last one ends.
-- **A request of its agent waits for a client** (an approval or a form, see above). The session
-  stays loaded, so a client that comes back can answer it and the turn can go on (that
-  client then has the session open). Without one, it is closed once the agent withdraws the
-  request and nothing else uses it.
-
-The close checks all this again under the session's gate (the one a discard holds,
+The unload checks all this again under the session's gate (the one a discard holds,
 [Drafts and deletion](#drafts-and-deletion) step 1), so a client that loads, resumes or prompts
-the session before the close keeps it open, and one that comes back while the close is under
-way waits for it and opens the session again. A session the service woke for its own turns is
-closed the same way after them ([Opinions between agents](#opinions-between-agents)). A turn
-the service does not run is not seen: one that Claude's channel starts for a report delivered
-through it can be stopped by the close.
+the session before it keeps the session loaded, and one that comes while it is under way waits
+for it and opens the session again. A turn the service does not run is not seen: one that
+Claude's channel starts for a report delivered through it can be stopped by an unload if it
+lasts longer than the idle time.
 
 ## Drafts and deletion
 

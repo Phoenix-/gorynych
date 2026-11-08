@@ -85,7 +85,7 @@ internal sealed class ClientConnection
             case AcpMethods.Agent.SessionPrompt:
                 return await conductor.PromptAsync(this, request, ct);
             case AcpMethods.Agent.SessionClose:
-                return await conductor.CloseAsync(this, RequireSession(request), request, ct);
+                return await conductor.CloseAsync(this, RequireSession(request), ct);
             case AcpMethods.Agent.SessionDelete:
                 return await conductor.DeleteAsync(RequireSession(request), ct);
             case GorynychProtocol.MethodStatus:

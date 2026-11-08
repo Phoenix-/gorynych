@@ -27,6 +27,7 @@ public sealed class WakeTests
         DataDirectory = TestDirs.New(),
         ServiceId = "t",
         PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"],
+        UnloadAfter = TimeSpan.Zero, // at once, as --unload-after 0; DisconnectTests time the wait
     }, adapters);
 
     static async Task<string> NewPromptedAsync(TestClient client, string agent, string text)

@@ -21,6 +21,7 @@ public sealed class StableAcpTests
         DataDirectory = TestDirs.New(),
         ServiceId = "t",
         PeerServerCommand = peers ? ["svc.exe", "peers", "--pipe", "p"] : null,
+        UnloadAfter = TimeSpan.Zero, // a closed session is unloaded at once, so opening it again resumes it
     }, adapters);
 
     static async Task<string> NewAsync(TestClient client, string agent) =>

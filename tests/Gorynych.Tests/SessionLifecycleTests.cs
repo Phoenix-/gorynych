@@ -75,7 +75,7 @@ public sealed class SessionLifecycleTests
     public async Task Close_DiscardsADraft_AndOnlyClosesAPromptedSession()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);
-        await using var conductor = TestDirs.Conductor(TestDirs.New(), kimi.Adapter);
+        await using var conductor = TestDirs.UnloadingAtOnce(TestDirs.New(), kimi.Adapter);
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var draft = await NewAsync(zed);
         var used = await NewAsync(zed);
@@ -95,7 +95,7 @@ public sealed class SessionLifecycleTests
     public async Task Close_LeavesTheSessionOpenWhileAnotherClientHasIt()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);
-        await using var conductor = TestDirs.Conductor(TestDirs.New(), kimi.Adapter);
+        await using var conductor = TestDirs.UnloadingAtOnce(TestDirs.New(), kimi.Adapter);
         await using var first = await TestClient.ConnectAsync(conductor, "first");
         await using var second = await TestClient.ConnectAsync(conductor, "second");
         var id = await NewAsync(first);
@@ -425,7 +425,7 @@ public sealed class SessionLifecycleTests
     public async Task Peers_ListOnlySessionsWithHistory_OpenOnesFirst()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);
-        await using var conductor = TestDirs.Conductor(TestDirs.New(), kimi.Adapter);
+        await using var conductor = TestDirs.UnloadingAtOnce(TestDirs.New(), kimi.Adapter);
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var older = await NewAsync(zed);
         await PromptAsync(zed, older, "older, closed");

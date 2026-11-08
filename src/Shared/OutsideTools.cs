@@ -106,7 +106,8 @@ internal static class OutsideTools
                 "session_id, agent, title, cwd, status, updated_at and parent_session_id (set when another session started it with " +
                 "spawn_session). Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare UUID, " +
                 "Kimi's start with session_. status open means the agent has the session loaded now; a saved one is started when " +
-                "asked, so it answers more slowly, and read_session reads it without starting it. Archived sessions are left out " +
+                "asked, so it answers more slowly, and is unloaded again once it has been idle with no client for some minutes; " +
+                "read_session reads it without starting it. Archived sessions are left out " +
                 "unless include_archived is true; when some are left out, the result's last line says how many.",
             ["inputSchema"] = new JsonObject
             {

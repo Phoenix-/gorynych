@@ -267,7 +267,7 @@ public static class PeersServer
     /// </summary>
     internal const string StatusLegend =
         "status \"open\": the session's agent has it loaded right now. status \"saved\": it is saved but not loaded; asking it " +
-        "starts it, so it answers more slowly, and it is closed again after it answers.";
+        "starts it, so it answers more slowly, and it is unloaded again once it has been idle with no client for some minutes.";
 
     /// <summary>The first line of <c>list_agents</c>: the calling session, named as the service names sessions to agents.</summary>
     /// <param name="parent">The session that started the caller with <c>spawn_session</c>, named the same way.</param>

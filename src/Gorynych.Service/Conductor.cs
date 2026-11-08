@@ -33,6 +33,18 @@ public sealed class ConductorOptions
     /// notification at the latest, so its host does not take the call for idle.
     /// </summary>
     public TimeSpan OutsideProgressInterval { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// How long a session stays loaded in its agent once it is idle (no turn running, no operation
+    /// registered) with no client attached; then it is closed there. Zero closes it at once.
+    /// </summary>
+    public TimeSpan UnloadAfter { get; init; } = DefaultUnloadAfter;
+
+    /// <summary>The default of <see cref="UnloadAfter"/>: ten minutes.</summary>
+    public static readonly TimeSpan DefaultUnloadAfter = TimeSpan.FromMinutes(10);
+
+    /// <summary>The clock of <see cref="UnloadAfter"/>; tests pass one they move by hand.</summary>
+    public TimeProvider Time { get; init; } = TimeProvider.System;
 }
 
 /// <summary>
@@ -62,14 +74,6 @@ public sealed class Conductor : IAsyncDisposable
     readonly ConcurrentDictionary<Task, byte> backgroundTurns = new();
     readonly SemaphoreSlim archiveGate = new(1, 1); // archive changes, so their session_info_updates keep the flag's order
 
-    /// <summary>
-    /// Sessions loaded in their agent that no client holds: the service loaded or started them only
-    /// for its own turns (an opinion, a report, a read), or the last client attached to them went
-    /// away without <c>session/close</c>. Such a session is closed in its agent once nothing uses
-    /// it (<see cref="CloseIfIdleAsync"/>), unless a client takes it over meanwhile
-    /// (<see cref="EnsureLiveAsync"/> for a client drops it from here).
-    /// </summary>
-    readonly ConcurrentDictionary<string, byte> unattended = new(StringComparer.Ordinal);
     long opinionCount;
     readonly string runTag = GorynychProtocol.NewRunTag(); // in message IDs: m<tag>-<n>
     long spawnCount;
@@ -226,7 +230,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         var feed = Feed(sessionId);
         // A use of the session from the first wait for a client to the answer: while a client may
-        // still answer, the session stays loaded (CloseIfIdleAsync).
+        // still answer, the session is not idle, so it stays loaded (IdleFromNow).
         feed.EnterUse();
         try
         {
@@ -248,7 +252,7 @@ public sealed class Conductor : IAsyncDisposable
         finally
         {
             feed.ExitUse();
-            CloseIfUnattended(sessionId);
+            IdleFromNow(sessionId);
         }
     }
 
@@ -361,14 +365,11 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>
     /// Makes sure the agent has the session open in its current instance. Prefers
     /// <c>session/resume</c>; falls back to <c>session/load</c> with the agent's replay
-    /// suppressed, since the history comes from the service's own journal.
+    /// suppressed, since the history comes from the service's own journal. Called under a use of
+    /// the session, whose end starts its idle timer (<see cref="IdleFromNow"/>).
     /// </summary>
-    /// <param name="forService">Opened for a service turn (an opinion or a report): a session this
-    /// opens is closed again after the service's turns. Otherwise a client or the session's own
-    /// work uses it, which takes it over: the service no longer closes it after its turns.</param>
-    internal async Task<(JsonRpcConnection Rpc, JsonObject? Opened)> EnsureLiveAsync(SessionRecord record, CancellationToken ct, bool forService = false)
+    internal async Task<(JsonRpcConnection Rpc, JsonObject? Opened)> EnsureLiveAsync(SessionRecord record, CancellationToken ct)
     {
-        if (!forService) unattended.TryRemove(record.SessionId, out _);
         var host = HostOf(record);
         var rpc = await host.GetAsync(ct);
         if (host.IsLive(record.SessionId)) return (rpc, null);
@@ -379,7 +380,6 @@ public sealed class Conductor : IAsyncDisposable
             rpc = await host.GetAsync(ct);
             if (host.IsLive(record.SessionId)) return (rpc, null);
             var opened = await OpenAsync(host, rpc, record, ct);
-            if (forService) unattended[record.SessionId] = 0;
             return (rpc, opened);
         }
         finally
@@ -439,7 +439,6 @@ public sealed class Conductor : IAsyncDisposable
             var rpc = await host.GetAsync(ct);
             if (host.CanLoad)
             {
-                unattended.TryRemove(record.SessionId, out _);
                 feed.Attach(client);
                 opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
                     AcpJson.ToNode(new LoadSessionRequest
@@ -589,12 +588,13 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
-    /// <c>session/close</c>: the client lets go of the session. Only when no other client has it
-    /// open is it closed in its agent, or, for a draft, discarded. A client that goes away without
-    /// it lets go all the same (<see cref="LetGo"/>), but that close waits until nothing uses the
-    /// session.
+    /// <c>session/close</c>: the client lets go of the session. Another client that has it open
+    /// keeps it as it is. For the last one, a draft is discarded; otherwise, as ACP asks of a
+    /// close, the session's running turn is cancelled (<c>session/cancel</c> to its agent), and
+    /// the session is closed in its agent after its idle timer (<see cref="IdleFromNow"/>), like
+    /// one a client left without closing it (<see cref="LetGo"/>).
     /// </summary>
-    internal async Task<JsonNode?> CloseAsync(ClientConnection client, string sessionId, JsonRpcRequest request, CancellationToken ct)
+    internal async Task<JsonNode?> CloseAsync(ClientConnection client, string sessionId, CancellationToken ct)
     {
         client.Release(sessionId);
         if (feeds.TryGetValue(sessionId, out var feed))
@@ -608,13 +608,13 @@ public sealed class Conductor : IAsyncDisposable
             await DiscardDraftAsync(sessionId, ct);
             return new JsonObject();
         }
-        if (!agents.TryGetValue(record.Agent, out var host) || !host.IsRunning || !host.IsLive(sessionId) || !host.CanClose)
-            return new JsonObject();
-        var rpc = await host.GetAsync(ct);
-        var result = await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
-        host.MarkClosed(sessionId);
-        unattended.TryRemove(sessionId, out _);
-        return result;
+        if (feed is { TurnGate.CurrentCount: 0 })
+        {
+            ServiceLog.Info($"{record.Agent} {sessionId}: closed by its last client during a turn; cancelling the turn");
+            await ForwardNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId }, sessionId);
+        }
+        if (StartIdle(sessionId) is { } unload) await unload();
+        return new JsonObject();
     }
 
     // ---------------------------------------------------------------- drafts and deletion
@@ -640,8 +640,8 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>
     /// Resolves a session for an operation that uses it (load, resume, prompt, opinion, a
     /// forwarded request) and registers the operation, so a draft is never discarded and a session
-    /// no client holds never closed under it. While a discard, deletion or such a close of the
-    /// session is under way this waits for its outcome; a session that is gone by then is not found.
+    /// never unloaded under it. While a discard, deletion or unload of the session is under way
+    /// this waits for its outcome; a session that is gone by then is not found.
     /// </summary>
     async Task<SessionUse> UseAsync(string sessionId, CancellationToken ct)
     {
@@ -653,7 +653,7 @@ public sealed class Conductor : IAsyncDisposable
             var record = await FindAsync(sessionId, ct);
             if (feed.Retired) throw NotFound(sessionId);
             feed.EnterUse();
-            return new SessionUse(feed, record, () => CloseIfUnattended(sessionId));
+            return new SessionUse(feed, record, () => IdleFromNow(sessionId));
         }
         finally
         {
@@ -877,7 +877,6 @@ public sealed class Conductor : IAsyncDisposable
     {
         var id = record.SessionId;
         removed[id] = 0;
-        unattended.TryRemove(id, out _);
         feed.Retire();
         feeds.TryRemove(new KeyValuePair<string, SessionFeed>(id, feed));
         if (sessionTokens.TryRemove(id, out var token)) peerTokens.TryRemove(token, out _);
@@ -905,10 +904,10 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
-    /// The last client attached to a session let go of it without <c>session/close</c>: it went
-    /// away (a GUI that quits sends none). A draft is discarded, as before; any other session is
-    /// closed in its agent once nothing uses it (<see cref="CloseIfIdleAsync"/>). Runs in the
-    /// background, so a disconnecting client is not held up by its agent.
+    /// A client went away without <c>session/close</c> (a GUI that quits sends none). It stops
+    /// nothing: a draft is discarded, as before, and any other session its last client left starts
+    /// its idle timer (<see cref="IdleFromNow"/>). Runs in the background, so a disconnecting
+    /// client is not held up by its agent.
     /// </summary>
     void LetGo(string sessionId) => RunCleanup(async () =>
     {
@@ -918,10 +917,7 @@ public sealed class Conductor : IAsyncDisposable
             await DiscardDraftAsync(sessionId, CancellationToken.None);
             return;
         }
-        if (shutdown.IsCancellationRequested || Volatile.Read(ref disposed) != 0) return; // the agents stop anyway
-        if (feeds.TryGetValue(sessionId, out var feed) && feed.Clients().Length > 0) return;
-        unattended[sessionId] = 0;
-        await CloseIfIdleAsync(sessionId);
+        if (StartIdle(sessionId) is { } unload) await unload();
     });
 
     /// <summary>Runs cleanup work in the background, for <see cref="CleanupsIdleAsync"/>; a failure is logged.</summary>
@@ -1309,8 +1305,8 @@ public sealed class Conductor : IAsyncDisposable
             }
             var text = ReportText(child, outcome, finalMessage);
             var sender = $"child_{child.Agent}";
-            using var use = await UseAsync(parentId, cleanupStop.Token); // its end closes a parent woken for this
-            var (rpc, _) = await EnsureLiveAsync(use.Record, cleanupStop.Token, forService: true);
+            using var use = await UseAsync(parentId, cleanupStop.Token); // its end starts the parent's idle timer
+            var (rpc, _) = await EnsureLiveAsync(use.Record, cleanupStop.Token);
             try
             {
                 await rpc.SendRequestAsync(GorynychProtocol.MethodNote, new JsonObject
@@ -1326,7 +1322,6 @@ public sealed class Conductor : IAsyncDisposable
             {
                 // No live-note path, or the session's agent is not running (Claude): a turn reaches it
                 // either way, and in the second case starts the agent just for it.
-                if (e.Code == JsonRpcException.InvalidRequest) unattended[parentId] = 0;
             }
             await ReportTurnAsync(use, rpc, sender, childId, text);
             ServiceLog.Info($"report: {childId} -> {parentId} (turn)");
@@ -1338,38 +1333,63 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
-    /// Something that kept a session no client holds loaded has ended (an operation registered on
-    /// it: a turn, a service turn, a request waiting for a client): the session is closed in the
-    /// background once nothing uses it.
+    /// Something that held the session let go of it: a client detached, or an operation registered
+    /// on it ended (a turn, a service turn, a request of its agent waiting for a client). If it is
+    /// now idle with no client, its idle timer starts again from now (<see cref="StartIdle"/>).
     /// </summary>
-    void CloseIfUnattended(string sessionId)
+    void IdleFromNow(string sessionId)
     {
-        if (unattended.ContainsKey(sessionId)) RunCleanup(() => CloseIfIdleAsync(sessionId));
+        if (StartIdle(sessionId) is { } unload) RunCleanup(unload);
     }
 
     /// <summary>
-    /// Closes a session no client holds (<see cref="unattended"/>) in its agent, as
-    /// <c>session/close</c> would, unless something still uses it: a client attached to it (which
-    /// keeps it from now on), or an operation registered on it, such as a turn, a service turn
-    /// waiting for its turn, or a request of its agent waiting for a client to answer it (an
-    /// approval or a form, which a client that comes back can still answer). The end of each comes
-    /// back here. An agent that cannot close sessions keeps it loaded.
+    /// Starts the idle timer of a session that is loaded in its agent, idle (no turn running, no
+    /// operation registered) and has no client attached; after
+    /// <see cref="ConductorOptions.UnloadAfter"/> it is closed in its agent
+    /// (<see cref="UnloadIfIdleAsync"/>). A client that attaches or an operation that registers
+    /// stops the timer (<see cref="SessionFeed.StopIdle"/>), and the end of each starts it again,
+    /// so the time counts from the later of the last client leaving and the session going idle.
+    /// Nothing is cancelled. With no wait configured, returns the unload for the caller to run now.
     /// </summary>
-    async Task CloseIfIdleAsync(string sessionId)
+    Func<Task>? StartIdle(string sessionId)
     {
-        var feed = Feed(sessionId);
+        if (shutdown.IsCancellationRequested || Volatile.Read(ref disposed) != 0) return null; // the agents stop anyway
+        if (!feeds.TryGetValue(sessionId, out var feed) || feed.Retired || feed.Users > 0 || feed.Clients().Length > 0) return null;
+        if (store.Get(sessionId) is not { } record || !agents.TryGetValue(record.Agent, out var host) || !host.IsLive(sessionId)) return null;
+        var timer = feed.StopIdle(); // a timer started earlier no longer counts
+        if (options.UnloadAfter <= TimeSpan.Zero) return () => UnloadIfIdleAsync(feed, timer);
+        try
+        {
+            _ = Task.Delay(options.UnloadAfter, options.Time, cleanupStop.Token).ContinueWith(t =>
+            {
+                if (t.IsCompletedSuccessfully) RunCleanup(() => UnloadIfIdleAsync(feed, timer));
+            }, TaskScheduler.Default);
+        }
+        catch (ObjectDisposedException)
+        {
+            // disposed meanwhile: the agents stop anyway
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The idle timer <paramref name="timer"/> of a session ran out: the session is closed in its
+    /// agent, unless the timer was stopped since (a client attached, an operation registered) or
+    /// something holds it now. Checked under the session's gate, which a client's load takes too.
+    /// An agent that cannot close sessions keeps it loaded.
+    /// </summary>
+    async Task UnloadIfIdleAsync(SessionFeed feed, long timer)
+    {
+        var sessionId = feed.SessionId;
         await feed.LifeGate.WaitAsync(cleanupStop.Token);
         try
         {
-            // Read under the gate: a client may have loaded the session or prompted it meanwhile.
-            if (!unattended.ContainsKey(sessionId) || feed.Retired || feed.Users > 0) return;
-            unattended.TryRemove(sessionId, out _);
-            if (feed.Clients().Length > 0) return; // a client has it open: it stays
+            if (feed.IdleTimer != timer || feed.Retired || feed.Users > 0 || feed.Clients().Length > 0) return;
             if (store.Get(sessionId) is not { } record || !agents.TryGetValue(record.Agent, out var host)) return;
             if (!host.IsRunning || !host.IsLive(sessionId) || !host.CanClose) return;
             var rpc = await host.GetAsync(cleanupStop.Token);
             await CloseInAgentAsync(host, rpc, sessionId, cleanupStop.Token);
-            ServiceLog.Info($"{record.Agent} {sessionId}: closed in its agent, since no client has it open");
+            ServiceLog.Info($"{record.Agent} {sessionId}: unloaded from its agent, idle with no client for {options.UnloadAfter}");
         }
         finally
         {
@@ -1604,7 +1624,7 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>
     /// Reads a page of a session's history from the service journal; reading never runs a turn. A
     /// session the service has never journaled is loaded in its agent first, which replays its
-    /// history into the journal (Kimi), and closed again afterwards when it was loaded only for
+    /// history into the journal (Kimi), and unloaded again after its idle time when it was loaded only for
     /// this, as after service turns. Reading a Claude session never starts Claude: the service
     /// journals every Claude session from its first prompt, and the Claude adapter cannot load one
     /// (learning that may start the in-process adapter, which starts no claude process).
@@ -1612,7 +1632,7 @@ public sealed class Conductor : IAsyncDisposable
     /// <exception cref="SessionReader.UnknownCursorException">The cursor names no message of the session.</exception>
     internal async Task<SessionRead> ReadAsync(string sessionId, string? cursor, int limit, bool thoughts, int? budget, CancellationToken ct)
     {
-        using var use = await UseAsync(sessionId, ct); // its end closes a session loaded only for this
+        using var use = await UseAsync(sessionId, ct); // its end starts the idle timer of a session loaded for this
         var feed = use.Feed;
         var host = HostOf(use.Record);
         if (!feed.Journal.HasTurns && !host.IsLive(sessionId))
@@ -1625,9 +1645,9 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
-    /// Loads a session the journal has no turn of in its agent, journaling the agent's replay, and
-    /// marks it to be closed again like a session woken for service turns. Does nothing when the
-    /// agent cannot load sessions (Claude), or the session was loaded meanwhile.
+    /// Loads a session the journal has no turn of in its agent, journaling the agent's replay; it
+    /// is unloaded again after its idle timer, like a session woken for service turns. Does nothing
+    /// when the agent cannot load sessions (Claude), or the session was loaded meanwhile.
     /// </summary>
     async Task LoadHistoryAsync(SessionUse use, CancellationToken ct)
     {
@@ -1645,7 +1665,6 @@ public sealed class Conductor : IAsyncDisposable
             }), ct) as JsonObject;
             host.MarkLive(record.SessionId);
             use.Feed.CaptureState(opened);
-            unattended[record.SessionId] = 0;
             ServiceLog.Info($"{host.Name}: loaded {record.SessionId} to read its history");
         }
         finally
@@ -1743,10 +1762,10 @@ public sealed class Conductor : IAsyncDisposable
             var woken = false; // by this call, so a failed turn is a failure to start
             try
             {
-                // Not loaded in its agent: loaded now, and closed again after the service's turns.
+                // Not loaded in its agent: loaded now, and unloaded again after its idle timer.
                 woken = !HostOf(record).IsLive(target);
                 if (woken) onState?.Invoke(StartingState(target));
-                (rpc, _) = await EnsureLiveAsync(record, ct, forService: true);
+                (rpc, _) = await EnsureLiveAsync(record, ct);
             }
             catch (Exception e) when (asker.IsAgent && e is not OperationCanceledException)
             {
@@ -1787,7 +1806,6 @@ public sealed class Conductor : IAsyncDisposable
                 if (e.Code == JsonRpcException.InvalidRequest)
                 {
                     woken = true;
-                    unattended[target] = 0;
                     onState?.Invoke(StartingState(target));
                 }
                 turnHasUse = true;
@@ -1954,7 +1972,7 @@ public sealed class Conductor : IAsyncDisposable
                     pending.TurnText = feed.EndOpinionTurn();
                     pending.TurnError = t.Exception?.InnerException;
                     feed.TurnGate.Release();
-                    use.Dispose(); // the turn may end after the answer: the session is closed again only now
+                    use.Dispose(); // the turn may end after the answer: the session's idle time starts only now
                 }, TaskScheduler.Default);
                 turnStarted = true;
                 onState?.Invoke(AskedState(record.SessionId));
@@ -2040,7 +2058,7 @@ public sealed class Conductor : IAsyncDisposable
     /// <c>_gorynych/peers {token, includeArchived?}</c>: the sessions the session behind <c>token</c>
     /// can ask; archived ones only with <c>includeArchived</c>, and then every entry says whether it is.
     /// Each entry's <c>status</c> uses the words of ACP's session-status RFD: <c>open</c> when its agent
-    /// has it loaded now, <c>saved</c> when it does not (a question starts it, and it is closed again after).
+    /// has it loaded now, <c>saved</c> when it does not (a question starts it, and it is unloaded again after its idle time).
     /// <c>caller</c> names the session behind the token as <see cref="Who"/> does, since the list
     /// leaves it out and an agent does not know its own ID otherwise. Without <c>includeArchived</c>,
     /// <c>hiddenArchived</c> counts the archived sessions the list would otherwise show (never the caller).

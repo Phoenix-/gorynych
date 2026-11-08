@@ -13,7 +13,8 @@ agent. New sessions then go to that agent and `session/list` shows only its sess
 client needs no Gorynych extensions. `codex app-server proxy` follows the same idea.
 
 Service options after `--agent` (`--data`, `--claude-model`, `--default-agent`,
-`--no-channel`, `--no-peers`) apply only when the bridge has to start the service; a running
+`--unload-after <minutes>`, `--no-channel`, `--no-peers`) apply only when the bridge has to
+start the service; a running
 service keeps its own. The service outlives the bridge and the client: it is started
 without inherited handles, without a console and, when the client's job object allows it,
 outside that job.
@@ -73,11 +74,13 @@ and what the service does about it:
   these drafts when the bridge disconnects, and sweeps any left over at its next start.
 - `session/close` is sent, because the service advertises `close`, when Zed drops a thread:
   a thread or draft removed or replaced, idle threads beyond the five it keeps, an
-  abandoned new or load. Archiving and quitting send nothing. The service closes a session in
-  its agent only when no other client has it open. When Zed quits, the service takes the
-  bridge going away as letting go of every session Zed had open: each is closed in its agent
-  once its running turn ends, unless another client has it open or an approval in it waits
-  for an answer ([service-protocol.md](service-protocol.md#letting-go-of-a-session)).
+  abandoned new or load. Archiving and quitting send nothing. When no other client has the
+  session open, the service cancels its running turn, as ACP asks of a close, and unloads it
+  from its agent once it has been idle for `--unload-after` minutes (10 by default). Quitting
+  sends nothing, so the service takes the bridge going away as letting go of every session Zed
+  had open: each is unloaded after the same idle time, counted from the end of its running
+  turn if it has one. Nothing is cancelled, and a session whose approval waits for an answer
+  stays loaded ([service-protocol.md](service-protocol.md#unloading-idle-sessions)).
 - Archiving is local to Zed: stock Zed sends nothing, so the service and its agents see the
   session as merely closed and keep listing it (`list_agents` too). A client that wants the
   service to know calls `_gorynych/archive` ([service-protocol.md](service-protocol.md#archive)).

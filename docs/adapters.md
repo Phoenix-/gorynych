@@ -36,8 +36,8 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   The service answers Kimi's approval of `spawn_session` itself, since it asks the person
   before it spawns ([service-protocol.md](service-protocol.md#child-sessions)). Kimi does not
   know `_gorynych/note`, so a child's report reaches a Kimi parent as a marked turn. A Kimi
-  session that is not loaded is resumed for an opinion request or a report and closed again
-  after it ([adapter-contract.md](adapter-contract.md#61-waking-a-session-and-closing-it-again)).
+  session that is not loaded is resumed for an opinion request or a report and unloaded again
+  after the service's idle time ([adapter-contract.md](adapter-contract.md#61-waking-a-session-and-closing-it-again)).
 - **Archive: not mirrored.** Kimi Code 2.5.2 has a native archive (`"archived"` in a
   session's `state.json`, `kimi session list --archived`, set from Kimi's own UI), but
   `kimi acp` offers no method for it. Its `session/list` leaves natively archived sessions out:

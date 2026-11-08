@@ -31,6 +31,7 @@ public sealed class OutsideTests
         PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"],
         OutsideProgressInterval = progress,
         JournalMaxEntries = journal,
+        UnloadAfter = TimeSpan.Zero, // a session woken or loaded to read is unloaded at once after
     }, adapters);
 
     static async Task<string> NewPromptedAsync(TestClient client, string agent, string text)

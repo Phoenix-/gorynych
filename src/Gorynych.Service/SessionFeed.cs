@@ -46,8 +46,24 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// </summary>
     public int Users => Volatile.Read(ref users);
 
-    public void EnterUse() => Interlocked.Increment(ref users);
+    public void EnterUse()
+    {
+        Interlocked.Increment(ref users);
+        StopIdle();
+    }
     public void ExitUse() => Interlocked.Decrement(ref users);
+
+    long idleTimer;
+
+    /// <summary>
+    /// The session's idle timer: the conductor starts one with the value this returns, and the
+    /// timer counts only while it is still the current one. Called when a client attaches or an
+    /// operation registers, it stops the running timer.
+    /// </summary>
+    public long StopIdle() => Interlocked.Increment(ref idleTimer);
+
+    /// <summary>The current idle timer (see <see cref="StopIdle"/>).</summary>
+    public long IdleTimer => Interlocked.Read(ref idleTimer);
 
     bool retired;
 
@@ -218,6 +234,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             clientAttached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         }
         client.Hold(SessionId);
+        StopIdle();
         signal.TrySetResult();
     }
 
