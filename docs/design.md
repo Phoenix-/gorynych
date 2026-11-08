@@ -70,12 +70,12 @@ flowchart LR
     zed["Zed (GUI)"]
     test["gorynych-test<br/>(console client)"]
   end
-  bridge["bridge<br/>Gorynych.Service acp --agent claude|kimi"]
+  bridge["bridge<br/>Gorynych.Service acp --agent claude|kimi|codex"]
   subgraph service["Gorynych service (one per user and machine)"]
     conductor["conductor<br/>sessions, journal, overlay,<br/>opinion router, idle unload"]
     claudeA["Claude adapter<br/>(in process)"]
     kimiA["Kimi adapter"]
-    codexA["Codex adapter<br/>(in progress)"]
+    codexA["Codex adapter<br/>(in process)"]
   end
   subgraph agents["Native agents, unmodified"]
     claude["claude TUI<br/>in ConPTY"]
@@ -91,11 +91,11 @@ flowchart LR
   test -- "ACP over a named pipe" --> conductor
   conductor -- "ACP" --> claudeA
   conductor -- "ACP" --> kimiA
-  conductor -. "ACP" .-> codexA
+  conductor -- "ACP" --> codexA
   claudeA -- "per-launch flags, keys" --> claude
   claude -- "http hooks" --> claudeA
   kimiA -- "ACP over stdio" --> kimi
-  codexA -. "JSON-RPC over stdio" .-> codex
+  codexA -- "JSON-RPC over stdio" --> codex
   claude -- "MCP" --> peers
   kimi -- "MCP" --> peers
   peers -- "pipe" --> conductor
@@ -116,7 +116,7 @@ flowchart LR
   parent links), the router for questions between sessions, and the idle unload. Everything
   particular to an agent sits behind the [adapter contract](adapter-contract.md).
 - **Adapters are ACP agents.** An external one is an executable that speaks ACP over stdio
-  (`kimi acp`); an own one (Claude, later Codex and DeepSeek) is an assembly with an ACP
+  (`kimi acp`); an own one (Claude and Codex, later DeepSeek) is an assembly with an ACP
   interface over an in-memory link, so moving it into its own process later means only
   wrapping it in JSON-RPC.
 
@@ -174,7 +174,7 @@ All three have a structured protocol, so neither a terminal nor screen reading i
 | Harness | Feed | Approvals and input | Status |
 | --- | --- | --- | --- |
 | [Kimi Code](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp) | `kimi acp`, native ACP | `session/request_permission`, `session/prompt` | **done**; recorded with Kimi Code 2.4.1, verified live on 7 November 2026 |
-| [Codex](https://learn.chatgpt.com/docs/app-server.md) | `codex app-server`, official JSON-RPC with a schema per version: item events, `turn/plan/updated` | approvals are server requests to the client; input is `turn/start` | **in progress**; probed with codex-cli 0.167 |
+| [Codex](https://learn.chatgpt.com/docs/app-server.md) | `codex app-server`, official JSON-RPC with a schema per version: item events, `turn/plan/updated` | approvals are server requests to the client; input is `turn/start` | **done**; types generated from codex-cli 0.167's schema, verified live on 8 November 2026 |
 | DeepSeek Harness | the native host's local HTTP API (`/api/session/projections`, `/api/session/list`); no official documentation | `/api/permission`, `/api/commands/execute` | **planned**; runs on an API key |
 
 For DeepSeek the only ACP route found, `acp-llm-adapter`, wraps the bare model and loses the
@@ -203,7 +203,7 @@ an ACP client. The types are generated from the published JSON schema
 | GUI reconnect | `session/load` replays history through `session/update`; `session/resume` returns the session without it | v1 | **done**; the history comes from the service's journal |
 | Feed | `session/update`: message and thought chunks, `tool_call`, `tool_call_update`, `plan`, `usage_update`, `session_info_update` | v1 | **done**, as is; every chunk carries a `messageId` |
 | Prompts and cancel | `session/prompt`, `session/cancel` | v1 | **done**; the Claude adapter turns a prompt into a PTY paste |
-| Approvals | `session/request_permission` | v1 | **done**; Claude's hook (and Codex's server requests, later) map to it |
+| Approvals | `session/request_permission` | v1 | **done**; Claude's hook and Codex's server requests map to it |
 | Questions with choices | `elicitation/create` (forms) | v1 | **done** for `AskUserQuestion`; a client without forms gets approvals instead |
 | System prompt | `systemPrompt` (append or override) on new, load and resume | completed RFD, in ACP main | **done**: the service sends its peer instructions to agents that advertise it (Claude) |
 | Loaded or not | `session/status` (`open`, `saved`) | draft RFD | the same words in `list_agents`; adopt when stable |
@@ -228,7 +228,7 @@ Titles and archive live in the harness when it has them; otherwise in the servic
 | --- | --- | --- | --- |
 | Claude Code | the adapter's own list of the sessions it started; sessions started elsewhere (the Agent SDK's `listSessions`, or the transcripts in `~/.claude/projects`): **planned** | Claude writes `ai-title` itself; `/rename` writes `custom-title`. A name given at spawn stays in the overlay | none in Claude Code: overlay |
 | Kimi Code | ACP `session/list` | first prompt; a name given at spawn stays in the overlay | Kimi has one, but `kimi acp` cannot reach it: overlay |
-| Codex | `thread/list` | `thread/name/set` | `thread/archive`, `thread/unarchive` (**planned**, native) |
+| Codex | `thread/list` | `thread/name/set` for a name given at spawn; a thread without a name shows the service's provisional title | Codex will not resume an archived thread, so the archive stays in the overlay |
 
 - **Sessions start from the first prompt.** Creating a session is the composer: pick the agent
   and the folder, write the first prompt. The service runs `session/new` and `session/prompt`;
@@ -238,8 +238,8 @@ Titles and archive live in the harness when it has them; otherwise in the servic
   view opens) is deleted when its client lets go of it, and never listed.
 - **Deleting** is native where the agent can (Kimi); a Claude session is only hidden, its
   transcript belongs to `~/.claude`.
-- **One thread, one writer.** Codex keeps writer locks per thread; the service will not open a
-  thread a desktop app holds (**planned**, with the Codex adapter).
+- **One thread, one writer.** Codex lets one process write a thread; a thread that Codex Desktop
+  or the CLI holds fails to open through Gorynych with a message that says so (**done**).
 - **Renaming from the GUI** goes to the native side (Codex `thread/name/set`, Claude `/rename`
   typed through the PTY after `Stop`): **planned**.
 
@@ -362,7 +362,8 @@ and runs the service as an external agent through the bridge, one entry per agen
 lacks two things Gorynych needs: sessions an agent creates reach it only through a manual
 import (and land in the archive), and it has no session tree. A Zed fork adds both (picking up
 sessions as the service announces them, and nesting children under their parents); it is
-**in progress** and not published yet. Its changes stay in rarely changing parts of Zed, so it
+**in progress** and public at [Phoenix-/zed](https://github.com/Phoenix-/zed) (branch `gorynych`), with a Windows
+build of every change on the rolling [nightly](https://github.com/Phoenix-/zed/releases/tag/nightly) prerelease. Its changes stay in rarely changing parts of Zed, so it
 can follow Zed's stable releases. Once the scheme settles, the pickup is a candidate for Zed
 itself, and the fork shrinks.
 
@@ -372,6 +373,7 @@ treats sessions, and what the service does about it, is in
 [external-clients.md](external-clients.md#zed).
 
 Model, mode and effort selectors for Claude are deferred: the Claude adapter exposes none yet.
+The Codex adapter exposes all three as ACP session config options.
 
 ## Stage one and what comes next
 
@@ -385,17 +387,18 @@ Done in stage one:
 - Claude through its TUI in ConPTY, http hooks, the channel with `reply`, pastes after `Stop`,
   and the person's consent before the development-channels notice is confirmed;
 - Kimi through `kimi acp`, the second kind of adapter, which checked the whole model;
+- Codex through `codex app-server`, the second own adapter, with its permission modes as a
+  selector (including Codex's automatic reviewer);
 - questions between sessions, child sessions with reports, archive, list changes;
 - agents outside Gorynych, idle unload;
 - contract tests on recorded fixtures and a fake Claude, and opt-in live tests.
 
 Next, in order (**planned**):
 
-1. Codex through `codex app-server` (in progress).
-2. DeepSeek through its host's HTTP API.
-3. One GUI over several services: a combined session list, remote services over `ssh -T`. The
+1. DeepSeek through its host's HTTP API.
+2. One GUI over several services: a combined session list, remote services over `ssh -T`. The
    standard OpenSSH for Windows supports only asynchronous stdio and hangs on synchronous pipes.
-4. Questions between machines: the GUI is connected to both services and forwards the
+3. Questions between machines: the GUI is connected to both services and forwards the
    question itself, so the services need not know each other.
 
 ## Probe results
