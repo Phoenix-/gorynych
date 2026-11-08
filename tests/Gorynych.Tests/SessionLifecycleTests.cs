@@ -686,6 +686,7 @@ sealed class LifecycleAgent
                                 Delete = canDelete ? new SessionDeleteCapabilities() : null,
                                 SystemPrompt = TakesSystemPrompt ? new SessionSystemPromptCapabilities() : null,
                             },
+                            Meta = UnaskedMcpTools ? new JsonObject { [GorynychProtocol.CapUnaskedMcpTools] = true } : null,
                         },
                         AgentInfo = new Implementation { Name = name, Version = "1" },
                     });
@@ -760,6 +761,9 @@ sealed class LifecycleAgent
 
     /// <summary>Advertises <c>sessionCapabilities.systemPrompt</c> (append), as the Claude adapter does; set before the first use.</summary>
     public bool TakesSystemPrompt { get; set; }
+
+    /// <summary>Advertises <c>gorynych/unaskedMcpTools</c>, as the DSH adapter does; set before the first use.</summary>
+    public bool UnaskedMcpTools { get; set; }
 
     /// <summary>The <c>systemPrompt</c> param of every <c>session/new</c> and <c>session/resume</c>, in order.</summary>
     public List<(string Method, string SessionId, JsonNode? SystemPrompt)> SystemPrompts { get; } = [];

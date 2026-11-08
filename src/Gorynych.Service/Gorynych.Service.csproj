@@ -12,6 +12,7 @@
     <ProjectReference Include="..\Gorynych.Adapters.Kimi\Gorynych.Adapters.Kimi.csproj" />
     <ProjectReference Include="..\Gorynych.Adapters.Claude\Gorynych.Adapters.Claude.csproj" />
     <ProjectReference Include="..\Gorynych.Adapters.Codex\Gorynych.Adapters.Codex.csproj" />
+    <ProjectReference Include="..\Gorynych.Adapters.Dsh\Gorynych.Adapters.Dsh.csproj" />
   </ItemGroup>
   <ItemGroup>
     <!-- Shared with Gorynych.Outside: the outside tools, the ancestry walk, the detached start. -->

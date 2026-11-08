@@ -2,16 +2,17 @@ using System.Text.Json;
 using Gorynych.Acp.Hosting;
 using Gorynych.Adapters.Claude;
 using Gorynych.Adapters.Codex;
+using Gorynych.Adapters.Dsh;
 using Gorynych.Adapters.Kimi;
 using Gorynych.Service;
 
-// Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex] [--claude-model <m>] [--unload-after <minutes>]
+// Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex|dsh] [--claude-model <m>] [--unload-after <minutes>]
 //   [--claude-channels ask|accept|decline] [--no-channel] [--no-peers] [--console]
 // Gorynych.Service peers [--pipe <name> --token <t>] [--channel-url <url>]
 //   the gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel
 if (args.Length > 0 && args[0] == "peers")
     return await PeersServer.RunAsync(Arg(args, "--pipe"), Arg(args, "--token"), Arg(args, "--channel-url"));
-// Gorynych.Service acp --agent claude|kimi|codex [--pipe <name>] [service options]
+// Gorynych.Service acp --agent claude|kimi|codex|dsh [--pipe <name>] [service options]
 //   the stdio entry point for external ACP clients (Zed); starts the service when needed
 if (args.Length > 0 && args[0] == "acp")
 {
@@ -60,6 +61,12 @@ var adapters = new List<IAgentAdapter>
     }),
     new KimiAdapter(new KimiAdapterOptions { Log = ServiceLog.Info }),
     new CodexAdapter(new CodexAdapterOptions { Log = ServiceLog.Info, ClientVersion = AgentHost.Version }),
+    new DshAdapter(new DshAdapterOptions
+    {
+        DataDirectory = Path.Combine(dataDirectory, "dsh"),
+        Instructions = args.Contains("--no-peers") ? null : PeersServer.SystemPrompt,
+        Log = ServiceLog.Info,
+    }),
 };
 
 await using var conductor = new Conductor(new ConductorOptions

@@ -406,3 +406,122 @@ ACP config options, applied with the next `turn/start`, which Codex keeps for la
 - A live-note path through `turn/steer` (a child's report into the parent's running turn).
 - Pre-allowing tools, for every harness at once.
 - `thread/settings/update` (experimental) to apply an option before the next turn.
+
+## DeepSeek Harness
+
+DeepSeek Harness (DSH) speaks ACP itself (`dsh --profile acp`), so the adapter is not a
+translator. It starts DSH with a per-launch patch and puts a thin ACP proxy between DSH and the
+service. The proxy forwards every frame with its IDs and fields, and rewrites only what DSH's ACP
+lacks. The design, the probes and the decisions the user took are in
+[research/dsh-adapter-spec.md](../research/dsh-adapter-spec.md); the probes are in
+`research/probes/dsh`. Built and checked against DSH 0.2.2-rc.1 on 9 November 2026. DSH is a
+developer preview that runs on the user's own DeepSeek API key, so every turn costs money.
+
+- **Process.**
+  - The adapter finds the `@deepseek-ai/dsh` package from the `dsh` on PATH: next to npm's
+    shim on Windows, or through the `bin/dsh` link elsewhere.
+  - It runs `node <package>/lib/bin.js --profile acp --patch <data>/dsh/gorynych.patch.yml`
+    with `<data>/dsh` as the working folder. DSH loads its launch folder's `.env` into its
+    environment, so that is never a repository.
+  - It adds `DSH_TELEMETRY_DISABLED=1` to the environment and changes nothing else.
+  - One process serves every session, and DSH starts the sessions' stdio MCP servers as its own
+    children, inside Gorynych for the `gorynych-outside` walk.
+  - Starting and initializing takes about 3.7 s. Closing stdin ends DSH in under 0.1 s when it
+    is idle; the adapter waits up to 6 s, then kills the tree.
+  - The package's version is logged, with a warning when it is not one the adapter was checked
+    against. `agentInfo.version` is a constant `0.0.1`.
+- **Configuration.**
+  - DSH runs on the user's own `~/.dsh`: its key, its sessions, the same store `dsh web` uses.
+  - On first boot DSH creates its shipped `acp` profile in `~/.dsh/profiles/acp` and rewrites
+    that profile's `cordis.yml` on every boot. The user accepted this. Gorynych writes nothing there.
+  - Everything of Gorynych's is in the patch, rewritten before each start. A patch replaces a
+    row's whole config, so its rows restate what they keep. It holds:
+    - **`system-prompt`.** The acp app's `personaPrefix`, restated, and a `personaSuffix`:
+      the service's peer instructions; a line naming the gorynych tools in full (DSH has a
+      `list_agents` of its own, for its subagents); and what a Gorynych DSH session can do
+      (below). DSH assembles the system prompt per request, so it holds for every session of
+      that launch and for no other. The adapter does not advertise
+      `sessionCapabilities.systemPrompt`, and refuses to start if the text holds `{{`, which DSH
+      reads as a template variable.
+    - **`sandbox-policy`: `read-only`; `approval`: `ask`.**
+  - The user's own layers (`~/.dsh/cordis.patch.yml`, the acp profile's `cordis.patch.yml`)
+    still apply, but these three rows are replaced by Gorynych's.
+
+### Sandbox: a read-only shell, approved file writes
+
+DSH's Windows sandbox would write a standing allow ACE, a `FILE_DELETE_CHILD` deny and a Low
+integrity label onto a workspace tree at its first shell write. These edits cannot be removed
+with icacls. Gorynych's DSH sessions never let that happen:
+
+- New sessions run in DSH's `read-only` mode (DSH pins the mode into a session at its first
+  turn; sessions made in `dsh web` keep their own). Reads, searches and commands that only read
+  run without asking.
+- DSH asks only to escalate a denied call, never otherwise. The proxy refuses every shell
+  escalation itself, with `reject-once`, without asking the person. It also refuses an
+  escalation for a call it did not see announced. So the ACL never changes.
+  - The model's tool result says `the user rejected escalating this command …; stop and explain`.
+    ACP has no way to give another reason, so the appended prompt says in advance that this
+    text comes from Gorynych's policy, not from a person.
+  - Checked live: the turn ends `end_turn`, and the model explains that the command was refused.
+- A `write` or `edit` escalation goes to the person as an approval card. It names the tool,
+  the path, the diff and "Asks to run this once with workspace-write permissions: <the model's
+  justification>". The appended prompt asks the model to pass `sandbox_permissions` on every
+  write, so a write asks once instead of failing first.
+- The appended prompt says that builds, tests and installs are not available, that files are
+  changed with the file tools, and that `git status`, `git diff` and `git log` work.
+- A full-access option is not in this version.
+
+### Sessions
+
+| ACP | DSH, through the proxy |
+| --- | --- |
+| `session/new` | DSH's own: a bare UUID, durable at once (it writes the session log before any prompt). DSH lists no title for it ever, and cannot delete it, so an unused draft gets a tombstone; it stays in `~/.dsh`, where `dsh web` can delete it |
+| `session/list` | DSH's `{sessionId, cwd}`, newest-created first, with its cursor and `cwd` filter. DSH leaves out the sessions open in its own process, so the proxy adds back the sessions it has open, on the first page and in the requested folder. No `title` and no `updatedAt`: the service shows its provisional title |
+| `session/resume` | DSH's own, with the request's `mcpServers` (about 0.2 s). A session open in another DSH process fails with `-32603`, which the proxy words as "This DeepSeek Harness session is open in another DSH app (dsh web or another dsh); close it there, then try again." |
+| `session/load`, `session/delete` | not supported (`-32601`); history comes from the service's journal, delete is a tombstone |
+| `session/close` | DSH's own: it cancels a running prompt (`cancelled`), drains DSH's subagents and flushes |
+
+- **Idle time.** `gorynych/unloadAfter` is 120 s: a session has one writer, so while Gorynych
+  holds it, `dsh web` cannot open it.
+
+### Prompts and turns
+
+- Prompts, `session/cancel` and stop reasons are DSH's own. A cancel aborts the running tool
+  call and ends the prompt `cancelled` within a quarter of a second.
+- DSH's subagents run inside the prompt. The prompt stays in flight until they finish and DSH
+  has taken their results. Their sessions are DSH's and are not listed.
+- Messages and thoughts arrive whole, each as one chunk after the model step. DSH gives a
+  thought and its answer one `messageId`; the proxy sends the thought as `<id>:thought`.
+- **Tool calls.** DSH sends every call as `kind: other`, titled with the tool's name, with the
+  arguments as `rawInput` and nothing else. The proxy adds:
+  - **kinds:**
+    - `pwsh` / `bash`, `job_kill` → `execute`;
+    - `read`, `read_image`, `read_mcp_resource`, `job_output` → `read`;
+    - `write`, `edit` → `edit`;
+    - `glob`, `grep`, the MCP resource lists, `web_search` → `search`;
+    - `web_fetch` → `fetch`;
+    - `todo_write` and the goal tools → `think`;
+    - everything else → `other`;
+  - **titles:**
+    - a shell call by its `description`, with the command in `rawInput`;
+    - a file tool with its path, a search with its pattern;
+    - MCP tools keep `mcp__<server>__<tool>`, which pre-allowing and `read_session` read;
+  - **locations:** `file_path` resolved against the session's folder, or the shell's working folder;
+  - **diffs:** `write` (new text) and `edit` (`old_string` → `new_string`).
+- **The gorynych tools.** DSH runs MCP tools without asking, so the adapter sets
+  `gorynych/unaskedMcpTools`. The service then asks the person before `ask_agent`,
+  `archive_session` and `restore_session`, as it asks before every spawn
+  ([adapter-contract.md](adapter-contract.md#62-the-gorynych-mcp-server)).
+- **Withdrawn questions.** On a cancel DSH drops its own pending approval without
+  `$/cancel_request`. The proxy withdraws it from the service when the call ends or the prompt
+  does, and drops a late answer.
+- No forms: the acp profile has no ask tool and no elicitation. No plans, no titles over ACP,
+  no live-note path (`-32601`).
+
+### Not done yet
+
+- A full-access option (DSH's `danger-full-access`, which would ask nothing).
+- Titles from DSH: its acp app switches its model titles off, and the title it keeps is in its
+  projection cache, not on the wire.
+- History for sessions made in `dsh web` (no `session/load`).
+- Images in prompts (DSH offers them only for an image-capable route).

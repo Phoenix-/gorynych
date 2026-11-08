@@ -124,6 +124,9 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// <summary>The agent keeps nothing durable before a session's first prompt.</summary>
     public bool DraftsNotDurable => Flag(GorynychProtocol.CapDraftsNotDurable);
 
+    /// <summary>The agent runs MCP tools without asking, so the service asks before the gorynych tools that act for the person.</summary>
+    public bool UnaskedMcpTools => Flag(GorynychProtocol.CapUnaskedMcpTools);
+
     /// <summary>The idle time the adapter asks for its sessions (at most a day), or null for the service's own.</summary>
     public TimeSpan? UnloadAfter =>
         Info?.AgentCapabilities?.Meta?[GorynychProtocol.CapUnloadAfter] is JsonValue v && v.TryGetValue<double>(out var seconds) && seconds >= 0

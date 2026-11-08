@@ -257,9 +257,9 @@ public sealed class Conductor : IAsyncDisposable
     {
         var sessionId = (string?)request.Params?["sessionId"]
             ?? throw new JsonRpcException(JsonRpcException.MethodNotFound, $"{request.Method} is not supported by Gorynych");
-        if (request.Method == AcpMethods.Client.SessionRequestPermission && PreAllowed(request.Params) is { } optionId)
+        if (request.Method == AcpMethods.Client.SessionRequestPermission && PreAllowed(request.Params, Feed(sessionId)) is { } optionId)
         {
-            ServiceLog.Info($"{host.Name} {sessionId}: allowed {(string?)request.Params?["toolCall"]?["title"]} without asking");
+            ServiceLog.Info($"{host.Name} {sessionId}: allowed {(string?)request.Params?["toolCall"]?["title"] ?? (string?)request.Params?["toolCall"]?["toolCallId"]} without asking");
             return AcpJson.ToNode(new RequestPermissionResponse { Outcome = new SelectedPermissionOutcome { OptionId = optionId } });
         }
         var feed = Feed(sessionId);
@@ -1109,11 +1109,25 @@ public sealed class Conductor : IAsyncDisposable
     /// <c>session/request_permission</c> on the calling session (allow once or reject, never
     /// always: every spawn is asked). Waits for a client if none is attached.
     /// </summary>
-    async Task<RequestPermissionOutcome> AskToSpawnAsync(SessionFeed feed, SessionRecord parent, string callId, string what, AgentHost host, string cwd,
+    Task<RequestPermissionOutcome> AskToSpawnAsync(SessionFeed feed, SessionRecord parent, string callId, string what, AgentHost host, string cwd,
         string prompt, string? title, CancellationToken ct)
     {
         var input = new JsonObject { ["agent"] = host.Name, ["cwd"] = cwd, ["prompt"] = prompt };
         if (title is not null) input["title"] = title;
+        return AskPersonAsync(feed, parent, callId, what, input, $"{prompt}\n\nFolder: {cwd}",
+            new PermissionOption { OptionId = "start", Name = "Start", Kind = PermissionOptionKind.AllowOnce },
+            new PermissionOption { OptionId = "decline", Name = "Don't start", Kind = PermissionOptionKind.RejectOnce }, ct);
+    }
+
+    /// <summary>
+    /// Shows something the service does for a session's agent as a tool call in that session's
+    /// thread, and asks the person there with <c>session/request_permission</c> (allow once or
+    /// reject, never always). Waits for a client if none is attached, and asks the next one if a
+    /// client goes away before answering.
+    /// </summary>
+    async Task<RequestPermissionOutcome> AskPersonAsync(SessionFeed feed, SessionRecord caller, string callId, string what, JsonObject input, string text,
+        PermissionOption allow, PermissionOption decline, CancellationToken ct)
+    {
         var card = new ToolCall
         {
             ToolCallId = callId,
@@ -1121,25 +1135,21 @@ public sealed class Conductor : IAsyncDisposable
             Kind = ToolKind.Other,
             Status = ToolCallStatus.Pending,
             RawInput = input.DeepClone(),
-            Content = [new Content { ContentValue = new TextContent { Text = $"{prompt}\n\nFolder: {cwd}" } }],
+            Content = [new Content { ContentValue = new TextContent { Text = text } }],
         };
-        await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(card)!.AsObject(), except: null, () => store.Touch(parent.SessionId));
+        await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(card)!.AsObject(), except: null, () => store.Touch(caller.SessionId));
         var ask = new RequestPermissionRequest
         {
-            SessionId = parent.SessionId,
+            SessionId = caller.SessionId,
             ToolCall = new ToolCallUpdate { ToolCallId = callId, Title = what, Kind = ToolKind.Other, Status = ToolCallStatus.Pending, RawInput = input },
-            Options =
-            [
-                new PermissionOption { OptionId = "start", Name = "Start", Kind = PermissionOptionKind.AllowOnce },
-                new PermissionOption { OptionId = "decline", Name = "Don't start", Kind = PermissionOptionKind.RejectOnce },
-            ],
+            Options = [allow, decline],
         };
         while (true)
         {
             var client = await feed.WaitForClientAsync(_ => true, ct);
             try
             {
-                // A withdrawn spawn (ct) sends the client $/cancel_request for this request.
+                // A withdrawn request (ct) sends the client $/cancel_request for this request.
                 var answer = await client.Rpc.RequestAsync<RequestPermissionRequest, RequestPermissionResponse>(AcpMethods.Client.SessionRequestPermission, ask, ct);
                 return answer.Outcome;
             }
@@ -1148,6 +1158,43 @@ public sealed class Conductor : IAsyncDisposable
                 feed.Detach(client); // gone before answering: ask the next one
             }
         }
+    }
+
+    /// <summary>
+    /// For a session whose agent runs MCP tools without asking (<c>gorynych/unaskedMcpTools</c>, DSH):
+    /// asks the person on that session before a gorynych tool acts for them (<c>ask_agent</c>,
+    /// <c>archive_session</c>, <c>restore_session</c>), as every spawn is asked. Returns when
+    /// allowed; throws with what the agent is told otherwise. Other agents ask for their tools themselves.
+    /// </summary>
+    async Task ConfirmForUnaskingAgentAsync(string callerId, string what, JsonObject input, string text, PermissionOption allow, string declineName,
+        string declined, CancellationToken ct)
+    {
+        if (store.Get(callerId) is not { } caller || !HostOf(caller).UnaskedMcpTools) return;
+        using var use = await UseAsync(callerId, ct);
+        var callId = "gorynych-confirm-" + Interlocked.Increment(ref spawnCount);
+        RequestPermissionOutcome outcome;
+        try
+        {
+            outcome = await AskPersonAsync(use.Feed, use.Record, callId, what, input, text, allow,
+                new PermissionOption { OptionId = "decline", Name = declineName, Kind = PermissionOptionKind.RejectOnce }, ct);
+        }
+        catch (Exception e) when (e is OperationCanceledException or JsonRpcException)
+        {
+            await EndSpawnCardAsync(use.Feed, use.Record, callId, ToolCallStatus.Failed,
+                e is OperationCanceledException ? "Not done: the request was withdrawn." : $"Not done: {e.Message}");
+            throw;
+        }
+        if (outcome is RequestPermissionOutcomeCancelled)
+        {
+            await EndSpawnCardAsync(use.Feed, use.Record, callId, ToolCallStatus.Failed, "Not done: the turn was cancelled.");
+            throw new JsonRpcException(JsonRpcException.RequestCancelled, "The turn was cancelled, so nothing was done.");
+        }
+        if (outcome is not SelectedPermissionOutcome selected || selected.OptionId != allow.OptionId)
+        {
+            await EndSpawnCardAsync(use.Feed, use.Record, callId, ToolCallStatus.Failed, "Not done: the user declined.");
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, declined);
+        }
+        await EndSpawnCardAsync(use.Feed, use.Record, callId, ToolCallStatus.Completed, "Allowed by the user.");
     }
 
     Task EndSpawnCardAsync(SessionFeed feed, SessionRecord parent, string callId, ToolCallStatus status, string text) =>
@@ -1613,6 +1660,13 @@ public sealed class Conductor : IAsyncDisposable
         }
         using (use)
         {
+            if (from is not null && store.Get(target) is { Deleted: false } current && current.Archived != archived)
+                await ConfirmForUnaskingAgentAsync(from, $"{(archived ? "Archive" : "Restore")} {Who(current)}",
+                    new JsonObject { ["session_id"] = target },
+                    archived ? "Hides the session from the session lists; nothing in it is lost, and it can be restored." : "Brings the session back into the session lists.",
+                    new PermissionOption { OptionId = archived ? "archive" : "restore", Name = archived ? "Archive" : "Restore", Kind = PermissionOptionKind.AllowOnce },
+                    archived ? "Don't archive" : "Don't restore",
+                    $"The user declined to {(archived ? "archive" : "restore")} session_id {target}, so nothing changed.", ct);
             SessionRecord record;
             bool changed;
             await archiveGate.WaitAsync(ct);
@@ -1840,6 +1894,11 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.InvalidRequest,
                 $"This session is answering opinion request {answering}, so it cannot ask another session during this turn. " +
                 $"Send your answer with the reply tool, passing message_id \"{answering}\"; if another opinion would help, say so in the answer.");
+        if (from is not null && store.Get(target) is { Deleted: false } askedRecord)
+            await ConfirmForUnaskingAgentAsync(from, $"Ask {Who(askedRecord)} for an opinion",
+                new JsonObject { ["session_id"] = target, ["question"] = text }, text,
+                new PermissionOption { OptionId = "ask", Name = "Ask", Kind = PermissionOptionKind.AllowOnce }, "Don't ask",
+                $"The user declined to ask session_id {target}, so it was not asked. Go on without its opinion, or ask the user.", ct);
         // The asked agent sees who asks by the asking session's real ID, which it can pass to ask_agent;
         // sender (peer_claude) is only a label for GUIs.
         var origin = from is not null && store.Get(from) is { } asking ? $"from {Who(asking)}" : $"from {sender ?? "a Gorynych client"}";
@@ -2150,11 +2209,15 @@ public sealed class Conductor : IAsyncDisposable
         return new JsonObject { ["delivered"] = delivered };
     }
 
-    /// <summary>The option to choose for a pre-allowed gorynych tool, or null to ask the person.</summary>
-    static string? PreAllowed(JsonNode? @params)
+    /// <summary>
+    /// The option to choose for a pre-allowed gorynych tool, or null to ask the person. A request that
+    /// names its tool call by ID alone, as ACP allows, is matched by the title the call was published with.
+    /// </summary>
+    static string? PreAllowed(JsonNode? @params, SessionFeed feed)
     {
-        var request = AcpJson.FromNode<RequestPermissionRequest>(@params);
-        if (request?.ToolCall.Title is not { } title || !PreAllowedTools.Contains(title)) return null;
+        if (AcpJson.FromNode<RequestPermissionRequest>(@params) is not { } request
+            || (request.ToolCall.Title ?? feed.ToolTitle(request.ToolCall.ToolCallId)) is not { } title
+            || !PreAllowedTools.Contains(title)) return null;
         return (request.Options.FirstOrDefault(o => o.Kind == PermissionOptionKind.AllowOnce)
             ?? request.Options.FirstOrDefault(o => o.Kind.Value.StartsWith("allow", StringComparison.Ordinal)))?.OptionId;
     }

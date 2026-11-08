@@ -116,9 +116,10 @@ flowchart LR
   parent links), the router for questions between sessions, and the idle unload. Everything
   particular to an agent sits behind the [adapter contract](adapter-contract.md).
 - **Adapters are ACP agents.** An external one is an executable that speaks ACP over stdio
-  (`kimi acp`); an own one (Claude and Codex, later DeepSeek) is an assembly with an ACP
-  interface over an in-memory link, so moving it into its own process later means only
-  wrapping it in JSON-RPC.
+  (`kimi acp`); an own one (Claude and Codex) is an assembly with an ACP interface over an
+  in-memory link, so moving it into its own process later means only wrapping it in JSON-RPC.
+  DeepSeek Harness speaks ACP itself; its adapter is a thin in-process proxy in front of
+  `dsh --profile acp`.
 
 ## Claude Code without touching its configuration
 
@@ -175,10 +176,10 @@ All three have a structured protocol, so neither a terminal nor screen reading i
 | --- | --- | --- | --- |
 | [Kimi Code](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp) | `kimi acp`, native ACP | `session/request_permission`, `session/prompt` | **done**; recorded with Kimi Code 2.4.1, verified live on 7 November 2026 |
 | [Codex](https://learn.chatgpt.com/docs/app-server.md) | `codex app-server`, official JSON-RPC with a schema per version: item events, `turn/plan/updated` | approvals are server requests to the client; input is `turn/start` | **done**; types generated from codex-cli 0.167's schema, verified live on 8 November 2026 |
-| DeepSeek Harness | the native host's local HTTP API (`/api/session/projections`, `/api/session/list`); no official documentation | `/api/permission`, `/api/commands/execute` | **planned**; runs on an API key |
+| [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) | `dsh --profile acp`, native ACP (an automation profile: no titles, no load, no delete), behind a thin proxy | `session/request_permission`, only for sandbox escalations; `session/prompt` | **done**; DSH 0.2.2-rc.1, a developer preview on the user's API key, verified live on 9 November 2026 ([adapters.md](adapters.md#deepseek-harness)) |
 
-For DeepSeek the only ACP route found, `acp-llm-adapter`, wraps the bare model and loses the
-harness, so it is not used.
+DSH's earlier HTTP API (`/api/session/...` of `dsh web`) is not used: its ACP profile carries
+the harness itself.
 
 How messages travel, per harness:
 
@@ -187,8 +188,9 @@ How messages travel, per harness:
 - **A question from another agent:** into Claude's channel, answered with `reply`; to the
   others as an ordinary turn marked with the asking session ([below](#asking-another-session)).
 - **An approval:** Claude's `PermissionRequest`, Kimi's `session/request_permission`, Codex's
-  server request and DeepSeek's `/api/permission` all become one `session/request_permission`
-  card.
+  server request and DSH's `session/request_permission` all become one
+  `session/request_permission` card. DSH asks only for sandbox escalations; its sessions' shell
+  escalations are refused by the adapter, and the service asks before DSH's gorynych tool calls.
 
 ## The protocol: ACP and its extensions
 
@@ -389,16 +391,17 @@ Done in stage one:
 - Kimi through `kimi acp`, the second kind of adapter, which checked the whole model;
 - Codex through `codex app-server`, the second own adapter, with its permission modes as a
   selector (including Codex's automatic reviewer);
+- DeepSeek Harness through `dsh --profile acp` behind a thin proxy, with a read-only shell and
+  approved file writes;
 - questions between sessions, child sessions with reports, archive, list changes;
 - agents outside Gorynych, idle unload;
 - contract tests on recorded fixtures and a fake Claude, and opt-in live tests.
 
 Next, in order (**planned**):
 
-1. DeepSeek through its host's HTTP API.
-2. One GUI over several services: a combined session list, remote services over `ssh -T`. The
+1. One GUI over several services: a combined session list, remote services over `ssh -T`. The
    standard OpenSSH for Windows supports only asynchronous stdio and hangs on synchronous pipes.
-3. Questions between machines: the GUI is connected to both services and forwards the
+2. Questions between machines: the GUI is connected to both services and forwards the
    question itself, so the services need not know each other.
 
 ## Probe results

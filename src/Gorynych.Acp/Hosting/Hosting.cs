@@ -175,6 +175,13 @@ public static class GorynychProtocol
     public const string CapDraftsNotDurable = "gorynych/draftsNotDurable";
 
     /// <summary>
+    /// In <c>agentCapabilities._meta</c>: <c>true</c> when the agent runs MCP tools without asking
+    /// the person, so the service asks before the gorynych tools that act for the person:
+    /// <c>ask_agent</c>, <c>archive_session</c> and <c>restore_session</c> (docs/adapter-contract.md, §6.2).
+    /// </summary>
+    public const string CapUnaskedMcpTools = "gorynych/unaskedMcpTools";
+
+    /// <summary>
     /// On a <c>session/prompt</c> the service sends: the <c>messageId</c> under which the service
     /// journals the prompt's text, for an agent that can keep it with the message (docs/adapter-contract.md, §5).
     /// </summary>

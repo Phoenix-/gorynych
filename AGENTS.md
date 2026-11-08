@@ -14,10 +14,11 @@ architecture. Keep this file short: it is loaded into every agent session.
     `_`-prefixed, as ACP's extensibility rules say.
   - The service is an ACP conductor (see the proxy-chains RFD).
   - Adapters are ACP agents.
-- **Never edit an agent's own configuration** (`~/.claude`, `~/.codex`, `~/.kimi-code`).
+- **Never edit an agent's own configuration** (`~/.claude`, `~/.codex`, `~/.kimi-code`, `~/.dsh`).
   - Claude is integrated only through per-launch flags (`--settings` with http hooks,
     `--mcp-config`, channels, `--append-system-prompt`) and its PTY.
-  - Codex is integrated through `codex app-server`, Kimi through `kimi acp`.
+  - Codex is integrated through `codex app-server`, Kimi through `kimi acp`, DeepSeek Harness
+    through `dsh --profile acp` with a `--patch` file in Gorynych's data dir.
 - **Subscriptions.** Use only the user's own login on each machine, run the unmodified
   agent binaries, never copy credentials between machines and never serve other people.
 - **Native state is the source of truth.** Where a harness has a native attribute

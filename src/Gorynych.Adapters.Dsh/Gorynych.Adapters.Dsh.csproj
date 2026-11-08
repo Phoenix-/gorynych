@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Gorynych.Acp\Gorynych.Acp.csproj" />
+    <InternalsVisibleTo Include="Gorynych.Tests" />
+  </ItemGroup>
+</Project>

@@ -1,6 +1,38 @@
 # DeepSeek Harness adapter: specification
 
-**Draft for review.** Nothing is built. It rests on three sources:
+Approved 9 November 2026 and built on branch `claude/dsh-adapter`. The adapter as built is
+described in [docs/adapters.md](../docs/adapters.md#deepseek-harness), and the contract changes
+are in [docs/adapter-contract.md](../docs/adapter-contract.md). This file keeps the design and
+the probe results it rests on.
+
+The user's decisions at approval:
+
+1. **Sandbox: (c), `read-only` with `ask`, plus a Gorynych guard.**
+   - The proxy answers every shell escalation with a rejection itself, without asking the person,
+     so DSH's ACL sandbox never changes a folder. File-tool escalations go to the person as
+     approval cards (D5).
+   - The appended prompt says up front that the shell cannot write in Gorynych, so builds,
+     tests and installs are not available; files are changed with the file tools; reads,
+     searches and `git status` work.
+   - Checked live: on the refusal DSH tells the model `the user rejected …; stop and explain`.
+     The turn ends `end_turn`, and the model explains. ACP's rejection carries no reason, so
+     the prompt says in advance that this text is Gorynych's policy.
+   - No full-access option in this version (later work).
+   - The guard and the read-only patch apply per launch only.
+2. **C3:** `gorynych/unaskedMcpTools`; the service asks before `ask_agent`, `archive_session`
+   and `restore_session`, as before every spawn.
+3. **Telemetry off:** `DSH_TELEMETRY_DISABLED=1` (D13).
+4. **Titles:** the service's provisional title or the spawn name; no model titles (D9).
+
+C1–C8 as proposed.
+
+Deviation found while building: D2 removed `DSH_HOME` and `DSH_PERMISSION_MODE` from the launch
+environment. The adapter keeps both as inherited instead:
+- a `DSH_HOME` the user set is the home their own `dsh web` uses too;
+- the patch's `sandbox-policy` and `approval` rows replace the base rows that read
+  `DSH_PERMISSION_MODE`, so it has no effect.
+
+The draft as reviewed follows. It rested on three sources:
 
 - reading DSH's packages;
 - keyless probes in a scratch `DSH_HOME`;

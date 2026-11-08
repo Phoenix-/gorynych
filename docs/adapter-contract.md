@@ -4,7 +4,7 @@ What an agent adapter must do so that every Gorynych feature behaves the same fo
 agent, and what the service does with it. A new adapter (Codex, DeepSeek) is checked
 against this document; [adapters.md](adapters.md) keeps what is particular to each adapter
 that exists. Codex was the first adapter written from it rather than alongside it; what that
-changed is marked "(Codex)".
+changed is marked "(Codex)", and what DeepSeek Harness changed after it, "(DSH)".
 
 The contract is a profile of [ACP v1](https://agentclientprotocol.com/protocol/overview): an
 adapter is an ACP agent, and the service is its ACP client. The profile names the ACP methods
@@ -53,10 +53,13 @@ fallback when the adapter does not provide it.
   loaded ([§4](#4-opening-a-session-that-is-not-loaded)).
 - An adapter MUST run the unmodified agent binary or API client under the user's own login on
   that machine, MUST NOT copy credentials between machines, and MUST NOT edit the agent's own
-  configuration (`~/.claude`, `~/.codex`, `~/.kimi-code`). Everything it needs goes through
+  configuration (`~/.claude`, `~/.codex`, `~/.kimi-code`, `~/.dsh`). Everything it needs goes through
   per-launch flags, the agent's own protocol, hooks or a terminal.
 - The adapter's name (`IAgentAdapter.Name`, such as `claude`) is what the service records per
   session and what `spawn_session` takes; it MUST be stable.
+- An adapter MUST start its agent in a folder of its own, never in a session's folder: an agent
+  may read its launch folder's configuration (DSH loads its `.env` into its environment), which
+  would then hold for every session. (DSH)
 - An adapter MUST start its agent as a descendant of the service process, so that the MCP
   servers the agent starts from the user's own configuration are recognised as inside
   Gorynych: the `gorynych-outside` server, which the user registers for agents outside
@@ -115,6 +118,9 @@ the agent the `mcpServers` it gets ([§6.2](#62-the-gorynych-mcp-server)).
 - The service merges the agents' lists with its overlay, keeps titles and folders in one
   spelling, sorts and pages with its own cursor. A session the service knows that a running
   agent no longer lists is taken to be gone and left out.
+- So an adapter MUST list the sessions it has loaded. Where its agent leaves them out of its
+  own `session/list`, the adapter adds them to the first page, in the requested folder. DSH
+  leaves out the sessions open in its own process. (DSH)
 - The adapter SHOULD honour `cursor`. The service follows `nextCursor` for at most 20 pages.
 - An adapter whose harness has a native archive SHOULD leave archived sessions out of the
   default list, as ACP's draft archive RFD does ([§11](#11-archive)).
@@ -165,6 +171,8 @@ field names the message that each `agent_message_chunk`, `agent_thought_chunk` a
   message, never the same for two messages of the session, and taken from the harness where it
   has one (its native state is the source of truth), generated otherwise. Claude's are in
   [adapters.md](adapters.md#claude-code).
+- A thought and an answer are two messages. An adapter whose harness gives both one ID derives a
+  distinct, stable one for the thought (DSH: `<id>:thought`). (DSH)
 - The service passes an adapter's IDs on unchanged. Fallback: a chunk without one gets one from
   the service as it publishes it. Consecutive chunks of one kind are one message, as a client
   would infer without IDs, and any other part of the turn (a chunk of another kind or with its
@@ -226,6 +234,11 @@ prompt and a spawned session's first turn are not service turns.
   SHOULD title them `mcp__gorynych__<tool>`, as Kimi does, so the service can answer the
   first three itself. An adapter that approves tools on its own MUST allow exactly those three
   without asking (Claude's PermissionRequest hook). Fallback: the person is asked for all.
+- An adapter whose agent runs MCP tools without asking the person (DSH) MUST say so with
+  `agentCapabilities._meta["gorynych/unaskedMcpTools"]: true`. The service then asks the person
+  on the calling session before `ask_agent`, `archive_session` and `restore_session` act, the way
+  it asks before every spawn (allow once or decline; a decline fails the tool with a sentence
+  for the agent). An archive or restore that would change nothing is not asked. (DSH)
 - Fallback without the server: the agent cannot ask, answer, spawn or archive; an opinion
   asked as a turn is answered with the turn's text.
 
@@ -250,6 +263,10 @@ prompt and a spawned session's first turn are not service turns.
 - Fallback without the capability: the agent learns the tools from the server's MCP
   `instructions` and the tools' descriptions, and each request's or report's text says what to
   do (Kimi).
+- An adapter whose agent takes instructions only per process (DSH: a `--patch` with
+  `personaSuffix`) applies the service's text at launch, from its options, and does not advertise
+  the capability. It MAY add text of its own for that harness (DSH names the gorynych tools in
+  full, since the harness has a `list_agents` of its own). (DSH)
 
 ### 6.3 Answering with reply
 
@@ -329,8 +346,14 @@ in the middle of one.
   never as an approval. (Codex) The service
   relays each to the client that attached to the session last, waits while none is attached,
   and asks the next client if one goes away before answering.
+- ACP lets a permission request name its tool call by `toolCallId` alone. The adapter SHOULD
+  send the tool call's title and input with the request (DSH's adapter fills them from the
+  earlier `tool_call`). The service's pre-allow also matches a bare request by the title the call
+  was published with. (DSH)
 - When the agent abandons a question, the adapter SHOULD withdraw it with `$/cancel_request`;
-  the service withdraws it from the client too.
+  the service withdraws it from the client too. Where the agent drops its own question without
+  withdrawing it (DSH on a cancel), the adapter withdraws it when the tool call ends or the
+  prompt does, and drops a late answer. (DSH)
 - Forms MAY be `elicitation/create` in form mode. The service relays them to a client that
   declared forms; for one that did not, it asks each choice field as a
   `session/request_permission` and declines a form with free text. The adapter SHOULD handle a
@@ -392,30 +415,32 @@ archive closes an active session, and an agent MAY refuse to load or resume an a
 
 ## 13. Conformance
 
-Claude, Kimi and Codex as built; DeepSeek as expected, nothing built. The Codex column is
-Codex 0.167.0 as built and probed on 8 November 2026 ([adapters.md](adapters.md#codex));
-`codex app-server` speaks its own JSON-RPC, not ACP, so its adapter translates, like Claude's.
+Claude, Kimi, Codex and DeepSeek Harness as built. The Codex column is Codex 0.167.0 as built
+and probed on 8 November 2026 ([adapters.md](adapters.md#codex)); `codex app-server` speaks its
+own JSON-RPC, not ACP, so its adapter translates, like Claude's. The DSH column is DeepSeek
+Harness 0.2.2-rc.1 as built and probed on 9 November 2026 ([adapters.md](adapters.md#deepseek-harness));
+DSH speaks ACP, and its adapter is a thin proxy.
 
-| Feature | Claude Code (in-process adapter, TUI in a pseudo console) | Kimi Code 2.5.2 (`kimi acp`, native ACP) | Codex 0.167 (in-process adapter over `codex app-server`) | DeepSeek, expected |
+| Feature | Claude Code (in-process adapter, TUI in a pseudo console) | Kimi Code 2.5.2 (`kimi acp`, native ACP) | Codex 0.167 (in-process adapter over `codex app-server`) | DeepSeek Harness 0.2.2-rc.1 (`dsh --profile acp`, native ACP, in-process proxy) |
 | --- | --- | --- | --- | --- |
-| Capabilities | list, resume, close | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable` | list, load, close, delete over its own store |
-| New ([§3](#3-new-sessions-the-list-and-discovery)) | UUID from the adapter; recorded at the first prompt | `session_…`; a real session at once, listed untitled | `thread/start`; nothing on disk before the first turn | its own store: the adapter keeps the history, since DeepSeek has no session store; ID scheme to be chosen |
-| List | the adapter's own list of the sessions it started | Kimi's list; leaves natively archived sessions out; ignores `cursor` | `thread/list` (`cursor`, `limit`, exact `cwd`); archived left out; title = the thread's `name` | its own store |
-| Open not loaded ([§4](#4-opening-a-session-that-is-not-loaded)) | `session/resume` only registers; the process starts with the next prompt | `session/resume` | `thread/resume`, `excludeTurns`; `session/load` replays `thread/items/list`; fails while another Codex process has the thread (one writer) or when it is archived in Codex | `session/load` from its own store, which MUST keep the whole history |
-| Turns ([§5](#5-prompts-and-turns)) | bracketed paste into the TUI; `Stop` hook ends the turn | native | `turn/start`; `turn/interrupt` for `session/cancel` | API calls |
-| Service turns and waking ([§6.1](#61-waking-a-session-and-closing-it-again)) | turns start the process; unloaded after the idle time | turns; resumed, then unloaded after the idle time | turns; resumed, then unloaded after its 2-minute idle time | expected the same |
-| `gorynych` MCP server ([§6.2](#62-the-gorynych-mcp-server)) | per-launch `--mcp-config` | through ACP `mcpServers` | per-thread `config.mcp_servers` on `thread/start` and every `thread/resume` (kept only while loaded) | unknown: depends on its MCP client |
-| System prompt ([§6.2](#62-the-gorynych-mcp-server)) | `sessionCapabilities.systemPrompt: {}` (append only): `--append-system-prompt`, after the channel's authorization; other modes and non-text content fail with `-32602` | not advertised by 2.5.2: the MCP instructions and the requests' texts | append only: `developerInstructions`; Codex keeps those a thread was created with | expected: append, and override too, since the adapter writes the system message itself |
-| Hidden from `gorynych-outside` ([§1](#1-building-and-starting-an-adapter)) | yes: `claude` is the service's child and starts MCP servers as its own children (probe); the adapter's `--settings` also denies `mcp__gorynych-outside` | yes: `kimi acp` is the service's child and starts MCP servers as its own children (probe) | yes: `codex.exe` is the service's child and starts MCP servers as its own children (probe); also turned off per thread when the user registered it | unknown: depends on its MCP client |
+| Capabilities | list, resume, close | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable` | list, resume, close; `gorynych/unloadAfter` 120, `gorynych/unaskedMcpTools` |
+| New ([§3](#3-new-sessions-the-list-and-discovery)) | UUID from the adapter; recorded at the first prompt | `session_…`; a real session at once, listed untitled | `thread/start`; nothing on disk before the first turn | UUID from DSH; durable at once, never titled, so an unused draft gets a tombstone |
+| List | the adapter's own list of the sessions it started | Kimi's list; leaves natively archived sessions out; ignores `cursor` | `thread/list` (`cursor`, `limit`, exact `cwd`); archived left out; title = the thread's `name` | DSH's `{sessionId, cwd}` with cursor and `cwd`; the sessions open in DSH added back by the proxy; no title or `updatedAt` |
+| Open not loaded ([§4](#4-opening-a-session-that-is-not-loaded)) | `session/resume` only registers; the process starts with the next prompt | `session/resume` | `thread/resume`, `excludeTurns`; `session/load` replays `thread/items/list`; fails while another Codex process has the thread (one writer) or when it is archived in Codex | `session/resume`, about 0.2 s; fails while `dsh web` or another DSH process has the session (one writer); no `session/load` |
+| Turns ([§5](#5-prompts-and-turns)) | bracketed paste into the TUI; `Stop` hook ends the turn | native | `turn/start`; `turn/interrupt` for `session/cancel` | native; subagents run inside the prompt |
+| Service turns and waking ([§6.1](#61-waking-a-session-and-closing-it-again)) | turns start the process; unloaded after the idle time | turns; resumed, then unloaded after the idle time | turns; resumed, then unloaded after its 2-minute idle time | turns; resumed, then unloaded after its 2-minute idle time |
+| `gorynych` MCP server ([§6.2](#62-the-gorynych-mcp-server)) | per-launch `--mcp-config` | through ACP `mcpServers` | per-thread `config.mcp_servers` on `thread/start` and every `thread/resume` (kept only while loaded) | through ACP `mcpServers` on new and every resume |
+| System prompt ([§6.2](#62-the-gorynych-mcp-server)) | `sessionCapabilities.systemPrompt: {}` (append only): `--append-system-prompt`, after the channel's authorization; other modes and non-text content fail with `-32602` | not advertised by 2.5.2: the MCP instructions and the requests' texts | append only: `developerInstructions`; Codex keeps those a thread was created with | per launch: `personaSuffix` in the `--patch`, not advertised |
+| Hidden from `gorynych-outside` ([§1](#1-building-and-starting-an-adapter)) | yes: `claude` is the service's child and starts MCP servers as its own children (probe); the adapter's `--settings` also denies `mcp__gorynych-outside` | yes: `kimi acp` is the service's child and starts MCP servers as its own children (probe) | yes: `codex.exe` is the service's child and starts MCP servers as its own children (probe); also turned off per thread when the user registered it | yes: DSH (node) is the service's child and starts MCP servers as its own children (probe) |
 | … on Linux and macOS | only the deny rule would hide it; the adapter itself runs on Windows only yet (ConPTY) | not hidden: the parent walk is Windows only yet, so every caller counts as outside | hidden: turned off per thread | not hidden, as for Kimi |
-| Message IDs ([§5](#5-prompts-and-turns)) | answers: `MessageDisplay`'s `message_id`; typed and channel messages: the hook's `prompt_id` (the transcript's `promptId`), a new UUID for a channel message within a turn; texts Claude gives no ID: a new UUID | none sent by 2.5.2: the service assigns them | item IDs (`msg_…`, `rs_…`, UUIDv7 user messages); the service's prompt ID kept as `clientUserMessageId` | its own store's IDs |
-| Live-note path ([§6.4](#64-the-live-note-path)) | development channel; `-32600` while not running | none (`-32601`) | none (`-32601`); `turn/steer` could carry notes into a running turn later | none |
-| Turns of its own marked ([§7](#7-closing-and-unloading)) | yes: channel and terminal turns, from `UserPromptSubmit` to `Stop` or exit | none to mark: Kimi runs no turn of its own | none: one writer, so the adapter's process drives every turn | none |
-| Approvals ([§8](#8-approvals-and-forms)) | PermissionRequest hook; pre-allows the three tools | Kimi's own `session/request_permission`; the service pre-allows | command, file change, permissions and MCP tool approvals; no option that writes `~/.codex`; the gorynych tools ask the person | unknown |
-| Forms | `AskUserQuestion` as `elicitation/create` | none seen | `item/tool/requestUserInput` and MCP form elicitations as `elicitation/create`; URL elicitations declined | unknown |
-| Titles ([§9](#9-titles)) | `ai-title` / `custom-title` from the transcript; no way to set one | the first prompt, cut at 200 characters; no way to set one | `thread/name/updated`; `_gorynych/set_title` → `thread/name/set` for spawn names | its own |
-| Close ([§7](#7-closing-and-unloading)) | ends the process | `session/close`, still listed | `turn/interrupt`, up to 5 s for the turn to end, then `thread/unsubscribe` (unloads an idle thread at once) | frees nothing native |
-| Delete ([§10](#10-delete)) | none: a tombstone | `session/delete` (`-32602` for an unknown one) | `thread/delete` (also deletes Codex's own sub-agent threads); a thread Codex lacks: `-32002` | its own store |
+| Message IDs ([§5](#5-prompts-and-turns)) | answers: `MessageDisplay`'s `message_id`; typed and channel messages: the hook's `prompt_id` (the transcript's `promptId`), a new UUID for a channel message within a turn; texts Claude gives no ID: a new UUID | none sent by 2.5.2: the service assigns them | item IDs (`msg_…`, `rs_…`, UUIDv7 user messages); the service's prompt ID kept as `clientUserMessageId` | DSH's on answers; thoughts as `<id>:thought` |
+| Live-note path ([§6.4](#64-the-live-note-path)) | development channel; `-32600` while not running | none (`-32601`) | none (`-32601`); `turn/steer` could carry notes into a running turn later | none (`-32601`) |
+| Turns of its own marked ([§7](#7-closing-and-unloading)) | yes: channel and terminal turns, from `UserPromptSubmit` to `Stop` or exit | none to mark: Kimi runs no turn of its own | none: one writer, so the adapter's process drives every turn | none marked: autonomous work after a cancel falls back to idle since the last update |
+| Approvals ([§8](#8-approvals-and-forms)) | PermissionRequest hook; pre-allows the three tools | Kimi's own `session/request_permission`; the service pre-allows | command, file change, permissions and MCP tool approvals; no option that writes `~/.codex`; the gorynych tools ask the person | sandbox escalations only: a shell escalation refused by the proxy, a file write asks the person; MCP tools unasked, so the service asks before `ask_agent`, `archive_session`, `restore_session` |
+| Forms | `AskUserQuestion` as `elicitation/create` | none seen | `item/tool/requestUserInput` and MCP form elicitations as `elicitation/create`; URL elicitations declined | none (no ask tool, no elicitation in the acp profile) |
+| Titles ([§9](#9-titles)) | `ai-title` / `custom-title` from the transcript; no way to set one | the first prompt, cut at 200 characters; no way to set one | `thread/name/updated`; `_gorynych/set_title` → `thread/name/set` for spawn names | none over ACP: the provisional title |
+| Close ([§7](#7-closing-and-unloading)) | ends the process | `session/close`, still listed | `turn/interrupt`, up to 5 s for the turn to end, then `thread/unsubscribe` (unloads an idle thread at once) | `session/close`: cancels a running prompt, drains DSH's subagents |
+| Delete ([§10](#10-delete)) | none: a tombstone | `session/delete` (`-32602` for an unknown one) | `thread/delete` (also deletes Codex's own sub-agent threads); a thread Codex lacks: `-32002` | none: a tombstone (`dsh web` can delete) |
 | Archive ([§11](#11-archive)) | none: the overlay | native in Kimi's UI, not in `kimi acp`: the overlay | native, but an archived thread cannot be resumed: the overlay; Codex-archived threads left out | none: the overlay |
 
 ## 14. Checking a new adapter
@@ -444,7 +469,7 @@ Codex 0.167.0 as built and probed on 8 November 2026 ([adapters.md](adapters.md#
 - **Permissions across harnesses.** Whether the service should pre-allow some tools, and how, is
   left for one pass over Claude, Kimi and Codex together. Codex's MCP tool approvals reach the
   person today.
-- **Titles.** Neither Claude nor Kimi lets the service set a native title; Codex does.
+- **Titles.** Neither Claude, Kimi nor DSH lets the service set a native title; Codex does.
 - **Kimi's cursor.** Kimi 2.5.2 ignores `session/list`'s `cursor`
   ([adapters.md](adapters.md#kimi-code)).
 - **A client's system prompt.** The service does not advertise `sessionCapabilities.systemPrompt`

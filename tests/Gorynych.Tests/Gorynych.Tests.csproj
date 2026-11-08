@@ -16,6 +16,7 @@
     <ProjectReference Include="..\..\src\Gorynych.Service\Gorynych.Service.csproj" />
     <ProjectReference Include="..\..\src\Gorynych.Adapters.Claude\Gorynych.Adapters.Claude.csproj" />
     <ProjectReference Include="..\..\src\Gorynych.Adapters.Codex\Gorynych.Adapters.Codex.csproj" />
+    <ProjectReference Include="..\..\src\Gorynych.Adapters.Dsh\Gorynych.Adapters.Dsh.csproj" />
     <!-- Built first so the adapter tests can launch it; not referenced as an assembly. -->
     <ProjectReference Include="..\Gorynych.FakeClaude\Gorynych.FakeClaude.csproj" ReferenceOutputAssembly="false" />
     <!-- Built first so the outside tests can launch it; its shared types are tested through the service. -->

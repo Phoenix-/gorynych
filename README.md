@@ -11,8 +11,8 @@ other for opinions and start child sessions.
 
 - **Native agents.** Claude Code runs as its interactive TUI in a pseudo console, driven only
   by per-launch flags (http hooks, an MCP config, a channel). Kimi Code runs through
-  `kimi acp`, Codex through `codex app-server`. Gorynych never edits an agent's own
-  configuration.
+  `kimi acp`, Codex through `codex app-server`, DeepSeek Harness through `dsh --profile acp`
+  with a per-launch patch. Gorynych never edits an agent's own configuration.
 - **ACP everywhere.** A per-machine service speaks the
   [Agent Client Protocol](https://agentclientprotocol.com) v1 to its clients and to its
   adapters: to a client it is one ACP agent with many sessions, to the agents an ACP client.
@@ -32,6 +32,7 @@ flowchart LR
   svc --> claude[Claude Code TUI]
   svc --> kimi[kimi acp]
   svc --> codex[codex app-server]
+  svc --> dsh[dsh --profile acp]
   outside[agents outside Gorynych] -- MCP --> shim[gorynych-outside] --> svc
 ```
 
@@ -44,6 +45,9 @@ The design, its decisions and the probes behind them: [docs/design.md](docs/desi
 - **Kimi Code** through `kimi acp`.
 - **Codex** through `codex app-server`: feed, approvals and questions, Codex's permission modes
   (including its automatic reviewer, "Approve for me"), model and effort, names, resume.
+- **DeepSeek Harness** through `dsh --profile acp` (a developer preview, on your own DeepSeek
+  API key): feed, model and effort, resume. Its shell is read-only in Gorynych, and every file
+  write asks you, so DSH's Windows sandbox never changes a folder's ACL.
 - **Peers:** `list_agents`, `ask_agent` in both directions, `spawn_session` with reports to the
   parent, archive and restore.
 - **Outside access:** the `gorynych-outside` MCP server lets agents outside Gorynych (Claude Code
@@ -51,7 +55,7 @@ The design, its decisions and the probes behind them: [docs/design.md](docs/desi
   one for its opinion.
 - **Idle unload:** a session nobody uses is unloaded from its agent after 10 minutes
   (`--unload-after`) and woken again when a client, a question or a report needs it.
-- **Zed** through the bridge, `Gorynych.Service acp --agent claude|kimi|codex`.
+- **Zed** through the bridge, `Gorynych.Service acp --agent claude|kimi|codex|dsh`.
 
 Claude Code delivers other agents' questions through development channels, a Claude Code
 research preview. Gorynych asks you once before it starts Claude with them; without them the
@@ -59,7 +63,6 @@ questions arrive as ordinary turns.
 
 ## Planned
 
-- DeepSeek through its host's HTTP API.
 - Claude on Linux and macOS (a Unix PTY host).
 - One GUI over several machines: remote services over `ssh -T`, questions between machines.
 - The [Zed fork](https://github.com/Phoenix-/zed) (in progress): automatic pickup of sessions and the session tree.
@@ -70,7 +73,9 @@ questions arrive as ordinary turns.
   on Linux and macOS, where only Kimi runs today.
 - The [.NET 10 SDK](https://dotnet.microsoft.com/download) to build.
 - The agents you want, installed and logged in with your own account: `claude` (Claude Code),
-  `kimi` (Kimi Code, `kimi login`), `codex` (Codex CLI, `codex login`).
+  `kimi` (Kimi Code, `kimi login`), `codex` (Codex CLI, `codex login`), `dsh` (DeepSeek
+  Harness, `npm install -g @deepseek-ai/dsh`, with your DeepSeek API key set in `dsh web`) and
+  Node.js for it.
 - An ACP client, such as Zed.
 
 Setup (Zed settings, publishing the service, registering the outside server):

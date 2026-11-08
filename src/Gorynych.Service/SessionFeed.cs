@@ -401,6 +401,33 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         runKind = null;
     }
 
+    readonly Dictionary<string, string> toolTitles = [];
+    readonly Queue<string> toolTitleOrder = new();
+
+    /// <summary>
+    /// The title of a tool call published on this feed, for an approval that names the call by
+    /// <c>toolCallId</c> alone, as ACP allows (docs/adapter-contract.md, §8). Kept for the latest 64 calls.
+    /// </summary>
+    public string? ToolTitle(string toolCallId)
+    {
+        lock (toolTitles) return toolTitles.GetValueOrDefault(toolCallId);
+    }
+
+    void RememberToolTitle(JsonObject update)
+    {
+        if ((string?)update["sessionUpdate"] is not ("tool_call" or "tool_call_update")
+            || (string?)update["toolCallId"] is not { } id || (string?)update["title"] is not { Length: > 0 } title) return;
+        lock (toolTitles)
+        {
+            if (!toolTitles.ContainsKey(id))
+            {
+                toolTitleOrder.Enqueue(id);
+                if (toolTitleOrder.Count > 64) toolTitles.Remove(toolTitleOrder.Dequeue());
+            }
+            toolTitles[id] = title;
+        }
+    }
+
     /// <summary>Journals an update, runs <paramref name="remember"/>, and sends it to the attached clients.</summary>
     /// <param name="journal">False sends it without journaling it.</param>
     public async Task PublishAsync(JsonObject update, ClientConnection? except, Action remember, bool journal = true)
@@ -410,6 +437,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         {
             if (Retired) return; // a late update of a deleted session must not bring its journal back
             StampMessageId(update);
+            RememberToolTitle(update);
             if (journal) Journal.Append(update);
             remember();
             foreach (var client in Clients())
