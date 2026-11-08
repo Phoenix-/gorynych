@@ -74,7 +74,10 @@ and what the service does about it:
 - `session/close` is sent, because the service advertises `close`, when Zed drops a thread:
   a thread or draft removed or replaced, idle threads beyond the five it keeps, an
   abandoned new or load. Archiving and quitting send nothing. The service closes a session in
-  its agent only when no other client has it open.
+  its agent only when no other client has it open. When Zed quits, the service takes the
+  bridge going away as letting go of every session Zed had open: each is closed in its agent
+  once its running turn ends, unless another client has it open or an approval in it waits
+  for an answer ([service-protocol.md](service-protocol.md#letting-go-of-a-session)).
 - Archiving is local to Zed: stock Zed sends nothing, so the service and its agents see the
   session as merely closed and keep listing it (`list_agents` too). A client that wants the
   service to know calls `_gorynych/archive` ([service-protocol.md](service-protocol.md#archive)).

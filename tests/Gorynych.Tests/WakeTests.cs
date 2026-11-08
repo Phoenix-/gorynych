@@ -9,7 +9,7 @@ namespace Gorynych.Tests;
 /// <summary>
 /// Service turns (opinions and reports) for a session that is not loaded in its agent, or whose
 /// agent is not running (Claude): the service loads or starts it for the turn, and closes it
-/// again after its last service turn, unless a client took it over meanwhile
+/// again after its last service turn, unless a client has it open by then
 /// (docs/adapter-contract.md, "Service turns").
 /// </summary>
 [TestClass]
@@ -52,12 +52,20 @@ public sealed class WakeTests
         client.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion,
             new JsonObject { ["sessionId"] = target, ["text"] = "Done?", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token } });
 
-    /// <summary>A session one client made and prompted, then left; <paramref name="close"/> also closes it in its agent.</summary>
+    /// <summary>
+    /// A session one client made and prompted, then left: with <c>session/close</c>
+    /// (<paramref name="close"/>) or by going away without it. Either way it is closed in its agent.
+    /// </summary>
     static async Task<string> LeftSessionAsync(Conductor conductor, string agent, string text, bool close)
     {
-        await using var owner = await TestClient.ConnectAsync(conductor, "owner");
-        var id = await NewPromptedAsync(owner, agent, text);
-        if (close) await CloseAsync(owner, id);
+        string id;
+        await using (var owner = await TestClient.ConnectAsync(conductor, "owner"))
+        {
+            id = await NewPromptedAsync(owner, agent, text);
+            if (close) await CloseAsync(owner, id);
+        }
+        await conductor.CleanupsIdleAsync();
+        Assert.IsFalse(conductor.Agents[agent].IsLive(id), "closed in its agent once its client left");
         return id;
     }
 
@@ -108,7 +116,7 @@ public sealed class WakeTests
         var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true, Running = false };
         var kimi = new LifecycleAgent("kimi", canDelete: true);
         await using var conductor = Conductor(claude.Adapter, kimi.Adapter);
-        // Registered in the adapter (open), but its Claude process is not running.
+        // Its client went away without closing it, and its Claude process does not start until a prompt.
         var target = await LeftSessionAsync(conductor, "claude", "Write the notes", close: false);
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var asker = await NewPromptedAsync(zed, "kimi", "Coordinate the release");
@@ -118,7 +126,7 @@ public sealed class WakeTests
         Assert.AreEqual("ok", (string?)answer!["text"], "asked in a turn: the turn's text, since this fake does not call reply");
         StringAssert.StartsWith(claude.Prompts.Last().Text, $"[Opinion request · from session_id {asker} (kimi, \"Coordinate the release\") · message_id m");
         await Until(() => claude.CallsFor(target).Last() == Close, "the close after the turn");
-        CollectionAssert.AreEqual(new[] { Opinion, Prompt, Close }, CallsFrom(claude, target, Opinion));
+        CollectionAssert.AreEqual(new[] { Resume, Opinion, Prompt, Close }, CallsFrom(claude, target, Resume));
         await Until(() => !conductor.Agents["claude"].IsLive(target), "unloaded again");
     }
 
@@ -128,8 +136,10 @@ public sealed class WakeTests
         var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
         var kimi = new LifecycleAgent("kimi", canDelete: true);
         await using var conductor = Conductor(claude.Adapter, kimi.Adapter);
-        var loadedKimi = await LeftSessionAsync(conductor, "kimi", "Fix the flaky test", close: false);
-        var runningClaude = await LeftSessionAsync(conductor, "claude", "Write the notes", close: false);
+        // A client has both open: Kimi has one loaded, and Claude's process runs for the other.
+        await using var owner = await TestClient.ConnectAsync(conductor, "owner");
+        var loadedKimi = await NewPromptedAsync(owner, "kimi", "Fix the flaky test");
+        var runningClaude = await NewPromptedAsync(owner, "claude", "Write the notes");
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var asker = await NewPromptedAsync(zed, "kimi", "Coordinate the release");
 
@@ -144,7 +154,7 @@ public sealed class WakeTests
     }
 
     [TestMethod]
-    public async Task AClientThatOpensTheWokenSessionMeanwhile_KeepsItOpen()
+    public async Task AClientThatOpensTheWokenSessionMeanwhile_KeepsItOpen_UntilItGoes()
     {
         var claude = new LifecycleAgent("claude", canDelete: false);
         var kimi = new LifecycleAgent("kimi", canDelete: true);
@@ -164,11 +174,13 @@ public sealed class WakeTests
             await asking;
             await Task.Delay(300);
             await conductor.CleanupsIdleAsync();
+            Assert.AreEqual(Prompt, kimi.CallsFor(target).Last(), "not closed while the client has it open");
+            Assert.IsTrue(conductor.Agents["kimi"].IsLive(target));
         }
-        await Task.Delay(200); // the client is gone now; it took the session over all the same
+        await conductor.CleanupsIdleAsync(); // gone without closing it: that lets go of it all the same
 
-        Assert.AreEqual(Prompt, kimi.CallsFor(target).Last(), "not closed");
-        Assert.IsTrue(conductor.Agents["kimi"].IsLive(target));
+        Assert.AreEqual(Close, kimi.CallsFor(target).Last());
+        Assert.IsFalse(conductor.Agents["kimi"].IsLive(target));
     }
 
     [TestMethod]

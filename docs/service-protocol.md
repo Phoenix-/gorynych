@@ -40,7 +40,7 @@ server ([Agents outside Gorynych](#agents-outside-gorynych)).
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. Returns the session state (below). |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
-| `session/close` | Detaches the client. Only when no other client has the session open is it closed in its agent, or, for a draft, discarded (see below). |
+| `session/close` | Detaches the client. Only when no other client has the session open is it closed in its agent, or, for a draft, discarded (see below). A client that disconnects without it lets go of its sessions all the same, once nothing uses them ([Letting go of a session](#letting-go-of-a-session)). |
 | `session/delete` | Closes the session in its agent if it is open, then deletes it there if the agent can (`sessionCapabilities.delete`); otherwise the overlay keeps a tombstone. Drops the journal. A session only the agent knows is found through its list; an unknown or already deleted session succeeds. |
 | anything else with a `sessionId` | Forwarded to the session's agent. |
 
@@ -80,8 +80,9 @@ is declined for it. Toward its adapters the service declares form elicitation, s
 relays or translates them. If none is attached the request waits; if
 the client disconnects before answering it goes to the next one. So an approval raised
 while the GUI is closed appears when the GUI loads the session again, right after the
-replay. When the agent withdraws the request (`$/cancel_request`), it is withdrawn from the
-client too.
+replay; meanwhile the session stays loaded in its agent
+([Letting go of a session](#letting-go-of-a-session)). When the agent withdraws the request
+(`$/cancel_request`), it is withdrawn from the client too.
 
 A client that stops reading for 15 seconds is disconnected, so one stuck GUI cannot stall
 the agent whose updates it is not taking. Notifications that belong to no session
@@ -176,8 +177,8 @@ How a request reaches the asked agent depends on what it has:
 
 A session that is not loaded in its agent is loaded for the request, and one whose agent is
 not running is started by the turn. A session the service woke only for such turns (opinion
-requests and reports) is closed again after the last of them, unless a client opened it
-meanwhile; a session that was loaded and running stays as it was. An archived session is woken
+requests and reports) is closed again after the last of them, unless a client has it open by
+then; a session that was loaded and running stays as it was. An archived session is woken
 the same way and stays archived. The rules for adapters are in
 [adapter-contract.md](adapter-contract.md#6-service-turns-opinions-and-reports).
 
@@ -885,6 +886,37 @@ every agent, and the service never writes an agent's own files for it.
   leaves it out unless `include_archived` is true, and so do the hint lists in the peer tools'
   errors; `ask_agent` reaches it all the same and leaves it archived.
 - A report to an archived parent is dropped ([Reports](#reports)).
+
+## Letting go of a session
+
+A client lets go of a session with `session/close`, or by disconnecting without it: Zed quits
+without closing anything ([external-clients.md](external-clients.md#what-zed-does-with-sessions)),
+and a client that stops reading is disconnected. That counts for every session the client
+attached to and has not closed, also one it was detached from on the way because a request or
+an update to it failed first. When the last client attached to a session lets go of it, the
+service closes the session in its agent (`session/close`), so the agent frees what it holds
+(Kimi's session in memory, Claude's process) and the lists show it `saved`. A draft is
+discarded instead ([Drafts and deletion](#drafts-and-deletion)). With two clients on a session,
+one that goes leaves the session with the other.
+
+After a disconnect the close waits, in the background, until nothing uses the session:
+
+- **A turn is running**: the person's (it outlives its client, see `session/prompt`), an
+  opinion request's or a report's. The session is closed when the turn ends.
+- **An operation is registered** on it: a load, a prompt waiting for the running turn, an
+  `ask_agent` or `read_session` in flight. The session is closed when the last one ends.
+- **A request of its agent waits for a client** (an approval or a form, see above). The session
+  stays loaded, so a client that comes back can answer it and the turn can go on (that
+  client then has the session open). Without one, it is closed once the agent withdraws the
+  request and nothing else uses it.
+
+The close checks all this again under the session's gate (the one a discard holds,
+[Drafts and deletion](#drafts-and-deletion) step 1), so a client that loads, resumes or prompts
+the session before the close keeps it open, and one that comes back while the close is under
+way waits for it and opens the session again. A session the service woke for its own turns is
+closed the same way after them ([Opinions between agents](#opinions-between-agents)). A turn
+the service does not run is not seen: one that Claude's channel starts for a report delivered
+through it can be stopped by the close.
 
 ## Drafts and deletion
 

@@ -184,8 +184,9 @@ prompt and a spawned session's first turn are not service turns.
   the request as a turn instead, which starts it.
 - A session the service opened or started only for service turns is closed again
   (`session/close`) after the last of them, unless a client opened, prompted or otherwise used
-  it meanwhile (it then stays with that client), or another service turn waits for it (the
-  last one closes it). A session that was already loaded and running stays as it was.
+  it meanwhile (it then stays while that client has it open), or another service turn waits
+  for it (the last one closes it). A session that was already loaded and running stays as it
+  was.
 - The adapter SHOULD implement `session/close` so this frees the agent's resources
   ([§7](#7-closing-and-unloading)). Fallback: the session stays loaded.
 - An archived session is woken the same way and stays archived.
@@ -271,6 +272,11 @@ in the middle of one.
   listed and can be opened again.
 - The service sends it when the last client lets go of a session, after the service turns of
   a session it woke ([§6.1](#61-waking-a-session-and-closing-it-again)), and before a delete.
+  A client that disconnects without `session/close` (Zed when it quits) lets go all the same;
+  then the service waits until the session's turn ends and no request of the agent waits for
+  a client (an approval or a form keeps the session loaded, so a client that comes back can
+  answer it). It cannot see a turn the adapter runs on its own (Claude's channel): closing the
+  session stops that one ([service-protocol.md](service-protocol.md#letting-go-of-a-session)).
 - Fallback without it: before a delete the service sends `session/cancel` instead, and nothing
   is ever unloaded until the adapter restarts.
 

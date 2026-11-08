@@ -29,6 +29,20 @@ internal sealed class ClientConnection
 
     public JsonRpcConnection Rpc { get; }
 
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> held = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The sessions this client attached to and has not closed. When it goes away it lets go of
+    /// each, also of one it was detached from on the way, because a request or an update to it
+    /// failed before the service saw it go.
+    /// </summary>
+    public ICollection<string> Held => held.Keys;
+
+    public void Hold(string sessionId) => held[sessionId] = 0;
+
+    /// <summary>The client closed the session with <c>session/close</c>.</summary>
+    public void Release(string sessionId) => held.TryRemove(sessionId, out _);
+
     /// <summary>True when the client sent <c>session/cancel</c> for the session after the message at <paramref name="sequence"/>.</summary>
     public bool CancelledAfter(string sessionId, long sequence) => cancelledAt.TryGetValue(sessionId, out var at) && at > sequence;
 

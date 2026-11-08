@@ -40,7 +40,10 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
 
     int users;
 
-    /// <summary>Operations using the session now: loads, resumes, prompts, opinions, forwarded requests.</summary>
+    /// <summary>
+    /// Operations using the session now: loads, resumes, prompts, opinions, forwarded requests, and
+    /// the agent's requests on their way to a client.
+    /// </summary>
     public int Users => Volatile.Read(ref users);
 
     public void EnterUse() => Interlocked.Increment(ref users);
@@ -202,7 +205,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         lock (clientsGate) return clients.Where(c => !c.Rpc.IsClosed).ToArray();
     }
 
-    /// <summary>Attaches a client; it becomes the first choice for the session's requests.</summary>
+    /// <summary>Attaches a client; it becomes the first choice for the session's requests, and holds the session.</summary>
     public void Attach(ClientConnection client)
     {
         TaskCompletionSource signal;
@@ -214,6 +217,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             signal = clientAttached;
             clientAttached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         }
+        client.Hold(SessionId);
         signal.TrySetResult();
     }
 
