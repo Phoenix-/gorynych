@@ -190,7 +190,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         var text = (string?)request.Params?["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
         var session = Session(id, null);
         if (!session.IsRunning) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running; prompt it first.");
-        var reply = await Channel.AskAsync(id, text, ct);
+        var reply = await Channel.AskAsync(id, text, request.Params?["_meta"] as JsonObject, ct);
         return new JsonObject { ["text"] = reply };
     }
 
@@ -206,7 +206,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         var text = (string?)request.Params?["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
         var session = Session(id, null);
         if (!session.IsRunning) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running.");
-        await Channel.NotifyAsync(id, text, ct);
+        await Channel.NotifyAsync(id, text, request.Params?["_meta"] as JsonObject, ct);
         return new JsonObject();
     }
 

@@ -113,12 +113,12 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/opinion` | `_meta` of the request message and of every update of its turn | the request's `message_id`, so a GUI can show the exchange apart from the user's own turns |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
-| `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards. An agent that answers method not found, or `-32600` because it is not running, is asked in a turn instead ([adapter-contract.md](adapter-contract.md#64-the-live-note-path)) |
+| `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards, and to the agent adds `_meta` with `gorynych/sender`, `gorynych/fromSessionId` and `gorynych/outside` as the journal keeps them on a request in a turn, for the user message the agent reports for it. An agent that answers method not found, or `-32600` because it is not running, is asked in a turn instead ([adapter-contract.md](adapter-contract.md#64-the-live-note-path)) |
 | `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `status` (`open` when its agent has it loaded now, `saved` when not, the words of ACP's draft session-status RFD), `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")`. Without `includeArchived`, `hiddenArchived` counts the archived sessions left out (never the caller) |
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
-| `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?}` → `{}` | tells a session's agent something that needs no answer (a child's report); the Claude adapter pushes it through the channel, an agent that answers method not found, or `-32600` because it is not running, gets it as a turn |
+| `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?, _meta}` → `{}` | tells a session's agent something that needs no answer (a child's report), with `gorynych/sender` and `gorynych/fromSessionId` in `_meta` for the user message the agent reports for it; the Claude adapter pushes it through the channel, an agent that answers method not found, or `-32600` because it is not running, gets it as a turn |
 | `_gorynych/mcp_message` | method, outside server → service, `{serverId, requestId, method, params}` → `{result}` or `{error}`; as a notification from the service, a notification of that request | an MCP request of `gorynych-outside`, in the shape of `mcp/message` from ACP's MCP-over-ACP RFD (see [`_gorynych/mcp_message`](#agents-outside-gorynych)) |
 | `_gorynych/read` | method, `{sessionId, cursor?, limit?, thoughts?}` → `{updates, nextCursor?, total, inProgress, trimmed}` | a page of a session's history from the journal (see [Reading a session](#reading-a-session)) |
 | `_gorynych/sessions_changed` | notification to clients, `{sessionId, change}` | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
@@ -675,6 +675,8 @@ Do not run other tools, edit files or take any other action for this request.
 - Journal `_meta` on the request:
   - `gorynych/origin` as for any opinion request (`peer` for a turn; `channel` on the message
     Claude reports), since it says how the request arrived;
+  - `gorynych/opinion`, the request's `message_id` (the service's `m…` in a turn, the
+    channel's `c…` through Claude's channel);
   - `gorynych/sender` `outside_<client name>`, for example `outside_claude-code`
     (`outside_unknown` without one);
   - `gorynych/outside` with the host object;
@@ -719,16 +721,22 @@ GUI can use it too.
   - `nextCursor`: set when older messages exist. It is opaque to callers, like ACP's
     `session/list` cursors; the service uses the `messageId` of the oldest message it
     returned.
-  - Entries journaled before `messageId` existed have none. The service then treats
-    consecutive chunks of one kind as one message, and uses `#<journal index>` as its cursor;
-    so it does for an ID that two messages share.
+  - A message without an ID of its own has a cursor anchored to the nearest later message that
+    has one: `<messageId>~<n>`, n messages before it. That covers entries journaled before
+    `messageId` existed, which the service treats as one message while consecutive chunks of
+    one kind follow each other, and chunks of one ID that a tool call splits into two messages.
+    Journal compaction drops the oldest entries and merges a message's chunks, which moves
+    neither, so a cursor stays valid; one whose message was dropped returns no older messages.
+    Only a journal with no later ID at all (an old one, which nothing appends to and so nothing
+    compacts) uses `#<journal index>`.
   - A cursor the session does not have fails with `-32602`.
 - `total`: how many messages the journal holds. `inProgress`: a turn is running. `trimmed`:
   the journal has lost its oldest entries ([Journal](#journal)).
 - **Source.** The service journal only; reading never runs a turn.
-  - A Claude session never needs its agent. The Claude adapter lists only sessions it created
-    through the service, and the service journals them from their first prompt. No Claude
-    process is started, and Claude's transcript is not read.
+  - Reading a Claude session never starts Claude. The Claude adapter lists only sessions it
+    created through the service, and the service journals them from their first prompt.
+    Claude's transcript is not read; for a session with no turn in the journal the service may
+    start the in-process adapter to learn that it cannot load one, which starts no `claude`.
   - A session the service has never journaled (a Kimi session made in Kimi's own UI) is first
     loaded in its agent. Kimi's `session/load` replays the history and runs no model turn. The
     service journals the replay, giving its chunks message IDs, and closes the session again
@@ -758,8 +766,11 @@ Older messages: call read_session with session_id "<id>" and before "<cursor>".
 - **Labels.** `── user` is a prompt the person typed (in a client or in Claude's terminal). A
   message the service put there names its origin: `── user · opinion request`, `· report`,
   `· spawned task` or `· from outside`. Its own text carries the header with the sending
-  session's ID. A message Claude reports from its channel is labelled from its text: a report
-  by its `kind="report"`, a request from outside by its first line. `── agent thinking`
+  session's ID. The label comes from the message's `_meta`: `gorynych/outside`,
+  `gorynych/opinion`, `gorynych/origin`. A message through Claude's channel carries its
+  request's keys as one in a turn does, and a report is the channel's only other message; only
+  a channel message journaled before it carried them is told by the `kind` in its channel tag,
+  the first line. `── agent thinking`
   appears only with `thoughts`. A tool call without a status reads `pending`.
 - **Budget.** At most `limit` messages and about 20,000 characters, filled from the newest
   backwards. A message that does not fit in what is left is cut in the middle with

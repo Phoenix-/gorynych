@@ -136,12 +136,13 @@ public static class ClaudeHooks
         promptId is { Length: > 0 } && taken.Add(promptId) ? promptId : Guid.NewGuid().ToString();
 
     /// <summary>A user message that did not come from the ACP client, such as a channel message.</summary>
-    public static SessionUpdateUserMessageChunk ForeignPrompt(string prompt, string messageId) => new()
+    /// <param name="meta">For a channel message, the <c>_meta</c> its request or note came with (<see cref="ChannelHost.MetaFor"/>).</param>
+    public static SessionUpdateUserMessageChunk ForeignPrompt(string prompt, string messageId, JsonObject? meta = null)
     {
-        Content = new TextContent { Text = prompt },
-        MessageId = messageId,
-        Meta = new JsonObject { [Acp.Hosting.GorynychProtocol.MetaOrigin] = IsChannelMessage(prompt) ? "channel" : "terminal" },
-    };
+        var journaled = meta?.DeepClone().AsObject() ?? [];
+        journaled[Acp.Hosting.GorynychProtocol.MetaOrigin] = IsChannelMessage(prompt) ? "channel" : "terminal"; // how it arrived
+        return new SessionUpdateUserMessageChunk { Content = new TextContent { Text = prompt }, MessageId = messageId, Meta = journaled };
+    }
 
     public static bool IsChannelMessage(string prompt) => prompt.TrimStart().StartsWith("<channel", StringComparison.Ordinal);
 

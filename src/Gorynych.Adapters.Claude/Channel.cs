@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using Gorynych.Acp;
 
@@ -12,7 +13,7 @@ namespace Gorynych.Adapters.Claude;
 /// with a channel URL it declares the <c>claude/channel</c> capability, long-polls this host
 /// for messages and posts its <c>reply</c> tool calls back here.
 /// </summary>
-internal sealed class ChannelHost(IReadOnlyList<string> serverCommand)
+internal sealed partial class ChannelHost(IReadOnlyList<string> serverCommand)
 {
     public const string ServerName = "gorynych";
     public const string ReplyToolName = "mcp__gorynych__reply";
@@ -41,7 +42,15 @@ internal sealed class ChannelHost(IReadOnlyList<string> serverCommand)
 
     readonly ConcurrentDictionary<string, Channel<JsonObject>> outboxes = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, TaskCompletionSource<string>> replies = new(StringComparer.Ordinal);
+    readonly ConcurrentDictionary<string, Pushed> pushed = new(StringComparer.Ordinal);
     long counter;
+    long notes;
+
+    /// <summary>A message pushed into a session, with the <c>_meta</c> for the user message Claude will report it as.</summary>
+    sealed record Pushed(string SessionId, string Content, JsonObject Meta, long Order);
+
+    /// <summary>At most this many pushed messages wait for Claude to report them; older ones are forgotten.</summary>
+    const int MaxPushed = 64;
 
     public string BaseUrl { get; set; } = "";
 
@@ -76,13 +85,19 @@ internal sealed class ChannelHost(IReadOnlyList<string> serverCommand)
     /// Claude's <c>reply</c>. The text names the asking session in its first line; the meta carries
     /// no sender label, which Claude could mistake for a session ID.
     /// </summary>
-    public async Task<string> AskAsync(string sessionId, string text, CancellationToken ct)
+    /// <param name="meta">The request's <c>_meta</c>: what the user message Claude reports for it carries
+    /// (<see cref="MetaFor"/>), with <c>gorynych/opinion</c> set to this request's <c>message_id</c>.</param>
+    public async Task<string> AskAsync(string sessionId, string text, JsonObject? meta, CancellationToken ct)
     {
         // "c", so it never equals a message_id of a request the service asked as a turn ("m"): the
         // peers server tries the channel first and the service after it.
-        var id = "c" + Interlocked.Increment(ref counter);
+        var n = Interlocked.Increment(ref counter);
+        var id = "c" + n;
         var reply = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         replies[id] = reply;
+        var journaled = meta?.DeepClone().AsObject() ?? [];
+        journaled[Acp.Hosting.GorynychProtocol.MetaOpinion] = id;
+        Remember(id, new Pushed(sessionId, text, journaled, n));
         try
         {
             var message = new JsonObject
@@ -100,12 +115,49 @@ internal sealed class ChannelHost(IReadOnlyList<string> serverCommand)
     }
 
     /// <summary>Pushes a message that needs no reply, such as a child's report (<c>meta.kind</c> <c>report</c>).</summary>
-    public ValueTask NotifyAsync(string sessionId, string text, CancellationToken ct) =>
-        Outbox(sessionId).Writer.WriteAsync(new JsonObject
+    /// <param name="meta">The note's <c>_meta</c>, for the user message Claude reports for it (<see cref="MetaFor"/>).</param>
+    public ValueTask NotifyAsync(string sessionId, string text, JsonObject? meta, CancellationToken ct)
+    {
+        var n = Interlocked.Increment(ref notes);
+        Remember("note-" + n, new Pushed(sessionId, text, meta?.DeepClone().AsObject() ?? [], long.MaxValue / 2 + n));
+        return Outbox(sessionId).Writer.WriteAsync(new JsonObject
         {
             ["content"] = text,
             ["meta"] = new JsonObject { ["kind"] = "report" },
         }, ct);
+    }
+
+    void Remember(string key, Pushed message)
+    {
+        pushed[key] = message;
+        if (pushed.Count <= MaxPushed) return;
+        foreach (var old in pushed.OrderBy(p => p.Value.Order).Take(pushed.Count - MaxPushed).Select(p => p.Key).ToList())
+            pushed.TryRemove(old, out _);
+    }
+
+    /// <summary>
+    /// The <c>_meta</c> for a channel message Claude reports as a prompt (<c>UserPromptSubmit</c>), so
+    /// the journal carries the same keys as for a request asked in a turn: who sent it
+    /// (<c>gorynych/sender</c>, <c>gorynych/fromSessionId</c>, <c>gorynych/outside</c>) and, for a
+    /// request, <c>gorynych/opinion</c>. A request is found by the <c>message_id</c> in the channel
+    /// tag, a note by its text; null for a message this host did not push.
+    /// </summary>
+    public JsonObject? MetaFor(string sessionId, string prompt)
+    {
+        var tag = prompt.TrimStart();
+        var end = tag.IndexOf('>');
+        if (end > 0 && MessageIdAttribute().Match(tag[..end]) is { Success: true } m
+            && pushed.TryGetValue(m.Groups[1].Value, out var asked) && asked.SessionId == sessionId
+            && pushed.TryRemove(m.Groups[1].Value, out _))
+            return asked.Meta.DeepClone().AsObject();
+        foreach (var (key, note) in pushed.Where(p => p.Value.SessionId == sessionId && prompt.Contains(p.Value.Content, StringComparison.Ordinal))
+                     .OrderBy(p => p.Value.Order).ToList())
+            if (pushed.TryRemove(key, out _)) return note.Meta.DeepClone().AsObject();
+        return null;
+    }
+
+    [GeneratedRegex("message_id=\"([^\"]*)\"")]
+    private static partial Regex MessageIdAttribute();
 
     /// <summary>Long poll from the channel server: the next messages, or none after a while.</summary>
     public async Task<JsonNode> NextAsync(string sessionId, CancellationToken ct)

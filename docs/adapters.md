@@ -175,7 +175,12 @@ asks the person before every spawn); `mcp__gorynych__ask_agent`, `archive_sessio
 `_gorynych/note` (a child's report to its parent) becomes a channel message with
 `meta: {kind: "report"}` and no `message_id`; the peer instructions say it needs no reply. The
 adapter ignores the `sender` param of `_gorynych/opinion` and `_gorynych/note`: the text names
-the session. Without a channel the adapter answers method not found; while Claude's process is not
+the session. It keeps the `_meta` each came with, and when Claude reports the channel message
+as a prompt (`UserPromptSubmit`, `<channel … message_id="c1">` and the content), it finds it by
+that `message_id`, or a report by its text, and puts those keys on the `user_message_chunk`
+with `gorynych/origin: channel` and, for a request, `gorynych/opinion` = its `message_id`. So
+the journal names the sender, a session or an agent outside Gorynych, as for a request in a
+turn. It keeps at most 64 pushed messages that Claude has not reported yet. Without a channel the adapter answers method not found; while Claude's process is not
 running (`session/resume` registers a session without starting one) it answers `-32600`, to
 `_gorynych/opinion` as well. Either way the service sends the request or report as a turn
 instead, which starts Claude, and closes the session again (ending the process) once its

@@ -361,7 +361,8 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
                 }
                 else
                 {
-                    await agent.EmitAsync(Id, ClaudeHooks.ForeignPrompt(prompt, UserMessageId(promptId)));
+                    var meta = ClaudeHooks.IsChannelMessage(prompt) ? agent.Channel?.MetaFor(Id, prompt) : null;
+                    await agent.EmitAsync(Id, ClaudeHooks.ForeignPrompt(prompt, UserMessageId(promptId), meta));
                 }
                 break;
             }

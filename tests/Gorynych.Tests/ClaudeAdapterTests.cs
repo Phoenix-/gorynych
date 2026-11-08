@@ -23,8 +23,8 @@ public sealed class ClaudeAdapterTests
     public async Task ChannelMessages_CarryTheirKind_AndNoSenderLabel()
     {
         var channel = new ChannelHost(["svc.exe", "peers"]);
-        var asking = channel.AskAsync("s1", "[Opinion request · from session_id k1 (kimi)]\nTabs?", CancellationToken.None);
-        await channel.NotifyAsync("s1", "[Report · from session_id k2 (kimi) · your child session · its turn ended]\nok", CancellationToken.None);
+        var asking = channel.AskAsync("s1", "[Opinion request · from session_id k1 (kimi)]\nTabs?", null, CancellationToken.None);
+        await channel.NotifyAsync("s1", "[Report · from session_id k2 (kimi) · your child session · its turn ended]\nok", null, CancellationToken.None);
 
         var messages = (await channel.NextAsync("s1", CancellationToken.None))["messages"]!.AsArray();
         Assert.AreEqual(2, messages.Count);
@@ -37,6 +37,36 @@ public sealed class ClaudeAdapterTests
             "a service turn's message_id is not the channel's");
         Assert.AreEqual(true, (bool?)channel.Reply(new System.Text.Json.Nodes.JsonObject { ["message_id"] = "c1", ["text"] = "Spaces." })["delivered"]);
         Assert.AreEqual("Spaces.", await asking);
+    }
+
+    [TestMethod]
+    public async Task AChannelMessage_IsJournaledWithItsRequestsMeta_AsInATurn()
+    {
+        var channel = new ChannelHost(["svc.exe", "peers"]);
+        var outside = new System.Text.Json.Nodes.JsonObject { ["client"] = new System.Text.Json.Nodes.JsonObject { ["name"] = "claude-code" }, ["folder"] = @"D:\w" };
+        var asking = channel.AskAsync("s1", "[Opinion request · from an agent outside Gorynych (Claude Code, D:\\w)]\nWhy?",
+            new System.Text.Json.Nodes.JsonObject { ["gorynych/sender"] = "outside_claude-code", ["gorynych/outside"] = outside.DeepClone() }, CancellationToken.None);
+        await channel.NotifyAsync("s1", "[Report · from session_id k2 (kimi) · your child session · its turn ended]\nok",
+            new System.Text.Json.Nodes.JsonObject { ["gorynych/sender"] = "child_kimi", ["gorynych/fromSessionId"] = "k2" }, CancellationToken.None);
+        await channel.NextAsync("s1", CancellationToken.None);
+
+        // As Claude reports them in UserPromptSubmit (recorded in hooks-channel.jsonl): the channel tag, its meta as attributes.
+        var request = "<channel source=\"gorynych\" kind=\"opinion\" message_id=\"c1\">\n[Opinion request · from an agent outside Gorynych (Claude Code, D:\\w)]\nWhy?\n</channel>";
+        var report = "<channel source=\"gorynych\" kind=\"report\">\n[Report · from session_id k2 (kimi) · your child session · its turn ended]\nok\n</channel>";
+        Assert.IsNull(channel.MetaFor("other-session", request), "only the session it was pushed into");
+        var asked = ClaudeHooks.ForeignPrompt(request, "p1", channel.MetaFor("s1", request)).Meta!;
+        Assert.AreEqual("channel", (string?)asked["gorynych/origin"], "origin still says how it arrived");
+        Assert.AreEqual("c1", (string?)asked["gorynych/opinion"]);
+        Assert.AreEqual("outside_claude-code", (string?)asked["gorynych/sender"]);
+        Assert.AreEqual(@"D:\w", (string?)asked["gorynych/outside"]!["folder"]);
+        var told = ClaudeHooks.ForeignPrompt(report, "p2", channel.MetaFor("s1", report)).Meta!;
+        Assert.AreEqual(("channel", "child_kimi", "k2"), ((string?)told["gorynych/origin"], (string?)told["gorynych/sender"], (string?)told["gorynych/fromSessionId"]));
+        Assert.IsNull(told["gorynych/opinion"]);
+        Assert.IsNull(channel.MetaFor("s1", request), "each message is matched once");
+        Assert.AreEqual(1, ClaudeHooks.ForeignPrompt("typed in the terminal", "p3").Meta!.Count);
+
+        channel.Reply(new System.Text.Json.Nodes.JsonObject { ["message_id"] = "c1", ["text"] = "Because." });
+        Assert.AreEqual("Because.", await asking);
     }
 
     [TestMethod]

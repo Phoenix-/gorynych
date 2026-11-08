@@ -141,10 +141,13 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
             }, ct);
             return rpc;
         }
-        catch (Exception e) when (e is IOException or JsonRpcException)
+        catch (Exception e)
         {
+            // Whatever ended it (the host's cancellation too), the pipe and its read loop go with it.
             await rpc.DisposeAsync();
-            throw new ServiceUnreachableException($"it did not answer ({e.Message})");
+            if (e is IOException or JsonRpcException or System.Text.Json.JsonException)
+                throw new ServiceUnreachableException($"it did not answer ({e.Message})");
+            throw;
         }
     }
 
@@ -173,7 +176,14 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
                 lastStartFailure = null;
                 return stream;
             }
-            catch (Exception e) when (e is not OperationCanceledException)
+            catch (OperationCanceledException)
+            {
+                // The host gave up on this request while the service was starting: the next request
+                // connects to it, or starts it again, instead of waiting out the minute.
+                lastStart = long.MinValue / 2;
+                throw;
+            }
+            catch (Exception e)
             {
                 lastStartFailure = e.Message;
                 OutsideLog.Warn($"cannot start the service: {e.Message}");

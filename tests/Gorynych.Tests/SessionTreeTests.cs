@@ -314,6 +314,8 @@ public sealed class SessionTreeTests
         Assert.AreEqual(parent, (string?)note["sessionId"]);
         Assert.AreEqual("child_kimi", (string?)note["sender"]);
         Assert.AreEqual(reported, (string?)note["fromSessionId"]);
+        Assert.AreEqual("child_kimi", (string?)note["_meta"]![GorynychProtocol.MetaSender], "the _meta for the message Claude will report");
+        Assert.AreEqual(reported, (string?)note["_meta"]![GorynychProtocol.MetaFromSessionId]);
         StringAssert.StartsWith((string?)note["text"], $"[Report · from session_id {reported} (kimi, \"Fix the flaky test\") · your child session · its turn ended]\nok\n");
         CollectionAssert.AreEqual(new[] { "Coordinate the release" }, Prompts(claude, parent), "a note is not a turn");
         Assert.IsFalse(conductor.Store.Get(quiet)!.ReportToParent);

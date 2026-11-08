@@ -254,6 +254,11 @@ in the middle of one.
   `-32600`; the service then uses a turn that starts the agent ([§6.1](#61-waking-a-session-and-closing-it-again)).
 - The adapter MUST pass the text unchanged, whose first line names the sending session, and
   SHOULD NOT show the agent the `sender` label, which an agent could take for a session ID.
+- The request's `_meta` holds the keys the journal keeps on a request asked in a turn
+  (`gorynych/sender`, and `gorynych/fromSessionId` or `gorynych/outside`). When the agent
+  reports the delivered message as a `user_message_chunk`, the adapter SHOULD put those keys on
+  it, with `gorynych/origin` saying how it arrived and, for an opinion, `gorynych/opinion` set
+  to its own `message_id`; the GUI and `read_session` tell requests and reports apart by them.
 - Today only Claude has it, through its development channel ([adapters.md](adapters.md#mcp-servers-and-the-channel-opinions-both-ways)).
 
 ## 7. Closing and unloading

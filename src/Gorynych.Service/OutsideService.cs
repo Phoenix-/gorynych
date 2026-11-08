@@ -166,19 +166,29 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
         return text.ToString();
     }
 
-    /// <summary>A user message the service put there names where it came from; a prompt the person typed has no label.</summary>
+    /// <summary>
+    /// A user message the service put there names where it came from, by its <c>_meta</c>; a prompt
+    /// the person typed has no label. A message through Claude's channel carries its request's keys
+    /// as one asked in a turn does (<c>gorynych/opinion</c> for a request), and a report is the
+    /// channel's only other message. Only a channel message journaled before it carried those keys
+    /// is told by the <c>kind</c> in its channel tag, the first line.
+    /// </summary>
     static string Label(JsonObject? meta, string body)
     {
         if (meta?[GorynychProtocol.MetaOutside] is not null) return " · from outside";
+        if (meta?[GorynychProtocol.MetaOpinion] is not null) return " · opinion request";
+        var named = meta?[GorynychProtocol.MetaSender] is not null;
         switch ((string?)meta?[GorynychProtocol.MetaOrigin])
         {
             case "peer": return " · opinion request";
             case "report": return " · report";
             case "spawn": return " · spawned task";
+            case "channel" when named: return " · report";
             case "channel":
-                // A request or report through Claude's channel, as Claude reports it.
-                if (body.Contains("kind=\"report\"", StringComparison.Ordinal)) return " · report";
-                return body.Contains("from an agent outside Gorynych", StringComparison.Ordinal) ? " · from outside" : " · opinion request";
+                var tag = body.TrimStart();
+                var end = tag.IndexOf('>');
+                return end > 0 && tag.StartsWith("<channel", StringComparison.Ordinal) && tag[..end].Contains("kind=\"report\"", StringComparison.Ordinal)
+                    ? " · report" : " · opinion request";
             default: return "";
         }
     }

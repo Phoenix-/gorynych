@@ -196,6 +196,35 @@ public sealed class OutsideTests
     }
 
     [TestMethod]
+    public void Read_CursorsWithoutAnIdOfTheirOwn_SurviveJournalCompaction()
+    {
+        static JsonNode Tool(string id) => new JsonObject { ["sessionUpdate"] = "tool_call", ["toolCallId"] = id, ["title"] = id };
+        // A message from before IDs, then one whose chunks a tool call splits (one ID, two messages), then newer ones.
+        var journal = new List<JsonNode>
+        {
+            User("old question"), Agent("old"), Agent(" answer"),
+            User("Q", "u1"), Agent("Split ", "a1"), Agent("one", "a1"), Tool("t1"), Agent("two", "a1"),
+            User("Next?", "u2"), Agent("Yes.", "a3"),
+        };
+        var page = SessionReader.Read(journal, null, limit: 3, thoughts: false);
+        Assert.AreEqual("agent_message_chunk two | user_message_chunk Next? | agent_message_chunk Yes.", Texts(page).Replace(" | tool t1 ", "", StringComparison.Ordinal));
+        Assert.AreEqual("u2~1", page.NextCursor, "the second half of a1, one message before u2");
+        var older = SessionReader.Read(journal, page.NextCursor, limit: 2, thoughts: false);
+        Assert.AreEqual("user_message_chunk Q | agent_message_chunk Split one | tool t1 ", Texts(older));
+        Assert.AreEqual("u1", older.NextCursor);
+        var oldest = SessionReader.Read(journal, "u1", limit: 5, thoughts: false);
+        Assert.AreEqual("user_message_chunk old question | agent_message_chunk old answer", Texts(oldest));
+
+        // Compaction merged a1's first chunks and dropped the oldest entries: the same cursors name the same messages.
+        var compacted = new List<JsonNode>
+        {
+            Agent(" answer"), User("Q", "u1"), Agent("Split one", "a1"), Tool("t1"), Agent("two", "a1"), User("Next?", "u2"), Agent("Yes.", "a3"),
+        };
+        Assert.AreEqual("user_message_chunk Q | agent_message_chunk Split one | tool t1 ", Texts(SessionReader.Read(compacted, "u2~1", 2, false)));
+        Assert.AreEqual(0, SessionReader.Read(compacted, "u1~2", 5, false).Count, "a message the journal dropped has nothing older left");
+    }
+
+    [TestMethod]
     public void Read_FillsTheBudgetFromTheNewest_AndCutsAMessageThatDoesNotFitInTheMiddle()
     {
         var huge = "start-" + new string('x', 30_000) + "-end";
@@ -228,15 +257,23 @@ public sealed class OutsideTests
             User("Do the task", "u4", Origin("spawn")),
             User("[Opinion request · from an agent outside Gorynych (Claude Code, D:\\x)]\nWhy?", "u5",
                 new JsonObject { [GorynychProtocol.MetaOrigin] = "peer", [GorynychProtocol.MetaOutside] = new JsonObject() }),
+            // Through Claude's channel, as journaled before the messages carried their request's _meta: the tag says.
             User("<channel source=\"gorynych\" kind=\"report\">\n[Report · from session_id c1 (claude)]\nok\n</channel>", "u6", Origin("channel")),
             User("<channel source=\"gorynych\" kind=\"opinion\" message_id=\"c1\">\n[Opinion request · from session_id k1 (kimi)]\nWhy?\n</channel>", "u7", Origin("channel")),
+            // And now: the _meta says, whatever the question quotes.
+            User("<channel source=\"gorynych\" kind=\"opinion\" message_id=\"c2\">\n[Opinion request · from session_id k1 (kimi)]\nIs kind=\"report\" an attribute?\n</channel>", "u8",
+                new JsonObject { [GorynychProtocol.MetaOrigin] = "channel", [GorynychProtocol.MetaOpinion] = "c2", [GorynychProtocol.MetaSender] = "peer_kimi" }),
+            User("<channel source=\"gorynych\" kind=\"opinion\" message_id=\"c3\">\n[Opinion request · from an agent outside Gorynych (Claude Code, D:\\x)]\nWhy?\n</channel>", "u9",
+                new JsonObject { [GorynychProtocol.MetaOrigin] = "channel", [GorynychProtocol.MetaOpinion] = "c3", [GorynychProtocol.MetaOutside] = new JsonObject() }),
+            User("<channel source=\"gorynych\" kind=\"report\">\n[Report · from session_id c1 (claude)]\nIt said: from an agent outside Gorynych\n</channel>", "u10",
+                new JsonObject { [GorynychProtocol.MetaOrigin] = "channel", [GorynychProtocol.MetaSender] = "child_claude", [GorynychProtocol.MetaFromSessionId] = "c1" }),
             Agent("Done.", "a2"),
         };
         var record = new SessionRecord { SessionId = "s1", Agent = "kimi", Title = "Fix the \"flaky\" test" };
-        var page = SessionReader.Read(journal, null, 10, false);
+        var page = SessionReader.Read(journal, null, 20, false);
         var text = OutsideService.ReadSessionText(new Conductor.SessionRead(record, Live: false, page, InProgress: true, Trimmed: true), newest: true);
         Assert.AreEqual(
-            "session_id s1 (kimi, \"Fix the 'flaky' test\") · status saved · messages 1–9 of 9, oldest first\n" +
+            "session_id s1 (kimi, \"Fix the 'flaky' test\") · status saved · messages 1–12 of 12, oldest first\n" +
             "(Older history was trimmed from Gorynych's journal.)\n" +
             "── user\nTyped by the person\n" +
             "── agent\nSure.\n" +
@@ -247,6 +284,9 @@ public sealed class OutsideTests
             "── user · from outside\n[Opinion request · from an agent outside Gorynych (Claude Code, D:\\x)]\nWhy?\n" +
             "── user · report\n<channel source=\"gorynych\" kind=\"report\">\n[Report · from session_id c1 (claude)]\nok\n</channel>\n" +
             "── user · opinion request\n<channel source=\"gorynych\" kind=\"opinion\" message_id=\"c1\">\n[Opinion request · from session_id k1 (kimi)]\nWhy?\n</channel>\n" +
+            "── user · opinion request\n<channel source=\"gorynych\" kind=\"opinion\" message_id=\"c2\">\n[Opinion request · from session_id k1 (kimi)]\nIs kind=\"report\" an attribute?\n</channel>\n" +
+            "── user · from outside\n<channel source=\"gorynych\" kind=\"opinion\" message_id=\"c3\">\n[Opinion request · from an agent outside Gorynych (Claude Code, D:\\x)]\nWhy?\n</channel>\n" +
+            "── user · report\n<channel source=\"gorynych\" kind=\"report\">\n[Report · from session_id c1 (claude)]\nIt said: from an agent outside Gorynych\n</channel>\n" +
             "── agent\nDone.\n" +
             "(turn in progress)", text);
 
@@ -384,6 +424,31 @@ public sealed class OutsideTests
     }
 
     [TestMethod]
+    public async Task OnTheLiveNotePath_TheRequestCarriesTheMetaItIsJournaledWith()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var target = await NewPromptedAsync(zed, "claude", "Write the notes");
+        var asker = await NewPromptedAsync(zed, "kimi", "Coordinate the release");
+
+        ToolText(await McpAsync(zed, "tools/call", Call("ask_agent", new JsonObject { ["session_id"] = target, ["question"] = "Why?" })));
+        var fromOutside = claude.Opinions.Last()["_meta"]!;
+        Assert.AreEqual("outside_probe-host", (string?)fromOutside[GorynychProtocol.MetaSender]);
+        Assert.AreEqual(Folder, (string?)fromOutside[GorynychProtocol.MetaOutside]!["folder"]);
+        Assert.IsNull(fromOutside[GorynychProtocol.MetaFromSessionId]);
+
+        await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject
+        {
+            ["sessionId"] = target, ["text"] = "Done?", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = kimi.Tokens[asker] },
+        });
+        var fromSession = claude.Opinions.Last()["_meta"]!;
+        Assert.AreEqual(("peer_kimi", asker), ((string?)fromSession[GorynychProtocol.MetaSender], (string?)fromSession[GorynychProtocol.MetaFromSessionId]));
+        Assert.IsNull(fromSession[GorynychProtocol.MetaOutside]);
+    }
+
+    [TestMethod]
     public async Task TheService_ServesBothEras_RefusesOtherVersions_AndOtherServers()
     {
         await using var conductor = Conductor(new LifecycleAgent("kimi", canDelete: true).Adapter);
@@ -429,14 +494,14 @@ public sealed class OutsideTests
         public JsonRpcConnection Host { get; }
         public List<JsonObject> Progress { get; } = [];
 
-        public Shim(string pipe)
+        public Shim(string pipe, string service = @"C:\nowhere\Gorynych.Service.exe", string? log = null)
         {
             var psi = new ProcessStartInfo(OutsideExe())
             {
                 RedirectStandardInput = true, RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true,
                 StandardOutputEncoding = new UTF8Encoding(false), WorkingDirectory = Cwd,
             };
-            foreach (var a in new[] { "--pipe", pipe, "--service", @"C:\nowhere\Gorynych.Service.exe", "--log", TestDirs.New() }) psi.ArgumentList.Add(a);
+            foreach (var a in new[] { "--pipe", pipe, "--service", service, "--log", log ?? TestDirs.New() }) psi.ArgumentList.Add(a);
             process = Process.Start(psi)!;
             Host = new JsonRpcConnection(process.StandardOutput.BaseStream, process.StandardInput.BaseStream, "host")
             {
@@ -620,6 +685,47 @@ public sealed class OutsideTests
             answering.TrySetResult();
             stop.Cancel();
             await listening;
+        }
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ARequestCancelledWhileTheServiceAnswersItsInitialize_ClosesThePipe()
+    {
+        var pipe = Pipe();
+        // A service that takes the connection and never answers.
+        await using var service = new System.IO.Pipes.NamedPipeServerStream(pipe, System.IO.Pipes.PipeDirection.InOut, 1,
+            System.IO.Pipes.PipeTransmissionMode.Byte, System.IO.Pipes.PipeOptions.Asynchronous);
+        var accepted = service.WaitForConnectionAsync();
+        await using var shim = new Shim(pipe);
+        using var cancel = new CancellationTokenSource();
+        var call = shim.Host.SendRequestAsync("tools/call", ModernCall("list_sessions", []), cancel.Token);
+        await accepted.WaitAsync(TimeSpan.FromSeconds(10));
+        using var reader = new StreamReader(service, new UTF8Encoding(false));
+        StringAssert.Contains(await reader.ReadLineAsync(), "\"initialize\"");
+
+        cancel.Cancel();
+        await Assert.ThrowsAsync<OperationCanceledException>(() => call);
+        // Its $/cancel_request may come first; then the connection ends.
+        var closed = Task.Run(async () => { while (await reader.ReadLineAsync() is not null) { } });
+        await closed.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ARequestCancelledWhileTheServiceStarts_LetsTheNextRequestStartItAgain()
+    {
+        var logs = TestDirs.New();
+        int Starts() => Directory.EnumerateFiles(logs, "outside-*.log").SelectMany(File.ReadAllLines).Count(l => l.Contains("starting the service", StringComparison.Ordinal));
+        // A "service" that never opens the pipe, so the server waits for it.
+        await using var shim = new Shim(Pipe(), Path.Combine(Environment.SystemDirectory, "whoami.exe"), logs);
+        foreach (var expected in new[] { 1, 2 })
+        {
+            using var cancel = new CancellationTokenSource();
+            var call = shim.Host.SendRequestAsync("tools/call", ModernCall("list_sessions", []), cancel.Token);
+            await Until(() => Starts() == expected, $"start {expected}, not a minute's wait");
+            cancel.Cancel();
+            await Assert.ThrowsAsync<OperationCanceledException>(() => call);
         }
     }
 

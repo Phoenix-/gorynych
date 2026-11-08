@@ -1276,8 +1276,12 @@ public sealed class Conductor : IAsyncDisposable
             var (rpc, _) = await EnsureLiveAsync(use.Record, cleanupStop.Token, forService: true);
             try
             {
-                await rpc.SendRequestAsync(GorynychProtocol.MethodNote,
-                    new JsonObject { ["sessionId"] = parentId, ["text"] = text, ["sender"] = sender, ["fromSessionId"] = childId }, cleanupStop.Token);
+                await rpc.SendRequestAsync(GorynychProtocol.MethodNote, new JsonObject
+                {
+                    ["sessionId"] = parentId, ["text"] = text, ["sender"] = sender, ["fromSessionId"] = childId,
+                    // for the user message the agent reports for it
+                    ["_meta"] = new JsonObject { [GorynychProtocol.MetaSender] = sender, [GorynychProtocol.MetaFromSessionId] = childId },
+                }, cleanupStop.Token);
                 ServiceLog.Info($"report: {childId} -> {parentId} (note)");
                 return;
             }
@@ -1561,8 +1565,9 @@ public sealed class Conductor : IAsyncDisposable
     /// Reads a page of a session's history from the service journal; reading never runs a turn. A
     /// session the service has never journaled is loaded in its agent first, which replays its
     /// history into the journal (Kimi), and closed again afterwards when it was loaded only for
-    /// this, as after service turns. A Claude session never needs its agent: the service journals
-    /// every Claude session from its first prompt.
+    /// this, as after service turns. Reading a Claude session never starts Claude: the service
+    /// journals every Claude session from its first prompt, and the Claude adapter cannot load one
+    /// (learning that may start the in-process adapter, which starts no claude process).
     /// </summary>
     /// <exception cref="SessionReader.UnknownCursorException">The cursor names no message of the session.</exception>
     internal async Task<SessionRead> ReadAsync(string sessionId, string? cursor, int limit, bool thoughts, int? budget, CancellationToken ct)
@@ -1716,7 +1721,13 @@ public sealed class Conductor : IAsyncDisposable
                 throw CouldNotStart(record, e, asker);
             }
             ServiceLog.Info($"opinion: {asker.From ?? asker.Sender} asks {record.Agent} {target}");
-            var forwarded = new JsonObject { ["sessionId"] = target, ["text"] = $"[Opinion request · {asker.Origin}]\n{text}", ["sender"] = asker.Sender };
+            var forwarded = new JsonObject
+            {
+                ["sessionId"] = target,
+                ["text"] = $"[Opinion request · {asker.Origin}]\n{text}",
+                ["sender"] = asker.Sender,
+                ["_meta"] = AskerMeta(asker), // for the user message the agent reports for it
+            };
             if (asker.From is not null) forwarded["fromSessionId"] = asker.From;
             // A live-note path answers at once when its agent cannot take the request, so it counts
             // as asked only after a moment.
@@ -1758,6 +1769,15 @@ public sealed class Conductor : IAsyncDisposable
         {
             if (!turnHasUse) EndServiceUse(use);
         }
+    }
+
+    /// <summary>Who asks, in the <c>_meta</c> keys the journal keeps on a request: the same on the live-note path as in a turn.</summary>
+    static JsonObject AskerMeta(Asker asker)
+    {
+        var meta = new JsonObject { [GorynychProtocol.MetaSender] = asker.Sender };
+        if (asker.From is not null) meta[GorynychProtocol.MetaFromSessionId] = asker.From;
+        if (asker.Outside is not null) meta[GorynychProtocol.MetaOutside] = asker.Outside.DeepClone();
+        return meta;
     }
 
     static string WaitingState(string sessionId) => $"Waiting for session_id {sessionId} to finish its running turn.";

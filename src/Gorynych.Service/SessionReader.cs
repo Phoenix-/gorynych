@@ -49,14 +49,31 @@ internal static class SessionReader
         var items = Items(journal);
         var messages = items.Where(i => i.IsMessage).ToList();
         var ids = messages.Where(m => m.MessageId is not null).GroupBy(m => m.MessageId!).ToDictionary(g => g.Key, g => g.Count());
-        foreach (var m in messages)
-            m.Cursor = m.MessageId is { } id && ids[id] == 1 && !id.StartsWith('#') ? id : $"#{m.Index}";
+        bool Unique(Item m) => m.MessageId is { } id && ids[id] == 1;
+        // A message's cursor is its own ID when no other message has it. Otherwise (an entry from before
+        // message IDs, or chunks of one ID split by a tool call) it is the distance to the nearest later
+        // message that has one: compaction drops the oldest entries and merges a message's chunks, which
+        // moves neither. Only a journal without any later ID falls back to the entry's index.
+        var anchor = -1;
+        for (var i = messages.Count - 1; i >= 0; i--)
+        {
+            if (Unique(messages[i])) { messages[i].Cursor = messages[i].MessageId!; anchor = i; continue; }
+            messages[i].Cursor = anchor >= 0 ? $"{messages[anchor].MessageId}~{anchor - i}" : $"#{messages[i].Index}";
+        }
 
         var end = messages.Count;
-        if (cursor is not null)
+        if (cursor is not null) end = Find(cursor);
+
+        int Find(string c)
         {
-            end = messages.FindIndex(m => m.Cursor == cursor || m.MessageId == cursor && ids[cursor] == 1);
-            if (end < 0) throw new UnknownCursorException(cursor);
+            var exact = messages.FindIndex(m => m.Cursor == c);
+            if (exact >= 0) return exact;
+            var tilde = c.LastIndexOf('~');
+            if (tilde > 0 && int.TryParse(c.AsSpan(tilde + 1), out var back) && back > 0
+                && messages.FindIndex(m => m.MessageId == c[..tilde] && Unique(m)) is var later and >= 0)
+                return Math.Max(later - back, 0); // before the oldest entry left: nothing older remains
+            var index = messages.FindIndex(m => $"#{m.Index}" == c);
+            return index >= 0 ? index : throw new UnknownCursorException(c);
         }
         // Each message carries the tool calls and thoughts that follow it, up to the next message.
         int Position(int message) => message < messages.Count ? items.IndexOf(messages[message]) : items.Count;
