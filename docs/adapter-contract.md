@@ -240,7 +240,7 @@ prompt and a spawned session's first turn are not service turns.
 - If the turn ends without `reply`, its text is the answer.
 - The service's `message_id`s start with `m`. An adapter's own live-note `message_id`s MUST
   NOT start with `m`, so neither path takes the other's answer (Claude's channel uses `c`).
-  Both are `<letter><run tag>-<count>` (`mk7q2-3`, `c9xw1-1`): a count kept in memory starts
+  Both are `<letter><run tag>-<count>` (`mk7q2-3`, `c9xw4-1`): a count kept in memory starts
   again after a restart, and an adapter SHOULD tag its own the same way, so a late reply to a
   request of an earlier run does not answer a new one.
 

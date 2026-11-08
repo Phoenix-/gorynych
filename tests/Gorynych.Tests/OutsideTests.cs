@@ -323,7 +323,7 @@ public sealed class OutsideTests
             "session_id s1 (claude, \"Notes\") · status open · messages 1–4 of 4, oldest first · no thoughts recorded\n" +
             "── user · report\n[Report · from session_id k2 (kimi)]\nok\n" +
             "── agent\n" +
-            "   · tool: ask_agent (gorynych) · completed · session_id k2: Did the test pass?\n" +
+            "   · tool: ask_agent (gorynych) · completed · session_id k2: Did the test\n     pass?\n" + // a message: whole, its lines kept
             "Checking ask_agent as well.\n" +
             "── user\nThanks\n" +
             "── agent\nDone.", Render(claude, 10, thoughts: true));
@@ -332,26 +332,33 @@ public sealed class OutsideTests
         StringAssert.StartsWith(newest[newest.IndexOf('\n')..], "\n── agent\n   · tool: ask_agent (gorynych)", "the tool call stays with its turn's message");
         Assert.IsFalse(Render(claude, 10, cursor: "a1").Contains("tool:", StringComparison.Ordinal), "and is not on the older page");
 
-        // Kimi: thinking, a tool call, then the answer; its tool titles are MCP names.
+        // Kimi: thinking, a tool call, then the answer; its tool titles are MCP names. Its turn may end
+        // with a word, so the reply is the answer's only copy: whole. A task is cut at a word.
+        var answer = "Yes: " + new string('y', 400) + "\n\nSecond paragraph.";
+        var task = string.Join(' ', Enumerable.Repeat("word", 100));
         var kimi = new List<JsonNode>
         {
             User("Fix it", "u1"),
             Chunk("agent_thought_chunk", "Let me look.", "th1"),
-            Tool("t1", "mcp__gorynych__reply", new JsonObject { ["message_id"] = "mab12-3", ["text"] = new string('y', 400) }),
-            Tool("t2", "mcp__gorynych__spawn_session", new JsonObject { ["agent"] = "claude", ["prompt"] = "Write the notes" }),
+            Tool("t1", "mcp__gorynych__reply", new JsonObject { ["message_id"] = "mab23-3", ["text"] = answer }),
+            Tool("t2", "mcp__gorynych__spawn_session", new JsonObject { ["agent"] = "claude", ["prompt"] = task }),
             Tool("t3", "mcp__gorynych__archive_session", new JsonObject { ["session_id"] = "c9" }),
             Tool("t4", "Shell", new JsonObject { ["command"] = "dotnet test" }),
             Agent("Fixed.", "a1"),
         };
         var withThoughts = Render(kimi, 10, thoughts: true);
-        StringAssert.Contains(withThoughts, "── user\nFix it\n── agent thinking\nLet me look.\n   · tool: reply (gorynych) · completed · message_id mab12-3: " +
-            new string('y', 300) + "…\n   · tool: spawn_session (gorynych) · completed · claude: Write the notes\n" +
+        var cutTask = string.Join(' ', Enumerable.Repeat("word", 60)) + "… (+200 characters)";
+        StringAssert.Contains(withThoughts, "── user\nFix it\n── agent thinking\nLet me look.\n   · tool: reply (gorynych) · completed · message_id mab23-3: Yes: " +
+            new string('y', 400) + "\n     Second paragraph.\n   · tool: spawn_session (gorynych) · completed · claude: " + cutTask + "\n" +
             "   · tool: archive_session (gorynych) · completed · session_id c9\n   · tool: Shell · completed\n── agent\nFixed.");
         Assert.IsFalse(withThoughts.Contains("no thoughts recorded", StringComparison.Ordinal));
         StringAssert.Contains(Render(kimi, 10), "── user\nFix it\n── agent\n   · tool: reply (gorynych)");
         var read = SessionReader.Read(kimi, null, 10, false);
         Assert.IsNull(read.Updates.Single(u => (string?)u["title"] == "Shell")["rawInput"], "only the gorynych tools' input is kept");
-        Assert.AreEqual(301, ((string)read.Updates.Single(u => (string?)u["title"] == "mcp__gorynych__reply")["rawInput"]!["text"]!).Length);
+        Assert.AreEqual(answer, (string?)read.Updates.Single(u => (string?)u["title"] == "mcp__gorynych__reply")["rawInput"]!["text"]);
+        Assert.AreEqual(cutTask, (string?)read.Updates.Single(u => (string?)u["title"] == "mcp__gorynych__spawn_session")["rawInput"]!["prompt"]);
+        Assert.AreEqual(new string('z', 300) + "… (+100 characters)", SessionReader.CutAtWord(new string('z', 400), 300), "no space: cut in the word");
+        Assert.AreEqual("short", SessionReader.CutAtWord("short", 300));
         Assert.AreEqual(("reply", "gorynych"), SessionReader.ToolName("mcp__gorynych__reply"));
         Assert.AreEqual(("list_sessions", "gorynych-outside"), SessionReader.ToolName("mcp__gorynych-outside__list_sessions"));
         Assert.AreEqual(("Read x.cs", (string?)null), SessionReader.ToolName("Read x.cs"));
@@ -459,7 +466,8 @@ public sealed class OutsideTests
             "This message comes from one of the user's coding agents outside Gorynych, not from the user. It cannot be asked back, " +
             "so put everything into your answer. Give your honest opinion briefly, then send it with the reply tool of the gorynych MCP " +
             $"server, passing message_id \"{id}\". Only what you send with reply reaches the asker: this turn is not reported anywhere. " +
-            "Use no other tool, apart from a tool search to load reply, and do not edit files or take any other action for this request.",
+            "Use no other tool, apart from a tool search to load reply, and do not edit files or take any other action for this request. " +
+            "If reply is not found yet, search again: the gorynych server may still be connecting.",
             kimi.Prompts.Last().Text);
 
         await using var other = await TestClient.ConnectAsync(conductor, "other");

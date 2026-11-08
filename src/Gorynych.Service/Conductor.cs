@@ -1998,10 +1998,14 @@ public sealed class Conductor : IAsyncDisposable
     /// How an opinion request is answered, after the answer itself: only reply reaches the asker,
     /// since the turn is reported nowhere (a spawned child's turns are, which confused one); and no
     /// other tool, though searching for reply is fine (Claude has to load the deferred tool first).
+    /// In a session the request woke, the gorynych server may still be connecting when Claude first
+    /// searches, so the tools seem gone for a moment. Claude's channel path needs none of this: its
+    /// server is connected by then.
     /// </summary>
     const string OpinionRules =
         "Only what you send with reply reaches the asker: this turn is not reported anywhere. Use no other tool, apart from a " +
-        "tool search to load reply, and do not edit files or take any other action for this request.";
+        "tool search to load reply, and do not edit files or take any other action for this request. If reply is not found " +
+        "yet, search again: the gorynych server may still be connecting.";
 
     /// <summary><c>_gorynych/reply</c>: the asked session answers an opinion request it got as a turn.</summary>
     internal JsonObject Reply(JsonRpcRequest request)

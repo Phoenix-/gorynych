@@ -121,7 +121,7 @@ internal static class OutsideTools
         {
             ["name"] = "read_session",
             ["description"] = "Read what was said in one of the user's Gorynych sessions: its latest messages, oldest first, with each " +
-                "tool call on one line. Use it to see what a session reported, decided or asked. It does not disturb the session and " +
+                "tool call on its own line. Use it to see what a session reported, decided or asked. It does not disturb the session and " +
                 "does not start its agent. When older messages exist, the result's last line says how to read them: pass its before value.",
             ["inputSchema"] = new JsonObject
             {

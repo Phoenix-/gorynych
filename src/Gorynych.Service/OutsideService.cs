@@ -191,17 +191,19 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
     /// <summary>
     /// What a tool call of the gorynych server says a session decided or asked, from its input:
     /// the question and whom it asked, the answer and to which request, the task and for which
-    /// agent, the session archived or restored. Empty for other tools, and without input (Kimi may
-    /// give none).
+    /// agent, the session archived or restored. The question and the answer are messages, so they
+    /// come whole, their further lines indented under the tool line; the task is on one line, cut
+    /// as <c>_gorynych/read</c> cut it. Empty for other tools, and without input (Kimi may give none).
     /// </summary>
     static string PeerDetail(JsonNode u)
     {
         if (u["rawInput"] is not JsonObject input || SessionReader.PeerTool((string?)u["title"]) is not { } tool) return "";
-        string? Field(string key) => input[key] is JsonValue v && v.TryGetValue<string>(out var s) && s.Length > 0 ? OneLine(s) : null;
+        string? Field(string key) => input[key] is JsonValue v && v.TryGetValue<string>(out var s) && s.Trim().Length > 0 ? OneLine(s) : null;
+        string? Message(string key) => input[key] is JsonValue v && v.TryGetValue<string>(out var s) && s.Trim().Length > 0 ? Indented(s) : null;
         var detail = tool switch
         {
-            "ask_agent" => Join(Field("session_id") is { } asked ? $"session_id {asked}" : null, Field("question")),
-            "reply" => Join(Field("message_id") is { } answered ? $"message_id {answered}" : null, Field("text")),
+            "ask_agent" => Join(Field("session_id") is { } asked ? $"session_id {asked}" : null, Message("question")),
+            "reply" => Join(Field("message_id") is { } answered ? $"message_id {answered}" : null, Message("text")),
             "spawn_session" => Join(Field("agent"), Field("prompt")),
             _ => Field("session_id") is { } id ? $"session_id {id}" : null,
         };
@@ -211,6 +213,10 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
     }
 
     static string OneLine(string text) => string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    /// <summary>A message's text with its lines kept, the further ones indented under the tool line, blank lines dropped.</summary>
+    static string Indented(string text) =>
+        string.Join("\n     ", text.Trim().Split('\n').Select(l => l.TrimEnd()).Where(l => l.Length > 0));
 
     /// <summary>A message through Claude's channel without its channel tag: the tag is how it travelled, not what it says.</summary>
     static string Unwrapped(JsonObject? meta, string body)

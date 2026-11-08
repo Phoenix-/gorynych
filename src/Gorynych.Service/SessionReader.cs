@@ -115,7 +115,9 @@ internal static partial class SessionReader
         return new Page(updates, start > 0 ? messages[start].Cursor : null, messages.Count, end > start ? start + 1 : 0, end - start);
     }
 
-    static int Cost(Item i) => i.Kind == "tool_call" ? (i.Title?.Length ?? 0) + 20 : i.Text.Length;
+    static int Cost(Item i) => i.Kind == "tool_call"
+        ? (i.Title?.Length ?? 0) + 20 + (PeerInput(i)?.Sum(p => p.Value is JsonValue v && v.TryGetValue<string>(out var s) ? s.Length : 0) ?? 0)
+        : i.Text.Length;
 
     /// <summary>Messages, thoughts and tool calls in journal order, the chunks of one message merged.</summary>
     static List<Item> Items(IReadOnlyList<JsonNode> journal)
@@ -181,17 +183,9 @@ internal static partial class SessionReader
             update["title"] = i.Title ?? "tool";
             if (i.ToolKind is not null) update["kind"] = i.ToolKind;
             if (i.Status is not null) update["status"] = i.Status;
-            // What a session asked, answered, started or archived through the gorynych server: its input,
-            // each text cut short. Other tools' input stays out.
-            if (i.RawInput is { } raw && PeerTool(i.Title) is not null)
-            {
-                var kept = new JsonObject();
-                foreach (var (key, value) in raw)
-                    kept[key] = value is JsonValue v && v.TryGetValue<string>(out var str) && str.Length > PeerInputLimit
-                        ? str[..PeerInputLimit] + "…"
-                        : value?.DeepClone();
-                update["rawInput"] = kept;
-            }
+            // What a session asked, answered, started or archived through the gorynych server: its
+            // input (PeerInput). Other tools' input stays out.
+            if (PeerInput(i) is { } kept) update["rawInput"] = kept;
         }
         else
         {
@@ -203,8 +197,39 @@ internal static partial class SessionReader
         return update;
     }
 
-    /// <summary>How much of each text in a gorynych tool's input a page keeps.</summary>
+    /// <summary>About how much of a text in a gorynych tool's input a page keeps, except a question or an answer.</summary>
     public const int PeerInputLimit = 300;
+
+    /// <summary>
+    /// The input of a gorynych tool's call that says what a session decided: <c>ask_agent</c>'s
+    /// question and <c>reply</c>'s answer whole, since they are messages (for Kimi, whose turn may
+    /// end with a word, the reply holds the only copy of its answer), and any other text cut at a
+    /// word near <see cref="PeerInputLimit"/>, saying how much is left out. Null for other tools.
+    /// </summary>
+    static JsonObject? PeerInput(Item i)
+    {
+        if (i.RawInput is not { } raw || PeerTool(i.Title) is not { } tool) return null;
+        var kept = new JsonObject();
+        foreach (var (key, value) in raw)
+            kept[key] = value is JsonValue v && v.TryGetValue<string>(out var text) && (tool, key) is not (("reply", "text") or ("ask_agent", "question"))
+                ? CutAtWord(text, PeerInputLimit)
+                : value?.DeepClone();
+        return kept;
+    }
+
+    /// <summary>
+    /// A text longer than <paramref name="limit"/> cut at the last space before it (inside a word
+    /// only when there is none in its second half), with <c>… (+N characters)</c> for the rest.
+    /// </summary>
+    public static string CutAtWord(string text, int limit)
+    {
+        if (text.Length <= limit) return text;
+        var cut = limit;
+        while (cut > limit / 2 && !char.IsWhiteSpace(text[cut])) cut--;
+        if (cut == limit / 2) cut = char.IsLowSurrogate(text[limit]) ? limit - 1 : limit;
+        var kept = text[..cut].TrimEnd();
+        return $"{kept}… (+{text.Length - kept.Length} characters)";
+    }
 
     /// <summary>
     /// A tool's name and its MCP server, from a tool call's title in either form the agents give it:

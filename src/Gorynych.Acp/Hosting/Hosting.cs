@@ -131,10 +131,12 @@ public static class GorynychProtocol
     /// A short random tag for one run, in the message IDs a component counts in memory (the
     /// service's <c>m…</c>, Claude's channel <c>c…</c>): after a restart the count starts again, and the
     /// tag keeps a late reply to a request of an earlier run from answering a new one. Four letters
-    /// or digits, so the IDs stay easy for an agent to copy.
+    /// or digits from <see cref="RunTagAlphabet"/>, so the IDs stay easy for an agent to copy.
     /// </summary>
-    public static string NewRunTag() =>
-        System.Security.Cryptography.RandomNumberGenerator.GetString("abcdefghijklmnopqrstuvwxyz0123456789", 4);
+    public static string NewRunTag() => System.Security.Cryptography.RandomNumberGenerator.GetString(RunTagAlphabet, 4);
+
+    /// <summary>The characters of a run tag: no look-alikes (0 1 i l o), since Kimi once copied an l as a 1.</summary>
+    public const string RunTagAlphabet = "abcdefghjkmnpqrstuvwxyz23456789";
 
     /// <summary>
     /// Sets a session's archive flag: <c>{sessionId, archived}</c> → <c>{}</c>. Only a flag: it

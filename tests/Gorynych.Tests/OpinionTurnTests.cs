@@ -111,9 +111,12 @@ public sealed partial class OpinionTurnTests
         var prompt = kimi.Prompts.Single();
         var messageId = MessageId(prompt);
         StringAssert.Matches(messageId, new Regex("^m[a-z0-9]{4}-1$"), "the run's tag, then the count");
+        var tags = string.Concat(Enumerable.Range(0, 500).Select(_ => GorynychProtocol.NewRunTag()));
+        Assert.AreEqual(-1, tags.IndexOfAny(['0', '1', 'i', 'l', 'o']), "no look-alikes in a tag");
         StringAssert.StartsWith(prompt, $"[Opinion request · from session_id asking (claude) · message_id {messageId}]");
         StringAssert.Contains(prompt, "Only what you send with reply reaches the asker: this turn is not reported anywhere. Use no other tool, " +
-            "apart from a tool search to load reply, and do not edit files or take any other action for this request.");
+            "apart from a tool search to load reply, and do not edit files or take any other action for this request. If reply is not found yet, " +
+            "search again: the gorynych server may still be connecting.");
         Assert.IsFalse(prompt.Contains("peer_claude", StringComparison.Ordinal), "no label that looks like a session ID");
         StringAssert.Contains(prompt, "Tabs or spaces for C#?");
         StringAssert.Contains(prompt, "reply tool of the gorynych MCP server");

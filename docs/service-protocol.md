@@ -205,14 +205,18 @@ never in the text. The journal keeps the text exactly as the agent got it.
   message_id "mk7q2-3" (reply answers this request; ask_agent would start a new question
   instead). Only what you send with reply reaches the asker: this turn is not reported
   anywhere. Use no other tool, apart from a tool search to load reply, and do not edit files or
-  take any other action for this request.
+  take any other action for this request. If reply is not found yet, search again: the
+  gorynych server may still be connecting.
   ```
 
   The `message_id` is `m`, a random tag of the service's run, `-` and a count:
-  `m<tag>-<n>`. The count starts again when the service does, and the tag keeps a late reply to
-  a request of an earlier run from answering a new one. The last two sentences came from a live
-  test: Kimi wondered whether its final message went to the asker, as a spawned child's does,
-  and Claude has to search for the deferred `reply` tool before it can call it.
+  `m<tag>-<n>`. The tag is four characters without the look-alikes `0`, `1`, `i`, `l` and `o`
+  (Kimi once copied an `l` as a `1`). The count starts again when the service does, and the
+  tag keeps a late reply to a request of an earlier run from answering a new one. The
+  sentences after the `reply` instruction came from live tests: Kimi wondered whether its final
+  message went to the asker, as a spawned child's does; Claude has to search for the deferred
+  `reply` tool before it can call it; and in a session the request woke, the gorynych server
+  may still be connecting when Claude first searches, so the tools seem gone for a moment.
 
   Through Claude's channel the content is the first line without the `message_id` (the
   channel message carries it in `meta`) and the question; Claude's appended system prompt
@@ -608,7 +612,7 @@ What the service returns for `tools/list`, outside Gorynych.
 **`read_session {session_id, before?, limit?, thoughts?}`**
 
 > Read what was said in one of the user's Gorynych sessions: its latest messages, oldest
-> first, with each tool call on one line. Use it to see what a session reported, decided or
+> first, with each tool call on its own line. Use it to see what a session reported, decided or
 > asked. It does not disturb the session and does not start its agent. When older messages
 > exist, the result's last line says how to read them: pass its before value.
 
@@ -677,7 +681,8 @@ It cannot be asked back, so put everything into your answer. Give your honest op
 briefly, then send it with the reply tool of the gorynych MCP server, passing message_id
 "mk7q2-3". Only what you send with reply reaches the asker: this turn is not reported anywhere.
 Use no other tool, apart from a tool search to load reply, and do not edit files or take any
-other action for this request.
+other action for this request. If reply is not found yet, search again: the gorynych server
+may still be connecting.
 ```
 
 - The parenthesis is the host's `client.title` (else `client.name`) and its `folder`. A host
@@ -728,7 +733,10 @@ GUI can use it too.
     in, and its `content`, locations and raw output dropped. Its raw input is dropped too,
     except for the `gorynych` server's `ask_agent`, `reply`, `spawn_session`,
     `archive_session` and `restore_session`, whose input says what the session asked, answered,
-    started or archived: kept, each text cut at 300 characters with `…`;
+    started or archived. It is kept: `ask_agent`'s `question` and `reply`'s `text` whole, since
+    they are messages (for Kimi, whose turn may end with a word, the reply holds the only copy
+    of its answer), and any other text cut at the last space before 300 characters, with
+    `… (+<n> characters)` for the rest;
   - `agent_thought_chunk` only with `thoughts: true`.
 
   Plans, usage, `session_info_update` and the other kinds are left out.
@@ -779,7 +787,7 @@ session_id <id> (<agent>, "<title>") · status saved · messages 31–40 of 40, 
 [Opinion request · from session_id … · message_id mk7q2-2]
 …
 ── agent
-   · tool: reply (gorynych) · completed · message_id mk7q2-2: <the answer, cut at 300 characters>
+   · tool: reply (gorynych) · completed · message_id mk7q2-2: <the answer, whole>
 <text>
 (turn in progress)
 Older messages: call read_session with session_id "<id>" and before "<cursor>".
@@ -813,10 +821,12 @@ Checking with that session as well.
   and none on the page (Claude records none), the header ends with `· no thoughts recorded`.
 - **Tool lines.** `   · tool: <tool> (<server>) · <status>`: an MCP name `mcp__<server>__<tool>`
   (Kimi's titles) reads as Claude's titles do; a tool call without a status reads `pending`.
-  A `gorynych` tool adds what it said, on one line: `ask_agent` `· session_id <id>: <question>`,
+  A `gorynych` tool adds what it said: `ask_agent` `· session_id <id>: <question>`,
   `reply` `· message_id <id>: <answer>`, `spawn_session` `· <agent>: <task>`,
-  `archive_session` and `restore_session` `· session_id <id>`. Without input (Kimi may give
-  none) the line ends at the status.
+  `archive_session` and `restore_session` `· session_id <id>`. The question and the answer
+  come whole, each further line of theirs indented by five spaces under the tool line; the task
+  is on one line, cut at a word with `… (+<n> characters)`. Without input (Kimi may give none)
+  the line ends at the status.
 - **Budget.** At most `limit` messages and about 20,000 characters, filled from the newest
   backwards. A message that does not fit in what is left is cut in the middle with
   `[… <n> characters cut …]` and is the oldest shown, unless less than 500 characters are left
