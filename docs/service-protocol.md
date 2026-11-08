@@ -12,9 +12,14 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
 - One service per user and endpoint, enforced by a named mutex
   (`Gorynych.Service.<pipe>`, current user, all logon sessions).
 - Transport: a named pipe, default `gorynych-acp-<user name>`, carrying the ACP stdio
-  framing (JSON-RPC 2.0, one message per line). On Windows its ACL allows only the
-  current user and denies the NETWORK group; clients connect with
-  `PipeOptions.CurrentUserOnly`, which also checks the server's owner.
+  framing (JSON-RPC 2.0, one message per line). Clients connect with
+  `PipeOptions.CurrentUserOnly`, which checks the server's owner. On Windows the pipe's
+  owner and the only principal its ACL allows is the default owner of the service's
+  token, the SID that this check compares with; the ACL also denies the NETWORK group.
+  That owner is the user, or BUILTIN\Administrators when the service runs elevated, so
+  an elevated service and its clients are kept apart from the user's plain processes:
+  both run elevated or neither does. A plain process can never drive an elevated service,
+  which starts agents. Elsewhere the pipe is a Unix socket, open only to the user.
 - The service is not a Windows service (session 0 could not start agents under the
   user's login). The GUI, the test client or a logon task starts it; it keeps running
   after clients disconnect.
