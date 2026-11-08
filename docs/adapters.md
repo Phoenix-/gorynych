@@ -59,11 +59,169 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
 
 ## Claude Code
 
-The adapter (`Gorynych.Adapters.Claude`) is an in-process ACP agent that runs the
-interactive `claude` TUI in a Windows pseudo console. It never touches `~/.claude`:
-everything goes through per-launch flags, hook HTTP calls and the terminal.
+The adapter (`Gorynych.Adapters.Claude`) is an in-process ACP agent that drives the unmodified
+`claude` binary under the person's own login. It never touches `~/.claude`: everything goes
+through per-launch flags and Claude's own protocols. It has two transports, picked with the
+service option `--claude-transport`:
 
-### Launch
+- **`headless`** (the default): `claude -p` with stream-json in and out, one process per loaded
+  session. Anthropic's help center says `claude -p` and the Agent SDK signed in with a plan draw
+  from the plan's limits (updated 15 June and 7 October 2026).
+- **`tui`** (the fallback): the interactive TUI in a Windows pseudo console, with http hooks and
+  the development channel ([below](#tui-transport)). It stays built and tested for the day
+  Anthropic moves `-p` off the plans.
+
+Both use Claude's own transcripts and session IDs and the adapter's one session list, so
+switching is one flag with no migration: a session started with one transport continues with
+the other (`LiveSmokeTests.Claude_SessionsMoveBetweenTransports_BothWays`). The design and the
+probes behind the headless transport are in
+[research/claude-headless-spec.md](../research/claude-headless-spec.md).
+
+### Headless transport
+
+#### Launch
+
+```
+claude -p --input-format stream-json --output-format stream-json --verbose
+       --include-partial-messages --replay-user-messages --permission-prompt-tool=stdio
+       --settings <session>/settings.json --permission-mode <mode> [--model <m>] [--effort <e>]
+       [--mcp-config <session>/mcp.json] [--append-system-prompt <live-note authorization>\n\n<ACP systemPrompt>]
+       (--session-id <id> | --resume <id>)
+```
+
+- `settings.json` holds only the deny rule for `mcp__gorynych-outside`; the transport needs no
+  hooks.
+- The process starts with the session's first prompt, not at `session/new` or
+  `session/resume`, and lives until `session/close` or the service's idle unload. It gets the
+  same cleaned environment as the TUI.
+- Right after the start the adapter sends the `initialize` control request (no fields). Its
+  answer brings the model catalog and the account, which the adapter checks
+  ([below](#failing-loudly)).
+- Stdout is read line by line on a thread of its own; stdin takes JSON lines under one lock;
+  stderr goes to `<session>/stderr.log` (up to 1 MB) and its tail into the error when Claude
+  exits early.
+
+#### Prompts and turns
+
+- `session/prompt` waits while a turn runs, then writes one `user` message stamped with a fresh
+  `uuid`; the next `result` ends the turn. Text blocks go as text, `image` blocks as
+  Anthropic image blocks (`promptCapabilities.image`), resource links as `@<uri>`.
+- `result` → `stopReason`: `success` → `end_turn`, `stop_reason: max_tokens` → `max_tokens`,
+  `refusal` → `refusal`, `error_max_turns` → `max_turn_requests`, any result after
+  `session/cancel` → `cancelled`. Another error adds a note (`[Claude stopped with an error: …]`)
+  and ends the turn.
+- `session/cancel` sends the `interrupt` control request (queued live notes survive it); the
+  turn ends with its `result`, or as `cancelled` 5 s later without one.
+- Claude exiting during a turn fails the prompt with the exit code and the end of stderr; the
+  next prompt starts a new process with `--resume`.
+
+#### Stream → ACP
+
+| Claude stream | ACP |
+| --- | --- |
+| `stream_event` `message_start` | the message ID (`msg_…`) for the chunks that follow |
+| `stream_event` `text_delta` / `thinking_delta` | `agent_message_chunk` / `agent_thought_chunk`, `messageId` = that ID |
+| `assistant` with `tool_use` | `tool_call` (`pending`), `toolCallId` = the block's `id`, title, kind and locations as in the TUI |
+| `assistant` text no delta carried | `agent_message_chunk` with the whole text |
+| `user` with `tool_result` | `tool_call_update` `completed` / `failed`, `rawOutput` = `tool_use_result`, Bash output or the error as content |
+| replay of the client's own prompt | nothing (ACP does not echo) |
+| replay of a live note | `user_message_chunk`, `messageId` = the note's `uuid`, the note's `_meta`, `gorynych/origin: "live"` |
+| `system` `init` | the current model and mode (`config_option_update` when they change) |
+| `result` | ends the turn; a turn of Claude's own ends with `_meta["gorynych/agentTurn"]: "ended"` |
+| a subagent's messages (`parent_tool_use_id`) | not shown yet; the `Task` tool call shows until its result |
+
+Output that arrives while no turn was counted is a turn Claude began itself (a background
+task ended): it is marked `gorynych/agentTurn: "started"` on its first update and `"ended"`
+with its `result`, so the service holds the session meanwhile.
+
+#### Approvals and questions
+
+- `can_use_tool` control requests become `session/request_permission` with the TUI's two
+  options, Allow (`allow_once`) and Deny (`reject_once`); the answer is `{behavior: "allow",
+  updatedInput}` or `{behavior: "deny", message}`, and a denial marks the tool call `failed`.
+  Nothing offered writes Claude's settings: the request's `permission_suggestions` are not
+  used.
+- `AskUserQuestion` (present in `-p` only because the adapter declares a permission host)
+  becomes the same `elicitation/create` form as in the TUI; an accepted form answers `allow`
+  with `updatedInput.answers`.
+- `mcp__gorynych__reply`, `list_agents` and `spawn_session` are allowed without asking, as in
+  the TUI.
+- `control_cancel_request` withdraws the ACP request.
+- An MCP server's `elicitation` is declined for now; other control requests from Claude get an
+  error.
+
+#### Live notes: opinions and reports on stdin
+
+`_gorynych/opinion` and `_gorynych/note` go into the running Claude as user messages, so they
+join a running turn after its current tool, or start a turn of Claude's own when Claude is
+idle. No development channel, consent question or notice is involved.
+
+- An opinion keeps the service's text unchanged and gets a footer that names the adapter's
+  `message_id` (`c<run tag>-<n>`) and says to answer with `reply`. The `gorynych` server gets
+  `--reply-url …/channel/<session>/<token>`: it routes `reply` to the adapter first, without
+  declaring a channel or polling, and on to the service for a `message_id` the adapter does not
+  know.
+- A report goes in as the service's text.
+- The note's `uuid` finds its `_meta` when Claude replays it; the `user_message_chunk` carries
+  it with `gorynych/origin: "live"` and, for an opinion, `gorynych/opinion`.
+- While Claude's process is not running the adapter answers `-32600`, so the service asks in a
+  turn that starts Claude.
+- `--append-system-prompt` starts with the adapter's authorization for this path: messages
+  whose first line starts with `[Opinion request` or `[Report` come from the user's other agents
+  through Gorynych; opinions are answered with `reply` and no other action, reports need none.
+
+#### Mode, model and effort selectors
+
+ACP config options, like Codex's:
+
+- `mode`: `default` ("Ask"), `acceptEdits`, `plan`, and `auto` when the current model supports
+  it; a mode set in the person's own settings shows as itself.
+- `model`: the catalog of `initialize` (`value`, `displayName`, `description`).
+- `reasoning_effort`: `default` (Claude's own) and the model's `supportedEffortLevels`.
+- The catalog comes from the first launch and is kept for the adapter's life; before it,
+  `session/new` returns only `mode`.
+- A change applies to a running Claude at once (`set_permission_mode`, `set_model`,
+  `apply_flag_settings {effortLevel}`), is kept in the session's record in `claude/sessions.json`,
+  and is passed to later launches (`--permission-mode`, `--model`, `--effort`). Nothing the
+  person did not change is sent.
+
+#### Titles
+
+Headless Claude writes no generated `ai-title`, so the service's provisional title stays until
+a name is given. The adapter advertises `gorynych/setTitle`: `_gorynych/set_title` becomes the
+`rename_session` control request, which writes Claude's own `custom-title` (waiting for the next
+launch when Claude is not running). The transcript is still followed, so a title written
+elsewhere reaches the client.
+
+#### Folder trust
+
+`claude -p` asks nothing before working in a folder and runs that folder's project hooks and
+`.mcp.json` servers at once. So before the first launch in a folder the adapter reads Claude's
+own flag (`projects[<folder or a parent>].hasTrustDialogAccepted` in `~/.claude.json`, or in
+`$CLAUDE_CONFIG_DIR`), and otherwise asks the person with the same approval the TUI's trust
+dialog becomes. An allow is kept in `claude/trusted.json`, never in Claude's configuration; a
+deny fails the prompt.
+
+#### Failing loudly
+
+The transport never runs on silently when Claude is not on the person's plan:
+
+- `initialize` shows no login (no plan, `tokenSource: "none"`), which is what `--bare` looks
+  like: Claude is stopped and the prompt fails, telling the person to sign in or to start the
+  service with `--claude-transport tui` (the headless docs say `--bare` will become the default
+  for `-p`; it reads no OAuth login).
+- `initialize` shows an API key (`apiKeySource`, which wins over the login in `-p`): Claude is
+  stopped and the prompt fails, naming the variable to remove.
+- An assistant error `authentication_failed`, `billing_error`, `account_on_hold`,
+  `oauth_org_not_allowed` or `verification_required` fails the client's prompt and leaves a
+  note in the feed, both naming `--claude-transport tui`.
+
+### TUI transport
+
+The fallback: the interactive `claude` TUI in a Windows pseudo console, fed by http hooks and
+the development channel.
+
+#### Launch
 
 ```
 claude --settings <session>/settings.json --permission-mode default [--model <m>]
@@ -96,7 +254,7 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
   ([below](#consent-to-development-channels)). The folder-trust question is relayed to the
   client as an approval and answered with Enter only if the person allows it.
 
-### Consent to development channels
+#### Consent to development channels
 
 Claude Code loads the service's channel only with `--dangerously-load-development-channels`, a
 research preview, and then shows a notice at every launch that needs Enter. Gorynych confirms
@@ -125,7 +283,7 @@ that notice for the person, so it asks first:
 - `--claude-channels accept|decline` answers up front, for a service nobody watches; `ask` is
   the default. `--no-channel` is the same as `decline`.
 
-### Prompts and turns
+#### Prompts and turns
 
 - The first `session/prompt` is the launch argument (after `--`). Until Claude has taken
   a prompt the launch uses `--session-id`; after that, `--resume`.
@@ -141,7 +299,7 @@ that notice for the person, so it asks first:
 - An approval is withdrawn when Claude abandons the hook call (its timeout, an answer typed
   in the TUI, an interrupt).
 
-### Hooks → ACP
+#### Hooks → ACP
 
 | Hook | ACP |
 | --- | --- |
@@ -169,7 +327,7 @@ and questions are kept apart: `session/request_permission` asks to allow an acti
 `elicitation/create` asks for information. If the client cannot show forms, the question
 is denied with a note so Claude asks in plain text.
 
-### MCP servers and the channel (opinions both ways)
+#### MCP servers and the channel (opinions both ways)
 
 The `mcpServers` of `session/new` and `session/resume` go into the per-launch
 `--mcp-config` (stdio, http and sse), so Claude gets the client's servers and the
@@ -219,9 +377,10 @@ service turns are over, unless a client opened it meanwhile
 ([adapter-contract.md](adapter-contract.md#61-waking-a-session-and-closing-it-again)). For
 Claude, *loaded* therefore means registered in the adapter, not that its process runs.
 
-A name given to `spawn_session` stays in the service's overlay: the adapter cannot write
-Claude's own `custom-title` yet (that needs `/rename` through the PTY), and Claude's
-generated `ai-title` does not replace the name.
+In the TUI, a name given to `spawn_session` stays in the service's overlay: the transport cannot
+write Claude's own `custom-title` (that needs `/rename` through the PTY), and Claude's
+generated `ai-title` does not replace the name. The headless transport writes it natively
+([Titles](#titles)).
 
 Claude Code has no archive of its own, so the archive flag of a Claude session lives in the
 service's overlay ([service-protocol.md](service-protocol.md#archive)); the adapter knows
@@ -229,10 +388,11 @@ nothing of it.
 
 ### Not done yet
 
-- A Unix PTY host; the adapter reports "not supported" off Windows, the service still builds.
+- Headless: subagent messages, background tasks and `/compact` are not mapped; MCP servers'
+  elicitations are declined; not tried on Linux and macOS.
+- TUI: a Unix PTY host (the transport reports "not supported" off Windows), `/rename` from the
+  GUI, resizing the pseudo console.
 - Listing Claude sessions the adapter did not start (`~/.claude/projects`).
-- Subagent events, `/rename` from the GUI (and so a spawn name written as Claude's own
-  `custom-title`), resizing the pseudo console.
 
 ## Codex
 

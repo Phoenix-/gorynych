@@ -9,8 +9,9 @@ other for opinions and start child sessions.
 
 ## The idea
 
-- **Native agents.** Claude Code runs as its interactive TUI in a pseudo console, driven only
-  by per-launch flags (http hooks, an MCP config, a channel). Kimi Code runs through
+- **Native agents.** Claude Code runs headless (`claude -p` with stream-json) under your own
+  plan login, driven only by per-launch flags; its interactive TUI in a pseudo console is the
+  fallback (`--claude-transport tui`). Kimi Code runs through
   `kimi acp`, Codex through `codex app-server`. Gorynych never edits an agent's own
   configuration.
 - **ACP everywhere.** A per-machine service speaks the
@@ -29,7 +30,7 @@ other for opinions and start child sessions.
 flowchart LR
   zed[Zed] -- ACP over stdio --> bridge[bridge]
   bridge -- ACP over a named pipe --> svc[Gorynych service]
-  svc --> claude[Claude Code TUI]
+  svc --> claude["claude -p (or its TUI)"]
   svc --> kimi[kimi acp]
   svc --> codex[codex app-server]
   outside[agents outside Gorynych] -- MCP --> shim[gorynych-outside] --> svc
@@ -39,8 +40,9 @@ The design, its decisions and the probes behind them: [docs/design.md](docs/desi
 
 ## What works today
 
-- **Claude Code** (Windows): feed, approvals, questions as forms, titles, resume after a
-  restart, follow-up prompts typed into the live TUI.
+- **Claude Code**: streamed answers and thoughts, approvals, questions as forms, model, effort
+  and mode selectors, names, resume after a restart, images in prompts; the TUI fallback
+  (Windows) with the same feed through hooks.
 - **Kimi Code** through `kimi acp`.
 - **Codex** through `codex app-server`: feed, approvals and questions, Codex's permission modes
   (including its automatic reviewer, "Approve for me"), model and effort, names, resume.
@@ -53,14 +55,14 @@ The design, its decisions and the probes behind them: [docs/design.md](docs/desi
   (`--unload-after`) and woken again when a client, a question or a report needs it.
 - **Zed** through the bridge, `Gorynych.Service acp --agent claude|kimi|codex`.
 
-Claude Code delivers other agents' questions through development channels, a Claude Code
-research preview. Gorynych asks you once before it starts Claude with them; without them the
-questions arrive as ordinary turns.
+Headless Claude gets other agents' questions on its input. In the TUI fallback they go through
+development channels, a Claude Code research preview: Gorynych asks you once before it starts
+Claude with them; without them the questions arrive as ordinary turns.
 
 ## Planned
 
 - DeepSeek through its host's HTTP API.
-- Claude on Linux and macOS (a Unix PTY host).
+- Trying headless Claude on Linux and macOS (it uses nothing Windows-only).
 - One GUI over several machines: remote services over `ssh -T`, questions between machines.
 - The [Zed fork](https://github.com/Phoenix-/zed) (in progress): automatic pickup of sessions and the session tree.
 

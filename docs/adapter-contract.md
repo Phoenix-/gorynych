@@ -282,7 +282,8 @@ in the middle of one.
   reports the delivered message as a `user_message_chunk`, the adapter SHOULD put those keys on
   it, with `gorynych/origin` saying how it arrived and, for an opinion, `gorynych/opinion` set
   to its own `message_id`; the GUI and `read_session` tell requests and reports apart by them.
-- Today only Claude has it, through its development channel ([adapters.md](adapters.md#mcp-servers-and-the-channel-opinions-both-ways)).
+- Today only Claude has it: on Claude's input when it runs headless ([adapters.md](adapters.md#live-notes-opinions-and-reports-on-stdin)),
+  through its development channel in the TUI ([adapters.md](adapters.md#mcp-servers-and-the-channel-opinions-both-ways)).
 
 ## 7. Closing and unloading
 
@@ -347,7 +348,8 @@ in the middle of one.
   (ACP has no method for it). The service then writes explicit names natively: a
   `spawn_session` name, and later a rename. It never writes the provisional title, since the
   harness shows a nameless session by its first message anyway. Codex has `thread/name/set`;
-  Claude's `/rename` needs the terminal. (Codex)
+  headless Claude has the `rename_session` control request; the TUI's `/rename` would need the
+  terminal. (Codex, Claude headless)
 
 ## 10. Delete
 
@@ -396,24 +398,24 @@ Claude, Kimi and Codex as built; DeepSeek as expected, nothing built. The Codex 
 Codex 0.167.0 as built and probed on 8 November 2026 ([adapters.md](adapters.md#codex));
 `codex app-server` speaks its own JSON-RPC, not ACP, so its adapter translates, like Claude's.
 
-| Feature | Claude Code (in-process adapter, TUI in a pseudo console) | Kimi Code 2.5.2 (`kimi acp`, native ACP) | Codex 0.167 (in-process adapter over `codex app-server`) | DeepSeek, expected |
+| Feature | Claude Code (in-process adapter: headless `claude -p` by default, the TUI in a pseudo console as the fallback) | Kimi Code 2.5.2 (`kimi acp`, native ACP) | Codex 0.167 (in-process adapter over `codex app-server`) | DeepSeek, expected |
 | --- | --- | --- | --- | --- |
-| Capabilities | list, resume, close | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable` | list, load, close, delete over its own store |
+| Capabilities | list, resume, close, systemPrompt; headless also `gorynych/setTitle` and image prompts | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable` | list, load, close, delete over its own store |
 | New ([§3](#3-new-sessions-the-list-and-discovery)) | UUID from the adapter; recorded at the first prompt | `session_…`; a real session at once, listed untitled | `thread/start`; nothing on disk before the first turn | its own store: the adapter keeps the history, since DeepSeek has no session store; ID scheme to be chosen |
 | List | the adapter's own list of the sessions it started | Kimi's list; leaves natively archived sessions out; ignores `cursor` | `thread/list` (`cursor`, `limit`, exact `cwd`); archived left out; title = the thread's `name` | its own store |
 | Open not loaded ([§4](#4-opening-a-session-that-is-not-loaded)) | `session/resume` only registers; the process starts with the next prompt | `session/resume` | `thread/resume`, `excludeTurns`; `session/load` replays `thread/items/list`; fails while another Codex process has the thread (one writer) or when it is archived in Codex | `session/load` from its own store, which MUST keep the whole history |
-| Turns ([§5](#5-prompts-and-turns)) | bracketed paste into the TUI; `Stop` hook ends the turn | native | `turn/start`; `turn/interrupt` for `session/cancel` | API calls |
+| Turns ([§5](#5-prompts-and-turns)) | headless: a user message on stdin, the `result` ends the turn, `interrupt` for `session/cancel`; TUI: bracketed paste, the `Stop` hook ends the turn | native | `turn/start`; `turn/interrupt` for `session/cancel` | API calls |
 | Service turns and waking ([§6.1](#61-waking-a-session-and-closing-it-again)) | turns start the process; unloaded after the idle time | turns; resumed, then unloaded after the idle time | turns; resumed, then unloaded after its 2-minute idle time | expected the same |
 | `gorynych` MCP server ([§6.2](#62-the-gorynych-mcp-server)) | per-launch `--mcp-config` | through ACP `mcpServers` | per-thread `config.mcp_servers` on `thread/start` and every `thread/resume` (kept only while loaded) | unknown: depends on its MCP client |
-| System prompt ([§6.2](#62-the-gorynych-mcp-server)) | `sessionCapabilities.systemPrompt: {}` (append only): `--append-system-prompt`, after the channel's authorization; other modes and non-text content fail with `-32602` | not advertised by 2.5.2: the MCP instructions and the requests' texts | append only: `developerInstructions`; Codex keeps those a thread was created with | expected: append, and override too, since the adapter writes the system message itself |
+| System prompt ([§6.2](#62-the-gorynych-mcp-server)) | `sessionCapabilities.systemPrompt: {}` (append only): `--append-system-prompt`, after the adapter's live-note authorization; other modes and non-text content fail with `-32602` | not advertised by 2.5.2: the MCP instructions and the requests' texts | append only: `developerInstructions`; Codex keeps those a thread was created with | expected: append, and override too, since the adapter writes the system message itself |
 | Hidden from `gorynych-outside` ([§1](#1-building-and-starting-an-adapter)) | yes: `claude` is the service's child and starts MCP servers as its own children (probe); the adapter's `--settings` also denies `mcp__gorynych-outside` | yes: `kimi acp` is the service's child and starts MCP servers as its own children (probe) | yes: `codex.exe` is the service's child and starts MCP servers as its own children (probe); also turned off per thread when the user registered it | unknown: depends on its MCP client |
-| … on Linux and macOS | only the deny rule would hide it; the adapter itself runs on Windows only yet (ConPTY) | not hidden: the parent walk is Windows only yet, so every caller counts as outside | hidden: turned off per thread | not hidden, as for Kimi |
-| Message IDs ([§5](#5-prompts-and-turns)) | answers: `MessageDisplay`'s `message_id`; typed and channel messages: the hook's `prompt_id` (the transcript's `promptId`), a new UUID for a channel message within a turn; texts Claude gives no ID: a new UUID | none sent by 2.5.2: the service assigns them | item IDs (`msg_…`, `rs_…`, UUIDv7 user messages); the service's prompt ID kept as `clientUserMessageId` | its own store's IDs |
-| Live-note path ([§6.4](#64-the-live-note-path)) | development channel; `-32600` while not running | none (`-32601`) | none (`-32601`); `turn/steer` could carry notes into a running turn later | none |
-| Turns of its own marked ([§7](#7-closing-and-unloading)) | yes: channel and terminal turns, from `UserPromptSubmit` to `Stop` or exit | none to mark: Kimi runs no turn of its own | none: one writer, so the adapter's process drives every turn | none |
-| Approvals ([§8](#8-approvals-and-forms)) | PermissionRequest hook; pre-allows the three tools | Kimi's own `session/request_permission`; the service pre-allows | command, file change, permissions and MCP tool approvals; no option that writes `~/.codex`; the gorynych tools ask the person | unknown |
-| Forms | `AskUserQuestion` as `elicitation/create` | none seen | `item/tool/requestUserInput` and MCP form elicitations as `elicitation/create`; URL elicitations declined | unknown |
-| Titles ([§9](#9-titles)) | `ai-title` / `custom-title` from the transcript; no way to set one | the first prompt, cut at 200 characters; no way to set one | `thread/name/updated`; `_gorynych/set_title` → `thread/name/set` for spawn names | its own |
+| … on Linux and macOS | headless runs there (not tried yet) and only the deny rule would hide it; the TUI runs on Windows only (ConPTY) | not hidden: the parent walk is Windows only yet, so every caller counts as outside | hidden: turned off per thread | not hidden, as for Kimi |
+| Message IDs ([§5](#5-prompts-and-turns)) | headless: answers the API's `msg_…`; live notes the `uuid` the adapter wrote them with; TUI: answers `MessageDisplay`'s `message_id`, typed and channel messages the hook's `prompt_id` (the transcript's `promptId`), a new UUID for a channel message within a turn; texts Claude gives no ID: a new UUID | none sent by 2.5.2: the service assigns them | item IDs (`msg_…`, `rs_…`, UUIDv7 user messages); the service's prompt ID kept as `clientUserMessageId` | its own store's IDs |
+| Live-note path ([§6.4](#64-the-live-note-path)) | headless: user messages on stdin, `reply` routed by `--reply-url`; TUI: the development channel; `-32600` while not running | none (`-32601`) | none (`-32601`); `turn/steer` could carry notes into a running turn later | none |
+| Turns of its own marked ([§7](#7-closing-and-unloading)) | yes: headless from the first update of a turn the client did not start (a live note's, or one Claude began itself) to its `result` or the exit; TUI channel and terminal turns from `UserPromptSubmit` to `Stop` or exit | none to mark: Kimi runs no turn of its own | none: one writer, so the adapter's process drives every turn | none |
+| Approvals ([§8](#8-approvals-and-forms)) | headless: `can_use_tool` control requests; TUI: the PermissionRequest hook; Allow / Deny only, and the three tools pre-allowed, in both | Kimi's own `session/request_permission`; the service pre-allows | command, file change, permissions and MCP tool approvals; no option that writes `~/.codex`; the gorynych tools ask the person | unknown |
+| Forms | `AskUserQuestion` as `elicitation/create` (headless: through `can_use_tool`); MCP elicitations declined (headless) or shown only in the terminal (TUI) | none seen | `item/tool/requestUserInput` and MCP form elicitations as `elicitation/create`; URL elicitations declined | unknown |
+| Titles ([§9](#9-titles)) | `ai-title` (TUI only) / `custom-title` from the transcript; headless: `_gorynych/set_title` → `rename_session`, which writes `custom-title` | the first prompt, cut at 200 characters; no way to set one | `thread/name/updated`; `_gorynych/set_title` → `thread/name/set` for spawn names | its own |
 | Close ([§7](#7-closing-and-unloading)) | ends the process | `session/close`, still listed | `turn/interrupt`, up to 5 s for the turn to end, then `thread/unsubscribe` (unloads an idle thread at once) | frees nothing native |
 | Delete ([§10](#10-delete)) | none: a tombstone | `session/delete` (`-32602` for an unknown one) | `thread/delete` (also deletes Codex's own sub-agent threads); a thread Codex lacks: `-32002` | its own store |
 | Archive ([§11](#11-archive)) | none: the overlay | native in Kimi's UI, not in `kimi acp`: the overlay | native, but an archived thread cannot be resumed: the overlay; Codex-archived threads left out | none: the overlay |

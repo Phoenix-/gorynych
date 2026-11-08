@@ -2,9 +2,10 @@
 
 Gorynych is early work in progress. This guide sets it up on Windows with Zed as the GUI.
 
-On Linux and macOS the service builds and Kimi Code runs. Claude Code needs Windows: the
-adapter drives its TUI through ConPTY. Codex has not been tried there, and nothing is
-published for those systems yet.
+On Linux and macOS the service builds and Kimi Code runs. Claude Code's default, headless
+transport uses nothing Windows-only but has not been tried there; its TUI fallback needs
+Windows (ConPTY). Codex has not been tried there either, and nothing is published for those
+systems yet.
 
 ## What you need
 
@@ -104,8 +105,8 @@ user name in the paths:
 - `auto_import_sessions` exists only in the fork. Stock Zed does not know it and ignores it.
 - `default_config_options` is a stock Zed setting. It sets an agent's selectors for new
   threads, for example `"default_config_options": { "mode": "auto" }` for Codex.
-- Arguments after `--agent` such as `--unload-after <minutes>` or
-  `--claude-channels ask|accept|decline` configure the service. They apply only when the bridge
+- Arguments after `--agent` such as `--unload-after <minutes>`, `--claude-transport headless|tui`
+  or `--claude-channels ask|accept|decline` configure the service. They apply only when the bridge
   starts it ([external-clients.md](external-clients.md)).
 
 `Gorynych.Service.exe acp --agent …` is a small bridge. It starts the service if it is not
@@ -121,10 +122,21 @@ quits and serves every client.
 
 Approvals, questions and the agent's answers come into the thread as with any ACP agent.
 
-**Claude asks once about development channels.** Other agents' questions reach a running
-Claude session through Claude Code's development channels, a research preview. With them on,
-Claude Code shows a notice at every launch that needs Enter, so before the first such launch
-Gorynych asks in the thread:
+**Claude** runs headless by default: the unmodified `claude -p` under your own plan login, which
+Anthropic's terms allow today ([adapters.md](adapters.md#claude-code)). Its thread has three
+selectors: **mode** (`Ask`, `Accept edits`, `Plan`, and `Auto` where the model has it), **model**
+and **reasoning effort**. A change applies at once and stays with the session. The first time
+Claude works in a folder you have not trusted in Claude Code, Gorynych asks in the thread
+whether to trust it.
+
+Should headless Claude stop working on your plan, start the service with
+`--claude-transport tui`: Gorynych then drives the interactive Claude Code instead, and your
+sessions carry over.
+
+**Only with `--claude-transport tui`: Claude asks once about development channels.** In the TUI,
+other agents' questions reach a running Claude session through Claude Code's development
+channels, a research preview. With them on, Claude Code shows a notice at every launch that
+needs Enter, so before the first such launch Gorynych asks in the thread:
 
 - **Allow:** Gorynych starts Claude with the channel and confirms the notice on each launch.
 - **Don't allow:** Claude runs without the channel. Other agents' questions and child sessions'
@@ -133,8 +145,8 @@ Gorynych asks in the thread:
 The answer is kept in `%LOCALAPPDATA%\Gorynych\claude\channels.json`. To be asked again, delete
 that file and restart the service (`Gorynych.Service.exe shutdown`, then reopen Zed): a running
 service keeps the answer it read. If you dismiss the question, that launch runs without the channel and Gorynych asks
-again later ([adapters.md](adapters.md#consent-to-development-channels)). The first time Claude
-works in a folder, its folder-trust question also arrives as an approval.
+again later ([adapters.md](adapters.md#consent-to-development-channels)). The headless transport
+needs no channel and never asks this.
 
 **Codex** has three selectors in the thread:
 
@@ -212,8 +224,9 @@ If a file is still in use, look for processes that are left over:
 - **Data:** `%LOCALAPPDATA%\Gorynych`.
   - `sessions.json`: the service's list of sessions, with titles, parents and archive flags.
   - `journal\`: what each session said, as the service relayed it.
-  - `claude\`: the Claude adapter's session list, `channels.json`, and per session the launch
-    files and `terminal.log`.
+  - `claude\`: the Claude adapter's session list (with each session's selector choices),
+    `trusted.json` (folders you trusted in Gorynych), `channels.json` (TUI only), and per session
+    the launch files and `stderr.log` (headless) or `terminal.log` (TUI).
   - `logs\`: `service-<date>.log` and `outside-<date>.log`.
 - **The agents' own state** stays in their folders (`~/.claude`, `~/.codex`, `~/.kimi-code`).
 - **Elevation.** The service serves only clients at its own elevation. A service started from
@@ -242,7 +255,16 @@ writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
 - **"gorynych acp: cannot reach the service on pipe …"**, with a note about elevation. A service
   at the other elevation already runs. Stop it from a terminal at its elevation with
   `Gorynych.Service.exe shutdown`, or use clients at its elevation.
-- **"Claude did not start the turn within 90 s. Last screen: …"**. Claude Code waited on a screen
+- **"Claude Code started without your login …"**. Run `claude` in a terminal and sign in. If you
+  are signed in, `claude -p` may have started to run bare by default, which ignores the login:
+  start the service with `--claude-transport tui`.
+- **"Claude Code would run on ANTHROPIC_API_KEY, billed outside your plan"**. An API key in the
+  service's environment wins over your login in `claude -p`. Remove it from the environment Zed
+  (and so the service) starts with, then restart the service.
+- **"Claude cannot run on your plan (…)"**. Claude Code reported an auth or billing error. If
+  Anthropic no longer lets `claude -p` run on your plan, start the service with
+  `--claude-transport tui`.
+- **"Claude did not start the turn within 90 s. Last screen: …"** (TUI transport). Claude Code waited on a screen
   Gorynych cannot answer, such as a login. The error quotes the screen, and the session's
   `terminal.log` under `%LOCALAPPDATA%\Gorynych\claude\sessions\<session>\` has all of it. Run
   `claude` once in a terminal in that folder, deal with what it asks, then prompt again.
