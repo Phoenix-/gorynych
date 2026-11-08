@@ -98,6 +98,61 @@ public sealed class LiveSmokeTests
 
     [TestMethod]
     [Timeout(600_000, CooperativeCancellation = true)]
+    public async Task Claude_NotRunning_IsStartedForAQuestion_AnswersWithReply_AndIsClosedAgain()
+    {
+        RequireLive();
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var root = RepoRoot();
+        var exe = ServiceExe(root);
+        var dir = TestDirs.New();
+        var pipe = "gorynych-live-" + Guid.NewGuid().ToString("N")[..8];
+        await using var conductor = new Gorynych.Service.Conductor(new Gorynych.Service.ConductorOptions
+        {
+            DataDirectory = dir,
+            ServiceId = "live",
+            PeerServerCommand = [exe, "peers", "--pipe", pipe],
+        }, [new ClaudeAdapter(new ClaudeAdapterOptions { DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "peers"] })]);
+        using var stop = new CancellationTokenSource();
+        var listening = Gorynych.Service.PipeListener.RunAsync(conductor, pipe, stop.Token);
+        try
+        {
+            await using var client = await TestClient.ConnectAsync(conductor);
+            client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId });
+            var id = (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+            {
+                Cwd = root, McpServers = [], Meta = new JsonObject { [GorynychProtocol.MetaAgent] = "claude" },
+            })).SessionId;
+            await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = "Remember the code word PELICAN. Reply with exactly READY." }] });
+            await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id }); // Claude's process exits
+            Assert.IsFalse(conductor.Agents["claude"].IsLive(id));
+
+            var answer = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject
+            {
+                ["sessionId"] = id,
+                ["sender"] = "peer_kimi",
+                ["text"] = "Which code word were you asked to remember? Answer with the word only.",
+            });
+
+            var text = (string?)answer?["text"] ?? "";
+            Console.WriteLine($"answer: {text}");
+            StringAssert.Contains(text.ToUpperInvariant(), "PELICAN", "started with its own history");
+            var journal = conductor.Feed(id).Journal.ReadAll();
+            Assert.IsTrue(journal.Any(u => (string?)u["sessionUpdate"] == "tool_call" && ((string?)u["title"] ?? "").Contains("reply", StringComparison.Ordinal)
+                && u["_meta"]?[GorynychProtocol.MetaOpinion] is not null), "answered with the reply tool, which reached the service past the channel");
+            var deadline = DateTime.UtcNow.AddSeconds(60);
+            while (DateTime.UtcNow < deadline && conductor.Agents["claude"].IsLive(id)) await Task.Delay(250);
+            Assert.IsFalse(conductor.Agents["claude"].IsLive(id), "closed again after the question's turn");
+        }
+        finally
+        {
+            stop.Cancel();
+            await listening;
+        }
+    }
+
+    [TestMethod]
+    [Timeout(600_000, CooperativeCancellation = true)]
     public async Task Opinions_BothWays_ClaudeAsksKimi_KimiAsksClaude()
     {
         RequireLive();

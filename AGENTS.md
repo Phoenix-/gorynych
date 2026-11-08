@@ -29,8 +29,9 @@ architecture. Keep this file short: it is loaded into every agent session.
 
 ## Code
 
-- Specifications live in `docs/` (service protocol, adapters, ACP types); keep them in step
-  with the code. ACP types are generated: change `tools/Gorynych.AcpGen`, not `Acp.g.cs`.
+- Specifications live in `docs/` (service protocol, the adapter contract, adapters, ACP
+  types); keep them in step with the code. A new adapter is checked against
+  `docs/adapter-contract.md`. ACP types are generated: change `tools/Gorynych.AcpGen`, not `Acp.g.cs`.
 
 - C# on .NET 10. A build-time assembly per adapter; no runtime assembly loading, so the
   service stays Native AOT compatible.

@@ -55,6 +55,13 @@ public sealed class Conductor : IAsyncDisposable
     readonly ConcurrentDictionary<string, byte> trailingUpdateNotice = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<Task, byte> backgroundTurns = new();
     readonly SemaphoreSlim archiveGate = new(1, 1); // archive changes, so their session_info_updates keep the flag's order
+
+    /// <summary>
+    /// Sessions the service loaded or started in their agent only for a service turn (an opinion
+    /// or a report). The last service turn closes such a session again, unless a client took it
+    /// over meanwhile (<see cref="EnsureLiveAsync"/> for a client drops it from here).
+    /// </summary>
+    readonly ConcurrentDictionary<string, byte> wokenForService = new(StringComparer.Ordinal);
     long opinionCount;
     long spawnCount;
 
@@ -330,8 +337,12 @@ public sealed class Conductor : IAsyncDisposable
     /// <c>session/resume</c>; falls back to <c>session/load</c> with the agent's replay
     /// suppressed, since the history comes from the service's own journal.
     /// </summary>
-    internal async Task<(JsonRpcConnection Rpc, JsonObject? Opened)> EnsureLiveAsync(SessionRecord record, CancellationToken ct)
+    /// <param name="forService">Opened for a service turn (an opinion or a report): a session this
+    /// opens is closed again after the service's turns. Otherwise a client or the session's own
+    /// work uses it, which takes it over: the service no longer closes it after its turns.</param>
+    internal async Task<(JsonRpcConnection Rpc, JsonObject? Opened)> EnsureLiveAsync(SessionRecord record, CancellationToken ct, bool forService = false)
     {
+        if (!forService) wokenForService.TryRemove(record.SessionId, out _);
         var host = HostOf(record);
         var rpc = await host.GetAsync(ct);
         if (host.IsLive(record.SessionId)) return (rpc, null);
@@ -341,7 +352,9 @@ public sealed class Conductor : IAsyncDisposable
         {
             rpc = await host.GetAsync(ct);
             if (host.IsLive(record.SessionId)) return (rpc, null);
-            return (rpc, await OpenAsync(host, rpc, record, ct));
+            var opened = await OpenAsync(host, rpc, record, ct);
+            if (forService) wokenForService[record.SessionId] = 0;
+            return (rpc, opened);
         }
         finally
         {
@@ -393,6 +406,7 @@ public sealed class Conductor : IAsyncDisposable
             var rpc = await host.GetAsync(ct);
             if (host.CanLoad)
             {
+                wokenForService.TryRemove(record.SessionId, out _);
                 feed.Attach(client);
                 opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
                     AcpJson.ToNode(new LoadSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId) }), ct) as JsonObject;
@@ -558,6 +572,7 @@ public sealed class Conductor : IAsyncDisposable
         var rpc = await host.GetAsync(ct);
         var result = await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
         host.MarkClosed(sessionId);
+        wokenForService.TryRemove(sessionId, out _);
         return result;
     }
 
@@ -816,6 +831,7 @@ public sealed class Conductor : IAsyncDisposable
     {
         var id = record.SessionId;
         removed[id] = 0;
+        wokenForService.TryRemove(id, out _);
         feed.Retire();
         feeds.TryRemove(new KeyValuePair<string, SessionFeed>(id, feed));
         if (sessionTokens.TryRemove(id, out var token)) peerTokens.TryRemove(token, out _);
@@ -1214,6 +1230,7 @@ public sealed class Conductor : IAsyncDisposable
     /// </summary>
     async Task ReportAsync(string childId, string outcome, string finalMessage)
     {
+        string? reached = null;
         try
         {
             if (store.Get(childId) is not { ParentSessionId: { } parentId } child || child.Deleted) return;
@@ -1227,7 +1244,8 @@ public sealed class Conductor : IAsyncDisposable
             var text = ReportText(child, outcome, finalMessage);
             var sender = $"child_{child.Agent}";
             using var use = await UseAsync(parentId, cleanupStop.Token);
-            var (rpc, _) = await EnsureLiveAsync(use.Record, cleanupStop.Token);
+            reached = parentId;
+            var (rpc, _) = await EnsureLiveAsync(use.Record, cleanupStop.Token, forService: true);
             try
             {
                 await rpc.SendRequestAsync(GorynychProtocol.MethodNote,
@@ -1237,7 +1255,9 @@ public sealed class Conductor : IAsyncDisposable
             }
             catch (JsonRpcException e) when (e.Code is JsonRpcException.MethodNotFound or JsonRpcException.InvalidRequest)
             {
-                // No channel, or the Claude session is not running: a turn reaches it either way.
+                // No live-note path, or the session's agent is not running (Claude): a turn reaches it
+                // either way, and in the second case starts the agent just for it.
+                if (e.Code == JsonRpcException.InvalidRequest) wokenForService[parentId] = 0;
             }
             await ReportTurnAsync(use, rpc, sender, childId, text);
             ServiceLog.Info($"report: {childId} -> {parentId} (turn)");
@@ -1245,6 +1265,46 @@ public sealed class Conductor : IAsyncDisposable
         catch (Exception e)
         {
             ServiceLog.Warn($"report of {childId} to its parent not delivered: {e.Message}");
+        }
+        finally
+        {
+            if (reached is not null) AfterServiceTurn(reached); // the use is released by now
+        }
+    }
+
+    /// <summary>
+    /// After a service turn on a session, with that turn's use of it released: a session the
+    /// service woke only for its turns is closed again in the background once nothing uses it.
+    /// </summary>
+    void AfterServiceTurn(string sessionId)
+    {
+        if (wokenForService.ContainsKey(sessionId)) RunCleanup(() => CloseIfIdleAsync(sessionId));
+    }
+
+    /// <summary>
+    /// Closes a session the service woke for its own turns, unless something still uses it: a
+    /// client attached to it (which keeps it from now on), or an operation registered on it, such
+    /// as another service turn waiting for its turn (whose end comes back here). An agent that
+    /// cannot close sessions keeps it loaded.
+    /// </summary>
+    async Task CloseIfIdleAsync(string sessionId)
+    {
+        var feed = Feed(sessionId);
+        await feed.LifeGate.WaitAsync(cleanupStop.Token);
+        try
+        {
+            if (!wokenForService.ContainsKey(sessionId) || feed.Retired || feed.Users > 0) return;
+            wokenForService.TryRemove(sessionId, out _);
+            if (feed.Clients().Length > 0) return; // a client has it open: it stays
+            if (store.Get(sessionId) is not { } record || !agents.TryGetValue(record.Agent, out var host)) return;
+            if (!host.IsRunning || !host.IsLive(sessionId) || !host.CanClose) return;
+            var rpc = await host.GetAsync(cleanupStop.Token);
+            await CloseInAgentAsync(host, rpc, sessionId, cleanupStop.Token);
+            ServiceLog.Info($"{record.Agent} {sessionId}: closed again after the service turns it was woken for");
+        }
+        finally
+        {
+            feed.LifeGate.Release();
         }
     }
 
@@ -1476,39 +1536,70 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.InvalidRequest,
                 $"This session is answering opinion request {answering}, so it cannot ask another session during this turn. " +
                 $"Send your answer with the reply tool, passing message_id \"{answering}\"; if another opinion would help, say so in the answer.");
-        using var use = await UseAskedAsync(target, from, ct);
-        var record = use.Record;
-        var (rpc, _) = await EnsureLiveAsync(record, ct);
-        ServiceLog.Info($"opinion: {from ?? "client"} asks {record.Agent} {target}");
-        // The asked agent sees who asks by the asking session's real ID, which it can pass to ask_agent;
-        // sender (peer_claude) is only a label for GUIs.
-        var origin = from is not null && store.Get(from) is { } asking ? $"from {Who(asking)}" : $"from {sender ?? "a Gorynych client"}";
-        sender ??= "peer_agent";
-        var forwarded = new JsonObject { ["sessionId"] = target, ["text"] = $"[Opinion request · {origin}]\n{text}", ["sender"] = sender };
-        if (from is not null) forwarded["fromSessionId"] = from;
+        var use = await UseAskedAsync(target, from, ct);
+        var turnHasUse = false; // an opinion turn releases the use when the turn ends, which may be after the answer
         try
         {
-            // An agent with its own way in (Claude's channel) answers directly.
-            var answer = await rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, forwarded, ct);
-            if (record.Draft)
+            var record = use.Record;
+            JsonRpcConnection rpc;
+            try
             {
-                // It answered, so it has history now.
-                try { Promote(record); }
-                catch (JsonRpcException e) { ServiceLog.Warn($"{record.Agent} {target}: {e.Message}"); }
+                // Not loaded in its agent: loaded now, and closed again after the service's turns.
+                (rpc, _) = await EnsureLiveAsync(record, ct, forService: true);
             }
-            return answer;
+            catch (Exception e) when (from is not null && e is not OperationCanceledException)
+            {
+                throw CouldNotStart(record, e);
+            }
+            ServiceLog.Info($"opinion: {from ?? "client"} asks {record.Agent} {target}");
+            // The asked agent sees who asks by the asking session's real ID, which it can pass to ask_agent;
+            // sender (peer_claude) is only a label for GUIs.
+            var origin = from is not null && store.Get(from) is { } asking ? $"from {Who(asking)}" : $"from {sender ?? "a Gorynych client"}";
+            sender ??= "peer_agent";
+            var forwarded = new JsonObject { ["sessionId"] = target, ["text"] = $"[Opinion request · {origin}]\n{text}", ["sender"] = sender };
+            if (from is not null) forwarded["fromSessionId"] = from;
+            try
+            {
+                // An agent with its own way in (Claude's channel) answers directly.
+                var answer = await rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, forwarded, ct);
+                if (record.Draft)
+                {
+                    // It answered, so it has history now.
+                    try { Promote(record); }
+                    catch (JsonRpcException e) { ServiceLog.Warn($"{record.Agent} {target}: {e.Message}"); }
+                }
+                return answer;
+            }
+            catch (JsonRpcException e) when (e.Code is JsonRpcException.MethodNotFound or JsonRpcException.InvalidRequest)
+            {
+                // No live-note path (Kimi), or the agent is not running (Claude refuses while its process
+                // is down): ask in a turn, which in the second case starts the agent just for it.
+                if (e.Code == JsonRpcException.InvalidRequest) wokenForService[target] = 0;
+                turnHasUse = true;
+                return await OpinionTurnAsync(use, rpc, sender, from, origin, text, woken: wokenForService.ContainsKey(target), ct);
+            }
         }
-        catch (JsonRpcException e) when (e.Code == JsonRpcException.MethodNotFound)
+        finally
         {
-            return await OpinionTurnAsync(record, rpc, sender, from, origin, text, ct);
+            if (!turnHasUse) EndServiceUse(use);
         }
-        catch (JsonRpcException e) when (from is not null && e.Code == JsonRpcException.InvalidRequest)
-        {
-            // The Claude adapter refuses while Claude's process is not running; only a prompt starts it.
-            throw new JsonRpcException(JsonRpcException.InvalidRequest,
-                $"{Who(record)} cannot answer now: its agent is not running, and it starts only when the user prompts that session. " +
-                "Ask another session from list_agents, or ask the user to prompt that one first.");
-        }
+    }
+
+    /// <summary>Releases a service turn's use of a session, then closes the session if the service woke it only for its turns.</summary>
+    void EndServiceUse(SessionUse use)
+    {
+        use.Dispose();
+        AfterServiceTurn(use.Record.SessionId);
+    }
+
+    /// <summary>For an agent that asks: the asked session could not be started (or failed at once after it was).</summary>
+    static JsonRpcException CouldNotStart(SessionRecord record, Exception e)
+    {
+        var reason = e.Message.TrimEnd();
+        if (!reason.EndsWith('.')) reason += ".";
+        return new JsonRpcException(e is JsonRpcException rpc ? rpc.Code : JsonRpcException.InternalError,
+            $"{Who(record)} could not be started to answer: {reason} Ask another session from list_agents, " +
+            "or ask the user to open that session and check it.");
     }
 
     /// <summary>The asked session; for an agent that asks, an unknown ID fails with the IDs it can pass instead.</summary>
@@ -1570,17 +1661,22 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
-    /// Asks an agent that has no channel (Kimi) in an ordinary <c>session/prompt</c> turn,
-    /// marked with the sender and a <c>message_id</c>. The turn waits for the session's current
-    /// turn, since ACP cannot inject into a running one. The answer is the agent's
-    /// <c>reply</c> tool call (<c>_gorynych/reply</c>), or else the turn's own text.
+    /// Asks an agent without a live-note path (Kimi), or one that is not running (Claude), in an
+    /// ordinary <c>session/prompt</c> turn, marked with the asking session and a <c>message_id</c>.
+    /// The turn waits for the session's current turn, since ACP cannot inject into a running one.
+    /// The answer is the agent's <c>reply</c> tool call (<c>_gorynych/reply</c>), or else the turn's
+    /// own text. Takes over <paramref name="use"/> and releases it when the turn ends.
     /// </summary>
-    async Task<JsonNode?> OpinionTurnAsync(SessionRecord record, JsonRpcConnection rpc, string sender, string? from, string origin, string question, CancellationToken ct)
+    /// <param name="woken">The service loaded or started the session for its turns, so a failure here is a failure to start.</param>
+    async Task<JsonNode?> OpinionTurnAsync(SessionUse use, JsonRpcConnection rpc, string sender, string? from, string origin, string question,
+        bool woken, CancellationToken ct)
     {
-        var feed = Feed(record.SessionId);
+        var record = use.Record;
+        var feed = use.Feed;
         var messageId = "m" + Interlocked.Increment(ref opinionCount);
         var pending = new PendingOpinion(record.SessionId);
         pendingOpinions[messageId] = pending;
+        var turnStarted = false;
         try
         {
             await feed.TurnGate.WaitAsync(ct);
@@ -1620,7 +1716,9 @@ public sealed class Conductor : IAsyncDisposable
                     pending.TurnText = feed.EndOpinionTurn();
                     pending.TurnError = t.Exception?.InnerException;
                     feed.TurnGate.Release();
+                    EndServiceUse(use); // the turn may end after the answer: the session is closed again only now
                 }, TaskScheduler.Default);
+                turnStarted = true;
             }
             catch
             {
@@ -1630,14 +1728,18 @@ public sealed class Conductor : IAsyncDisposable
             }
             await Task.WhenAny(pending.Reply.Task, turnDone).WaitAsync(ct);
             if (pending.Reply.Task.IsCompleted) return new JsonObject { ["text"] = pending.Reply.Task.Result };
-            if (pending.TurnError is JsonRpcException failed) throw failed;
-            if (pending.TurnError is not null) throw new JsonRpcException(JsonRpcException.InternalError, pending.TurnError.Message);
+            if (pending.TurnError is { } error)
+            {
+                if (woken && from is not null) throw CouldNotStart(record, error);
+                throw error as JsonRpcException ?? new JsonRpcException(JsonRpcException.InternalError, error.Message);
+            }
             var fallback = pending.TurnText?.Trim();
             return new JsonObject { ["text"] = string.IsNullOrEmpty(fallback) ? "(no answer)" : fallback };
         }
         finally
         {
             pendingOpinions.TryRemove(messageId, out _);
+            if (!turnStarted) EndServiceUse(use);
         }
     }
 

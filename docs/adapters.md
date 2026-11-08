@@ -1,9 +1,8 @@
 # Adapters
 
-Every adapter is an ACP agent (`IAgentAdapter` in `Gorynych.Acp.Hosting`) compiled into
-the service; nothing is loaded at run time, so the service stays Native AOT compatible.
-An adapter returns the byte streams of an ACP connection: an external process's stdio,
-or a `DuplexLink` to an in-process agent.
+What every adapter must provide, and how Claude, Kimi, Codex and DeepSeek compare, is in
+[adapter-contract.md](adapter-contract.md). This file keeps what is particular to each
+adapter that exists.
 
 ## Kimi Code
 
@@ -32,7 +31,9 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   lives in the service's overlay and wins over the title Kimi takes from the first prompt.
   The service answers Kimi's approval of `spawn_session` itself, since it asks the person
   before it spawns ([service-protocol.md](service-protocol.md#child-sessions)). Kimi does not
-  know `_gorynych/note`, so a child's report reaches a Kimi parent as a marked turn.
+  know `_gorynych/note`, so a child's report reaches a Kimi parent as a marked turn. A Kimi
+  session that is not loaded is resumed for an opinion request or a report and closed again
+  after it ([adapter-contract.md](adapter-contract.md#61-waking-a-session-and-closing-it-again)).
 - **Archive: not mirrored.** Kimi Code 2.5.2 has a native archive (`"archived"` in a
   session's `state.json`, `kimi session list --archived`, set from Kimi's own UI), but
   `kimi acp` offers no method for it. Its `session/list` leaves natively archived sessions out:
@@ -130,14 +131,16 @@ adapter adds `--channel-url …/channel/<session>/<token>` to that `gorynych` se
 Claude with `--dangerously-load-development-channels server:gorynych`: the one server then
 declares `capabilities.experimental["claude/channel"]`, long-polls the adapter for opinion
 requests, pushes them as `notifications/claude/channel` with `meta: {kind: "opinion",
-message_id}`, and posts `reply` back. The content's first line names the asking session by
+message_id}` (a `message_id` starting with `c`, never the service's `m`), and posts `reply`
+back; a `reply` the channel does not know goes on to the service. The content's first line names the asking session by
 its `session_id` ([service-protocol.md](service-protocol.md#what-agents-are-told)); the meta
 carries no sender label, which Claude could take for a session ID. `reply` reports an error
 when the channel has no request with that `message_id`. Without a service-given server the adapter starts a channel-only
 `gorynych` server itself.
 
 `--append-system-prompt` authorizes opinions from the user's agents, forbids actions on
-their behalf, says each channel message names the asking session by its `session_id`, and,
+their behalf, says each channel message names the asking session by its `session_id` and
+that such a message arrives as a prompt when Claude was not running, and,
 when the peer tools are there, tells Claude about `list_agents`, `ask_agent` (by exact
 `session_id`; `reply` only answers) and `spawn_session`. The PermissionRequest hook allows `mcp__gorynych__reply`,
 `mcp__gorynych__list_agents` and `mcp__gorynych__spawn_session` without asking (the service
@@ -148,8 +151,12 @@ asks the person before every spawn); `mcp__gorynych__ask_agent`, `archive_sessio
 `meta: {kind: "report"}` and no `message_id`; the system prompt says it needs no reply. The
 adapter ignores the `sender` param of `_gorynych/opinion` and `_gorynych/note`: the text names
 the session. Without a channel the adapter answers method not found; while Claude's process is not
-running (`session/resume` registers a session without starting one) it answers `-32600`.
-Either way the service sends the report as a turn instead, which starts Claude.
+running (`session/resume` registers a session without starting one) it answers `-32600`, to
+`_gorynych/opinion` as well. Either way the service sends the request or report as a turn
+instead, which starts Claude, and closes the session again (ending the process) once its
+service turns are over, unless a client opened it meanwhile
+([adapter-contract.md](adapter-contract.md#61-waking-a-session-and-closing-it-again)). For
+Claude, *loaded* therefore means registered in the adapter, not that its process runs.
 
 A name given to `spawn_session` stays in the service's overlay: the adapter cannot write
 Claude's own `custom-title` yet (that needs `/rename` through the PTY), and Claude's

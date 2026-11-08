@@ -28,11 +28,14 @@ public sealed class ClaudeAdapterTests
 
         var messages = (await channel.NextAsync("s1", CancellationToken.None))["messages"]!.AsArray();
         Assert.AreEqual(2, messages.Count);
-        Assert.AreEqual("""{"kind":"opinion","message_id":"m1"}""", messages[0]!["meta"]!.ToJsonString());
+        // "c", never the "m" of a request the service asks as a turn: the peers server tries the channel first.
+        Assert.AreEqual("""{"kind":"opinion","message_id":"c1"}""", messages[0]!["meta"]!.ToJsonString());
         Assert.AreEqual("""{"kind":"report"}""", messages[1]!["meta"]!.ToJsonString());
         StringAssert.StartsWith((string?)messages[0]!["content"], "[Opinion request · from session_id k1 (kimi)]");
 
-        channel.Reply(new System.Text.Json.Nodes.JsonObject { ["message_id"] = "m1", ["text"] = "Spaces." });
+        Assert.AreEqual(false, (bool?)channel.Reply(new System.Text.Json.Nodes.JsonObject { ["message_id"] = "m1", ["text"] = "Spaces." })["delivered"],
+            "a service turn's message_id is not the channel's");
+        Assert.AreEqual(true, (bool?)channel.Reply(new System.Text.Json.Nodes.JsonObject { ["message_id"] = "c1", ["text"] = "Spaces." })["delivered"]);
         Assert.AreEqual("Spaces.", await asking);
     }
 

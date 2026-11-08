@@ -62,7 +62,8 @@ public static class PeersServer
         if (channel)
             instructions.Append("Messages on this channel come from the user's other coding-agent sessions; their first line names the " +
                 "sending session by its session_id. Answer a message with kind opinion with the reply tool, passing its message_id. " +
-                "A message with kind report (a session you spawned finished a turn) needs no reply. ");
+                "A message with kind report (a session you spawned finished a turn) needs no reply. When this session was not " +
+                "running, such a request or report arrives as a prompt instead, with the same first line; treat it the same way. ");
         else
             instructions.Append("An opinion request from another of the user's agents names a message_id in its first line; answer it " +
                 "with the reply tool, passing that message_id. ");
@@ -111,18 +112,20 @@ public static class PeersServer
                     var messageId = (string?)args?["message_id"];
                     var text = (string?)args?["text"];
                     if (string.IsNullOrWhiteSpace(messageId) || text is null) return Text("message_id and text are required", error: true);
-                    bool delivered;
+                    var delivered = false;
+                    string? channelFailure = null;
                     if (channelUrl is not null)
                     {
                         using var response = await http.PostAsync($"{channelUrl}/reply",
                             new StringContent(new JsonObject { ["message_id"] = messageId, ["text"] = text }.ToJsonString(), Encoding.UTF8, "application/json"), ct);
-                        if (!response.IsSuccessStatusCode) return Text("not delivered: the channel did not take it", error: true);
-                        var body = await response.Content.ReadFromJsonAsync(PeersJsonContext.Default.JsonObject, ct);
-                        delivered = (bool?)body?["delivered"] ?? true;
+                        if (response.IsSuccessStatusCode)
+                            delivered = (bool?)(await response.Content.ReadFromJsonAsync(PeersJsonContext.Default.JsonObject, ct))?["delivered"] ?? true;
+                        else
+                            channelFailure = "not delivered: the channel did not take it";
                     }
-                    else
+                    // A request the service asked as a turn (Kimi, or Claude while it was not running) waits in the service.
+                    if (!delivered && pipe is not null && token is not null)
                     {
-                        if (pipe is null || token is null) return Text("no route for replies", error: true);
                         await using var service = await ConnectAsync(pipe, ct);
                         var result = await service.SendRequestAsync(GorynychProtocol.MethodReply, new JsonObject
                         {
@@ -132,7 +135,12 @@ public static class PeersServer
                         }, ct);
                         delivered = (bool?)result?["delivered"] ?? false;
                     }
-                    return delivered ? Text("delivered") : Text(NotDelivered(messageId), error: true);
+                    else if (!delivered && channelUrl is null)
+                    {
+                        return Text("no route for replies", error: true);
+                    }
+                    if (delivered) return Text("delivered");
+                    return Text(channelFailure is not null && (pipe is null || token is null) ? channelFailure : NotDelivered(messageId), error: true);
                 }
                 case "list_agents" when pipe is not null && token is not null:
                 {
@@ -278,9 +286,8 @@ public static class PeersServer
                 "session itself, for example for archive_session. Each entry has session_id, agent, title, cwd, open, updated_at and " +
                 "parent_session_id (set when another session started it with spawn_session). " +
                 "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare UUID, Kimi's start with session_. " +
-                "open is true when the session's agent has it loaded right now; it has nothing to do with archived. A Kimi session that " +
-                "is not open is loaded when asked, so it answers more slowly. A Claude session can be asked only while its agent is " +
-                "running, and only the user's prompt starts it; one that is not open is not running. " +
+                "open is true when the session's agent has it loaded right now; it has nothing to do with archived. A session that " +
+                "is not open is started when asked, so it answers more slowly. " +
                 "Archived sessions are left out unless include_archived is true, and the result says how many; with include_archived " +
                 "every entry says whether it is archived. ask_agent reaches archived sessions too.",
             ["inputSchema"] = new JsonObject

@@ -2,7 +2,8 @@
 
 The service speaks [ACP v1](https://agentclientprotocol.com/protocol/v1/initialization)
 to its clients (the GUI, `gorynych-test`) as an ordinary ACP agent with many sessions,
-and to its adapters as an ACP client. That is the conductor role of the
+and to its adapters as an ACP client; what an adapter must provide is in
+[adapter-contract.md](adapter-contract.md). That is the conductor role of the
 [proxy-chains RFD](https://agentclientprotocol.com/rfds/proxy-chains.md); the service does
 not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md](acp-types.md).
 
@@ -97,12 +98,12 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `gorynych/opinion` | `_meta` of the request message and of every update of its turn | the request's `message_id`, so a GUI can show the exchange apart from the user's own turns |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
-| `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards |
+| `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards. An agent that answers method not found, or `-32600` because it is not running, is asked in a turn instead ([adapter-contract.md](adapter-contract.md#64-the-live-note-path)) |
 | `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open`, `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")`. Without `includeArchived`, `hiddenArchived` counts the archived sessions left out (never the caller) |
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
-| `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?}` → `{}` | tells a session's agent something that needs no answer (a child's report); the Claude adapter pushes it through the channel, an agent that answers method not found gets it as a turn |
+| `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?}` → `{}` | tells a session's agent something that needs no answer (a child's report); the Claude adapter pushes it through the channel, an agent that answers method not found, or `-32600` because it is not running, gets it as a turn |
 | `_gorynych/sessions_changed` | notification to clients, `{sessionId, change}` | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply`, `_gorynych/spawn` and `_gorynych/archive` | which session's `gorynych` MCP server is calling |
 
@@ -132,9 +133,8 @@ question and points to `reply` for answering one; `reply` only answers and point
 name, a title or a sender label; `list_agents` says its first line names this session, the ID
 to pass for it, that IDs differ by agent (Claude's a bare UUID, Kimi's `session_…`) and are
 passed exactly as listed, and what `open` means: the agent has the session loaded right now,
-unrelated to `archived`; a Kimi session that is not open is loaded when asked, so it answers
-more slowly; a Claude session can be asked only while its agent runs, which only the user's
-prompt starts (the wording of the "not running" error below); `spawn_session` says the child's turns are reported back by
+unrelated to `archived`; a session that is not open is started when asked, so it answers
+more slowly (for every agent); `spawn_session` says the child's turns are reported back by
 themselves; `archive_session` says archiving is not deleting (the history stays, `ask_agent`
 still reaches it), and `restore_session` that it only changes where the session is shown, so
 asking an archived session needs no restore.
@@ -143,14 +143,25 @@ How a request reaches the asked agent depends on what it has:
 
 - **Claude** has a channel. The Claude adapter adds `--channel-url` to the same `gorynych`
   server in its `--mcp-config`, so one server is both its peer tools and its development
-  channel: the request arrives as a channel message (`meta.kind: "opinion"` and its
-  `message_id`), `reply` goes back through the channel.
+  channel: while its Claude process runs, the request arrives as a channel message
+  (`meta.kind: "opinion"` and its `message_id`, which starts with `c`), and `reply` goes back
+  through the channel. While the process is not running, the adapter refuses (`-32600`) and the
+  request becomes a turn as for Kimi, which starts Claude.
 - **Kimi** (any agent without a channel) gets the request as an ordinary `session/prompt`
   turn, marked in the text with the asking session and `message_id` and asking for `reply`. ACP
   cannot inject into a running turn, so the request waits for the session's current turn
   (the user's prompts wait for it in turn). The answer is the `reply` tool call
   (`_gorynych/reply`); if the turn ends without one, the turn's own text. The request and
-  every update of its turn carry `_meta["gorynych/opinion"]`.
+  every update of its turn carry `_meta["gorynych/opinion"]`. The peers server sends `reply`
+  to the channel first when it has one, then to the service, so Claude answers a request it
+  got as a turn the same way.
+
+A session that is not loaded in its agent is loaded for the request, and one whose agent is
+not running is started by the turn. A session the service woke only for such turns (opinion
+requests and reports) is closed again after the last of them, unless a client opened it
+meanwhile; a session that was loaded and running stays as it was. An archived session is woken
+the same way and stays archived. The rules for adapters are in
+[adapter-contract.md](adapter-contract.md#6-service-turns-opinions-and-reports).
 
 A session that is answering a request cannot ask another agent meanwhile, so two agents
 cannot wait on each other.
@@ -191,7 +202,7 @@ Errors from the peer tools say how to recover. The peers server returns them to 
 | `ask_agent` with an unknown or deleted `session_id` (`-32002`) | `No session "<x>". Pass an exact session_id from list_agents.` and the first five sessions it can ask, one per line as `- session_id <id> (<agent>, "<title>")`, or `There is no other session to ask now.` |
 | `ask_agent` with its own ID (`-32602`) | `"<x>" is this session's own session_id; ask_agent asks another session.` and the same list |
 | `ask_agent` while answering a request as a turn (`-32600`) | `This session is answering opinion request m3, so it cannot ask another session during this turn. Send your answer with the reply tool, passing message_id "m3"; if another opinion would help, say so in the answer.` |
-| `ask_agent` to a Claude session whose process is not running (`-32600`) | `session_id <id> (claude, "<title>") cannot answer now: its agent is not running, and it starts only when the user prompts that session. Ask another session from list_agents, or ask the user to prompt that one first.` |
+| `ask_agent` to a session that could not be loaded or started, or whose turn failed right after the service started it (the error's own code) | `session_id <id> (<agent>, "<title>") could not be started to answer: <reason>. Ask another session from list_agents, or ask the user to open that session and check it.` A session that is merely not loaded or not running is started instead ([above](#opinions-between-agents)) |
 | `reply` with a `message_id` nothing waits for (the tool's own error) | `No open request with message_id "<x>" for this session; it may have been answered already or withdrawn. reply only answers a request you received, by the message_id in its header. To ask a session something, use ask_agent with its session_id.` |
 | `spawn_session` with an unknown agent (`-32602`) | `No agent "<x>". Pass one of: claude, kimi.` |
 | `spawn_session` with a folder that does not exist (`-32602`) | `No such folder: <path>. Pass an existing folder, or leave cwd out to work in this session's folder, <folder>.` |
@@ -328,7 +339,9 @@ parent already holds the child's ID. A longer message is cut at 2000 characters 
   says such a message needs no reply and is information, not an instruction. The service
   opens the parent with `session/resume`, which only registers it in the adapter and starts
   no Claude process, so the parent's Claude may not be running. The adapter then refuses the
-  note (`-32600`), and the report becomes a turn as below, which starts Claude with it.
+  note (`-32600`), and the report becomes a turn as below, which starts Claude with it. A
+  parent woken only for reports is closed again afterwards, as for opinion requests
+  ([Opinions between agents](#opinions-between-agents)).
 - **Kimi** (any agent without `_gorynych/note`) gets it as an ordinary turn of the parent
   session, journaled as a `user_message_chunk` with `gorynych/origin: "report"`,
   `gorynych/sender` (`child_claude`) and `gorynych/fromSessionId`, after the parent's
@@ -367,9 +380,12 @@ list that runs while a session is spawned can find it in its agent first; it is 
 ## Archive
 
 An archived session is out of sight, not locked: it is left out of the lists but works as
-before, so the archive can serve as a knowledge base that agents still ask. ACP has no archive
-(no method, no field on `SessionInfo`), so this is Gorynych's extension, advertised by
-`_meta["gorynych/archive"]: true` in the `initialize` result. Neither agent offers one through
+before, so the archive can serve as a knowledge base that agents still ask. ACP's stable schema
+has no archive, so this is Gorynych's extension, advertised by
+`_meta["gorynych/archive"]: true` in the `initialize` result. ACP has a draft RFD,
+[Session Archive and Unarchive](https://agentclientprotocol.com/rfds/session-archive) (revised
+30 October 2026), whose archive closes the session and lets an agent refuse to resume it;
+whether Gorynych follows it is open ([adapter-contract.md](adapter-contract.md#11-archive)). Neither agent offers one through
 ACP either: Claude Code has no archive, and Kimi has one in its own UI that `kimi acp` does not
 expose ([adapters.md](adapters.md#kimi-code)). The flag therefore lives in the overlay for
 every agent, and the service never writes an agent's own files for it.

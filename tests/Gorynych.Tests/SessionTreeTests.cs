@@ -649,7 +649,7 @@ public sealed class SessionTreeTests
     }
 
     [TestMethod]
-    public async Task Ask_ThroughClaudesChannel_NamesTheAsker_AndANotRunningClaudeSaysWhatToDoInstead()
+    public async Task Ask_ThroughClaudesChannel_NamesTheAsker_AndANotRunningClaudeIsAskedInATurn()
     {
         var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
         var kimi = new LifecycleAgent("kimi", canDelete: true);
@@ -665,10 +665,10 @@ public sealed class SessionTreeTests
         Assert.AreEqual($"[Opinion request · from session_id {asker} (kimi, \"Coordinate the release\")]\nDone?", (string?)opinion["text"]);
         Assert.AreEqual("peer_kimi", (string?)opinion["sender"], "the label for GUIs stays");
 
+        // Claude's process is not running: the question becomes a turn, which starts it (WakeTests).
         claude.Running = false;
-        var e = await Assert.ThrowsExactlyAsync<JsonRpcException>(Ask);
-        Assert.AreEqual(JsonRpcException.InvalidRequest, e.Code);
-        Assert.AreEqual($"session_id {asked} (claude, \"Write the notes\") cannot answer now: its agent is not running, and it starts only when " +
-            "the user prompts that session. Ask another session from list_agents, or ask the user to prompt that one first.", e.Message);
+        Assert.AreEqual("ok", (string?)(await Ask())!["text"]);
+        Assert.AreEqual(1, claude.Opinions.Count, "the channel refused it");
+        StringAssert.StartsWith(Prompts(claude, asked).Last(), $"[Opinion request · from session_id {asker} (kimi, \"Coordinate the release\") · message_id m");
     }
 }

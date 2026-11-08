@@ -139,8 +139,8 @@ public sealed class PeersTests
         StringAssert.Contains(Description("list_agents"),
             "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare UUID, Kimi's start with session_.");
         StringAssert.Contains(Description("list_agents"), "open is true when the session's agent has it loaded right now; it has nothing to do with archived.");
-        StringAssert.Contains(Description("list_agents"), "A Kimi session that is not open is loaded when asked, so it answers more slowly.");
-        StringAssert.Contains(Description("list_agents"), "A Claude session can be asked only while its agent is running, and only the user's prompt starts it");
+        StringAssert.Contains(Description("list_agents"), "A session that is not open is started when asked, so it answers more slowly.");
+        Assert.IsFalse(Description("list_agents").Contains("Claude session can", StringComparison.Ordinal), "every agent is started the same way now");
         StringAssert.Contains(Description("list_agents"), "Archived sessions are left out unless include_archived is true, and the result says how many");
         Assert.AreEqual("boolean", (string?)tools["list_agents"]["inputSchema"]!["properties"]!["include_archived"]!["type"]);
         StringAssert.Contains(Description("archive_session"), "this one included");
