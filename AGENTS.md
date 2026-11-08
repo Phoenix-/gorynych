@@ -2,8 +2,7 @@
 
 Gorynych is a cockpit for several native AI coding agents: a per-machine **service**
 plus a **GUI** that talk ACP. The design (decisions, probe results, protocol mapping,
-stage one scope) lives in the private design doc
-https://claude.ai/artifact/XuNPxC4mX7eLNrJFFS1yFZ; read it before changing the
+stage one scope) lives in [docs/design.md](docs/design.md); read it before changing the
 architecture. Keep this file short: it is loaded into every agent session.
 
 ## Ground rules
@@ -29,8 +28,8 @@ architecture. Keep this file short: it is loaded into every agent session.
 
 ## Code
 
-- Specifications live in `docs/` (service protocol, the adapter contract, adapters, ACP
-  types); keep them in step with the code. A new adapter is checked against
+- Specifications live in `docs/` (design, service protocol, the adapter contract, adapters,
+  ACP types); keep them in step with the code. A new adapter is checked against
   `docs/adapter-contract.md`. ACP types are generated: change `tools/Gorynych.AcpGen`, not `Acp.g.cs`.
 
 - C# on .NET 10. A build-time assembly per adapter; no runtime assembly loading, so the
