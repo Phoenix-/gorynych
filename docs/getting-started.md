@@ -1,0 +1,248 @@
+# Getting started
+
+Gorynych is early work in progress. This guide sets it up on Windows with Zed as the GUI.
+
+On Linux and macOS the service builds and Kimi Code runs. Claude Code needs Windows: the
+adapter drives its TUI through ConPTY. Codex has not been tried there, and nothing is
+published for those systems yet.
+
+## What you need
+
+- Windows 10 1809 or later, x64.
+- The agents you want, installed, on your `PATH` and logged in with your own account. Any
+  subset works:
+  - Claude Code: `claude`.
+  - Kimi Code: `kimi`, after `kimi login`.
+  - Codex CLI: `codex`, after `codex login`.
+- An ACP client. This guide uses Zed.
+
+Gorynych runs these agents as they are, under your login, and never edits their own
+configuration (`~/.claude`, `~/.codex`, `~/.kimi-code`).
+
+## Install Gorynych
+
+Every push to `main` that passes CI publishes a Windows build on the
+[nightly](https://github.com/Phoenix-/gorynych/releases/tag/nightly) prerelease. In
+PowerShell:
+
+```powershell
+$zip = "$env:TEMP\gorynych-windows-x64.zip"
+Invoke-WebRequest https://github.com/Phoenix-/gorynych/releases/download/nightly/gorynych-windows-x64.zip -OutFile $zip
+Unblock-File $zip
+Expand-Archive $zip "$env:LOCALAPPDATA\Programs" -Force
+```
+
+This gives `%LOCALAPPDATA%\Programs\Gorynych`, which holds `Gorynych.Service.exe`,
+`outside\Gorynych.Outside.exe` and `LICENSE`. Any other folder works too; the paths below
+then change with it.
+
+The binaries are not signed. A zip downloaded with a browser carries the Mark of the Web, and
+Explorer's "Extract All" copies it to every file. `Expand-Archive` and `tar` do not. Files with
+the mark may get a SmartScreen warning when you start them yourself. Clear the mark with
+`Unblock-File`, on the zip before extracting or afterwards:
+
+```powershell
+Get-ChildItem "$env:LOCALAPPDATA\Programs\Gorynych" -Recurse -File | Unblock-File
+```
+
+You never start these programs by hand: Zed starts the service, and agents start the outside
+server.
+
+### Or build from source
+
+You need the [.NET 10 SDK](https://dotnet.microsoft.com/download) and, for Native AOT, Visual
+Studio or its Build Tools with the "Desktop development with C++" workload. Native AOT finds
+the C++ linker through `vswhere.exe`, which is not on `PATH` by default:
+
+```powershell
+$env:PATH += ";${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+dotnet publish src/Gorynych.Service -c Release -r win-x64 -p:PublishAot=true -o "$env:LOCALAPPDATA\Programs\Gorynych"
+dotnet publish src/Gorynych.Outside -c Release -r win-x64 -p:PublishAot=true -o "$env:LOCALAPPDATA\Programs\Gorynych\outside"
+```
+
+## Set up Zed
+
+Two choices:
+
+- **The Zed fork.** Its [nightly](https://github.com/Phoenix-/zed/releases/tag/nightly)
+  (`zed-gorynych-windows-x64.zip`) picks up sessions that agents start and shows child sessions
+  under their parent. Unzip it and run `zed-gorynych\zed.exe`. It is Zed's dev channel: it does
+  not update itself, it keeps its own database beside an installed Zed, and it shares that
+  Zed's settings, `%APPDATA%\Zed\settings.json`.
+- **Stock [Zed](https://zed.dev).** It works through the same bridge, but without the automatic
+  pickup and without the tree: sessions made by agents show up only through "Import threads".
+
+In Zed run `zed: open settings file` from the command palette and add the agents, with your own
+user name in the paths:
+
+```json
+{
+  "agent_servers": {
+    "Gorynych: Claude": {
+      "type": "custom",
+      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
+      "args": ["acp", "--agent", "claude"],
+      "auto_import_sessions": true
+    },
+    "Gorynych: Kimi": {
+      "type": "custom",
+      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
+      "args": ["acp", "--agent", "kimi"],
+      "auto_import_sessions": true
+    },
+    "Gorynych: Codex": {
+      "type": "custom",
+      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
+      "args": ["acp", "--agent", "codex"],
+      "auto_import_sessions": true
+    }
+  }
+}
+```
+
+- Leave out the agents you do not use.
+- `auto_import_sessions` exists only in the fork. Stock Zed does not know it and ignores it.
+- `default_config_options` is a stock Zed setting. It sets an agent's selectors for new
+  threads, for example `"default_config_options": { "mode": "auto" }` for Codex.
+- Arguments after `--agent` such as `--unload-after <minutes>` or
+  `--claude-channels ask|accept|decline` configure the service. They apply only when the bridge
+  starts it ([external-clients.md](external-clients.md)).
+
+`Gorynych.Service.exe acp --agent …` is a small bridge. It starts the service if it is not
+running, then passes ACP between Zed and the service. The service keeps running after Zed
+quits and serves every client.
+
+## Your first session
+
+1. Open the folder you want to work in (File > Open Folder…).
+2. In the Agent Panel's new-thread menu, pick "Gorynych: Claude", "Gorynych: Kimi" or
+   "Gorynych: Codex".
+3. Write the first prompt.
+
+Approvals, questions and the agent's answers come into the thread as with any ACP agent.
+
+**Claude asks once about development channels.** Other agents' questions reach a running
+Claude session through Claude Code's development channels, a research preview. With them on,
+Claude Code shows a notice at every launch that needs Enter, so before the first such launch
+Gorynych asks in the thread:
+
+- **Allow:** Gorynych starts Claude with the channel and confirms the notice on each launch.
+- **Don't allow:** Claude runs without the channel. Other agents' questions and child sessions'
+  reports reach it as ordinary turns.
+
+The answer is kept in `%LOCALAPPDATA%\Gorynych\claude\channels.json`; delete that file to be
+asked again. If you dismiss the question, that launch runs without the channel and Gorynych asks
+again later ([adapters.md](adapters.md#consent-to-development-channels)). The first time Claude
+works in a folder, its folder-trust question also arrives as an approval.
+
+**Codex** has three selectors in the thread:
+
+- **mode:** `read-only`, `auto`, `auto-review` ("Approve for me", Codex's automatic reviewer) or
+  `full-access`.
+- **model.**
+- **reasoning effort.**
+
+A new thread starts with your own Codex defaults, and a change applies from the next prompt
+([adapters.md](adapters.md#modes-models-and-effort)). **Kimi** has its own model, thinking and
+mode selectors.
+
+## Sessions that talk to each other
+
+Every session gets a `gorynych` MCP server with these tools:
+
+- `list_agents`: see the other sessions.
+- `ask_agent`: ask one for its opinion. You approve each question like any other tool.
+- `spawn_session`: start a child session in another agent. You approve each spawn, and by
+  default the child reports each finished turn to its parent.
+
+A child is an ordinary session you can open and prompt yourself. How it works:
+[design.md](design.md#sessions-that-talk-to-each-other).
+
+## Optional: agents outside Gorynych
+
+Claude Code in a terminal or in Claude Desktop, Codex, and Kimi Code can list Gorynych's
+sessions, read them and ask one for its opinion through the `gorynych-outside` MCP server.
+Registering it changes that agent's own configuration, so Gorynych never does it for you. Run
+the command yourself, and keep the name `gorynych-outside`:
+
+- **Claude Code** (Claude Desktop's Code tab reads the same configuration):
+  ```powershell
+  claude mcp add --scope user gorynych-outside -- "$env:LOCALAPPDATA\Programs\Gorynych\outside\Gorynych.Outside.exe"
+  ```
+  To undo: `claude mcp remove --scope user gorynych-outside`.
+- **Codex:**
+  ```powershell
+  codex mcp add gorynych-outside -- "$env:LOCALAPPDATA\Programs\Gorynych\outside\Gorynych.Outside.exe"
+  ```
+  To undo: `codex mcp remove gorynych-outside`.
+- **Kimi Code:** add this entry to the `mcpServers` object of `~/.kimi-code/mcp.json`; to undo,
+  remove it. Not tried yet:
+  ```json
+  { "mcpServers": { "gorynych-outside": { "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\outside\\Gorynych.Outside.exe" } } }
+  ```
+
+The server starts the service from its parent folder when the service is not running. Details,
+timeouts and how to try it without registering:
+[external-clients.md](external-clients.md#agents-outside-gorynych).
+
+## Update
+
+1. Quit Zed. Its bridges run `Gorynych.Service.exe` and keep the file locked.
+2. Stop the service. Turns still running are cancelled:
+   ```powershell
+   & "$env:LOCALAPPDATA\Programs\Gorynych\Gorynych.Service.exe" shutdown
+   ```
+3. If an agent outside Gorynych runs the outside server, Windows will not overwrite its exe, but
+   it allows a rename:
+   ```powershell
+   Rename-Item "$env:LOCALAPPDATA\Programs\Gorynych\outside\Gorynych.Outside.exe" Gorynych.Outside.old.exe
+   ```
+   That agent keeps the old copy until it restarts its MCP servers.
+4. Install the new build as above. `Expand-Archive -Force` overwrites the old files.
+5. Start Zed.
+
+If a file is still in use, look for processes that are left over:
+`Get-Process Gorynych.Service, Gorynych.Outside`.
+
+## Where things are
+
+- **Programs:** `%LOCALAPPDATA%\Programs\Gorynych`, or wherever you put them.
+- **Data:** `%LOCALAPPDATA%\Gorynych`.
+  - `sessions.json`: the service's list of sessions, with titles, parents and archive flags.
+  - `journal\`: what each session said, as the service relayed it.
+  - `claude\`: the Claude adapter's session list, `channels.json`, and per session the launch
+    files and `terminal.log`.
+  - `logs\`: `service-<date>.log` and `outside-<date>.log`.
+- **The agents' own state** stays in their folders (`~/.claude`, `~/.codex`, `~/.kimi-code`).
+- **Elevation.** The service serves only clients at its own elevation. A service started from
+  an elevated (administrator) terminal, which includes an SSH session, serves only elevated
+  clients. One started by Zed in a plain session serves only plain clients. So a plain process
+  can never drive an elevated service, which runs agents
+  ([service-protocol.md](service-protocol.md#endpoint)).
+
+## Uninstall
+
+1. Undo any outside registrations (`claude mcp remove …`, `codex mcp remove …`, the Kimi entry).
+2. Quit Zed and run `Gorynych.Service.exe shutdown`.
+3. Remove the `Gorynych: …` entries from Zed's `agent_servers`.
+4. Delete `%LOCALAPPDATA%\Programs\Gorynych`, and `%LOCALAPPDATA%\Gorynych` if you do not want
+   its journals and logs. The agents' own transcripts stay where they are.
+
+## Troubleshooting
+
+Logs: Zed's `dev: open acp logs` shows the messages between Zed and the bridge. The service
+writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
+
+- **"claude was not found on PATH"**, likewise for `kimi` and `codex`. The service looks agents up
+  on the `PATH` it inherited from whoever started it, usually Zed through the bridge. Install the
+  agent, then restart the service so it picks up the new `PATH`: quit Zed, run
+  `Gorynych.Service.exe shutdown`, and start Zed again from a fresh shell or the Start menu.
+- **"gorynych acp: cannot reach the service on pipe …"**, with a note about elevation. A service
+  at the other elevation already runs. Stop it from a terminal at its elevation with
+  `Gorynych.Service.exe shutdown`, or use clients at its elevation.
+- **"Claude did not start the turn within 90 s. Last screen: …"**. Claude Code waited on a screen
+  Gorynych cannot answer, such as a login. The error quotes the screen, and the session's
+  `terminal.log` under `%LOCALAPPDATA%\Gorynych\claude\sessions\<session>\` has all of it. Run
+  `claude` once in a terminal in that folder, deal with what it asks, then prompt again.
+- **The update cannot overwrite a file.** A client or an agent outside Gorynych still runs it.
+  See [Update](#update).

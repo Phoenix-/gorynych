@@ -64,19 +64,25 @@ questions arrive as ordinary turns.
 - One GUI over several machines: remote services over `ssh -T`, questions between machines.
 - The [Zed fork](https://github.com/Phoenix-/zed) (in progress): automatic pickup of sessions and the session tree.
 
-## Requirements
+## Getting started
 
-- Windows 10 1809 or later for Claude Code (the adapter needs ConPTY). The service also builds
-  on Linux and macOS, where only Kimi runs today.
-- The [.NET 10 SDK](https://dotnet.microsoft.com/download) to build.
-- The agents you want, installed and logged in with your own account: `claude` (Claude Code),
-  `kimi` (Kimi Code, `kimi login`), `codex` (Codex CLI, `codex login`).
-- An ACP client, such as Zed.
+On Windows 10 1809 or later:
 
-Setup (Zed settings, publishing the service, registering the outside server):
-[docs/external-clients.md](docs/external-clients.md).
+1. Install the agents you want and log in with your own account: Claude Code, Kimi Code
+   (`kimi login`), Codex CLI (`codex login`).
+2. Unzip Gorynych's [nightly build](https://github.com/Phoenix-/gorynych/releases/tag/nightly)
+   into `%LOCALAPPDATA%\Programs`.
+3. Get Zed, the [fork's nightly](https://github.com/Phoenix-/zed/releases/tag/nightly) or stock
+   Zed, and add the `Gorynych: …` agents to its settings.
+4. Open a folder in Zed and start a "Gorynych: Claude" (or Kimi, or Codex) thread.
+
+The details, building from source, updating and troubleshooting:
+[docs/getting-started.md](docs/getting-started.md).
 
 ## Build and test
+
+You need the [.NET 10 SDK](https://dotnet.microsoft.com/download); a Native AOT publish also
+needs the C++ build tools ([getting started](docs/getting-started.md#or-build-from-source)).
 
 ```
 dotnet build Gorynych.slnx
@@ -107,7 +113,7 @@ Gorynych is a tool for one person and their own machines:
 
 ## Documentation
 
-[Design](docs/design.md) · [service protocol](docs/service-protocol.md) ·
+[Getting started](docs/getting-started.md) · [design](docs/design.md) · [service protocol](docs/service-protocol.md) ·
 [adapter contract](docs/adapter-contract.md) · [adapters](docs/adapters.md) ·
 [ACP types](docs/acp-types.md) · [external clients](docs/external-clients.md) ·
 [probes](research/probes/README.md)
