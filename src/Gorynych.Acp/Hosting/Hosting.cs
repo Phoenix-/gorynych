@@ -89,10 +89,16 @@ public static class GorynychProtocol
     /// <summary>A notification to clients: <c>{sessionId, change}</c>, change <c>added</c>, <c>updated</c> or <c>removed</c>.</summary>
     public const string MethodSessionsChanged = "_gorynych/sessions_changed";
 
-    /// <summary>In the <c>initialize</c> result: the service sends <see cref="MethodSessionsChanged"/>.</summary>
+    /// <summary>
+    /// In <c>agentCapabilities._meta</c> of the <c>initialize</c> result: the service sends
+    /// <see cref="MethodSessionsChanged"/>. (Also in the result's own <c>_meta</c>, deprecated.)
+    /// </summary>
     public const string MetaSessionsChanged = "gorynych/sessionsChanged";
 
-    /// <summary>In the <c>initialize</c> result: the service keeps an archive flag per session (<see cref="MethodArchive"/>).</summary>
+    /// <summary>
+    /// In <c>agentCapabilities._meta</c> of the <c>initialize</c> result: the service keeps an archive
+    /// flag per session (<see cref="MethodArchive"/>). (Also in the result's own <c>_meta</c>, deprecated.)
+    /// </summary>
     public const string MetaArchive = "gorynych/archive";
 
     /// <summary>

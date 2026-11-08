@@ -74,7 +74,9 @@ public sealed class ClaudeAdapterTests
         var args = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", sessionId + ".args.json")))!
             .AsArray().Select(a => (string)a!).ToList();
         CollectionAssert.Contains(args, "server:gorynych");
-        StringAssert.Contains(args[args.IndexOf("--append-system-prompt") + 1], "ask_agent");
+        Assert.AreEqual(ChannelHost.SystemPrompt + "\n\n" + Gorynych.Service.PeersServer.SystemPrompt, args[args.IndexOf("--append-system-prompt") + 1],
+            "the channel's authorization, then the service's systemPrompt (append), which the adapter advertises");
+        Assert.AreEqual(1, args.Count(a => a == "--append-system-prompt"));
         var mcp = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(args[args.IndexOf("--mcp-config") + 1]))!["mcpServers"]!;
         var gorynych = mcp["gorynych"]!["args"]!.AsArray().Select(a => (string)a!).ToArray();
         CollectionAssert.AreEqual(new[] { "peers", "--pipe", "p", "--token" }, gorynych[..4]);
@@ -156,6 +158,10 @@ public sealed class ClaudeAdapterTests
         Assert.AreEqual("Write fake.txt", client.Approvals.Single().ToolCall.Title);
         Assert.AreEqual("wrote it", client.Text());
         CollectionAssert.IsSubsetOf(new[] { "tool_call", "tool_call_update", "agent_message_chunk" }, client.Kinds());
+        var launched = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", created.SessionId + ".args.json")))!
+            .AsArray().Select(a => (string)a!).ToList();
+        CollectionAssert.DoesNotContain(launched, "--append-system-prompt", "no channel and no peers server: nothing to add");
+        Assert.IsNotNull(client.Snapshot().Last(u => (string?)u["sessionUpdate"] == "agent_message_chunk")["messageId"], "Claude's own message_id");
 
         // The generated title comes from the transcript a moment later.
         var deadline = DateTime.UtcNow.AddSeconds(15);

@@ -445,7 +445,8 @@ public sealed class SessionLifecycleTests
         var peers = (await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodPeers, new JsonObject()))!["sessions"]!.AsArray();
 
         CollectionAssert.AreEqual(new[] { open, newer, older }, peers.Select(p => (string)p!["session_id"]!).ToArray());
-        CollectionAssert.AreEqual(new[] { true, false, false }, peers.Select(p => (bool)p!["open"]!).ToArray());
+        CollectionAssert.AreEqual(new[] { "open", "saved", "saved" }, peers.Select(p => (string)p!["status"]!).ToArray());
+        Assert.IsFalse(peers.Any(p => p!.AsObject().ContainsKey("open")), "status replaced the open flag");
     }
 
     // ---------------------------------------------------------------- the overlay file
@@ -677,6 +678,7 @@ sealed class LifecycleAgent
                                 Resume = new SessionResumeCapabilities(),
                                 Close = new SessionCloseCapabilities(),
                                 Delete = canDelete ? new SessionDeleteCapabilities() : null,
+                                SystemPrompt = TakesSystemPrompt ? new SessionSystemPromptCapabilities() : null,
                             },
                         },
                         AgentInfo = new Implementation { Name = name, Version = "1" },
@@ -685,6 +687,7 @@ sealed class LifecycleAgent
                     var id = $"{name}-{Interlocked.Increment(ref next)}";
                     lock (sessions) sessions.Add(id);
                     lock (calls) calls.Add((req.Method, id));
+                    lock (SystemPrompts) SystemPrompts.Add((req.Method, id, req.Params?["systemPrompt"]?.DeepClone()));
                     if (req.Params?["mcpServers"]?.AsArray().FirstOrDefault(s => (string?)s?["name"] == "gorynych")?["args"]?.AsArray() is { Count: > 0 } peerArgs)
                         lock (Tokens) Tokens[id] = (string)peerArgs[peerArgs.Count - 1]!;
                     if (BeforeNew is { } beforeNew) await beforeNew(id);
@@ -703,9 +706,12 @@ sealed class LifecycleAgent
                     lock (Prompts) { Prompts.Add((sessionId!, text)); firstBlocks.TryAdd(sessionId!, blocks); }
                     if (BeforePrompt is { } beforePrompt) await beforePrompt(sessionId!);
                     lock (sessions) this.titles.TryAdd(sessionId!, blocks[0]);
-                    if (Answer is { } answer) await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = answer } });
+                    if (AnswerUpdates is { } updates)
+                        foreach (var u in updates) await agent.Update(sessionId!, u);
+                    else if (Answer is { } answer) await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = answer } });
                     return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn });
                 case AcpMethods.Agent.SessionResume:
+                    lock (SystemPrompts) SystemPrompts.Add((req.Method, sessionId!, req.Params?["systemPrompt"]?.DeepClone()));
                     if (BeforeResume is { } beforeResume) await beforeResume(sessionId!);
                     return new JsonObject();
                 case AcpMethods.Agent.SessionClose:
@@ -745,6 +751,15 @@ sealed class LifecycleAgent
     {
         lock (Prompts) return firstBlocks.GetValueOrDefault(sessionId) ?? [];
     }
+
+    /// <summary>Advertises <c>sessionCapabilities.systemPrompt</c> (append), as the Claude adapter does; set before the first use.</summary>
+    public bool TakesSystemPrompt { get; set; }
+
+    /// <summary>The <c>systemPrompt</c> param of every <c>session/new</c> and <c>session/resume</c>, in order.</summary>
+    public List<(string Method, string SessionId, JsonNode? SystemPrompt)> SystemPrompts { get; } = [];
+
+    /// <summary>Chunks a prompt answers with instead of <see cref="Answer"/>, sent as given (so without a messageId unless they have one).</summary>
+    public List<SessionUpdate>? AnswerUpdates { get; set; }
 
     /// <summary>Takes <c>_gorynych/note</c> as Claude's channel does; otherwise the agent does not know the method, like Kimi.</summary>
     public bool HasChannel { get; set; }

@@ -9,7 +9,8 @@ namespace Gorynych.Service;
 /// <summary>
 /// The bounded history of one session: every <c>session/update</c> payload, one JSON object
 /// per line, replayed to a client on <c>session/load</c>. When it grows past the limit,
-/// consecutive text chunks of one message are merged and the oldest entries dropped.
+/// consecutive text chunks of one message (one <c>messageId</c>) are merged and the oldest
+/// entries dropped.
 /// </summary>
 public sealed class SessionJournal
 {
@@ -50,6 +51,12 @@ public sealed class SessionJournal
     }
 
     static bool IsTurn(JsonNode? node) => node is JsonObject o && TurnKinds.Contains((string?)o["sessionUpdate"] ?? "");
+
+    /// <summary>A message, thought or user message chunk: the updates that carry a <c>messageId</c>.</summary>
+    public static bool IsChunkKind(string? kind) => kind is not null && ChunkKinds.Contains(kind);
+
+    /// <summary>An update that only a turn produces: a message, a thought, a tool call or a plan.</summary>
+    public static bool IsTurnKind(string? kind) => kind is not null && TurnKinds.Contains(kind);
 
     public void Append(JsonNode update)
     {
@@ -135,11 +142,17 @@ public sealed class SessionJournal
     static bool IsTextChunk(JsonObject o) =>
         ChunkKinds.Contains((string?)o["sessionUpdate"] ?? "") && (string?)o["content"]?["type"] == "text" && o["_meta"] is null;
 
+    /// <summary>
+    /// Merges <paramref name="next"/> into <paramref name="into"/> when both are text chunks of one
+    /// message: the same kind and the same <c>messageId</c>. Chunks without one are never merged,
+    /// since nothing says that two of them belong to one message (the service gives every chunk it
+    /// publishes an ID; only journals written before it did lack them).
+    /// </summary>
     static bool TryMerge(JsonObject into, JsonObject next)
     {
         if (!IsTextChunk(next)) return false;
         if ((string?)into["sessionUpdate"] != (string?)next["sessionUpdate"]) return false;
-        if ((string?)into["messageId"] != (string?)next["messageId"]) return false;
+        if ((string?)into["messageId"] is not { } id || (string?)next["messageId"] != id) return false;
         into["content"]!["text"] = (string?)into["content"]!["text"] + (string?)next["content"]!["text"];
         return true;
     }

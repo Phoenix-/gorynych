@@ -100,6 +100,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                             List = new SessionListCapabilities(),
                             Resume = new SessionResumeCapabilities(),
                             Close = new SessionCloseCapabilities(),
+                            // append only: --append-system-prompt adds to Claude Code's own prompt
+                            SystemPrompt = new SessionSystemPromptCapabilities(),
                         },
                     },
                     AuthMethods = [],
@@ -108,9 +110,10 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             {
                 var p = request.ParamsAs<NewSessionRequest>();
                 var cwd = RequireDirectory(p.Cwd);
+                var systemPrompt = ClaudeHooks.SystemPromptText(p.SystemPrompt);
                 var id = Guid.NewGuid().ToString();
                 // Recorded at the first prompt: a session nobody prompts never reaches the list.
-                sessions[id] = new ClaudeSession(this, options, id, cwd, resume: false) { McpServers = p.McpServers };
+                sessions[id] = new ClaudeSession(this, options, id, cwd, resume: false) { McpServers = p.McpServers, SystemPrompt = systemPrompt };
                 return AcpJson.ToNode(new NewSessionResponse { SessionId = id });
             }
             case AcpMethods.Agent.SessionList:
@@ -131,8 +134,10 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             case AcpMethods.Agent.SessionResume:
             {
                 var p = request.ParamsAs<ResumeSessionRequest>();
+                var systemPrompt = ClaudeHooks.SystemPromptText(p.SystemPrompt);
                 var session = Session(p.SessionId, p.Cwd);
                 if (p.McpServers is { } servers) session.McpServers = servers;
+                session.SystemPrompt = systemPrompt; // it applies per request: none now means none
                 return AcpJson.ToNode(new ResumeSessionResponse());
             }
             case AcpMethods.Agent.SessionPrompt:

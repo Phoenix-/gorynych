@@ -60,7 +60,15 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
     /// </summary>
     public List<McpServer> McpServers { get; set; } = [];
 
-    bool HasPeerTools => McpServers.OfType<McpServerStdio>().Any(s => s.Name == ChannelHost.ServerName);
+    /// <summary>
+    /// The text of the ACP <c>systemPrompt</c> (append mode) the client gave this session in
+    /// <c>session/new</c> or its latest <c>session/resume</c>, or null; Claude gets it through the
+    /// per-launch <c>--append-system-prompt</c>, after the channel's part, from the next launch.
+    /// </summary>
+    public string? SystemPrompt { get; set; }
+
+    /// <summary>Message IDs this session's user messages already use (see <see cref="UserMessageId"/>).</summary>
+    readonly HashSet<string> userMessageIds = new(StringComparer.Ordinal);
 
     public bool IsRunning => pty is { Exited.IsCompleted: false };
 
@@ -194,14 +202,16 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         if (agent.Channel is { } channel)
         {
             File.WriteAllText(mcpPath, channel.McpConfig(Id, Token, McpServers).ToJsonString());
-            args.AddRange(["--mcp-config", mcpPath, "--dangerously-load-development-channels", "server:" + ChannelHost.ServerName,
-                "--append-system-prompt", ChannelHost.SystemPrompt(HasPeerTools)]);
+            args.AddRange(["--mcp-config", mcpPath, "--dangerously-load-development-channels", "server:" + ChannelHost.ServerName]);
         }
         else if (McpServers.Count > 0)
         {
             File.WriteAllText(mcpPath, Claude.McpServers.Config(McpServers).ToJsonString());
             args.AddRange(["--mcp-config", mcpPath]);
         }
+        var appended = string.Join("\n\n", new[] { agent.Channel is null ? null : ChannelHost.SystemPrompt, SystemPrompt }
+            .Where(t => !string.IsNullOrEmpty(t)));
+        if (appended.Length > 0) args.AddRange(["--append-system-prompt", appended]);
         args.AddRange(resume ? ["--resume", Id] : ["--session-id", Id]);
         args.AddRange(["--", prompt]);
         var commandLine = TerminalText.Quote(exe) + " " + TerminalText.JoinArguments(args);
@@ -343,10 +353,16 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
                 var prompt = (string?)e["prompt"] ?? "";
                 Turn? current;
                 lock (stateGate) { current = turn; idle = idle.Task.IsCompleted ? NewSignal() : idle; }
+                var promptId = (string?)e["prompt_id"];
                 if (current is { Confirmed: false } && !ClaudeHooks.IsChannelMessage(prompt))
+                {
                     current.Confirmed = true; // the client's own prompt: ACP does not echo it back
+                    UserMessageId(promptId);  // its prompt_id is taken, even though the service names that message
+                }
                 else
-                    await agent.EmitAsync(Id, ClaudeHooks.ForeignPrompt(prompt));
+                {
+                    await agent.EmitAsync(Id, ClaudeHooks.ForeignPrompt(prompt, UserMessageId(promptId)));
+                }
                 break;
             }
             case "PreToolUse":
@@ -372,10 +388,12 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
                 Turn? current;
                 lock (stateGate) current = turn;
                 var last = (string?)e["last_assistant_message"];
+                // Claude gives these texts no message ID of their own, so each is a new message.
                 if (current is { HadText: false } && !string.IsNullOrEmpty(last))
-                    await agent.EmitAsync(Id, ClaudeHooks.TextChunk(last));
+                    await agent.EmitAsync(Id, ClaudeHooks.TextChunk(last, Guid.NewGuid().ToString()));
                 if (name == "StopFailure")
-                    await agent.EmitAsync(Id, ClaudeHooks.TextChunk($"\n[Claude stopped with an error: {(string?)e["error"] ?? (string?)e["reason"] ?? "unknown"}]"));
+                    await agent.EmitAsync(Id, ClaudeHooks.TextChunk($"\n[Claude stopped with an error: {(string?)e["error"] ?? (string?)e["reason"] ?? "unknown"}]",
+                        Guid.NewGuid().ToString()));
                 await agent.TouchAsync(Id);
                 SetIdle();
                 // Only a turn Claude has started ends here; a late Stop of an interrupted turn
@@ -424,6 +442,12 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
     }
 
     static string ToolKey(JsonObject e) => (string?)e["tool_name"] + "\n" + e["tool_input"]?.ToJsonString();
+
+    /// <summary>The ACP <c>messageId</c> of a user message Claude reports itself; see <see cref="ClaudeHooks.UserMessageId"/>.</summary>
+    string UserMessageId(string? promptId)
+    {
+        lock (stateGate) return ClaudeHooks.UserMessageId(userMessageIds, promptId);
+    }
 
     static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 

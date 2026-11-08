@@ -11,7 +11,11 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
 (recorded in `tests/Gorynych.Tests/Fixtures/kimi`):
 
 - `initialize`: `loadSession`, `sessionCapabilities` list, resume, close, delete, fork,
-  additionalDirectories; one terminal auth method (`kimi login`).
+  additionalDirectories; one terminal auth method (`kimi login`). Kimi 2.5.2 advertises no
+  `sessionCapabilities.systemPrompt`, so it gets no peer instructions as a system prompt
+  (checked in its bundled ACP agent on 8 November 2026).
+- Its chunks carry no `messageId` (2.5.2, same check): the service gives them IDs as it
+  publishes them ([service-protocol.md](service-protocol.md#standard-methods)).
 - `session/new` returns config options (model, thinking, mode) and modes; the first
   prompt immediately yields `session_info_update` with the prompt as the title.
 - `session/list` returns titles and `updatedAt`. A folder may come with forward slashes
@@ -63,8 +67,8 @@ everything goes through per-launch flags, hook HTTP calls and the terminal.
 
 ```
 claude --settings <session>/settings.json --permission-mode default [--model <m>]
-       [--mcp-config <session>/mcp.json --dangerously-load-development-channels server:gorynych
-        --append-system-prompt <channel authorization>]
+       [--mcp-config <session>/mcp.json [--dangerously-load-development-channels server:gorynych]]
+       [--append-system-prompt <channel authorization>\n\n<ACP systemPrompt>]
        (--session-id <id> | --resume <id>) -- <first prompt>
 ```
 
@@ -108,14 +112,24 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
 
 | Hook | ACP |
 | --- | --- |
-| `UserPromptSubmit` | nothing for the client's own prompt (ACP does not echo it); otherwise `user_message_chunk` with `_meta["gorynych/origin"]` = `channel` or `terminal` |
+| `UserPromptSubmit` | nothing for the client's own prompt (ACP does not echo it); otherwise `user_message_chunk` with `_meta["gorynych/origin"]` = `channel` or `terminal` and `messageId` = the hook's `prompt_id` (below) |
 | `PreToolUse` | `tool_call` (`pending`), `toolCallId` = `tool_use_id`, title and kind from the tool, locations from `file_path` |
 | `PermissionRequest` | `session/request_permission` with Allow / Deny; the hook replies `allow` or `deny`. A denial also marks the tool call `failed`. |
 | `PermissionRequest` for `AskUserQuestion` | one `elicitation/create` form (scoped to the session and tool call) with a property `q1`, `q2`, … per question: a string with `oneOf` for a single choice, an array of titled items for `multiSelect`; an accepted form makes the hook reply `allow` with `updatedInput.answers` (`{question: label}`, several labels joined by ", "), anything else `deny` |
 | `PostToolUse` / `PostToolUseFailure` | `tool_call_update` `completed` / `failed`, `rawOutput`, Bash output as content |
-| `MessageDisplay` | `agent_message_chunk` (`messageId` = `message_id`) |
-| `Stop` | ends the turn; if no `MessageDisplay` came, `last_assistant_message` is sent as the answer |
+| `MessageDisplay` | `agent_message_chunk` (`messageId` = `message_id`, the same for all pieces of one message) |
+| `Stop` | ends the turn; if no `MessageDisplay` came, `last_assistant_message` is sent as the answer, with a new `messageId` |
+| `StopFailure` | ends the turn after a note with the error, with a new `messageId` |
 | transcript `ai-title` / `custom-title` | `session_info_update` with the title (a chosen name wins) |
+
+**Message IDs** are Claude's own where it has them. An answer's is `MessageDisplay`'s
+`message_id`, which Claude's transcript does not keep (the hook carries no transcript ID, and
+mapping streamed pieces to transcript entries would hold the stream back). A typed or channel
+message's is the hook's `prompt_id`, which the transcript keeps as the `promptId` of the
+prompt that started the turn (checked live on 8 November 2026). A channel message that
+arrives while Claude works on a turn carries that turn's `prompt_id` (recorded in
+`hooks-channel.jsonl`), so an ID an earlier message of the session took gets a new UUID
+instead; so does a message without one. The client's own prompts get the service's IDs.
 
 The transcript is only read, from the path the hooks report, for the title. Approvals
 and questions are kept apart: `session/request_permission` asks to allow an action,
@@ -138,17 +152,24 @@ carries no sender label, which Claude could take for a session ID. `reply` repor
 when the channel has no request with that `message_id`. Without a service-given server the adapter starts a channel-only
 `gorynych` server itself.
 
-`--append-system-prompt` authorizes opinions from the user's agents, forbids actions on
-their behalf, says each channel message names the asking session by its `session_id` and
-that such a message arrives as a prompt when Claude was not running, and,
-when the peer tools are there, tells Claude about `list_agents`, `ask_agent` (by exact
-`session_id`; `reply` only answers) and `spawn_session`. The PermissionRequest hook allows `mcp__gorynych__reply`,
+`--append-system-prompt` holds two parts. With a channel, the adapter's own authorization
+comes first: it authorizes opinions from the user's agents, forbids actions on their behalf,
+says each channel message names the asking session by its `session_id` and that such a
+message arrives as a prompt when Claude was not running. Then comes the session's ACP
+`systemPrompt`: the adapter advertises `sessionCapabilities.systemPrompt: {}` (append only,
+since Claude Code can only add to its own prompt) and takes the text of the latest
+`session/new` or `session/resume`. The service sends its peer instructions there, which tell
+Claude about `list_agents`, `ask_agent` (by exact `session_id`; `reply` only answers),
+`spawn_session` and reports ([service-protocol.md](service-protocol.md#what-agents-are-told)).
+`override`, any other mode, an empty `content` and blocks other than text fail the request
+with `-32602`, as ACP requires. Without a channel and without a `systemPrompt` there is no
+`--append-system-prompt`. The PermissionRequest hook allows `mcp__gorynych__reply`,
 `mcp__gorynych__list_agents` and `mcp__gorynych__spawn_session` without asking (the service
 asks the person before every spawn); `mcp__gorynych__ask_agent`, `archive_session` and
 `restore_session` become ACP approvals like any tool.
 
 `_gorynych/note` (a child's report to its parent) becomes a channel message with
-`meta: {kind: "report"}` and no `message_id`; the system prompt says it needs no reply. The
+`meta: {kind: "report"}` and no `message_id`; the peer instructions say it needs no reply. The
 adapter ignores the `sender` param of `_gorynych/opinion` and `_gorynych/note`: the text names
 the session. Without a channel the adapter answers method not found; while Claude's process is not
 running (`session/resume` registers a session without starting one) it answers `-32600`, to

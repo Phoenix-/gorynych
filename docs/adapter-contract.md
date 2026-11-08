@@ -9,10 +9,11 @@ The contract is a profile of [ACP v1](https://agentclientprotocol.com/protocol/o
 adapter is an ACP agent, and the service is its ACP client. The profile names the ACP methods
 and capabilities Gorynych relies on, and adds Gorynych's own extensions through ACP's
 extension points: fields under `_meta` with `gorynych/` keys and methods with a `_gorynych/`
-prefix ([service-protocol.md](service-protocol.md#extensions)). Types come from the schema
-release in [acp-types.md](acp-types.md) (v1.29.1, `protocolVersion` 1); ACP features that are
-still drafts or unstable are named as such where they matter. Checked against
-agentclientprotocol.com on 8 November 2026.
+prefix ([service-protocol.md](service-protocol.md#extensions)). Types come from the schema in
+[acp-types.md](acp-types.md) (`protocolVersion` 1; for now ACP's main branch at 7441d10, which
+is release v1.29.1 plus the completed client-system-prompt RFD); ACP features that are still
+drafts or unstable are named as such where they matter. Checked against
+agentclientprotocol.com and ACP's repository on 8 November 2026.
 
 The key words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, RECOMMENDED,
 NOT RECOMMENDED, MAY and OPTIONAL are to be interpreted as described in BCP 14
@@ -60,8 +61,13 @@ fallback when the adapter does not provide it.
 
 - The adapter MUST answer `initialize` with `protocolVersion` 1 and the capabilities it has.
   The service reads `agentCapabilities.loadSession` and
-  `agentCapabilities.sessionCapabilities.list`, `.resume`, `.close` and `.delete`; each
-  feature below depends on one of them.
+  `agentCapabilities.sessionCapabilities.list`, `.resume`, `.close`, `.delete` and
+  `.systemPrompt`; each feature below depends on one of them.
+- The service reads no Gorynych flag from an adapter: it finds the live-note path by calling
+  it ([§6.4](#64-the-live-note-path)). A flag that an adapter's extension would need goes in
+  `agentCapabilities._meta` under a `gorynych/` key, as ACP's extensibility rules (advertising
+  custom capabilities) say, not in the result's own `_meta`; the service advertises its own
+  flags that way ([service-protocol.md](service-protocol.md#methods)).
 - The service declares no file system and no terminal (`fs.readTextFile`, `fs.writeTextFile`
   and `terminal` false), so the adapter MUST NOT call `fs/*` or `terminal/*`. It declares
   form elicitation, which it relays ([§8](#8-approvals-and-forms)).
@@ -104,7 +110,8 @@ it is; after an adapter restart, or a `session/close`, it is not.
 - The adapter MUST implement `session/resume` (`sessionCapabilities.resume`) or
   `session/load` (`loadSession`) for every session it lists, also after a restart. It MUST
   honour the `mcpServers` of that request: the peer token is per session, and the service
-  sends the same server again.
+  sends the same server again. An adapter that advertises `sessionCapabilities.systemPrompt`
+  MUST honour the request's `systemPrompt` too ([§6.2](#62-the-gorynych-mcp-server)).
 - The service prefers `session/resume`. With `session/load` it drops the agent's replay,
   because the history comes from its own journal; only for a session the journal has never
   seen does it let the agent replay and journals it.
@@ -129,6 +136,23 @@ it is; after an adapter restart, or a `session/close`, it is not.
 - The adapter SHOULD stream `agent_message_chunk`, `tool_call` and `tool_call_update` as they
   happen: a report carries the child's final message, its text after its last tool call.
 - The adapter MAY ignore a prompt's `_meta`; it MUST pass the text to the agent unchanged.
+
+**Message IDs.** ACP's stable [message-id](https://agentclientprotocol.com/rfds/message-id)
+field names the message that each `agent_message_chunk`, `agent_thought_chunk` and
+`user_message_chunk` belongs to.
+
+- The adapter SHOULD give every such chunk a `messageId`: the same on all chunks of one
+  message, never the same for two messages of the session, and taken from the harness where it
+  has one (its native state is the source of truth), generated otherwise. Claude's are in
+  [adapters.md](adapters.md#claude-code).
+- The service passes an adapter's IDs on unchanged. Fallback: a chunk without one gets one from
+  the service as it publishes it. Consecutive chunks of one kind are one message, as a client
+  would infer without IDs, and any other part of the turn (a chunk of another kind or with its
+  own ID, a tool call, a plan) ends it; a title or usage update does not.
+- Messages the service writes itself (the client's prompt, an opinion request or a report
+  asked as a turn, a spawned session's first prompt) get the service's IDs, one per message.
+- The journal keeps the updates as they were published, so a replay on `session/load` has the
+  live stream's IDs. When it compacts, it merges text chunks only when they share a `messageId`.
 
 ## 6. Service turns: opinions and reports
 
@@ -178,6 +202,25 @@ prompt and a spawned session's first turn are not service turns.
   without asking (Claude's PermissionRequest hook). Fallback: the person is asked for all.
 - Fallback without the server: the agent cannot ask, answer, spawn or archive; an opinion
   asked as a turn is answered with the turn's text.
+
+**The instructions as a system prompt.** ACP's
+[client-system-prompt](https://agentclientprotocol.com/rfds/client-system-prompt) RFD (completed
+6 November 2026) lets a client add to the agent's system prompt.
+
+- With the server, the service sends what it tells agents about these tools as
+  `systemPrompt {mode: "append", content: [text]}` on every `session/new`, `session/load` and
+  `session/resume` (agents need not keep it) to an adapter that advertises
+  `sessionCapabilities.systemPrompt`. The text is in
+  [service-protocol.md](service-protocol.md#what-agents-are-told); it names no transport.
+- An adapter that advertises the capability MUST support `append` and SHOULD give the content
+  system-level precedence (Claude: `--append-system-prompt`). It MUST apply the latest
+  request's value, so a resume without one leaves none. It MUST fail the request with
+  `-32602`, instead of creating, loading or resuming the session, for a mode it does not
+  advertise and for content it cannot apply (an empty list, a block that is not text). It MAY
+  add text of its own for its own delivery (Claude's channel authorization comes first).
+- Fallback without the capability: the agent learns the tools from the server's MCP
+  `instructions` and the tools' descriptions, and each request's or report's text says what to
+  do (Kimi).
 
 ### 6.3 Answering with reply
 
@@ -293,6 +336,8 @@ own JSON-RPC, not ACP, so its adapter translates, like Claude's.
 | Turns ([§5](#5-prompts-and-turns)) | bracketed paste into the TUI; `Stop` hook ends the turn | native | `turn/start`; `turn/interrupt` for `session/cancel` | API calls |
 | Service turns and waking ([§6.1](#61-waking-a-session-and-closing-it-again)) | turns start the process; closed again afterwards | turns; resumed, then closed again | expected the same | expected the same |
 | `gorynych` MCP server ([§6.2](#62-the-gorynych-mcp-server)) | per-launch `--mcp-config` | through ACP `mcpServers` | unknown: how to give one thread an MCP server without editing `~/.codex` | unknown: depends on its MCP client |
+| System prompt ([§6.2](#62-the-gorynych-mcp-server)) | `sessionCapabilities.systemPrompt: {}` (append only): `--append-system-prompt`, after the channel's authorization; other modes and non-text content fail with `-32602` | not advertised by 2.5.2: the MCP instructions and the requests' texts | unknown | expected: append, and override too, since the adapter writes the system message itself |
+| Message IDs ([§5](#5-prompts-and-turns)) | answers: `MessageDisplay`'s `message_id`; typed and channel messages: the hook's `prompt_id` (the transcript's `promptId`), a new UUID for a channel message within a turn; texts Claude gives no ID: a new UUID | none sent by 2.5.2: the service assigns them | unknown; expected from its item IDs | its own store's IDs |
 | Live-note path ([§6.4](#64-the-live-note-path)) | development channel; `-32600` while not running | none (`-32601`) | none planned; `turn/steer` appends only to an active turn | none |
 | Approvals ([§8](#8-approvals-and-forms)) | PermissionRequest hook; pre-allows the three tools | Kimi's own `session/request_permission`; the service pre-allows | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval` | unknown |
 | Forms | `AskUserQuestion` as `elicitation/create` | none seen | `tool/requestUserInput` (experimental), `mcpServer/elicitation/request` | unknown |
@@ -306,7 +351,7 @@ own JSON-RPC, not ACP, so its adapter translates, like Claude's.
 1. Go through §1–§12 and fill in a column of the table above, marking every MUST it cannot meet.
 2. The service side of each feature is covered by contract tests against scripted agents
    (`tests/Gorynych.Tests`: `SessionLifecycleTests`, `OpinionTurnTests`, `SessionTreeTests`,
-   `ArchiveTests`, `WakeTests`). A new adapter needs tests of its own translation, as
+   `ArchiveTests`, `WakeTests`, `StableAcpTests`). A new adapter needs tests of its own translation, as
    `ClaudeAdapterTests` and `ClaudeHooksTests` do for Claude.
 3. Add a live smoke test under `GORYNYCH_LIVE=1` (`LiveSmokeTests`): a first prompt, an
    approval, a title, a reload, an `ask_agent` both ways, and a service turn that wakes a
@@ -327,3 +372,16 @@ own JSON-RPC, not ACP, so its adapter translates, like Claude's.
 - **Titles.** Neither Claude nor Kimi lets the service set a native title.
 - **Kimi's cursor.** Kimi 2.5.2 ignores `session/list`'s `cursor`
   ([adapters.md](adapters.md#kimi-code)).
+- **A client's system prompt.** The service does not advertise `sessionCapabilities.systemPrompt`
+  to its clients yet (Zed sends none) and refuses one with `-32602`. If it does, it has to
+  combine the client's prompt with its own peer instructions. In `append` mode both could go to
+  the agent in one `systemPrompt`, but in which order, and what reaches an agent that does not
+  advertise the capability, is not decided. `override` replaces the agent's own instructions,
+  so it would need the agent's `mode.override` and a rule for where the peer instructions go.
+- **IDs of the client's own prompts.** The service names the client's prompt with an ID of its
+  own, because ACP does not echo it; Claude's transcript has a `promptId` for it that the
+  service learns only once the turn starts. ACP's v2 prompt-lifecycle RFD would let the agent
+  return the ID it gave the prompt.
+- **IDs for agents that send none.** Kimi 2.5.2 sends no `messageId`. The service's IDs group
+  its chunks as a client would, so two of its messages with nothing between them stay one.
+  Whether Kimi keeps message IDs of its own that it could send is not known.

@@ -126,17 +126,33 @@ internal sealed class ClientConnection
                 Close = new SessionCloseCapabilities(),
                 Delete = new SessionDeleteCapabilities(),
             },
+            // ACP's extensibility rules advertise custom capabilities in the capability object's _meta.
+            Meta = Extensions(),
         },
         AuthMethods = [],
-        Meta = new JsonObject
+        Meta = ResultMeta(),
+    };
+
+    /// <summary>The service's extension flags, advertised in <c>agentCapabilities._meta</c>.</summary>
+    static JsonObject Extensions() => new()
+    {
+        [GorynychProtocol.MetaSessionsChanged] = true,
+        [GorynychProtocol.MetaArchive] = true,
+    };
+
+    /// <summary>The <c>initialize</c> result's <c>_meta</c>: data about the service, not flags.</summary>
+    JsonObject ResultMeta()
+    {
+        var meta = new JsonObject
         {
             [GorynychProtocol.MetaServiceId] = conductor.ServiceId,
             [GorynychProtocol.MetaAgents] = new JsonArray(conductor.Agents.Values
                 .Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["displayName"] = a.DisplayName }).ToArray()),
-            [GorynychProtocol.MetaSessionsChanged] = true,
-            [GorynychProtocol.MetaArchive] = true,
-        },
-    };
+        };
+        // Deprecated: the flags' old place, kept for one release for clients built before they moved.
+        foreach (var (key, value) in Extensions()) meta[key] = value?.DeepClone();
+        return meta;
+    }
 
     static readonly TimeSpan NotifyTimeout = TimeSpan.FromSeconds(15);
 

@@ -122,6 +122,7 @@ public sealed partial class OpinionTurnTests
         Assert.AreEqual("peer", (string?)asked["_meta"]!["gorynych/origin"]);
         Assert.AreEqual("peer_claude", (string?)asked["_meta"]!["gorynych/sender"]);
         Assert.AreEqual("m1", (string?)asked["_meta"]!["gorynych/opinion"]);
+        Assert.IsFalse(string.IsNullOrEmpty((string?)asked["messageId"]), "the service names the message it writes");
         var answer = client.Snapshot().Single(u => (string?)u["sessionUpdate"] == "agent_message_chunk");
         Assert.AreEqual("m1", (string?)answer["_meta"]!["gorynych/opinion"]);
     }

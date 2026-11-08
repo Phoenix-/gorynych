@@ -126,10 +126,30 @@ public sealed class ClaudeHooksTests
         var events = Fixture("hooks-channel.jsonl");
         var prompts = events.Where(e => ClaudeHooks.Name(e) == "UserPromptSubmit").Select(e => (string)e["prompt"]!).ToList();
         CollectionAssert.AreEqual(new[] { false, true, true, false }, prompts.Select(ClaudeHooks.IsChannelMessage).ToArray());
-        var foreign = ClaudeHooks.ForeignPrompt(prompts[1]);
+        var foreign = ClaudeHooks.ForeignPrompt(prompts[1], "p1");
         Assert.AreEqual("channel", (string?)foreign.Meta!["gorynych/origin"]);
+        Assert.AreEqual("p1", foreign.MessageId);
         var reply = ClaudeHooks.ToolCall(First(events, "PreToolUse", "mcp__probechan__reply"));
         Assert.AreEqual("reply (probechan)", reply.Title);
+    }
+
+    [TestMethod]
+    public void UserMessages_TakeTheirPromptId_ButAChannelMessageWithinATurnGetsItsOwn()
+    {
+        // Recorded: the client's prompt, a channel message while Claude ran it (same prompt_id),
+        // a channel message while idle (its own prompt_id), then a prompt typed in the terminal.
+        var promptIds = Fixture("hooks-channel.jsonl").Where(e => ClaudeHooks.Name(e) == "UserPromptSubmit")
+            .Select(e => (string)e["prompt_id"]!).ToList();
+        Assert.AreEqual(promptIds[0], promptIds[1], "the recording has a channel message within the turn");
+
+        var taken = new HashSet<string>();
+        var ids = promptIds.Select(p => ClaudeHooks.UserMessageId(taken, p)).ToList();
+        Assert.AreEqual(promptIds[0], ids[0]);
+        Assert.AreNotEqual(promptIds[1], ids[1], "a message within the turn does not take the turn's prompt_id");
+        Assert.AreEqual(promptIds[2], ids[2]);
+        Assert.AreEqual(promptIds[3], ids[3]);
+        Assert.AreEqual(4, ids.Distinct().Count());
+        Assert.AreNotEqual(ClaudeHooks.UserMessageId(taken, null), ClaudeHooks.UserMessageId(taken, null));
     }
 
     [TestMethod]

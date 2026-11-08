@@ -304,10 +304,12 @@ public sealed class Conductor : IAsyncDisposable
     internal async Task<NewSessionResponse> NewSessionAsync(ClientConnection client, NewSessionRequest request, CancellationToken ct)
     {
         // An explicit choice in the request wins; otherwise the agent the connection is scoped to.
+        RefuseSystemPrompt(request.SystemPrompt);
         var host = Agent((string?)request.Meta?[GorynychProtocol.MetaAgent] ?? client.AgentScope);
         var rpc = await host.GetAsync(ct);
         var token = NewToken();
         request.McpServers = WithPeers(request.McpServers, token);
+        request.SystemPrompt = SystemPromptFor(host);
         var response = await rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, request, ct);
         BindToken(token, response.SessionId);
         host.MarkLive(response.SessionId);
@@ -368,7 +370,10 @@ public sealed class Conductor : IAsyncDisposable
         if (host.CanResume)
         {
             opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionResume,
-                AcpJson.ToNode(new ResumeSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId) }), ct);
+                AcpJson.ToNode(new ResumeSessionRequest
+                {
+                    SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId), SystemPrompt = SystemPromptFor(host),
+                }), ct);
         }
         else if (host.CanLoad)
         {
@@ -377,7 +382,10 @@ public sealed class Conductor : IAsyncDisposable
             try
             {
                 opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
-                    AcpJson.ToNode(new LoadSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId) }), ct);
+                    AcpJson.ToNode(new LoadSessionRequest
+                    {
+                        SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId), SystemPrompt = SystemPromptFor(host),
+                    }), ct);
             }
             finally
             {
@@ -395,6 +403,7 @@ public sealed class Conductor : IAsyncDisposable
 
     internal async Task<JsonNode?> LoadAsync(ClientConnection client, LoadSessionRequest request, CancellationToken ct)
     {
+        RefuseSystemPrompt(request.SystemPrompt);
         using var use = await UseAsync(request.SessionId, ct);
         var record = use.Record;
         var host = HostOf(record);
@@ -409,7 +418,10 @@ public sealed class Conductor : IAsyncDisposable
                 wokenForService.TryRemove(record.SessionId, out _);
                 feed.Attach(client);
                 opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
-                    AcpJson.ToNode(new LoadSessionRequest { SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId) }), ct) as JsonObject;
+                    AcpJson.ToNode(new LoadSessionRequest
+                    {
+                        SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId), SystemPrompt = SystemPromptFor(host),
+                    }), ct) as JsonObject;
                 host.MarkLive(record.SessionId);
                 feed.CaptureState(opened);
                 return opened ?? [];
@@ -433,6 +445,7 @@ public sealed class Conductor : IAsyncDisposable
 
     internal async Task<JsonNode?> ResumeAsync(ClientConnection client, ResumeSessionRequest request, CancellationToken ct)
     {
+        RefuseSystemPrompt(request.SystemPrompt);
         using var use = await UseAsync(request.SessionId, ct);
         var (_, opened) = await EnsureLiveAsync(use.Record, ct);
         use.Feed.Attach(client);
@@ -483,9 +496,10 @@ public sealed class Conductor : IAsyncDisposable
         if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
         // Journal the user's message, show it to the session's other clients, and use the
         // first prompt as the title until the harness provides one.
+        var messageId = SessionFeed.NewMessageId(); // one message, however many blocks
         foreach (var block in prompt.Prompt)
         {
-            var update = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = block })!.AsObject();
+            var update = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = block, MessageId = messageId })!.AsObject();
             await feed.PublishAsync(update, except: client, () => store.Touch(record.SessionId));
         }
         await ProvisionalTitleAsync(feed, record, prompt.Prompt);
@@ -1047,7 +1061,8 @@ public sealed class Conductor : IAsyncDisposable
         var token = NewToken();
         // Not cancelled with the spawn: the agent may create the session anyway, and only its answer names it.
         var creating = await rpc.StartRequestAsync(AcpMethods.Agent.SessionNew,
-            AcpJson.ToNode(new NewSessionRequest { Cwd = cwd, McpServers = WithPeers([], token) }), CancellationToken.None);
+            AcpJson.ToNode(new NewSessionRequest { Cwd = cwd, McpServers = WithPeers([], token), SystemPrompt = SystemPromptFor(host) }),
+            CancellationToken.None);
         JsonNode? created;
         try
         {
@@ -1159,7 +1174,10 @@ public sealed class Conductor : IAsyncDisposable
                 [GorynychProtocol.MetaParentSessionId] = parent.SessionId,
             };
             var shown = new TextContent { Text = $"{task.Text}\n\n{context.Text}" };
-            var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = shown, Meta = meta })!.AsObject();
+            var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
+            {
+                Content = shown, MessageId = SessionFeed.NewMessageId(), Meta = meta,
+            })!.AsObject();
             await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
             await ProvisionalTitleAsync(feed, use.Record, [task]);
             feed.BeginTurnText(ReportLimit + 1);
@@ -1327,7 +1345,10 @@ public sealed class Conductor : IAsyncDisposable
                 [GorynychProtocol.MetaFromSessionId] = childId,
             };
             var block = new TextContent { Text = text };
-            var told = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = block, Meta = meta })!.AsObject();
+            var told = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
+            {
+                Content = block, MessageId = SessionFeed.NewMessageId(), Meta = meta,
+            })!.AsObject();
             await feed.PublishAsync(told, except: null, () => store.Touch(use.Record.SessionId));
             Task<JsonNode?> response;
             await feed.ForwardGate.WaitAsync(CancellationToken.None);
@@ -1693,7 +1714,10 @@ public sealed class Conductor : IAsyncDisposable
                     [GorynychProtocol.MetaOpinion] = messageId,
                 };
                 if (from is not null) meta[GorynychProtocol.MetaFromSessionId] = from;
-                var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = new TextContent { Text = text }, Meta = meta })!.AsObject();
+                var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
+                {
+                    Content = new TextContent { Text = text }, MessageId = SessionFeed.NewMessageId(), Meta = meta,
+                })!.AsObject();
                 await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
                 feed.BeginOpinionTurn(messageId);
                 Task<JsonNode?> response;
@@ -1783,6 +1807,8 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>
     /// <c>_gorynych/peers {token, includeArchived?}</c>: the sessions the session behind <c>token</c>
     /// can ask; archived ones only with <c>includeArchived</c>, and then every entry says whether it is.
+    /// Each entry's <c>status</c> uses the words of ACP's session-status RFD: <c>open</c> when its agent
+    /// has it loaded now, <c>saved</c> when it does not (a question starts it, and it is closed again after).
     /// <c>caller</c> names the session behind the token as <see cref="Who"/> does, since the list
     /// leaves it out and an agent does not know its own ID otherwise. Without <c>includeArchived</c>,
     /// <c>hiddenArchived</c> counts the archived sessions the list would otherwise show (never the caller).
@@ -1801,7 +1827,7 @@ public sealed class Conductor : IAsyncDisposable
                 ["agent"] = r.Agent,
                 ["title"] = r.Title,
                 ["cwd"] = FolderPath.Normalize(r.Cwd),
-                ["open"] = live,
+                ["status"] = live ? "open" : "saved",
                 ["updated_at"] = r.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
                 ["parent_session_id"] = r.ParentSessionId,
             };
@@ -1827,6 +1853,29 @@ public sealed class Conductor : IAsyncDisposable
         var token = sessionTokens.GetOrAdd(sessionId, _ => NewToken());
         peerTokens[token] = sessionId;
         return WithPeers([], token);
+    }
+
+    /// <summary>
+    /// The service's instructions for the peer tools as an ACP <c>systemPrompt</c> in append mode,
+    /// for an agent that advertises <c>sessionCapabilities.systemPrompt</c> and a session that gets
+    /// the peers server; null otherwise. ACP agents need not keep it, so the service sends it on
+    /// every <c>session/new</c>, <c>session/load</c> and <c>session/resume</c>.
+    /// </summary>
+    SystemPrompt? SystemPromptFor(AgentHost host) =>
+        host.TakesSystemPrompt && options.PeerServerCommand is { Count: > 0 }
+            ? new SystemPrompt { Mode = SystemPromptMode.Append, Content = [new TextContent { Text = PeersServer.SystemPrompt }] }
+            : null;
+
+    /// <summary>
+    /// The service does not advertise <c>sessionCapabilities.systemPrompt</c> to its clients yet, so a
+    /// client must not send one; it cannot apply one either, which ACP says to answer with an error
+    /// instead of opening the session.
+    /// </summary>
+    static void RefuseSystemPrompt(SystemPrompt? systemPrompt)
+    {
+        if (systemPrompt is not null)
+            throw new JsonRpcException(JsonRpcException.InvalidParams,
+                "Gorynych does not take systemPrompt from clients: it does not advertise sessionCapabilities.systemPrompt.");
     }
 
     /// <summary>Adds the peers MCP server, unless the client already brought one with that name.</summary>

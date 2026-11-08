@@ -138,8 +138,11 @@ public sealed class PeersTests
         StringAssert.Contains(Description("list_agents"), "The result's first line names this session, which the list leaves out: \"You are session_id ...\"");
         StringAssert.Contains(Description("list_agents"),
             "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare UUID, Kimi's start with session_.");
-        StringAssert.Contains(Description("list_agents"), "open is true when the session's agent has it loaded right now; it has nothing to do with archived.");
-        StringAssert.Contains(Description("list_agents"), "A session that is not open is started when asked, so it answers more slowly.");
+        StringAssert.Contains(Description("list_agents"), "Each entry has session_id, agent, title, cwd, status, updated_at and parent_session_id");
+        StringAssert.Contains(Description("list_agents"), "status \"open\": the session's agent has it loaded right now.");
+        StringAssert.Contains(Description("list_agents"),
+            "status \"saved\": it is saved but not loaded; asking it starts it, so it answers more slowly, and it is closed again after it answers.");
+        StringAssert.Contains(Description("list_agents"), "status has nothing to do with archived.");
         Assert.IsFalse(Description("list_agents").Contains("Claude session can", StringComparison.Ordinal), "every agent is started the same way now");
         StringAssert.Contains(Description("list_agents"), "Archived sessions are left out unless include_archived is true, and the result says how many");
         Assert.AreEqual("boolean", (string?)tools["list_agents"]["inputSchema"]!["properties"]!["include_archived"]!["type"]);
@@ -193,9 +196,11 @@ public sealed class PeersTests
 
             var listed = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_agents", ["arguments"] = new JsonObject() });
             var listing = (string)listed!["content"]![0]!["text"]!;
-            StringAssert.StartsWith(listing, "You are session_id asking (asker).\n[", "the caller first, then the list");
-            CollectionAssert.AreEqual(new[] { "answering" },
-                JsonNode.Parse(listing[(listing.IndexOf('\n') + 1)..])!.AsArray().Select(s => (string?)s!["session_id"]).ToArray());
+            StringAssert.StartsWith(listing, $"You are session_id asking (asker).\n{PeersServer.StatusLegend}\n[",
+                "the caller first, what status means, then the list");
+            var entries = JsonNode.Parse(listing[(listing.IndexOf("\n[", StringComparison.Ordinal) + 1)..])!.AsArray();
+            CollectionAssert.AreEqual(new[] { "answering" }, entries.Select(s => (string?)s!["session_id"]).ToArray());
+            Assert.AreEqual("open", (string?)entries[0]!["status"]);
 
             var answer = await mcp.SendRequestAsync("tools/call", new JsonObject
             {
@@ -246,9 +251,9 @@ public sealed class PeersTests
             async Task<(string[] Sessions, string Last)> Listed(bool includeArchived)
             {
                 var text = (string)(await Call("list_agents", new JsonObject { ["include_archived"] = includeArchived }))!;
-                StringAssert.StartsWith(text, "You are session_id asking (asker).\n[");
+                StringAssert.StartsWith(text, "You are session_id asking (asker).\n");
                 var end = text.LastIndexOf(']') + 1;
-                var sessions = JsonNode.Parse(text[(text.IndexOf('\n') + 1)..end])!.AsArray()
+                var sessions = JsonNode.Parse(text[(text.IndexOf("\n[", StringComparison.Ordinal) + 1)..end])!.AsArray()
                     .Select(s => $"{(string?)s!["session_id"]}{((bool?)s["archived"] == true ? " archived" : "")}").ToArray();
                 return (sessions, text[end..]);
             }

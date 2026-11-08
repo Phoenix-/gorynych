@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
+using Gorynych.Acp.JsonRpc;
 
 namespace Gorynych.Adapters.Claude;
 
@@ -10,6 +11,29 @@ namespace Gorynych.Adapters.Claude;
 /// </summary>
 public static class ClaudeHooks
 {
+    /// <summary>
+    /// The text of an ACP <c>systemPrompt</c>, for <c>--append-system-prompt</c>. Claude Code can only
+    /// add to its own system prompt, so the adapter advertises append mode alone, and as ACP
+    /// requires it fails the request, instead of creating or resuming the session, for any other
+    /// mode and for content it cannot pass on: an empty list, or a block that is not text.
+    /// </summary>
+    public static string? SystemPromptText(SystemPrompt? systemPrompt)
+    {
+        if (systemPrompt is null) return null;
+        if (systemPrompt.Mode != SystemPromptMode.Append)
+            throw new JsonRpcException(JsonRpcException.InvalidParams,
+                $"Claude sessions take systemPrompt only in append mode, not \"{systemPrompt.Mode}\".");
+        if (systemPrompt.Content.Count == 0)
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "systemPrompt.content is empty.");
+        var texts = new List<string>(systemPrompt.Content.Count);
+        foreach (var block in systemPrompt.Content)
+            texts.Add(block is TextContent text
+                ? text.Text
+                : throw new JsonRpcException(JsonRpcException.InvalidParams,
+                    $"Claude sessions take only text blocks in systemPrompt.content, not \"{(string?)AcpJson.ToNode(block)?["type"]}\"."));
+        return string.Join("\n\n", texts);
+    }
+
     /// <summary>The hook events the adapter subscribes to with <c>--settings</c>.</summary>
     public static readonly string[] Events =
     [
@@ -76,18 +100,36 @@ public static class ClaudeHooks
         return update;
     }
 
+    /// <summary>
+    /// A piece of Claude's answer. Its <c>messageId</c> is the hook's <c>message_id</c>, Claude's own
+    /// ID for the displayed message, the same for all its pieces. (Claude's transcript does not keep
+    /// it, and the hook carries no transcript ID.)
+    /// </summary>
     public static SessionUpdateAgentMessageChunk MessageChunk(JsonObject e) => new()
     {
         Content = new TextContent { Text = (string?)e["delta"] ?? "" },
         MessageId = (string?)e["message_id"],
     };
 
-    public static SessionUpdateAgentMessageChunk TextChunk(string text) => new() { Content = new TextContent { Text = text } };
+    public static SessionUpdateAgentMessageChunk TextChunk(string text, string messageId) =>
+        new() { Content = new TextContent { Text = text }, MessageId = messageId };
+
+    /// <summary>
+    /// The ACP <c>messageId</c> of a user message Claude reports itself (typed in the terminal, or
+    /// a channel message): the hook's <c>prompt_id</c>, which Claude's transcript keeps as the
+    /// <c>promptId</c> of the prompt that started the turn. A channel message that arrives while
+    /// Claude works on a turn carries that turn's <c>prompt_id</c> (recorded with Claude Code
+    /// 2.1.302), so an ID in <paramref name="taken"/> is not reused: such a message, or one without
+    /// a <c>prompt_id</c>, gets a new ID. The ID returned is added to <paramref name="taken"/>.
+    /// </summary>
+    public static string UserMessageId(ISet<string> taken, string? promptId) =>
+        promptId is { Length: > 0 } && taken.Add(promptId) ? promptId : Guid.NewGuid().ToString();
 
     /// <summary>A user message that did not come from the ACP client, such as a channel message.</summary>
-    public static SessionUpdateUserMessageChunk ForeignPrompt(string prompt) => new()
+    public static SessionUpdateUserMessageChunk ForeignPrompt(string prompt, string messageId) => new()
     {
         Content = new TextContent { Text = prompt },
+        MessageId = messageId,
         Meta = new JsonObject { [Acp.Hosting.GorynychProtocol.MetaOrigin] = IsChannelMessage(prompt) ? "channel" : "terminal" },
     };
 

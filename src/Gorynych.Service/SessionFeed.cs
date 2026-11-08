@@ -270,6 +270,34 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         }
     }
 
+    /// <summary>A new ACP <c>messageId</c> for a message the service writes or names.</summary>
+    public static string NewMessageId() => Guid.NewGuid().ToString();
+
+    // The message that chunks without a messageId of their own continue (see StampMessageId).
+    string? runKind;
+    string? runId;
+
+    /// <summary>
+    /// Gives a message chunk that has no <c>messageId</c> (Kimi sends none) the ID of the message it
+    /// belongs to, so clients and the journal see every chunk with one and replay shows the same IDs
+    /// as the live stream: consecutive chunks of one kind without an ID are one message, as a client
+    /// would infer without IDs, and any other part of a turn (a chunk with its own ID, a chunk of
+    /// another kind, a tool call, a plan) ends it. Chunks with their own ID pass unchanged. Runs
+    /// under <see cref="gate"/>, in publishing order.
+    /// </summary>
+    void StampMessageId(JsonObject update)
+    {
+        var kind = (string?)update["sessionUpdate"];
+        if (!SessionJournal.IsTurnKind(kind)) return; // a title or usage update does not end a message
+        if (SessionJournal.IsChunkKind(kind) && update["messageId"] is null)
+        {
+            if (runKind != kind) { runKind = kind; runId = NewMessageId(); }
+            update["messageId"] = runId;
+            return;
+        }
+        runKind = null;
+    }
+
     /// <summary>Journals an update, runs <paramref name="remember"/>, and sends it to the attached clients.</summary>
     /// <param name="journal">False sends it without journaling it.</param>
     public async Task PublishAsync(JsonObject update, ClientConnection? except, Action remember, bool journal = true)
@@ -278,6 +306,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         try
         {
             if (Retired) return; // a late update of a deleted session must not bring its journal back
+            StampMessageId(update);
             if (journal) Journal.Append(update);
             remember();
             foreach (var client in Clients())

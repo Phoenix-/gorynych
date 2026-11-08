@@ -114,6 +114,9 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     public bool CanClose => Info?.AgentCapabilities?.SessionCapabilities?.Close is not null;
     public bool CanDelete => Info?.AgentCapabilities?.SessionCapabilities?.Delete is not null;
 
+    /// <summary>The agent takes <c>systemPrompt</c> in append mode on new, load and resume.</summary>
+    public bool TakesSystemPrompt => Info?.AgentCapabilities?.SessionCapabilities?.SystemPrompt is not null;
+
     public JsonObject Describe() => new()
     {
         ["name"] = Name,

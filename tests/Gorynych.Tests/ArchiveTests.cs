@@ -101,7 +101,8 @@ public sealed class ArchiveTests
         await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         await using var kimiOnly = await TestClient.ConnectAsync(conductor, "kimi-only", agent: "kimi");
-        Assert.AreEqual(true, (bool?)zed.Initialized!.Meta![GorynychProtocol.MetaArchive]);
+        Assert.AreEqual(true, (bool?)zed.Initialized!.AgentCapabilities!.Meta![GorynychProtocol.MetaArchive]);
+        Assert.AreEqual(true, (bool?)zed.Initialized!.Meta![GorynychProtocol.MetaArchive], "the deprecated place, for one release");
         var kept = await NewPromptedAsync(zed, "claude", "Coordinate the release");
         var archived = await NewPromptedAsync(zed, "kimi", "Fix the flaky test");
 
@@ -267,7 +268,7 @@ public sealed class ArchiveTests
         var text = await ListAgents();
         StringAssert.EndsWith(text, "]\n" + One);
         Assert.AreEqual(One, text.Split('\n')[^1]);
-        StringAssert.StartsWith(text, $"You are session_id {asker} (claude, \"Coordinate the release\").\n[");
+        StringAssert.StartsWith(text, $"You are session_id {asker} (claude, \"Coordinate the release\").\n{PeersServer.StatusLegend}\n[");
 
         await ArchiveAsync(zed, sessions[1], true);
         await ArchiveAsync(zed, sessions[2], true);

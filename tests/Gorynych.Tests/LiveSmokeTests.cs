@@ -93,6 +93,18 @@ public sealed class LiveSmokeTests
                 ["text"] = "In one sentence: tabs or spaces for C#?",
             });
             Assert.IsFalse(string.IsNullOrWhiteSpace((string?)opinion?["text"]), "the channel reply came back");
+
+            // The channel message's messageId is Claude's own prompt_id, kept in its transcript as promptId.
+            JsonObject? channelMessage = null;
+            for (var i = 0; i < 100 && channelMessage is null; i++, await Task.Delay(100))
+                channelMessage = again.Snapshot().FirstOrDefault(u => (string?)u["sessionUpdate"] == "user_message_chunk"
+                    && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == "channel");
+            Assert.IsNotNull(channelMessage, "the channel message reached the feed");
+            var messageId = (string?)channelMessage["messageId"];
+            Assert.IsFalse(string.IsNullOrEmpty(messageId));
+            var transcript = File.ReadAllLines(Gorynych.Adapters.Claude.TranscriptTitles.ExpectedPath(root, sessionId));
+            Assert.IsTrue(transcript.Any(l => l.Contains($"\"promptId\":\"{messageId}\"", StringComparison.Ordinal) && l.Contains("<channel", StringComparison.Ordinal)),
+                $"Claude's transcript has the channel message with promptId {messageId}");
         }
     }
 

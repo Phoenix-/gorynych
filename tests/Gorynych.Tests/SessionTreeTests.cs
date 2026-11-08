@@ -122,6 +122,7 @@ public sealed class SessionTreeTests
         CollectionAssert.AreEqual(new[] { "Flaky test" }, infos.Select(u => (string?)u["title"]).Distinct().ToArray(), "Kimi's own title does not replace the name");
         var asked = replay.Single(u => (string?)u["sessionUpdate"] == "user_message_chunk");
         Assert.AreEqual("spawn", (string?)asked["_meta"]![GorynychProtocol.MetaOrigin]);
+        Assert.IsFalse(string.IsNullOrEmpty((string?)asked["messageId"]), "the service names the first prompt it writes");
         StringAssert.StartsWith((string?)asked["content"]!["text"], "Fix the flaky test\n\n[About this session · ", "the journal keeps what the agent got");
         Assert.AreEqual("ok", other.Text());
     }
@@ -204,7 +205,9 @@ public sealed class SessionTreeTests
         await using var all = await TestClient.ConnectAsync(conductor, "all");
         await using var kimiOnly = await TestClient.ConnectAsync(conductor, "kimi-only", agent: "kimi");
         await using var claudeOnly = await TestClient.ConnectAsync(conductor, "claude-only", agent: "claude");
-        Assert.AreEqual(true, (bool?)all.Initialized!.Meta![GorynychProtocol.MetaSessionsChanged]);
+        Assert.AreEqual(true, (bool?)all.Initialized!.AgentCapabilities!.Meta![GorynychProtocol.MetaSessionsChanged]);
+        Assert.AreEqual(true, (bool?)all.Initialized!.Meta![GorynychProtocol.MetaSessionsChanged], "the deprecated place, for one release");
+        Assert.IsNotNull(all.Initialized!.Meta![GorynychProtocol.MetaServiceId], "data stays in the result's _meta");
 
         var draft = await NewAsync(all, "kimi");
         await all.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = draft }); // discarded
@@ -276,6 +279,7 @@ public sealed class SessionTreeTests
         Assert.IsFalse(report.Contains("Looking around.", StringComparison.Ordinal), report);
         var told = zed.Snapshot().Last(u => (string?)u["sessionUpdate"] == "user_message_chunk");
         Assert.AreEqual("report", (string?)told["_meta"]![GorynychProtocol.MetaOrigin]);
+        Assert.IsFalse(string.IsNullOrEmpty((string?)told["messageId"]), "the service names the report it writes");
         Assert.AreEqual("child_claude", (string?)told["_meta"]![GorynychProtocol.MetaSender]);
         Assert.AreEqual(child, (string?)told["_meta"]![GorynychProtocol.MetaFromSessionId]);
 
