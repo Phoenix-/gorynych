@@ -32,9 +32,8 @@ Unblock-File $zip
 Expand-Archive $zip "$env:LOCALAPPDATA\Programs" -Force
 ```
 
-This gives `%LOCALAPPDATA%\Programs\Gorynych`, which holds `Gorynych.Service.exe`,
-`outside\Gorynych.Outside.exe` and `LICENSE`. Any other folder works too; the paths below
-then change with it.
+This gives `%LOCALAPPDATA%\Programs\Gorynych`, which holds `Gorynych.Service.exe` and
+`outside\Gorynych.Outside.exe`. Any other folder works too; the paths below then change with it.
 
 The binaries are not signed. A zip downloaded with a browser carries the Mark of the Web, and
 Explorer's "Extract All" copies it to every file. `Expand-Archive` and `tar` do not. Files with
@@ -52,7 +51,8 @@ server.
 
 You need the [.NET 10 SDK](https://dotnet.microsoft.com/download) and, for Native AOT, Visual
 Studio or its Build Tools with the "Desktop development with C++" workload. Native AOT finds
-the C++ linker through `vswhere.exe`, which is not on `PATH` by default:
+the C++ linker through `vswhere.exe`, which is not on `PATH` by default. In a clone of the
+repository, with the service stopped ([Update](#update) says how):
 
 ```powershell
 $env:PATH += ";${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
@@ -130,8 +130,9 @@ Gorynych asks in the thread:
 - **Don't allow:** Claude runs without the channel. Other agents' questions and child sessions'
   reports reach it as ordinary turns.
 
-The answer is kept in `%LOCALAPPDATA%\Gorynych\claude\channels.json`; delete that file to be
-asked again. If you dismiss the question, that launch runs without the channel and Gorynych asks
+The answer is kept in `%LOCALAPPDATA%\Gorynych\claude\channels.json`. To be asked again, delete
+that file and restart the service (`Gorynych.Service.exe shutdown`, then reopen Zed): a running
+service keeps the answer it read. If you dismiss the question, that launch runs without the channel and Gorynych asks
 again later ([adapters.md](adapters.md#consent-to-development-channels)). The first time Claude
 works in a folder, its folder-trust question also arrives as an approval.
 
@@ -197,7 +198,8 @@ timeouts and how to try it without registering:
    ```powershell
    Rename-Item "$env:LOCALAPPDATA\Programs\Gorynych\outside\Gorynych.Outside.exe" Gorynych.Outside.old.exe
    ```
-   That agent keeps the old copy until it restarts its MCP servers.
+   That agent keeps the old copy until it restarts its MCP servers. Delete a
+   `Gorynych.Outside.old.exe` left from an earlier update first, once nothing runs it.
 4. Install the new build as above. `Expand-Archive -Force` overwrites the old files.
 5. Start Zed.
 

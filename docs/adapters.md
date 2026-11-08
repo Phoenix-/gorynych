@@ -110,7 +110,8 @@ that notice for the person, so it asks first:
   or `failed`.
 - The answer is kept in the service's own data, `claude/channels.json`
   (`{"accepted": …, "answeredAt": …, "sessionId": …}`), never in Claude's configuration, and
-  holds for every later launch, after a restart too. To be asked again, delete the file.
+  holds for every later launch, after a restart too. To be asked again, delete the file and
+  restart the service, which reads it once at its start.
 - Allowed: Claude starts with the channel, and the adapter confirms the notice on each launch.
   Declined: Claude starts without the channel and without its part of
   `--append-system-prompt`, as with `--no-channel`; opinion requests and reports go in as
