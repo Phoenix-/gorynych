@@ -37,8 +37,11 @@ the service otherwise asks the person once ([adapters.md](adapters.md#consent-to
 `--no-channel` is the same as `decline`.
 The same executable is
 also the `gorynych` MCP server agents start over stdio:
-`peers [--pipe … --token …] [--channel-url …]` (see Opinions below), and the stdio bridge
-for external ACP clients: `acp --agent claude|kimi|codex` (see [external-clients.md](external-clients.md)).
+`peers [--pipe … --token …] [--channel-url …]` (see Opinions below), the stdio bridge
+for external ACP clients: `acp --agent claude|kimi|codex` (see [external-clients.md](external-clients.md)),
+and `shutdown [--pipe …]`, which sends the running service `_gorynych/shutdown` and waits up
+to 30 seconds for its process to end (exit code 0; 1 when no service runs on the pipe; 2 when
+it still runs).
 Agents outside Gorynych use a separate small executable, `Gorynych.Outside.exe`, as their MCP
 server ([Agents outside Gorynych](#agents-outside-gorynych)).
 

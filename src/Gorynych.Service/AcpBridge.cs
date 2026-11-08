@@ -3,7 +3,9 @@ using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
+using Gorynych.Acp.JsonRpc;
 
 namespace Gorynych.Service;
 
@@ -31,12 +33,81 @@ public static class AcpBridge
             Console.Error.WriteLine($"gorynych acp: cannot reach the service on pipe {pipe}: {e.Message}");
             return 1;
         }
+        catch (UnauthorizedAccessException e)
+        {
+            Console.Error.WriteLine($"gorynych acp: cannot reach the service on pipe {pipe}: {e.Message} {ElevationHint}");
+            return 1;
+        }
         await using (service)
         {
             var up = Task.Run(() => ClientToServiceAsync(Console.OpenStandardInput(), service, agent));
             var down = Task.Run(() => service.CopyToAsync(new FlushingStream(Console.OpenStandardOutput())));
             await Task.WhenAny(up, down);
         }
+        return 0;
+    }
+
+    /// <summary>What a refused connection to the pipe usually means (docs/service-protocol.md, Endpoint).</summary>
+    internal const string ElevationHint =
+        "The service serves only processes at its own elevation: one started from an elevated (administrator) " +
+        "terminal serves only elevated clients, and a plain one only plain clients.";
+
+    /// <summary>
+    /// <c>Gorynych.Service shutdown [--pipe P]</c>: asks the running service to exit, as a client's
+    /// <c>_gorynych/shutdown</c> does, and waits up to <paramref name="waitSeconds"/> for its process
+    /// to end. 0 when it stopped, 1 when no service runs on the pipe or it could not be asked, 2
+    /// when it was asked but still runs.
+    /// </summary>
+    public static async Task<int> ShutdownAsync(string pipe, int waitSeconds = 30)
+    {
+        NamedPipeClientStream? stream;
+        try
+        {
+            stream = await ConnectAsync(pipe, 1000);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"gorynych shutdown: cannot reach the service on pipe {pipe}: {e.Message} {ElevationHint}");
+            return 1;
+        }
+        if (stream is null)
+        {
+            Console.Error.WriteLine($"gorynych shutdown: no service is running on pipe {pipe}");
+            return 1;
+        }
+        int processId;
+        await using (var rpc = new JsonRpcConnection(stream, stream, "shutdown"))
+        {
+            rpc.Start();
+            try
+            {
+                await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
+                {
+                    ProtocolVersion = AcpMethods.ProtocolVersion,
+                    ClientInfo = new Implementation { Name = "gorynych-shutdown", Version = AgentHost.Version },
+                });
+                processId = (int?)(await rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()))?["processId"] ?? 0;
+                await rpc.SendRequestAsync(GorynychProtocol.MethodShutdown, new JsonObject());
+            }
+            catch (Exception e) when (e is IOException or JsonRpcException)
+            {
+                Console.Error.WriteLine($"gorynych shutdown: the service on pipe {pipe} did not take the request: {e.Message}");
+                return 1;
+            }
+        }
+        Console.Error.WriteLine($"gorynych shutdown: asked the service (process {processId}) to exit; turns still running are cancelled");
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(processId);
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(waitSeconds));
+        }
+        catch (ArgumentException) { } // already gone
+        catch (TimeoutException)
+        {
+            Console.Error.WriteLine($"gorynych shutdown: the service (process {processId}) still runs after {waitSeconds} s");
+            return 2;
+        }
+        Console.Error.WriteLine("gorynych shutdown: the service has stopped");
         return 0;
     }
 

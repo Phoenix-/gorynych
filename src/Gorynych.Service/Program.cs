@@ -11,6 +11,10 @@ using Gorynych.Service;
 //   the gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel
 if (args.Length > 0 && args[0] == "peers")
     return await PeersServer.RunAsync(Arg(args, "--pipe"), Arg(args, "--token"), Arg(args, "--channel-url"));
+// Gorynych.Service shutdown [--pipe <name>]
+//   asks the running service to exit and waits for it; exit code 1 when none runs on the pipe
+if (args.Length > 0 && args[0] == "shutdown")
+    return await AcpBridge.ShutdownAsync(Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName);
 // Gorynych.Service acp --agent claude|kimi|codex [--pipe <name>] [service options]
 //   the stdio entry point for external ACP clients (Zed); starts the service when needed
 if (args.Length > 0 && args[0] == "acp")
