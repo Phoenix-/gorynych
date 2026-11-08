@@ -195,13 +195,17 @@ sealed class CodexThread
         done?.TrySetResult(ended);
     }
 
-    /// <summary>Ends the running turn as interrupted: the thread was unloaded, closed or deleted, and no <c>turn/completed</c> will come.</summary>
-    public void Abandon()
+    /// <summary>
+    /// Ends the running turn as interrupted: the thread was unloaded, closed or deleted, and no
+    /// <c>turn/completed</c> is waited for. Returns the ID of the turn it ended, so that a late
+    /// completion of it is not taken for a later turn's.
+    /// </summary>
+    public string? Abandon()
     {
         TaskCompletionSource<Turn>? done;
         string? id;
         lock (gate) (done, id) = (turn, turnId);
-        done?.TrySetResult(new Turn { Id = id ?? "", Status = TurnStatus.Interrupted });
+        return done?.TrySetResult(new Turn { Id = id ?? "", Status = TurnStatus.Interrupted }) == true ? id : null;
     }
 
     public void Fail(Exception e)
@@ -308,6 +312,9 @@ sealed class CodexAgent : IAsyncDisposable
     readonly JsonRpcConnection app;
     readonly ConcurrentDictionary<string, CodexThread> threads = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, CancellationTokenSource> asking = new(StringComparer.Ordinal);
+
+    /// <summary>Turns ended here before Codex said so (a close, delete or unload): their late <c>turn/completed</c> is dropped.</summary>
+    readonly ConcurrentDictionary<string, byte> abandoned = new(StringComparer.Ordinal);
     readonly TaskCompletionSource exited = new(TaskCreationOptions.RunContinuationsAsynchronously);
     List<Model> models = [];
     HashSet<string> userServers = [];
@@ -439,13 +446,15 @@ sealed class CodexAgent : IAsyncDisposable
         }
     }
 
-    async Task OnNotificationAsync(string method, JsonNode? @params)
+    Task OnNotificationAsync(string method, JsonNode? @params)
     {
         // Notifications are handled in order of arrival, prompts on their own tasks: the cancel's
         // place in the stream tells which prompts it reaches (CodexThread.Begin).
         var sequence = rpc.NotificationSequence;
+        // The stop is noted at once; the interrupt is not waited for, so the read loop goes on.
         if (method == AcpMethods.Agent.SessionCancel && (string?)@params?["sessionId"] is { } id && threads.TryGetValue(id, out var t))
-            await StopAsync(t, sequence);
+            _ = StopAsync(t, sequence);
+        return Task.CompletedTask;
     }
 
     static string RequireId(JsonRpcRequest request) =>
@@ -568,37 +577,52 @@ sealed class CodexAgent : IAsyncDisposable
     async Task CloseAsync(string id, CancellationToken ct)
     {
         if (!threads.TryGetValue(id, out var t) || !t.Loaded) return;
-        await StopAsync(t);
-        await TurnEndAsync(t);
-        await app.SendRequestAsync(CodexMethods.Client.ThreadUnsubscribe, ToNode(new ThreadUnsubscribeParams { ThreadId = id },
-            CodexJsonContext.Default.ThreadUnsubscribeParams), ct);
-        t.Loaded = false;
-        t.Abandon();
+        await StopTurnAsync(t);
+        try
+        {
+            await app.SendRequestAsync(CodexMethods.Client.ThreadUnsubscribe, ToNode(new ThreadUnsubscribeParams { ThreadId = id },
+                CodexJsonContext.Default.ThreadUnsubscribeParams), ct);
+        }
+        finally
+        {
+            // Also when unsubscribing fails (app-server going away): the turn has had its time.
+            t.Loaded = false;
+            Abandon(t);
+        }
     }
 
     async Task DeleteAsync(string id, CancellationToken ct)
     {
         threads.TryGetValue(id, out var t);
-        if (t is not null)
-        {
-            await StopAsync(t);
-            await TurnEndAsync(t);
-        }
+        if (t is not null) await StopTurnAsync(t);
         try
         {
             await app.SendRequestAsync(CodexMethods.Client.ThreadDelete, ToNode(new ThreadDeleteParams { ThreadId = id },
                 CodexJsonContext.Default.ThreadDeleteParams), ct);
+            threads.TryRemove(id, out _);
         }
         catch (JsonRpcException e)
         {
             throw Explain(e, id);
         }
-        threads.TryRemove(id, out _);
-        if (t is not null)
+        finally
         {
-            t.Loaded = false;
-            t.Abandon();
+            if (t is not null)
+            {
+                t.Loaded = false;
+                Abandon(t);
+            }
         }
+    }
+
+    /// <summary>
+    /// Stops the running turn and waits for it to end, all within <see cref="CodexAdapterOptions.TurnEndWait"/>:
+    /// the interrupt is sent and not waited for, the turn's end is.
+    /// </summary>
+    async Task StopTurnAsync(CodexThread t)
+    {
+        _ = StopAsync(t);
+        await TurnEndAsync(t);
     }
 
     /// <summary>Waits a little for a stopped turn to end (<see cref="CodexAdapterOptions.TurnEndWait"/>).</summary>
@@ -703,12 +727,14 @@ sealed class CodexAgent : IAsyncDisposable
         if (t.Named(turnId)) _ = InterruptAsync(t.Id, turnId);
     }
 
+    /// <summary>Sends <c>turn/interrupt</c>, waiting for Codex's answer no longer than <see cref="CodexAdapterOptions.TurnEndWait"/>.</summary>
     async Task InterruptAsync(string threadId, string turnId)
     {
         try
         {
+            using var limit = new CancellationTokenSource(options.TurnEndWait);
             await app.SendRequestAsync(CodexMethods.Client.TurnInterrupt, ToNode(new TurnInterruptParams { ThreadId = threadId, TurnId = turnId },
-                CodexJsonContext.Default.TurnInterruptParams));
+                CodexJsonContext.Default.TurnInterruptParams), limit.Token);
         }
         catch (Exception e) when (e is JsonRpcException or IOException or ObjectDisposedException or OperationCanceledException)
         {
@@ -795,11 +821,37 @@ sealed class CodexAgent : IAsyncDisposable
 
     CodexThread? Thread(string id) => threads.GetValueOrDefault(id);
 
-    void Unloaded(CodexThread t)
+    /// <summary>
+    /// Codex says it unloaded a thread (<c>thread/closed</c>, status <c>notLoaded</c>). Such a note
+    /// can come late, for an unload before the thread was opened again, so it is checked against
+    /// <c>thread/loaded/list</c> first; only the instance it was about is marked. Never waits:
+    /// app-server's notifications call it.
+    /// </summary>
+    void Unloading(CodexThread t, string what) => _ = Task.Run(async () =>
     {
+        try
+        {
+            using var limit = new CancellationTokenSource(options.TurnEndWait);
+            var loaded = await app.SendRequestAsync(CodexMethods.Client.ThreadLoadedList, new JsonObject(), limit.Token);
+            if ((loaded?["data"] as JsonArray)?.Any(x => (string?)x == t.Id) == true)
+            {
+                Log($"codex {t.Id}: {what}, but Codex still has the thread loaded; ignored");
+                return;
+            }
+        }
+        catch (Exception e) when (e is JsonRpcException or IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            Log($"codex {t.Id}: {what}; loaded threads not read ({e.Message}), so taken as unloaded");
+        }
         t.Loaded = false;
         if (t.Turn is not null) Log($"codex {t.Id}: Codex unloaded the thread during a turn; the turn ends as cancelled");
-        t.Abandon();
+        Abandon(t);
+    });
+
+    /// <summary>Ends a thread's running turn here (<see cref="CodexThread.Abandon"/>) and notes it, as instances of a thread come and go.</summary>
+    void Abandon(CodexThread t)
+    {
+        if (t.Abandon() is { Length: > 0 } turnId) abandoned[turnId] = 0;
     }
 
     Task Update(string threadId, SessionUpdate update) => rpc.SendUpdateAsync(threadId, update);
@@ -830,6 +882,7 @@ sealed class CodexAgent : IAsyncDisposable
             case CodexMethods.Notification.TurnCompleted:
             {
                 var n = From(p, ctx.TurnCompletedNotification);
+                if (abandoned.TryRemove(n.Turn.Id, out _)) break; // ended here already; not a later turn's end
                 Thread(n.ThreadId)?.Completed(n.Turn);
                 break;
             }
@@ -949,13 +1002,13 @@ sealed class CodexAgent : IAsyncDisposable
             {
                 // Codex unloaded the thread: a turn still running ends, as no turn/completed comes for it.
                 var n = From(p, ctx.ThreadStatusChangedNotification);
-                if (n.Status is NotLoadedThreadStatus && Thread(n.ThreadId) is { } t) Unloaded(t);
+                if (n.Status is NotLoadedThreadStatus && Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "status notLoaded");
                 break;
             }
             case CodexMethods.Notification.ThreadClosed:
             {
                 var n = From(p, ctx.ThreadClosedNotification);
-                if (Thread(n.ThreadId) is { } t) Unloaded(t);
+                if (Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "thread/closed");
                 break;
             }
             case CodexMethods.Notification.ServerRequestResolved:

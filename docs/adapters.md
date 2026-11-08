@@ -322,7 +322,12 @@ over app-server's JSON-RPC. The design and the probes behind it are in
   `turn/started` or `turn/start`'s answer names it. `turn/start` is always waited for, so no
   turn runs on that the adapter does not know.
 - **Every turn ends.** When Codex unloads the thread mid-turn (`thread/closed`, status
-  `notLoaded`), the turn ends `cancelled`; when app-server stops, the prompt fails.
+  `notLoaded`), the turn ends `cancelled`; when app-server stops, the prompt fails. A close
+  ends its turn also when `thread/unsubscribe` fails. Such an unload note can come late, for an
+  unload before the thread was opened again, so it is checked against `thread/loaded/list`
+  first; and a late `turn/completed` of a turn ended here is not taken for a later turn's.
+- **`turn/interrupt` never holds anything up**: its answer is waited for at most 5 s, and a
+  `session/cancel` does not wait for it, so the ACP connection reads on.
 - Codex's own user message items are not echoed (ACP).
 
 | Codex | ACP `session/update` |

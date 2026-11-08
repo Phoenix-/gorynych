@@ -560,11 +560,114 @@ public sealed class CodexAdapterTests
         await using var __ = acp;
         var id = await NewDirectAsync(acp);
 
-        // The prompt runs on its own task and the cancel in the read loop, so the cancel may be handled first.
+        // The prompt runs on its own task and the cancel in the read loop, so the cancel is usually
+        // handled first; either way the turn stops. The order itself is pinned by the test below.
         var turn = PromptDirectAsync(acp, id, "wait");
         await acp.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
 
         Assert.AreEqual("cancelled", (string?)(await turn.WaitAsync(Wait))!["stopReason"]);
+    }
+
+    [TestMethod]
+    public void ACancelHandledBeforeItsPromptBegins_StopsThatTurn_ButNotALaterOne()
+    {
+        var t = new CodexThread("t", new CodexMap.CodexSettings("gpt-fake", "low", null, null, "user"));
+
+        // The prompt was message 5 of the ACP stream and the cancel message 6, handled first.
+        Assert.AreEqual((false, (string?)null), t.Stop(6));
+        var first = t.Begin(5)!;
+        Assert.IsTrue(t.Named("turn-1"), "interrupted as soon as Codex names it");
+        t.End(first);
+
+        t.Begin(7);
+        Assert.IsFalse(t.Named("turn-2"), "a prompt sent after the cancel is not stopped by it");
+    }
+
+    [TestMethod]
+    public async Task ATurnCodexRefuses_DropsTheHeldChange_SoTheNextTurnRuns()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption, new JsonObject { ["sessionId"] = id, ["configId"] = "model", ["value"] = "gpt-hidden" });
+
+        var refused = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(zed, id, "hello"));
+        StringAssert.Contains(refused.Message, "were reset");
+        var reset = Of(zed, "config_option_update").Last()["configOptions"]!.AsArray().First(o => (string?)o!["id"] == "model")!;
+        Assert.AreEqual("gpt-fake", (string?)reset["currentValue"], "the client sees the thread's own model again");
+
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, id, "again")).StopReason);
+        Assert.IsNull(fake.All("turn/start").Last()["model"]);
+    }
+
+    [TestMethod]
+    public async Task Close_WhenUnsubscribingFails_StillEndsTheTurn()
+    {
+        var fake = new FakeAppServer();
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+        var turn = PromptDirectAsync(acp, id, "stuck");
+        await Until(() => fake.Methods().Contains("turn/start"), "turn/start");
+        fake.FailUnsubscribe = true;
+
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id }));
+
+        Assert.AreEqual("cancelled", (string?)(await turn.WaitAsync(Wait))!["stopReason"]);
+    }
+
+    [TestMethod]
+    public async Task ALateUnloadNote_ForAThreadOpenedAgain_IsIgnored()
+    {
+        var fake = new FakeAppServer();
+        var log = new List<string>();
+        var (agent, acp) = await DirectAsync(fake, log);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+        await PromptDirectAsync(acp, id, "hello");
+        await acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+        await acp.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = id, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
+
+        // the note of the first unload, late
+        await fake.Rpc!.SendNotificationAsync("thread/closed", new JsonObject { ["threadId"] = id });
+        await Until(() => Logged(log, "Codex still has the thread loaded; ignored"), "the note checked against thread/loaded/list");
+
+        Assert.AreEqual("end_turn", (string?)(await PromptDirectAsync(acp, id, "again").WaitAsync(Wait))!["stopReason"]);
+    }
+
+    [TestMethod]
+    public async Task ALateEndOfATurnClosedBefore_IsNotTakenForTheNextTurns()
+    {
+        var fake = new FakeAppServer();
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+        await PromptDirectAsync(acp, id, "hello");
+        var first = fake.LastTurnId;
+        var stuck = PromptDirectAsync(acp, id, "stuck");
+        await Until(() => fake.LastTurnId != first, "the stuck turn");
+        var abandonedTurn = fake.LastTurnId!;
+        await acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+        Assert.AreEqual("cancelled", (string?)(await stuck.WaitAsync(Wait))!["stopReason"]);
+        await acp.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = id, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
+
+        // The next turn has begun but Codex has not named it yet, when the closed turn's end comes late.
+        fake.HoldTurnStart = new TaskCompletionSource();
+        var next = PromptDirectAsync(acp, id, "wait");
+        await Until(() => fake.All("turn/start").Length == 3, "the third turn/start");
+        await fake.Rpc!.SendNotificationAsync("turn/completed", new JsonObject
+        {
+            ["threadId"] = id, ["turn"] = new JsonObject { ["id"] = abandonedTurn, ["items"] = new JsonArray(), ["status"] = "completed" },
+        });
+        fake.HoldTurnStart.SetResult();
+        await Until(() => fake.LastTurnId != abandonedTurn, "the next turn");
+        await acp.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
+
+        Assert.AreEqual("cancelled", (string?)(await next.WaitAsync(Wait))!["stopReason"], "it ran on until cancelled, not ended by the late note");
     }
 
     [TestMethod]
