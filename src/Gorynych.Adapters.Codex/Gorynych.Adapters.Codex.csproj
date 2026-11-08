@@ -4,5 +4,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Gorynych.Acp\Gorynych.Acp.csproj" />
+    <InternalsVisibleTo Include="Gorynych.Tests" />
   </ItemGroup>
 </Project>

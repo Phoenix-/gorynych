@@ -79,6 +79,12 @@ sealed class FakeAppServer
     /// <summary>When set, <c>turn/start</c> answers only once it completes.</summary>
     public TaskCompletionSource? HoldTurnStart { get; set; }
 
+    /// <summary><c>thread/unsubscribe</c> fails, as when app-server is going away.</summary>
+    public bool FailUnsubscribe { get; set; }
+
+    /// <summary>The ID of the turn <c>turn/start</c> started last.</summary>
+    public string? LastTurnId { get; private set; }
+
     /// <summary>A thread made earlier in Codex itself, with a turn of history.</summary>
     public FakeThread Existing(string id, string cwd, string? name = null, bool archived = false, bool openElsewhere = false, JsonObject? settings = null)
     {
@@ -172,8 +178,11 @@ sealed class FakeAppServer
                 var entries = t.Items.Select(i => (JsonNode)new JsonObject { ["turnId"] = i.TurnId, ["item"] = i.Item.DeepClone() }).ToList();
                 return Done(Page(entries, (string?)p["cursor"]));
             }
+            case "thread/loaded/list":
+                return Done(new JsonObject { ["data"] = new JsonArray(Threads.Values.Where(t => t.Loaded).Select(t => (JsonNode?)t.Id).ToArray()) });
             case "thread/unsubscribe":
             {
+                if (FailUnsubscribe) throw new JsonRpcException(JsonRpcException.InternalError, "app-server is shutting down");
                 var id = (string)p["threadId"]!;
                 if (Threads.TryGetValue(id, out var t))
                 {
@@ -199,7 +208,9 @@ sealed class FakeAppServer
             {
                 var t = Threads[(string)p["threadId"]!];
                 if (!t.Loaded) throw new JsonRpcException(-32600, $"thread not found: {t.Id}");
+                if ((string?)p["model"] == "gpt-hidden") throw new JsonRpcException(-32600, "model gpt-hidden is not available to this account");
                 var turnId = $"turn-{Interlocked.Increment(ref next)}";
+                LastTurnId = turnId;
                 interrupts[turnId] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 _ = Task.Run(() => RunTurnAsync(t, turnId, p));
                 return Done(new JsonObject { ["turn"] = new JsonObject { ["id"] = turnId, ["items"] = new JsonArray(), ["status"] = "inProgress" } });
