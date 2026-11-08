@@ -460,11 +460,14 @@ public sealed class SessionLifecycleTests
         store.Update("a", "kimi", r => r.Title = "first");
         // An antivirus scanner or the indexer opens the file for a moment without delete sharing.
         var held = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        var released = Task.Delay(120).ContinueWith(_ => held.Dispose(), TaskScheduler.Default);
+        // Released by a thread of its own: a pool callback can come late in a busy parallel run,
+        // after the store's retries (about 0.4 s) are over.
+        var releaser = new Thread(() => { Thread.Sleep(120); held.Dispose(); }) { IsBackground = true };
+        releaser.Start();
 
         store.Update("a", "kimi", r => r.Title = "second");
 
-        released.Wait();
+        releaser.Join();
         Assert.AreEqual("second", new SessionStore(path).Get("a")!.Title);
     }
 

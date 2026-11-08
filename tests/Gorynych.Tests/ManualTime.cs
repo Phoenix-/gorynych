@@ -1,6 +1,6 @@
 namespace Gorynych.Tests;
 
-/// <summary>A clock a test moves by hand, for the service's idle timers (<c>ConductorOptions.Time</c>).</summary>
+/// <summary>A clock a test moves by hand, for the service's timers (<c>ConductorOptions.Time</c>).</summary>
 sealed class ManualTime : TimeProvider
 {
     readonly Lock gate = new();
@@ -10,6 +10,14 @@ sealed class ManualTime : TimeProvider
     public override DateTimeOffset GetUtcNow()
     {
         lock (gate) return now;
+    }
+
+    // Elapsed time (GetElapsedTime) moves with the clock too, in ticks.
+    public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+    public override long GetTimestamp()
+    {
+        lock (gate) return now.UtcTicks;
     }
 
     /// <summary>Timers set and not fired yet.</summary>

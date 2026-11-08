@@ -1643,7 +1643,7 @@ public sealed class Conductor : IAsyncDisposable
     void AnnounceList(string sessionId, string agent, string change)
     {
         if (change == "removed") lastUpdateNotice.TryRemove(sessionId, out _);
-        else lastUpdateNotice[sessionId] = Environment.TickCount64; // "added" is news enough for the interval
+        else lastUpdateNotice[sessionId] = options.Time.GetTimestamp(); // "added" is news enough for the interval
         foreach (var client in clients.Keys)
         {
             if (client.Init is null || (client.AgentScope is not null && client.AgentScope != agent)) continue;
@@ -1655,22 +1655,23 @@ public sealed class Conductor : IAsyncDisposable
     /// Announces a new <c>updatedAt</c> at most once per <see cref="ConductorOptions.ActivityNoticeInterval"/>
     /// per session; a change inside the interval is announced at its end. Called under the
     /// store's lock; the announcement at the end takes it again, so it never follows a <c>removed</c>.
+    /// Timed by <see cref="ConductorOptions.Time"/>, like the idle timers.
     /// </summary>
     void AnnounceActivity(string sessionId, string agent)
     {
-        var interval = (long)options.ActivityNoticeInterval.TotalMilliseconds;
-        var since = Environment.TickCount64 - lastUpdateNotice.GetValueOrDefault(sessionId, long.MinValue / 2);
+        var interval = options.ActivityNoticeInterval;
+        var since = lastUpdateNotice.TryGetValue(sessionId, out var last) ? options.Time.GetElapsedTime(last) : TimeSpan.MaxValue;
         if (since >= interval)
         {
             AnnounceList(sessionId, agent, "updated");
             return;
         }
         if (!trailingUpdateNotice.TryAdd(sessionId, 0)) return;
-        _ = Task.Delay(TimeSpan.FromMilliseconds(interval - since)).ContinueWith(delay =>
+        _ = Task.Delay(interval - since, options.Time).ContinueWith(delay =>
         {
             trailingUpdateNotice.TryRemove(sessionId, out _);
             store.Inspect(sessionId, r => { if (r is { Listed: true }) AnnounceList(sessionId, agent, "updated"); });
-        }, TaskScheduler.Default);
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
     // ---------------------------------------------------------------- reading a session

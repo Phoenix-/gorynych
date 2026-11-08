@@ -72,6 +72,19 @@ public sealed class OutsideTests
     static (string Text, bool IsError) ToolText(JsonNode? answer) =>
         ((string)answer!["result"]!["content"]![0]!["text"]!, (bool)answer["result"]!["isError"]!);
 
+    /// <summary>
+    /// A log's lines, read with the writer free to append meanwhile: a plain read shares only
+    /// reading, so on Windows the server's append at that moment fails and its line is lost.
+    /// </summary>
+    static IEnumerable<string> SharedLines(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        var lines = new List<string>();
+        while (reader.ReadLine() is { } line) lines.Add(line);
+        return lines;
+    }
+
     static async Task Until(Func<bool> condition, string what, int ms = 10_000)
     {
         for (var waited = 0; waited < ms; waited += 20)
@@ -430,8 +443,9 @@ public sealed class OutsideTests
         var updates = read!["updates"]!.AsArray();
         CollectionAssert.AreEqual(new[] { "What is X?", "X is Y." }, updates.Select(u => (string?)u!["content"]!["text"]).ToArray());
         Assert.IsTrue(updates.All(u => !string.IsNullOrEmpty((string?)u!["messageId"])), "the service named the replayed messages");
-        await Until(() => { lock (kimi.Methods) return kimi.Methods.Contains(AcpMethods.Agent.SessionClose); }, "the close after reading");
-        Assert.IsFalse(conductor.Agents["kimi"].IsLive("k-1"));
+        // The service marks the session closed once the adapter has answered session/close.
+        await Until(() => !conductor.Agents["kimi"].IsLive("k-1"), "the close after reading");
+        lock (kimi.Methods) CollectionAssert.Contains(kimi.Methods, AcpMethods.Agent.SessionClose);
 
         await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodRead, new JsonObject { ["sessionId"] = "k-1" });
         lock (kimi.Methods) Assert.AreEqual(1, kimi.Methods.Count(m => m == AcpMethods.Agent.SessionLoad), "the journal has it now");
@@ -815,7 +829,7 @@ public sealed class OutsideTests
     public async Task ARequestCancelledWhileTheServiceStarts_LetsTheNextRequestStartItAgain()
     {
         var logs = TestDirs.New();
-        int Starts() => Directory.EnumerateFiles(logs, "outside-*.log").SelectMany(File.ReadAllLines).Count(l => l.Contains("starting the service", StringComparison.Ordinal));
+        int Starts() => Directory.EnumerateFiles(logs, "outside-*.log").SelectMany(SharedLines).Count(l => l.Contains("starting the service", StringComparison.Ordinal));
         // A "service" that never opens the pipe, so the server waits for it.
         await using var shim = new Shim(Pipe(), OperatingSystem.IsWindows() ? Path.Combine(Environment.SystemDirectory, "whoami.exe") : "/bin/true", logs);
         foreach (var expected in new[] { 1, 2 })
