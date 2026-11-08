@@ -137,6 +137,7 @@ public sealed class PeersTests
         StringAssert.Contains(Description("spawn_session"), "sends this session a short report with the child's final message by itself");
         StringAssert.Contains(Description("list_agents"), "session_id (pass it exactly)");
         StringAssert.Contains(Description("list_agents"), "Archived sessions are left out unless include_archived is true");
+        StringAssert.Contains(Description("list_agents"), "the first line of the result names it instead: \"You are session_id ...\"");
         Assert.AreEqual("boolean", (string?)tools["list_agents"]["inputSchema"]!["properties"]!["include_archived"]!["type"]);
         StringAssert.Contains(Description("archive_session"), "this one included");
         StringAssert.Contains(Description("archive_session"), "Archiving is not deleting: the session keeps all its history, ask_agent still reaches it");
@@ -187,7 +188,10 @@ public sealed class PeersTests
                 tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
 
             var listed = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_agents", ["arguments"] = new JsonObject() });
-            StringAssert.Contains((string?)listed!["content"]![0]!["text"], "answering");
+            var listing = (string)listed!["content"]![0]!["text"]!;
+            StringAssert.StartsWith(listing, "You are session_id asking (asker).\n[", "the caller first, then the list");
+            CollectionAssert.AreEqual(new[] { "answering" },
+                JsonNode.Parse(listing[(listing.IndexOf('\n') + 1)..])!.AsArray().Select(s => (string?)s!["session_id"]).ToArray());
 
             var answer = await mcp.SendRequestAsync("tools/call", new JsonObject
             {
@@ -234,9 +238,13 @@ public sealed class PeersTests
                 Assert.IsFalse((bool)result!["isError"]!, (string?)result["content"]![0]!["text"]);
                 return result["content"]![0]!["text"]!;
             }
-            async Task<string[]> Listed(bool includeArchived) =>
-                JsonNode.Parse((string)(await Call("list_agents", new JsonObject { ["include_archived"] = includeArchived }))!)!.AsArray()
+            async Task<string[]> Listed(bool includeArchived)
+            {
+                var text = (string)(await Call("list_agents", new JsonObject { ["include_archived"] = includeArchived }))!;
+                StringAssert.StartsWith(text, "You are session_id asking (asker).\n");
+                return JsonNode.Parse(text[(text.IndexOf('\n') + 1)..])!.AsArray()
                     .Select(s => $"{(string?)s!["session_id"]}{((bool?)s["archived"] == true ? " archived" : "")}").ToArray();
+            }
             var who = "session_id answering (answerer, \"Pick a database for the cockpit\")";
             Assert.AreEqual($"Archived {who}. It is now hidden from list_agents and from the user's session list; nothing in it is lost. " +
                 "ask_agent still reaches it, and restore_session brings it back.", (string?)await Call("archive_session", new JsonObject { ["session_id"] = "answering" }));

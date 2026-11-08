@@ -98,7 +98,7 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards |
-| `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open`, `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived` |
+| `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open`, `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")` |
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
@@ -113,7 +113,9 @@ named `gorynych`: `Gorynych.Service peers --pipe <pipe> --token <token>`. The to
 random per session and tells the service who is calling. Its tools:
 
 - `list_agents {include_archived?}` — the user's other sessions (`_gorynych/peers`), archived
-  ones only with `include_archived: true`, marked `archived`;
+  ones only with `include_archived: true`, marked `archived`; a first line,
+  `You are session_id <id> (<agent>, "<title>").`, names the caller itself, which the list
+  leaves out;
 - `ask_agent {session_id, question}` — starts a new question to one, by its exact
   `session_id`, and waits for the answer (`_gorynych/opinion`); archived sessions too;
 - `spawn_session {agent, prompt, cwd?, title?, report?}` — starts a child session
@@ -127,7 +129,8 @@ random per session and tells the service who is calling. Its tools:
 Each description says when to use the tool rather than its neighbour: `ask_agent` starts a
 question and points to `reply` for answering one; `reply` only answers and points to
 `ask_agent`; `session_id` is the exact value from `list_agents` or a header, never an agent
-name, a title or a sender label; `spawn_session` says the child's turns are reported back by
+name, a title or a sender label; `list_agents` says its first line names this session, the ID
+to pass for it; `spawn_session` says the child's turns are reported back by
 themselves; `archive_session` says archiving is not deleting (the history stays, `ask_agent`
 still reaches it), and `restore_session` that it only changes where the session is shown, so
 asking an archived session needs no restore.
@@ -194,11 +197,14 @@ Errors from the peer tools say how to recover. The peers server returns them to 
 The hint lists of `ask_agent` and `archive_session` leave archived sessions out, as
 `list_agents` does.
 
-`archive_session` and `restore_session` succeed in every other case, and say what happened
-(`(this session)` follows the session when it is the caller's own):
+What the tools answer when they succeed. `list_agents` names the caller first: the list leaves
+it out, and an agent has no other way to learn its own `session_id` (which `archive_session`
+takes for the session itself). `archive_session` and `restore_session` say what happened;
+`(this session)` follows the session when it is the caller's own:
 
 | Case | Text |
 | --- | --- |
+| `list_agents` | first line `You are session_id <id> (<agent>, "<title>").`, then the list as JSON |
 | archived now | `Archived session_id <id> (<agent>, "<title>"). It is now hidden from list_agents and from the user's session list; nothing in it is lost. ask_agent still reaches it, and restore_session brings it back.` |
 | already archived | `session_id <id> (<agent>, "<title>") was already archived, so nothing changed. ask_agent still reaches it, and restore_session brings it back.` |
 | restored now | `Restored session_id <id> (<agent>, "<title>"). It is back in list_agents and in the user's session list.` |

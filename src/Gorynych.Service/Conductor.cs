@@ -1681,6 +1681,8 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>
     /// <c>_gorynych/peers {token, includeArchived?}</c>: the sessions the session behind <c>token</c>
     /// can ask; archived ones only with <c>includeArchived</c>, and then every entry says whether it is.
+    /// <c>caller</c> names the session behind the token as <see cref="Who"/> does, since the list
+    /// leaves it out and an agent does not know its own ID otherwise.
     /// </summary>
     internal JsonObject Peers(JsonRpcRequest request)
     {
@@ -1703,7 +1705,9 @@ public sealed class Conductor : IAsyncDisposable
             if (includeArchived) entry["archived"] = r.Archived;
             sessions.Add((JsonNode)entry);
         }
-        return new JsonObject { ["sessions"] = sessions };
+        var result = new JsonObject { ["sessions"] = sessions };
+        if (self is not null && store.Get(self) is { } caller) result["caller"] = Who(caller);
+        return result;
     }
 
     static string NewToken() => Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));

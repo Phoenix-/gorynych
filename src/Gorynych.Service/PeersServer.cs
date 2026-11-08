@@ -140,7 +140,9 @@ public static class PeersServer
                     if (args?["include_archived"] is JsonValue all && all.TryGetValue<bool>(out var include) && include) query["includeArchived"] = true;
                     await using var service = await ConnectAsync(pipe, ct);
                     var peers = await service.SendRequestAsync(GorynychProtocol.MethodPeers, query, ct);
-                    return Text(peers?["sessions"]?.ToJsonString(new() { WriteIndented = true }) ?? "[]");
+                    var listing = peers?["sessions"]?.ToJsonString(new() { WriteIndented = true }) ?? "[]";
+                    // The list leaves the caller out, so its own ID comes first, in the visible text.
+                    return Text((string?)peers?["caller"] is { } caller ? $"{YouAre(caller)}\n{listing}" : listing);
                 }
                 case "archive_session" or "restore_session" when pipe is not null && token is not null:
                 {
@@ -214,6 +216,9 @@ public static class PeersServer
         return rpc;
     }
 
+    /// <summary>The first line of <c>list_agents</c>: the calling session, named as the service names sessions to agents.</summary>
+    internal static string YouAre(string caller) => $"You are {caller}.";
+
     /// <summary>What <c>reply</c> says when nothing waits for its <c>message_id</c>.</summary>
     internal static string NotDelivered(string messageId) =>
         $"No open request with message_id \"{messageId}\" for this session; it may have been answered already or withdrawn. " +
@@ -254,6 +259,8 @@ public static class PeersServer
             ["name"] = "list_agents",
             ["description"] = "List the user's other coding-agent sessions in Gorynych that you can ask with ask_agent: session_id (pass it " +
                 "exactly), agent, title, folder, whether it is open, and parent_session_id for a session another session started with spawn_session. " +
+                "The list leaves this session out; the first line of the result names it instead: \"You are session_id ...\", the ID to " +
+                "pass for this session itself, for example to archive_session. " +
                 "Archived sessions are left out unless include_archived is true; then every entry says whether it is archived. " +
                 "ask_agent reaches archived sessions too.",
             ["inputSchema"] = new JsonObject

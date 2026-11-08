@@ -243,6 +243,25 @@ public sealed class ArchiveTests
     }
 
     [TestMethod]
+    public async Task ListAgents_NamesTheCallerFirst_WhichTheListLeavesOut()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var asker = await NewPromptedAsync(zed, "claude", "Coordinate the \"release\"");
+        var other = await NewPromptedAsync(zed, "kimi", "Review the API");
+
+        var peers = await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodPeers, new JsonObject { ["token"] = claude.Tokens[asker] });
+
+        Assert.AreEqual($"session_id {asker} (claude, \"Coordinate the 'release'\")", (string?)peers!["caller"], "named as every header names a session");
+        Assert.AreEqual($"You are session_id {asker} (claude, \"Coordinate the 'release'\").", PeersServer.YouAre((string)peers["caller"]!));
+        CollectionAssert.AreEqual(new[] { other }, peers["sessions"]!.AsArray().Select(s => (string?)s!["session_id"]).ToArray(), "the list still leaves the caller out");
+        var anonymous = await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodPeers, new JsonObject());
+        Assert.IsFalse(anonymous!.AsObject().ContainsKey("caller"), "a client without a token is nobody's session");
+    }
+
+    [TestMethod]
     public async Task ArchiveAndRestoreSession_SayWhatHappened_AndOnAnUnknownSessionWhatToPassInstead()
     {
         var claude = new LifecycleAgent("claude", canDelete: false);
