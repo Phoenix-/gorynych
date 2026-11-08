@@ -15,7 +15,7 @@ namespace Gorynych.Adapters.Claude;
 /// argument the first time and a bracketed paste plus Enter after <c>Stop</c> later on.
 /// </summary>
 [SupportedOSPlatform("windows")]
-internal sealed partial class ClaudeSession : IAsyncDisposable
+internal sealed partial class ClaudeSession : IClaudeSession
 {
     readonly ClaudeAgent agent;
     readonly ClaudeAdapterOptions options;
@@ -78,6 +78,14 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
     string Folder => Path.Combine(options.DataDirectory, "sessions", Id);
 
     // ---------------------------------------------------------------- prompts
+
+    /// <summary>The TUI takes text only: blocks other than text and resource links are dropped.</summary>
+    public Task<StopReason> PromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct)
+    {
+        var text = string.Join("\n\n", prompt.Select(StreamJson.BlockText).Where(t => t.Length > 0));
+        if (text.Length == 0) throw new JsonRpcException(JsonRpcException.InvalidParams, "The prompt has no text.");
+        return PromptAsync(text, cancelled, ct);
+    }
 
     /// <param name="cancelled">True once the client cancelled after sending this prompt.</param>
     public async Task<StopReason> PromptAsync(string text, Func<bool> cancelled, CancellationToken ct)
@@ -318,26 +326,7 @@ internal sealed partial class ClaudeSession : IAsyncDisposable
         catch (IOException) { }
     }
 
-    Dictionary<string, string> LaunchEnvironment()
-    {
-        var env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables())
-            env[(string)e.Key] = (string?)e.Value ?? "";
-        // Started from inside another Claude Code session (for example the desktop app),
-        // the child would otherwise attach to that session instead of the user's own login.
-        var nested = env.ContainsKey("CLAUDECODE");
-        foreach (var key in env.Keys.ToList())
-        {
-            if (key.Equals("CLAUDECODE", StringComparison.OrdinalIgnoreCase)
-                || key.StartsWith("CLAUDE_CODE_", StringComparison.OrdinalIgnoreCase)
-                || key.StartsWith("CLAUDE_AGENT_SDK", StringComparison.OrdinalIgnoreCase)
-                || key.StartsWith("CLAUDE_PREVIEW_", StringComparison.OrdinalIgnoreCase)
-                || key is "CLAUDE_PID" or "CLAUDE_EFFORT"
-                || (nested && key is "ANTHROPIC_BASE_URL" or "MCP_CONNECTION_NONBLOCKING" or "MCP_SERVER_CONNECTION_BATCH_SIZE"))
-                env.Remove(key);
-        }
-        return env;
-    }
+    static Dictionary<string, string> LaunchEnvironment() => ClaudeEnvironment.Clean();
 
     // ---------------------------------------------------------------- screens that need a key
 

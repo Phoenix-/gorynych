@@ -6,11 +6,11 @@ using Gorynych.Adapters.Kimi;
 using Gorynych.Service;
 
 // Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex] [--claude-model <m>] [--unload-after <minutes>]
-//   [--claude-channels ask|accept|decline] [--no-channel] [--no-peers] [--console]
-// Gorynych.Service peers [--pipe <name> --token <t>] [--channel-url <url>]
-//   the gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel
+//   [--claude-transport headless|tui] [--claude-channels ask|accept|decline] [--no-channel] [--no-peers] [--console]
+// Gorynych.Service peers [--pipe <name> --token <t>] [--channel-url <url> | --reply-url <url>]
+//   the gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel (TUI) or reply route (headless)
 if (args.Length > 0 && args[0] == "peers")
-    return await PeersServer.RunAsync(Arg(args, "--pipe"), Arg(args, "--token"), Arg(args, "--channel-url"));
+    return await PeersServer.RunAsync(Arg(args, "--pipe"), Arg(args, "--token"), Arg(args, "--channel-url"), Arg(args, "--reply-url"));
 // Gorynych.Service shutdown [--pipe <name>]
 //   asks the running service to exit and waits for it; exit code 1 when none runs on the pipe
 if (args.Length > 0 && args[0] == "shutdown")
@@ -21,7 +21,7 @@ if (args.Length > 0 && args[0] == "acp")
 {
     var agent = Arg(args, "--agent") ?? throw new ArgumentException("--agent is required");
     var forwarded = new List<string>();
-    foreach (var option in new[] { "--data", "--claude-model", "--default-agent", "--unload-after", "--claude-channels" })
+    foreach (var option in new[] { "--data", "--claude-model", "--default-agent", "--unload-after", "--claude-transport", "--claude-channels" })
         if (Arg(args, option) is { } value) forwarded.AddRange([option, value]);
     foreach (var flag in new[] { "--no-channel", "--no-peers" })
         if (args.Contains(flag)) forwarded.Add(flag);
@@ -30,6 +30,7 @@ if (args.Length > 0 && args[0] == "acp")
 
 var pipeName = Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName;
 var channels = Channels(Arg(args, "--claude-channels"));
+var claudeTransport = Transport(Arg(args, "--claude-transport"));
 var dataDirectory = Path.GetFullPath(Arg(args, "--data")
     ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gorynych"));
 Directory.CreateDirectory(dataDirectory);
@@ -57,6 +58,7 @@ var adapters = new List<IAgentAdapter>
     new ClaudeAdapter(new ClaudeAdapterOptions
     {
         DataDirectory = Path.Combine(dataDirectory, "claude"),
+        Transport = claudeTransport,
         Model = Arg(args, "--claude-model"),
         ChannelServerCommand = args.Contains("--no-channel") ? null : [Environment.ProcessPath!, "peers"],
         Channels = channels,
@@ -120,6 +122,15 @@ static ChannelConsent Channels(string? value) => value switch
     "accept" => ChannelConsent.Accept,
     "decline" => ChannelConsent.Decline,
     _ => throw new ArgumentException($"--claude-channels takes ask, accept or decline; got '{value}'"),
+};
+
+// --claude-transport headless|tui: how the Claude adapter drives Claude Code. headless (the default) runs
+// `claude -p` with stream-json; tui runs the interactive TUI in a pseudo console, the fallback (Windows only).
+static ClaudeTransport Transport(string? value) => value switch
+{
+    null or "headless" => ClaudeTransport.Headless,
+    "tui" => ClaudeTransport.Tui,
+    _ => throw new ArgumentException($"--claude-transport takes headless or tui; got '{value}'"),
 };
 
 // --unload-after <minutes>: how long an idle session with no client stays loaded in its agent; 0 unloads at once.

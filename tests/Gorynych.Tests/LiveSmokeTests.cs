@@ -30,6 +30,10 @@ public sealed class LiveSmokeTests
         throw new InvalidOperationException("repository root not found");
     }
 
+    /// <summary>The Claude transport the live tests run: <c>GORYNYCH_CLAUDE_TRANSPORT=tui</c>, else headless.</summary>
+    static ClaudeTransport LiveClaudeTransport() =>
+        Environment.GetEnvironmentVariable("GORYNYCH_CLAUDE_TRANSPORT") == "tui" ? ClaudeTransport.Tui : ClaudeTransport.Headless;
+
     static string ServiceExe(string root)
     {
         var bin = Path.Combine(root, "src", "Gorynych.Service", "bin");
@@ -41,12 +45,14 @@ public sealed class LiveSmokeTests
     public async Task Claude_FirstPrompt_Approval_Title_Reload_AndOpinion()
     {
         RequireLive();
-        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var tui = LiveClaudeTransport() == ClaudeTransport.Tui;
+        if (tui && !OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
         var root = RepoRoot();
         var dir = TestDirs.New();
         var target = Path.Combine(dir, "live.txt");
         var adapter = new ClaudeAdapter(new ClaudeAdapterOptions
         {
+            Transport = LiveClaudeTransport(),
             DataDirectory = Path.Combine(dir, "claude"),
             Model = "haiku",
             ChannelServerCommand = [ServiceExe(root), "peers"],
@@ -73,12 +79,16 @@ public sealed class LiveSmokeTests
             Assert.AreEqual("hi", File.ReadAllText(target).Trim());
             StringAssert.Contains(client.Text(), "DONE");
 
+            // Headless Claude writes no generated title; the service's provisional one stays.
+            if (tui)
+            {
             var provisional = client.Snapshot().First(u => (string?)u["sessionUpdate"] == "session_info_update")["title"]?.ToString();
             var deadline = DateTime.UtcNow.AddSeconds(45);
             while (DateTime.UtcNow < deadline && !client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "session_info_update" && (string?)u["title"] != provisional))
                 await Task.Delay(500);
             Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "session_info_update" && (string?)u["title"] != provisional),
                 "Claude's generated title arrived");
+            }
         }
 
         await using (var again = await TestClient.ConnectAsync(conductor, "live-2"))
@@ -96,17 +106,65 @@ public sealed class LiveSmokeTests
             });
             Assert.IsFalse(string.IsNullOrWhiteSpace((string?)opinion?["text"]), "the channel reply came back");
 
-            // The channel message's messageId is Claude's own prompt_id, kept in its transcript as promptId.
+            // The live note's user message: through the channel (TUI) or Claude's input (headless).
             JsonObject? channelMessage = null;
             for (var i = 0; i < 100 && channelMessage is null; i++, await Task.Delay(100))
                 channelMessage = again.Snapshot().FirstOrDefault(u => (string?)u["sessionUpdate"] == "user_message_chunk"
-                    && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == "channel");
-            Assert.IsNotNull(channelMessage, "the channel message reached the feed");
+                    && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == (tui ? "channel" : "live"));
+            Assert.IsNotNull(channelMessage, "the live note reached the feed");
             var messageId = (string?)channelMessage["messageId"];
             Assert.IsFalse(string.IsNullOrEmpty(messageId));
+            Assert.IsNotNull(channelMessage["_meta"]?[GorynychProtocol.MetaOpinion], "it carries its request's message_id");
+            if (!tui) return;
+            // The channel message's messageId is Claude's own prompt_id, kept in its transcript as promptId.
             var transcript = File.ReadAllLines(Gorynych.Adapters.Claude.TranscriptTitles.ExpectedPath(root, sessionId));
             Assert.IsTrue(transcript.Any(l => l.Contains($"\"promptId\":\"{messageId}\"", StringComparison.Ordinal) && l.Contains("<channel", StringComparison.Ordinal)),
                 $"Claude's transcript has the channel message with promptId {messageId}");
+        }
+    }
+
+    /// <summary>
+    /// Switching the transport needs no migration: a session started headless continues in the TUI,
+    /// and one started in the TUI continues headless, since both use Claude's own transcripts and
+    /// the adapter's one session list.
+    /// </summary>
+    [TestMethod]
+    [Timeout(600_000, CooperativeCancellation = true)]
+    public async Task Claude_SessionsMoveBetweenTransports_BothWays()
+    {
+        RequireLive();
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("the TUI transport needs ConPTY");
+        var root = RepoRoot();
+        var dir = TestDirs.New();
+        ClaudeAdapter Adapter(ClaudeTransport transport) => new(new ClaudeAdapterOptions
+        {
+            Transport = transport, DataDirectory = Path.Combine(dir, "claude"), Model = "haiku",
+        });
+        async Task<(string SessionId, string Text)> Turn(ClaudeTransport transport, string? sessionId, string text)
+        {
+            await using var conductor = TestDirs.Conductor(dir, Adapter(transport));
+            await using var client = await TestClient.ConnectAsync(conductor, "live-" + transport);
+            client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId });
+            if (sessionId is null)
+                sessionId = (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+                {
+                    Cwd = root, McpServers = [], Meta = new JsonObject { [GorynychProtocol.MetaAgent] = "claude" },
+                })).SessionId;
+            else
+                await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume,
+                    AcpJson.ToNode(new ResumeSessionRequest { SessionId = sessionId, Cwd = root, McpServers = [] }));
+            var result = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = sessionId, Prompt = [new TextContent { Text = text }] });
+            Assert.AreEqual(StopReason.EndTurn, result.StopReason);
+            Console.WriteLine($"{transport}: {client.Text().Trim()}");
+            return (sessionId, client.Text());
+        }
+        foreach (var (first, second) in new[] { (ClaudeTransport.Headless, ClaudeTransport.Tui), (ClaudeTransport.Tui, ClaudeTransport.Headless) })
+        {
+            var word = first == ClaudeTransport.Headless ? "PELICAN" : "MARMOT";
+            var (sessionId, _) = await Turn(first, null, $"Remember the word {word}. Reply with exactly OK.");
+            var (_, answer) = await Turn(second, sessionId, "Which word did I ask you to remember? Reply with that word only.");
+            StringAssert.Contains(answer.ToUpperInvariant(), word, $"a session started with {first} continues with {second}");
         }
     }
 
@@ -115,7 +173,7 @@ public sealed class LiveSmokeTests
     public async Task Claude_NotRunning_IsStartedForAQuestion_AnswersWithReply_AndIsClosedAgain()
     {
         RequireLive();
-        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        if (LiveClaudeTransport() == ClaudeTransport.Tui && !OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
         var root = RepoRoot();
         var exe = ServiceExe(root);
         var dir = TestDirs.New();
@@ -125,7 +183,9 @@ public sealed class LiveSmokeTests
             DataDirectory = dir,
             ServiceId = "live",
             PeerServerCommand = [exe, "peers", "--pipe", pipe],
-        }, [new ClaudeAdapter(new ClaudeAdapterOptions { DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "peers"], Channels = ChannelConsent.Accept })]);
+            // A client's close unloads only after the idle time; here that is at once.
+            UnloadAfter = TimeSpan.Zero,
+        }, [new ClaudeAdapter(new ClaudeAdapterOptions { Transport = LiveClaudeTransport(), DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "peers"], Channels = ChannelConsent.Accept })]);
         using var stop = new CancellationTokenSource();
         var listening = Gorynych.Service.PipeListener.RunAsync(conductor, pipe, stop.Token);
         try
@@ -139,7 +199,8 @@ public sealed class LiveSmokeTests
             await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
                 new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = "Remember the code word PELICAN. Reply with exactly READY." }] });
             await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id }); // Claude's process exits
-            Assert.IsFalse(conductor.Agents["claude"].IsLive(id));
+            for (var i = 0; i < 100 && conductor.Agents["claude"].IsLive(id); i++) await Task.Delay(100);
+            Assert.IsFalse(conductor.Agents["claude"].IsLive(id), "unloaded once idle with no client");
 
             var answer = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject
             {
@@ -170,7 +231,7 @@ public sealed class LiveSmokeTests
     public async Task Opinions_BothWays_ClaudeAsksKimi_KimiAsksClaude()
     {
         RequireLive();
-        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        if (LiveClaudeTransport() == ClaudeTransport.Tui && !OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
         var root = RepoRoot();
         var exe = ServiceExe(root);
         var dir = TestDirs.New();
@@ -181,7 +242,7 @@ public sealed class LiveSmokeTests
             ServiceId = "live",
             PeerServerCommand = [exe, "peers", "--pipe", pipe],
         }, [
-            new ClaudeAdapter(new ClaudeAdapterOptions { DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "peers"], Channels = ChannelConsent.Accept }),
+            new ClaudeAdapter(new ClaudeAdapterOptions { Transport = LiveClaudeTransport(), DataDirectory = Path.Combine(dir, "claude"), Model = "haiku", ChannelServerCommand = [exe, "peers"], Channels = ChannelConsent.Accept }),
             new KimiAdapter(new KimiAdapterOptions()),
         ]);
         using var stop = new CancellationTokenSource();
