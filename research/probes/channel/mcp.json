@@ -2,9 +2,9 @@
   "mcpServers": {
     "probechan": {
       "args": [
-        "C:\\Users\\micha\\AppData\\Local\\Temp\\claude\\0ba64cc77c419dc6\\5a58f86a-6ef3-4013-9221-b74f784f02a9\\scratchpad\\hookprobe\\channel\\channel.log"
+        "C:\\work\\probe\\channel\\channel.log"
       ],
-      "command": "C:\\Users\\micha\\AppData\\Local\\Temp\\claude\\0ba64cc77c419dc6\\5a58f86a-6ef3-4013-9221-b74f784f02a9\\scratchpad\\hookprobe\\channel\\bin\\channel.exe",
+      "command": "C:\\work\\probe\\channel\\bin\\channel.exe",
       "type": "stdio"
     }
   }
