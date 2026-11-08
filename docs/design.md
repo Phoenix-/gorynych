@@ -43,12 +43,16 @@ approval card, one session list, without reading terminals.
   Everything goes through per-launch options and the agents' own protocols, so starting or
   removing Gorynych changes nothing in how the agents behave on their own.
 - **A structured protocol per harness, no screen scraping.** Kimi speaks ACP (`kimi acp`),
-  Codex has `codex app-server`, Claude Code gives hooks and channels. The terminal is used only
-  to type into Claude's TUI and to answer the few dialogs that need a key.
-- **Claude Code stays an interactive TUI.** The unmodified `claude` binary runs in a pseudo
-  console under the person's login; per-launch flags give the structured feed. A fallback,
-  Anthropic's ACP adapter (`claude-agent-acp`) with an API key, is kept in reserve and not
-  built.
+  Codex has `codex app-server`, Claude Code has stream-json (`claude -p`). In Claude's TUI
+  fallback the terminal is used only to type and to answer the few dialogs that need a key.
+- **Claude Code runs headless; the TUI is the fallback.** The unmodified `claude` binary runs as
+  `claude -p` with stream-json in and out, under the person's own plan login, one process per
+  session (decided 9 November 2026). Anthropic's help center says `claude -p` and the Agent SDK
+  signed in with a plan draw from its limits, and the legal page does not prevent signing in
+  to the unmodified binary with one's own subscription. The interactive TUI in a pseudo console
+  stays built and tested behind `--claude-transport tui`: a separate credit for `-p` was
+  announced and then paused in 2026, and `--bare` (no OAuth login) is to become the default for
+  `-p`. Switching needs no migration; both use Claude's own transcripts.
 - **Service and GUI are separate from day one.** A per-user background service on each
   machine owns the agent processes; a GUI connects to it, and later to several services.
 - **ACP v1 between them**, with own additions only through ACP's extension points. The
@@ -78,7 +82,7 @@ flowchart LR
     codexA["Codex adapter<br/>(in process)"]
   end
   subgraph agents["Native agents, unmodified"]
-    claude["claude TUI<br/>in ConPTY"]
+    claude["claude -p (stream-json),<br/>or its TUI in ConPTY"]
     kimi["kimi acp"]
     codex["codex app-server"]
   end
@@ -123,8 +127,23 @@ flowchart LR
 
 ## Claude Code without touching its configuration
 
-All of the Claude integration rests on the flags of one launch and its pseudo console; no file
-in `~/.claude` or in the project changes.
+All of the Claude integration rests on the flags of one launch and Claude's own protocols; no
+file in `~/.claude` or in the project changes.
+
+**Headless, the default** ([research/claude-headless-spec.md](../research/claude-headless-spec.md)):
+
+| Need | Mechanism | What it gives |
+| --- | --- | --- |
+| Feed | `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages` | token deltas, thoughts, tool calls and results, a replay of every user message with the `uuid` the adapter gave it, one `result` per turn |
+| Approvals and questions | `--permission-prompt-tool=stdio` | `can_use_tool` control requests, answered `allow` or `deny`; `AskUserQuestion` exists only with this host |
+| Permission mode, model, effort | `--permission-mode`, `--model`, `--effort`; `set_permission_mode`, `set_model`, `apply_flag_settings` while running | the selectors |
+| Messages from other agents and the person | user messages on stdin | a message joins a running turn after its current tool, or starts one |
+| Authorization for opinions | `--append-system-prompt` | answer opinion requests with `reply`, take no actions for other agents |
+| Title | the `rename_session` control request | Claude's own `custom-title` |
+| Folder trust | Claude's own flag, read only, else the person's answer | `-p` asks nothing itself and would run a folder's project hooks and MCP servers |
+| The login | the `account` of `initialize` | no login (what `--bare` gives) or an API key fails the prompt loudly |
+
+**TUI, the fallback:**
 
 | Need | Mechanism | What it gives |
 | --- | --- | --- |
@@ -164,9 +183,9 @@ sequenceDiagram
   S-->>C: stopReason end_turn
 ```
 
-The full hook-to-ACP mapping, the launch command and the channel are in
-[adapters.md](adapters.md#claude-code). Claude runs on Windows only for now: a Unix PTY host is
-planned.
+The full mappings, both launch commands and the channel are in
+[adapters.md](adapters.md#claude-code). The headless transport needs nothing Windows-only; the
+TUI fallback runs on Windows only, and a Unix PTY host is not planned while headless works.
 
 ## Kimi, Codex and DeepSeek
 
@@ -183,11 +202,12 @@ the harness itself.
 
 How messages travel, per harness:
 
-- **The person's prompt:** `session/prompt` for Kimi, `turn/start` for Codex, a paste into the
-  PTY after `Stop` for Claude.
-- **A question from another agent:** into Claude's channel, answered with `reply`; to the
-  others as an ordinary turn marked with the asking session ([below](#asking-another-session)).
-- **An approval:** Claude's `PermissionRequest`, Kimi's `session/request_permission`, Codex's
+- **The person's prompt:** `session/prompt` for Kimi and DSH, `turn/start` for Codex, a user message on
+  stdin for Claude (a paste into the PTY after `Stop` in the TUI fallback).
+- **A question from another agent:** into a running Claude, on stdin (the TUI's channel in the
+  fallback), answered with `reply`; to the others as an ordinary turn marked with the asking
+  session ([below](#asking-another-session)).
+- **An approval:** Claude's `can_use_tool` (the TUI's `PermissionRequest`), Kimi's `session/request_permission`, Codex's
   server request and DSH's `session/request_permission` all become one
   `session/request_permission` card. DSH asks only for sandbox escalations; its sessions' shell
   escalations are refused by the adapter, and the service asks before DSH's gorynych tool calls.
@@ -204,7 +224,7 @@ an ACP client. The types are generated from the published JSON schema
 | Session list | [`session/list`](https://agentclientprotocol.com/protocol/v1/session-list): `sessionId`, `cwd`, `title`, `updatedAt`, `_meta`, pages by `cursor` | v1 | **done**; the agent and the parent go in `_meta` |
 | GUI reconnect | `session/load` replays history through `session/update`; `session/resume` returns the session without it | v1 | **done**; the history comes from the service's journal |
 | Feed | `session/update`: message and thought chunks, `tool_call`, `tool_call_update`, `plan`, `usage_update`, `session_info_update` | v1 | **done**, as is; every chunk carries a `messageId` |
-| Prompts and cancel | `session/prompt`, `session/cancel` | v1 | **done**; the Claude adapter turns a prompt into a PTY paste |
+| Prompts and cancel | `session/prompt`, `session/cancel` | v1 | **done**; the Claude adapter turns a prompt into a user message on stdin (a PTY paste in the TUI fallback) |
 | Approvals | `session/request_permission` | v1 | **done**; Claude's hook and Codex's server requests map to it |
 | Questions with choices | `elicitation/create` (forms) | v1 | **done** for `AskUserQuestion`; a client without forms gets approvals instead |
 | System prompt | `systemPrompt` (append or override) on new, load and resume | completed RFD, in ACP main | **done**: the service sends its peer instructions to agents that advertise it (Claude) |
@@ -263,11 +283,11 @@ sequenceDiagram
   participant Q as asked session
   P->>M: ask_agent(session_id, question)
   M->>S: _gorynych/opinion (peer token)
-  alt Claude, running, with its channel
+  alt Claude, running (headless: on stdin; TUI: through its channel)
     S->>Q: _gorynych/opinion
-    Q->>Q: channel message, kind opinion, message_id
-    Q->>S: reply(message_id, text) through the channel
-  else Kimi, or Claude not running or without its channel
+    Q->>Q: a user message (or channel message) naming the adapter's message_id
+    Q->>S: reply(message_id, text) through the adapter
+  else Kimi, or Claude not running or without a live-note path
     S->>Q: session/prompt, a turn marked with the asker and message_id
     Q->>M: reply(message_id, text)
     M->>S: _gorynych/reply
@@ -304,8 +324,8 @@ sequenceDiagram
   S-->>P: session_id
   S->>C: session/prompt (the task)
   C-->>S: turn ends
-  alt Claude parent with its channel
-    S->>P: _gorynych/note, a channel message of kind report
+  alt a running Claude parent (headless, or the TUI with its channel)
+    S->>P: _gorynych/note, a user message on stdin (or a channel message of kind report)
   else otherwise
     S->>P: a report turn
   end
@@ -386,8 +406,11 @@ Done in stage one:
 
 - the service: one instance per user, a bounded journal per session, a persistent service ID,
   a named pipe open only to its user, the bridge for stdio clients;
-- Claude through its TUI in ConPTY, http hooks, the channel with `reply`, pastes after `Stop`,
-  and the person's consent before the development-channels notice is confirmed;
+- Claude headless (`claude -p`, stream-json): streamed answers and thoughts, approvals over
+  `can_use_tool`, live notes on stdin, model, effort and mode selectors, the native rename,
+  folder trust, and loud failures off the plan; the TUI fallback in ConPTY with http hooks,
+  the channel with `reply`, pastes after `Stop`, and the person's consent before the
+  development-channels notice is confirmed;
 - Kimi through `kimi acp`, the second kind of adapter, which checked the whole model;
 - Codex through `codex app-server`, the second own adapter, with its permission modes as a
   selector (including Codex's automatic reviewer);
@@ -444,8 +467,13 @@ Open:
 
 Risks:
 
-- **Channels are a research preview.** If Claude Code drops them, questions and reports go to
-  Claude as turns, as they already do for a session without the channel.
+- **Headless Claude on a plan can be restricted.** Anthropic announced a separate credit for
+  `claude -p` and the Agent SDK in May 2026 and paused it in June; `--bare`, which reads no OAuth
+  login, is to become the default for `-p`. The adapter fails loudly when a launch shows no
+  login or an API key, or when Claude reports an auth or billing error, and the TUI transport
+  is one flag away.
+- **Channels are a research preview** (TUI fallback only). If Claude Code drops them, questions
+  and reports go to Claude as turns, as they already do for a session without the channel.
 - **The development-channels notice** needs Enter at every launch. Gorynych confirms it only
   after the person agreed once ([adapters.md](adapters.md#consent-to-development-channels)).
 - **Formats change with releases.** Hook payloads and protocols are versioned by their vendors;

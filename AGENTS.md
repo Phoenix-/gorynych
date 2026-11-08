@@ -15,8 +15,10 @@ architecture. Keep this file short: it is loaded into every agent session.
   - The service is an ACP conductor (see the proxy-chains RFD).
   - Adapters are ACP agents.
 - **Never edit an agent's own configuration** (`~/.claude`, `~/.codex`, `~/.kimi-code`, `~/.dsh`).
-  - Claude is integrated only through per-launch flags (`--settings` with http hooks,
-    `--mcp-config`, channels, `--append-system-prompt`) and its PTY.
+  - Claude is integrated only through per-launch flags (`--settings`, `--mcp-config`,
+    `--append-system-prompt`, …) and its own protocols: headless `claude -p` with stream-json by
+    default; the TUI in a PTY, with http hooks and channels, as the fallback
+    (`--claude-transport tui`).
   - Codex is integrated through `codex app-server`, Kimi through `kimi acp`, DeepSeek Harness
     through `dsh --profile acp` with a `--patch` file in Gorynych's data dir.
 - **Subscriptions.** Use only the user's own login on each machine, run the unmodified

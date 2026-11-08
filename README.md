@@ -9,8 +9,9 @@ other for opinions and start child sessions.
 
 ## The idea
 
-- **Native agents.** Claude Code runs as its interactive TUI in a pseudo console, driven only
-  by per-launch flags (http hooks, an MCP config, a channel). Kimi Code runs through
+- **Native agents.** Claude Code runs headless (`claude -p` with stream-json) under your own
+  plan login, driven only by per-launch flags; its interactive TUI in a pseudo console is the
+  fallback (`--claude-transport tui`). Kimi Code runs through
   `kimi acp`, Codex through `codex app-server`, DeepSeek Harness through `dsh --profile acp`
   with a per-launch patch. Gorynych never edits an agent's own configuration.
 - **ACP everywhere.** A per-machine service speaks the
@@ -29,7 +30,7 @@ other for opinions and start child sessions.
 flowchart LR
   zed[Zed] -- ACP over stdio --> bridge[bridge]
   bridge -- ACP over a named pipe --> svc[Gorynych service]
-  svc --> claude[Claude Code TUI]
+  svc --> claude["claude -p (or its TUI)"]
   svc --> kimi[kimi acp]
   svc --> codex[codex app-server]
   svc --> dsh[dsh --profile acp]
@@ -40,8 +41,9 @@ The design, its decisions and the probes behind them: [docs/design.md](docs/desi
 
 ## What works today
 
-- **Claude Code** (Windows): feed, approvals, questions as forms, titles, resume after a
-  restart, follow-up prompts typed into the live TUI.
+- **Claude Code**: streamed answers and thoughts, approvals, questions as forms, model, effort
+  and mode selectors, names, resume after a restart, images in prompts; the TUI fallback
+  (Windows) with the same feed through hooks.
 - **Kimi Code** through `kimi acp`.
 - **Codex** through `codex app-server`: feed, approvals and questions, Codex's permission modes
   (including its automatic reviewer, "Approve for me"), model and effort, names, resume.
@@ -57,31 +59,36 @@ The design, its decisions and the probes behind them: [docs/design.md](docs/desi
   (`--unload-after`) and woken again when a client, a question or a report needs it.
 - **Zed** through the bridge, `Gorynych.Service acp --agent claude|kimi|codex|dsh`.
 
-Claude Code delivers other agents' questions through development channels, a Claude Code
-research preview. Gorynych asks you once before it starts Claude with them; without them the
-questions arrive as ordinary turns.
+Headless Claude gets other agents' questions on its input. In the TUI fallback they go through
+development channels, a Claude Code research preview: Gorynych asks you once before it starts
+Claude with them; without them the questions arrive as ordinary turns.
 
 ## Planned
 
-- Claude on Linux and macOS (a Unix PTY host).
+- Trying headless Claude on Linux and macOS (it uses nothing Windows-only).
 - One GUI over several machines: remote services over `ssh -T`, questions between machines.
 - The [Zed fork](https://github.com/Phoenix-/zed) (in progress): automatic pickup of sessions and the session tree.
 
-## Requirements
+## Getting started
 
-- Windows 10 1809 or later for Claude Code (the adapter needs ConPTY). The service also builds
-  on Linux and macOS, where only Kimi runs today.
-- The [.NET 10 SDK](https://dotnet.microsoft.com/download) to build.
-- The agents you want, installed and logged in with your own account: `claude` (Claude Code),
-  `kimi` (Kimi Code, `kimi login`), `codex` (Codex CLI, `codex login`), `dsh` (DeepSeek
-  Harness, `npm install -g @deepseek-ai/dsh`, with your DeepSeek API key set in `dsh web`) and
-  Node.js for it.
-- An ACP client, such as Zed.
+On Windows 10 1809 or later:
 
-Setup (Zed settings, publishing the service, registering the outside server):
-[docs/external-clients.md](docs/external-clients.md).
+1. Install the agents you want and log in with your own account: Claude Code, Kimi Code
+   (`kimi login`), Codex CLI (`codex login`), DeepSeek Harness (`npm install -g @deepseek-ai/dsh`,
+   with your own DeepSeek API key set in DSH).
+2. Unzip Gorynych's [nightly build](https://github.com/Phoenix-/gorynych/releases/tag/nightly)
+   into `%LOCALAPPDATA%\Programs`.
+3. Get Zed, the [fork's nightly](https://github.com/Phoenix-/zed/releases/tag/nightly) or stock
+   Zed, and add the `Gorynych: …` agents to its settings.
+4. Open a folder in Zed and start a "Gorynych: Claude" (or Kimi, Codex or DeepSeek) thread.
+
+The details, building from source, updating and troubleshooting:
+[docs/getting-started.md](docs/getting-started.md).
 
 ## Build and test
+
+You need the [.NET 10 SDK](https://dotnet.microsoft.com/download); a Native AOT publish also
+needs the C++ build tools ([getting started](docs/getting-started.md#or-build-from-source)).
 
 ```
 dotnet build Gorynych.slnx
@@ -112,7 +119,7 @@ Gorynych is a tool for one person and their own machines:
 
 ## Documentation
 
-[Design](docs/design.md) · [service protocol](docs/service-protocol.md) ·
+[Getting started](docs/getting-started.md) · [design](docs/design.md) · [service protocol](docs/service-protocol.md) ·
 [adapter contract](docs/adapter-contract.md) · [adapters](docs/adapters.md) ·
 [ACP types](docs/acp-types.md) · [external clients](docs/external-clients.md) ·
 [probes](research/probes/README.md)

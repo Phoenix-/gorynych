@@ -94,6 +94,7 @@ public sealed class ClaudeAdapterTests
             PeerServerCommand = [@"C:\svc\Gorynych.Service.exe", "peers", "--pipe", "p"],
         }, [new ClaudeAdapter(new ClaudeAdapterOptions
         {
+            Transport = ClaudeTransport.Tui,
             DataDirectory = Path.Combine(dir, "claude"),
             Executable = FakeClaude(),
             ChannelServerCommand = [@"C:\svc\Gorynych.Service.exe", "peers"],
@@ -142,6 +143,7 @@ public sealed class ClaudeAdapterTests
 
     static ClaudeAdapter ChannelAdapter(string dir, ChannelConsent channels = ChannelConsent.Ask) => new(new ClaudeAdapterOptions
     {
+        Transport = ClaudeTransport.Tui,
         DataDirectory = Path.Combine(dir, "claude"),
         Executable = FakeClaude(),
         ChannelServerCommand = [@"C:\svc\Gorynych.Service.exe", "peers"],
@@ -349,6 +351,7 @@ public sealed class ClaudeAdapterTests
         var log = new List<string>();
         await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(new ClaudeAdapterOptions
         {
+            Transport = ClaudeTransport.Tui,
             DataDirectory = Path.Combine(dir, "claude"),
             Executable = FakeClaude(),
             StartupTimeoutSeconds = 3,
@@ -389,6 +392,7 @@ public sealed class ClaudeAdapterTests
         var dir = TestDirs.New();
         var adapter = new ClaudeAdapter(new ClaudeAdapterOptions
         {
+            Transport = ClaudeTransport.Tui,
             DataDirectory = Path.Combine(dir, "claude"),
             Executable = FakeClaude(),
             StartupTimeoutSeconds = 30,
@@ -427,6 +431,7 @@ public sealed class ClaudeAdapterTests
         var dir = TestDirs.New();
         var adapter = new ClaudeAdapter(new ClaudeAdapterOptions
         {
+            Transport = ClaudeTransport.Tui,
             DataDirectory = Path.Combine(dir, "claude"),
             Executable = FakeClaude(),
             StartupTimeoutSeconds = 30,
@@ -493,6 +498,7 @@ public sealed class ClaudeAdapterTests
         var log = new List<string>();
         await using var restarted = TestDirs.Conductor(dir, new ClaudeAdapter(new ClaudeAdapterOptions
         {
+            Transport = ClaudeTransport.Tui,
             DataDirectory = Path.Combine(dir, "claude"),
             Executable = FakeClaude(),
             StartupTimeoutSeconds = 30,

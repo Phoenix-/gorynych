@@ -13,7 +13,7 @@ agent. New sessions then go to that agent and `session/list` shows only its sess
 client needs no Gorynych extensions. `codex app-server proxy` follows the same idea.
 
 Service options after `--agent` (`--data`, `--claude-model`, `--default-agent`,
-`--unload-after <minutes>`, `--claude-channels ask|accept|decline`, `--no-channel`,
+`--unload-after <minutes>`, `--claude-transport headless|tui`, `--claude-channels ask|accept|decline`, `--no-channel`,
 `--no-peers`) apply only when the bridge has to start the service; a running
 service keeps its own. The service outlives the bridge and the client: it is started
 without inherited handles, without a console and, when the client's job object allows it,
@@ -31,7 +31,7 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
   `tool_call_update`, `plan`, `usage_update`, `session_info_update`. Gorynych's own
   `_meta` keys can be ignored.
 - Approvals are `session/request_permission`.
-- Once, before the first Claude launch that would load Gorynych's channel, the person is asked
+- With the TUI transport (`--claude-transport tui`) only: once, before the first Claude launch that would load Gorynych's channel, the person is asked
   on that session whether Gorynych may start Claude Code with development channels (a Claude
   Code research preview) and confirm the notice Claude shows for them on each launch
   (tool call `development-channels`, options "Allow" and "Don't allow"). The answer is kept in
@@ -114,46 +114,9 @@ included.
 ### Settings
 
 Zed registers custom agents under `agent_servers` in its `settings.json`
-([docs](https://zed.dev/docs/ai/external-agents)). Open it from Zed with
-`zed: open settings` and add (paths for the build published to
-`%LOCALAPPDATA%\Programs\Gorynych`):
-
-```json
-{
-  "agent_servers": {
-    "Gorynych: Claude": {
-      "type": "custom",
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
-      "args": ["acp", "--agent", "claude"],
-      "env": {}
-    },
-    "Gorynych: Kimi": {
-      "type": "custom",
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
-      "args": ["acp", "--agent", "kimi"],
-      "env": {}
-    },
-    "Gorynych: Codex": {
-      "type": "custom",
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
-      "args": ["acp", "--agent", "codex"],
-      "env": {}
-    },
-    "Gorynych: DeepSeek": {
-      "type": "custom",
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
-      "args": ["acp", "--agent", "dsh"],
-      "env": {}
-    }
-  }
-}
-```
-
-Publish that build with (the service must not be running, its exe is locked):
-
-```
-dotnet publish src/Gorynych.Service -c Release -r win-x64 -p:PublishAot=true -o %LOCALAPPDATA%\Programs\Gorynych
-```
+([docs](https://zed.dev/docs/ai/external-agents)). The entries for Gorynych, installing or
+publishing the build they point to, and the fork's `auto_import_sessions` are in
+[getting-started.md](getting-started.md#set-up-zed).
 
 For debugging: Zed's `dev: open acp logs` shows the messages between Zed and the bridge; the
 service writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
@@ -168,12 +131,9 @@ it by itself: each command below changes the agent's own configuration, and the 
 
 ### Publishing the server
 
-The server is its own small exe with its own folder, because a host keeps it running for hours
-and Windows cannot overwrite a running exe:
-
-```
-dotnet publish src/Gorynych.Outside -c Release -r win-x64 -p:PublishAot=true -o %LOCALAPPDATA%\Programs\Gorynych\outside
-```
+The server is its own small exe with its own folder (`outside\` in the published build,
+[getting-started.md](getting-started.md#install-gorynych)), because a host keeps it running for
+hours and Windows cannot overwrite a running exe.
 
 It starts the service from the parent folder (`%LOCALAPPDATA%\Programs\Gorynych\Gorynych.Service.exe`)
 when the service is not running. To replace it while hosts run it, first rename the old
@@ -184,24 +144,15 @@ answers still come from the new service. Its log is
 
 ### Registering the server
 
+The commands for Claude Code (`claude mcp add --scope user`), Codex (`codex mcp add`) and Kimi
+Code (an entry in `~/.kimi-code/mcp.json`), and how to undo each, are in
+[getting-started.md](getting-started.md#optional-agents-outside-gorynych). What is known about them:
+
 - **Claude Code.** Checked on 8 November 2026: the Code tab of Claude Desktop reads the same
   user configuration. For its first seconds the server shows as still connecting, and
   ToolSearch waits for it.
-  ```
-  claude mcp add --scope user gorynych-outside -- "C:\Users\<you>\AppData\Local\Programs\Gorynych\outside\Gorynych.Outside.exe"
-  ```
-  To undo it: `claude mcp remove --scope user gorynych-outside`.
-- **Codex:**
-  ```
-  codex mcp add gorynych-outside -- "C:\Users\<you>\AppData\Local\Programs\Gorynych\outside\Gorynych.Outside.exe"
-  ```
-  To undo it: `codex mcp remove gorynych-outside`.
-- **Kimi Code:** an entry in the `mcpServers` object of `~/.kimi-code/mcp.json`, from Kimi's
-  docs. *Unverified:* the docs also name a TUI command, `/mcp-config`, that edits that file.
-  Neither has been tried with Kimi Code 2.5.2.
-  ```json
-  { "mcpServers": { "gorynych-outside": { "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\outside\\Gorynych.Outside.exe" } } }
-  ```
+- **Kimi Code.** The `mcp.json` entry follows Kimi's docs. *Unverified:* the docs also name a
+  TUI command, `/mcp-config`, that edits that file. Neither has been tried with Kimi Code 2.5.2.
 - Keep the name `gorynych-outside`: the Claude adapter's deny rule matches it. Any other name
   still works, and the server still hides itself inside Gorynych.
 - Optional: allow `mcp__gorynych-outside__list_sessions` and

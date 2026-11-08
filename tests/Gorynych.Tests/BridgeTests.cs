@@ -167,6 +167,47 @@ public sealed class BridgeTests
     }
 
     [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task Shutdown_StopsTheRunningService_AndSaysSoWhenNoneRuns()
+    {
+        var pipe = "gorynych-shutdown-" + Guid.NewGuid().ToString("N")[..8];
+        var service = Process.Start(new ProcessStartInfo(ServiceExe(), ["--pipe", pipe, "--data", TestDirs.New()])
+        {
+            UseShellExecute = false, CreateNoWindow = true,
+        })!;
+        try
+        {
+            // Started once it answers: the bridge's initialize needs the pipe.
+            await using (var probe = new PlainClient("acp", "--agent", "kimi", "--pipe", pipe))
+                await probe.InitializeAsync();
+
+            var (code, stderr) = await RunAsync("shutdown", "--pipe", pipe);
+            Assert.AreEqual(0, code, stderr);
+            StringAssert.Contains(stderr, "the service has stopped");
+            Assert.IsTrue(service.HasExited, "it waited for the process to end");
+
+            (code, stderr) = await RunAsync("shutdown", "--pipe", pipe);
+            Assert.AreEqual(1, code);
+            StringAssert.Contains(stderr, $"no service is running on pipe {pipe}");
+        }
+        finally
+        {
+            if (!service.HasExited) service.Kill();
+        }
+    }
+
+    static async Task<(int Code, string Stderr)> RunAsync(params string[] args)
+    {
+        using var process = Process.Start(new ProcessStartInfo(ServiceExe(), args)
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true,
+        })!;
+        var stderr = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync().WaitAsync(Wait * 3);
+        return (process.ExitCode, await stderr);
+    }
+
+    [TestMethod]
     public void ScopeInitialize_AddsTheAgent_AndKeepsTheClientsOwnMeta()
     {
         var line = AcpBridge.ScopeInitialize("""{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"_meta":{"zed":true}}}""", "kimi");

@@ -248,7 +248,8 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
             case "peer": return " · opinion request";
             case "report": return " · report";
             case "spawn": return " · spawned task";
-            case "channel" when named: return " · report";
+            case "channel" or "live" when named: return " · report";
+            case "live": return "";
             case "channel":
                 var tag = body.TrimStart();
                 var end = tag.IndexOf('>');

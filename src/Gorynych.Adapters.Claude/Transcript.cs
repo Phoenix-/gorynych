@@ -36,12 +36,17 @@ public sealed class TranscriptTitles
     }
 
     /// <summary>Where Claude keeps the transcript of a session started in <paramref name="cwd"/>.</summary>
-    public static string ExpectedPath(string cwd, string sessionId)
+    /// <param name="projectsDirectory">Claude's <c>projects</c> folder; null for <c>$CLAUDE_CONFIG_DIR/projects</c>, else <c>~/.claude/projects</c>.</param>
+    public static string ExpectedPath(string cwd, string sessionId, string? projectsDirectory = null)
     {
         var folder = new string(Path.GetFullPath(cwd).TrimEnd('\\', '/').Select(c => char.IsAsciiLetterOrDigit(c) ? c : '-').ToArray());
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        return Path.Combine(home, ".claude", "projects", folder, sessionId + ".jsonl");
+        return Path.Combine(projectsDirectory ?? DefaultProjectsDirectory(), folder, sessionId + ".jsonl");
     }
+
+    static string DefaultProjectsDirectory() =>
+        Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR") is { Length: > 0 } dir
+            ? Path.Combine(dir, "projects")
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
 }
 
 /// <summary>Follows a transcript file as Claude appends to it and reports title changes. Reads only.</summary>

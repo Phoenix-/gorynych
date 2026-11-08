@@ -10,6 +10,12 @@ public sealed class ClaudeSessionRecord
     public string SessionId { get; set; } = "";
     public string Cwd { get; set; } = "";
     public string? Title { get; set; }
+
+    /// <summary>Headless: the model, effort and permission mode the person picked, for the session's next launches.</summary>
+    public string? Model { get; set; }
+    public string? Effort { get; set; }
+    public string? Mode { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 }

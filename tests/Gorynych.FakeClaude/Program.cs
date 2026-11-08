@@ -10,6 +10,9 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
+// `claude -p` in stream-json mode: the headless transport (Headless.cs).
+if (args.Contains("-p")) return await FakeHeadless.RunAsync(args);
+
 var settingsPath = Arg("--settings") ?? throw new ArgumentException("--settings is required");
 var sessionId = Arg("--session-id") ?? Arg("--resume") ?? throw new ArgumentException("--session-id or --resume is required");
 var dash = Array.IndexOf(args, "--");
