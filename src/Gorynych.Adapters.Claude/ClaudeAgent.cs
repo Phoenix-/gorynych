@@ -51,8 +51,11 @@ public sealed class ClaudeAdapterOptions
     /// <summary>Headless: how long a closed Claude may take to exit before its process tree is killed.</summary>
     public int CloseTimeoutMs { get; init; } = 5000;
 
-    /// <summary>Headless: how long after an interrupt a turn without a result still counts as running.</summary>
+    /// <summary>Headless: how long after an interrupt Claude may take to end the turn before its process is stopped.</summary>
     public int InterruptGraceMs { get; init; } = 5000;
+
+    /// <summary>Headless: how long Claude may stay silent with messages waiting and no turn running before they count as dropped.</summary>
+    public int StallMs { get; init; } = 30_000;
 
     /// <summary>Claude's <c>projects</c> folder, where transcripts are; null for Claude's own default. For tests.</summary>
     public string? ProjectsDirectory { get; init; }
@@ -294,8 +297,11 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             {
                 var meta = (request.Params?["_meta"] as JsonObject)?.DeepClone().AsObject() ?? [];
                 meta[GorynychProtocol.MetaOpinion] = messageId;
-                await headless.DeliverAsync(LiveOpinionText(text, messageId), meta, ct);
-                return new JsonObject { ["text"] = await reply.WaitAsync(ct) };
+                var dropped = await headless.DeliverAsync(LiveOpinionText(text, messageId), meta, ct);
+                if (await Task.WhenAny(reply, dropped).WaitAsync(ct) != reply)
+                    // Cancelled with the client's turn, or lost with the process: the service asks in a turn instead.
+                    throw new JsonRpcException(JsonRpcException.MethodNotFound, "Claude did not take the request on its live-note path.");
+                return new JsonObject { ["text"] = await reply };
             }
             finally { Channel.Forget(messageId); }
         }
@@ -325,7 +331,9 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         if (session is HeadlessSession headless)
         {
             var meta = (request.Params?["_meta"] as JsonObject)?.DeepClone().AsObject() ?? [];
-            await headless.DeliverAsync(text, meta, ct);
+            var dropped = await headless.DeliverAsync(text, meta, ct);
+            _ = dropped.ContinueWith(_ => Log($"claude {id}: a report was not taken (cancelled with a turn, or Claude exited)"),
+                CancellationToken.None, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
             return new JsonObject();
         }
         if (!OperatingSystem.IsWindows() || session is not ClaudeSession { ChannelLoaded: true })
@@ -372,8 +380,9 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     {
         if (trust.IsTrusted(cwd)) return;
         var asking = trustQuestions.GetOrAdd(cwd, _ => new Lazy<Task>(() => AskTrustAsync(sessionId, cwd)));
-        try { await asking.Value.WaitAsync(ct); }
-        finally { trustQuestions.TryRemove(new KeyValuePair<string, Lazy<Task>>(cwd, asking)); }
+        // The question is forgotten once answered, not when one of its waiters gives up.
+        _ = asking.Value.ContinueWith(_ => trustQuestions.TryRemove(new KeyValuePair<string, Lazy<Task>>(cwd, asking)), TaskScheduler.Default);
+        await asking.Value.WaitAsync(ct);
     }
 
     async Task AskTrustAsync(string sessionId, string cwd)

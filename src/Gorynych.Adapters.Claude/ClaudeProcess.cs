@@ -61,12 +61,13 @@ internal sealed class ClaudeProcess : IAsyncDisposable
         foreach (var (k, v) in environment) info.Environment[k] = v;
         if (stderrLog is not null)
             try { File.WriteAllText(stderrLog, ""); }
-            catch (IOException) { stderrLog = null; }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { stderrLog = null; }
         var process = Process.Start(info) ?? throw new InvalidOperationException($"{exe} did not start");
         var claude = new ClaudeProcess(process, onMessage, log, stderrLog);
         // Blocking reads for the life of the process: threads of their own, so sessions never starve the pool.
-        _ = Task.Factory.StartNew(claude.ReadOutputAsync, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        var reading = Task.Factory.StartNew(claude.ReadOutputAsync, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
         _ = Task.Factory.StartNew(claude.ReadErrors, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        _ = claude.WatchExitAsync(reading);
         return claude;
     }
 
@@ -108,6 +109,14 @@ internal sealed class ClaudeProcess : IAsyncDisposable
             }
         }
         catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException) { }
+    }
+
+    /// <summary>
+    /// Completes <see cref="Exited"/> when the process has exited and its output is read, or 2 s
+    /// after the exit: a grandchild that inherited stdout must not keep the session "running".
+    /// </summary>
+    async Task WatchExitAsync(Task reading)
+    {
         int code;
         try
         {
@@ -115,6 +124,7 @@ internal sealed class ClaudeProcess : IAsyncDisposable
             code = process.ExitCode;
         }
         catch (InvalidOperationException) { code = -1; }
+        await Task.WhenAny(reading, Task.Delay(2000));
         foreach (var id in pending.Keys.ToList())
             if (pending.TryRemove(id, out var waiting))
                 waiting.TrySetException(new IOException($"Claude exited with code {code}"));

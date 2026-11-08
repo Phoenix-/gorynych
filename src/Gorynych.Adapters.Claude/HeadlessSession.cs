@@ -11,35 +11,48 @@ namespace Gorynych.Adapters.Claude;
 /// <summary>
 /// One Claude Code session driven headless: the unmodified <c>claude</c> in its documented
 /// non-interactive mode (<c>claude -p</c>, stream-json in and out), one process for the session's
-/// life, started with per-launch flags only. Prompts and live notes are user messages on stdin;
-/// the stream feeds ACP; approvals are <c>can_use_tool</c> control requests (docs/adapters.md).
+/// life, started with per-launch flags only. Prompts and live notes are user messages on stdin,
+/// each stamped with a <c>uuid</c>; the stream feeds ACP; approvals are <c>can_use_tool</c>
+/// control requests (docs/adapters.md).
 /// </summary>
+/// <remarks>
+/// Claude runs one turn at a time. A turn starts with the replay of the first message it takes,
+/// or with output Claude produces on its own, and ends with one <c>result</c>. A message written
+/// while a turn runs joins it (its replay comes before the result) or starts the next one. So a
+/// client's prompt ends with the result of the turn that replayed its <c>uuid</c>, never with
+/// another's.
+/// </remarks>
 internal sealed class HeadlessSession : IClaudeSession
 {
     readonly ClaudeAgent agent;
     readonly ClaudeAdapterOptions options;
     readonly SemaphoreSlim promptGate = new(1, 1);
     readonly SemaphoreSlim launchGate = new(1, 1);
+    readonly SemaphoreSlim inputGate = new(1, 1); // orders writes against interrupts
     readonly Lock stateGate = new();
     readonly CancellationTokenSource lifetime = new();
     ClaudeProcess? process;
     TranscriptWatcher? transcript;
     bool resume;
+    bool disposed;
     string? pendingTitle;
 
-    // The turn Claude runs, under stateGate. One `result` ends each turn; a message written while
-    // a turn runs joins it unless its replay comes only after the result, which makes it the next.
-    bool busy;
-    TaskCompletionSource idle = Completed();
-    TaskCompletionSource cancelSignal = NewSignal();
-    Turn? turn;
-    bool ownTurn;   // a turn the client's prompt did not start: a live note's, or one Claude began itself
-    bool ownMarked; // its start was marked with gorynych/agentTurn
-    string? planError; // an auth or billing error of this turn's assistant messages
+    // Under stateGate.
+    bool active;            // a turn runs in Claude
+    bool activeOwn;         // ... that the client's prompt did not start (a live note's, or Claude's own)
+    bool activeMarked;      // ... and its start was marked with gorynych/agentTurn
+    readonly HashSet<string> taken = new(StringComparer.Ordinal);   // uuids the running turn replayed
+    readonly List<string> pending = [];                              // written, not replayed yet
     readonly Dictionary<string, Note> notes = new(StringComparer.Ordinal);
-    readonly HashSet<string> unconsumed = new(StringComparer.Ordinal); // written, not replayed yet
+    Turn? turn;                                                      // the client's prompt
+    TaskCompletionSource idle = Completed();                         // no turn and nothing pending
+    TaskCompletionSource cancelSignal = NewSignal();
+    long generation;
+    long lastOutput;
+    string? planError;      // an auth or billing error of the running turn
+    string? lastResultError;
 
-    // Stream state, used only from the reader's handler.
+    // Used only from the reader's handler.
     string? messageId;
     readonly HashSet<string> streamed = new(StringComparer.Ordinal);
     readonly Dictionary<string, string> toolNames = new(StringComparer.Ordinal);
@@ -70,41 +83,74 @@ internal sealed class HeadlessSession : IClaudeSession
 
     string Folder => Path.Combine(options.DataDirectory, "sessions", Id);
 
+    bool Busy => active || pending.Count > 0;
+
+    /// <summary>Keeps <see cref="idle"/> in step with <see cref="Busy"/>; under stateGate.</summary>
+    void UpdateIdle()
+    {
+        if (!Busy) idle.TrySetResult();
+        else if (idle.Task.IsCompleted) idle = NewSignal();
+    }
+
     // ---------------------------------------------------------------- prompts
 
     public async Task<StopReason> PromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct)
     {
         await promptGate.WaitAsync(ct);
-        Turn? current = null;
+        var current = new Turn(Guid.NewGuid().ToString());
         try
         {
             if (cancelled()) return StopReason.Cancelled;
-            // One turn at a time: wait while one runs (a live note's, or one Claude began itself).
+            var claude = await EnsureRunningAsync(ct);
+            // One turn at a time: wait until Claude is idle, and take the input in the same step.
             while (true)
             {
                 Task wake;
                 lock (stateGate)
                 {
-                    if (!busy) break;
+                    if (!Busy)
+                    {
+                        turn = current;
+                        pending.Add(current.Uuid);
+                        UpdateIdle();
+                        break;
+                    }
                     wake = Task.WhenAny(idle.Task, cancelSignal.Task);
                 }
                 await wake.WaitAsync(ct);
                 if (cancelled()) return StopReason.Cancelled;
             }
-            var claude = await EnsureRunningAsync(ct);
-            if (cancelled()) return StopReason.Cancelled;
-            current = new Turn();
-            var uuid = Guid.NewGuid().ToString();
-            lock (stateGate)
+            var written = false;
+            await inputGate.WaitAsync(ct);
+            try
             {
-                busy = true;
-                idle = NewSignal();
-                turn = current;
-                ownTurn = false;
-                ownMarked = false;
-                unconsumed.Add(uuid);
+                lock (stateGate)
+                {
+                    if (current.CancelRequested || cancelled()) return StopReason.Cancelled;
+                    current.Written = true;
+                }
+                lock (stateGate) lastOutput = Environment.TickCount64;
+                try
+                {
+                    await claude.WriteAsync(StreamJson.UserMessage(current.Uuid, StreamJson.Content(prompt)), ct);
+                    written = true;
+                }
+                catch (IOException) when (current.Task.IsCompleted)
+                {
+                    // Claude took the message and was stopped at once (off the plan): that is the news, not the closed pipe.
+                    written = true;
+                }
+                catch (IOException e)
+                {
+                    throw new JsonRpcException(JsonRpcException.InternalError, $"Claude did not take the prompt: {e.Message} {StderrNote(claude)}");
+                }
             }
-            await claude.WriteAsync(StreamJson.UserMessage(uuid, StreamJson.Content(prompt)), ct);
+            finally
+            {
+                inputGate.Release();
+                if (!written) Withdraw(current);
+            }
+            ScheduleStallCheck();
             await using var registration = ct.Register(() => current.TryComplete(StopReason.Cancelled));
             if (await Task.WhenAny(current.Task, claude.Exited) != current.Task)
             {
@@ -123,41 +169,114 @@ internal sealed class HeadlessSession : IClaudeSession
         }
     }
 
+    /// <summary>Takes back a prompt that was never written.</summary>
+    void Withdraw(Turn current)
+    {
+        lock (stateGate)
+        {
+            pending.Remove(current.Uuid);
+            if (ReferenceEquals(turn, current)) turn = null;
+            UpdateIdle();
+        }
+    }
+
     public void Cancel()
     {
         Turn? current;
+        bool written;
         lock (stateGate)
         {
             current = turn;
             if (current is not null) current.CancelRequested = true;
+            written = current?.Written == true;
             var wake = cancelSignal;
             cancelSignal = NewSignal();
             wake.TrySetResult();
         }
-        if (current is null || current.Task.IsCompleted) return;
-        if (process is { Exited.IsCompleted: false } claude) _ = InterruptAsync(claude, current);
-        else current.TryComplete(StopReason.Cancelled);
+        // Not written yet: the prompt sees the cancel and writes nothing.
+        if (current is null || !written || current.Task.IsCompleted) return;
+        _ = InterruptAsync(current);
     }
 
-    async Task InterruptAsync(ClaudeProcess claude, Turn current)
+    /// <summary>
+    /// Stops the client's turn: <c>interrupt</c> with <c>cancel_queued</c>, after the prompt's own
+    /// write (the input gate orders them), so a prompt Claude has not started yet is dropped too.
+    /// The turn ends with its result; without one, Claude's process is stopped, and the next prompt
+    /// resumes the conversation in a new one.
+    /// </summary>
+    async Task InterruptAsync(Turn current)
     {
-        try { await claude.ControlAsync(new JsonObject { ["subtype"] = "interrupt" }, TimeSpan.FromSeconds(5)); }
+        if (process is not { Exited.IsCompleted: false } claude)
+        {
+            current.TryComplete(StopReason.Cancelled);
+            return;
+        }
+        await inputGate.WaitAsync();
+        try
+        {
+            var response = await claude.ControlAsync(new JsonObject { ["subtype"] = "interrupt", ["cancel_queued"] = true }, TimeSpan.FromSeconds(5));
+            foreach (var uuid in (response["cancelled"] as JsonArray)?.Select(n => (string?)n).OfType<string>() ?? [])
+                Drop(uuid, error: null);
+        }
         catch (Exception e) when (e is IOException or TimeoutException or ClaudeControlException or ObjectDisposedException)
         {
             agent.Log($"claude {Id}: interrupt failed: {e.Message}");
         }
-        // The turn ends with its result; should none come, it ends here.
+        finally { inputGate.Release(); }
         if (await Task.WhenAny(current.Task, Task.Delay(options.InterruptGraceMs)) == current.Task) return;
-        agent.Log($"claude {Id}: no result after the interrupt; the turn ends as cancelled");
         current.TryComplete(StopReason.Cancelled);
+        Abandon(claude, "no result after the interrupt; the next prompt resumes the session in a new process");
+    }
+
+    /// <summary>
+    /// A written message Claude will not take: cancelled with the interrupt, never replayed, or lost
+    /// with the process. A live note's waiter learns of it; the client's prompt ends with
+    /// <paramref name="error"/>, or as cancelled without one.
+    /// </summary>
+    void Drop(string uuid, Exception? error)
+    {
+        Note? note;
+        Turn? current;
         lock (stateGate)
         {
-            if (!ReferenceEquals(turn, current) && turn is not null) return;
-            busy = false;
-            ownTurn = false;
-            unconsumed.Clear();
-            idle.TrySetResult();
+            pending.Remove(uuid);
+            notes.Remove(uuid, out note);
+            current = turn?.Uuid == uuid ? turn : null;
+            UpdateIdle();
         }
+        note?.Dropped.TrySetResult();
+        if (current is null) return;
+        if (error is null) current.TryComplete(StopReason.Cancelled);
+        else current.TryFail(error);
+    }
+
+    /// <summary>
+    /// When messages wait with no turn running and Claude stays silent for
+    /// <see cref="ClaudeAdapterOptions.StallMs"/>, Claude is not going to take them: they are dropped,
+    /// so nothing waits on them for ever.
+    /// </summary>
+    void ScheduleStallCheck()
+    {
+        _ = Task.Run(async () =>
+        {
+            while (!lifetime.IsCancellationRequested)
+            {
+                try { await Task.Delay(options.StallMs, lifetime.Token); }
+                catch (OperationCanceledException) { return; }
+                List<string> stale;
+                lock (stateGate)
+                {
+                    if (active || pending.Count == 0) return;
+                    if (Environment.TickCount64 - lastOutput < options.StallMs) continue;
+                    stale = pending.ToList();
+                }
+                var reason = lastResultError is { } error ? $" Claude's last error: {error}" : "";
+                agent.Log($"claude {Id}: Claude took {stale.Count} message(s) in no turn; dropping them");
+                foreach (var uuid in stale)
+                    Drop(uuid, new JsonRpcException(JsonRpcException.InternalError, $"Claude did not take the prompt.{reason}"));
+                return;
+            }
+        });
     }
 
     // ---------------------------------------------------------------- live notes
@@ -167,41 +286,47 @@ internal sealed class HeadlessSession : IClaudeSession
     /// it joins a running turn after the current tool, or starts a turn of Claude's own. When
     /// Claude replays it, its <paramref name="meta"/> goes on the user message, with
     /// <c>gorynych/origin: "live"</c>. Not running: <c>-32600</c>, so the service asks in a turn.
+    /// The returned task completes when Claude will not take the message after all.
     /// </summary>
-    public async Task DeliverAsync(string text, JsonObject meta, CancellationToken ct)
+    public async Task<Task> DeliverAsync(string text, JsonObject meta, CancellationToken ct)
     {
         if (process is not { Exited.IsCompleted: false } claude)
             throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running.");
-        var uuid = Guid.NewGuid().ToString();
-        lock (stateGate)
-        {
-            notes[uuid] = new Note(text, meta);
-            unconsumed.Add(uuid);
-            if (!busy)
-            {
-                busy = true;
-                idle = NewSignal();
-                ownTurn = true;
-                ownMarked = false;
-            }
-        }
-        try { await claude.WriteAsync(StreamJson.UserMessage(uuid, JsonValue.Create(text)!), ct); }
-        catch
+        var note = new Note(Guid.NewGuid().ToString(), text, meta);
+        await inputGate.WaitAsync(ct);
+        try
         {
             lock (stateGate)
             {
-                notes.Remove(uuid);
-                unconsumed.Remove(uuid);
+                notes[note.Uuid] = note;
+                pending.Add(note.Uuid);
+                lastOutput = Environment.TickCount64;
+                UpdateIdle();
             }
-            throw;
+            try { await claude.WriteAsync(StreamJson.UserMessage(note.Uuid, JsonValue.Create(text)!), ct); }
+            catch
+            {
+                lock (stateGate)
+                {
+                    notes.Remove(note.Uuid);
+                    pending.Remove(note.Uuid);
+                    UpdateIdle();
+                }
+                throw;
+            }
         }
+        finally { inputGate.Release(); }
+        ScheduleStallCheck();
+        return note.Dropped.Task;
     }
 
     // ---------------------------------------------------------------- options and title
 
     public async Task<List<SessionConfigOption>> SetOptionAsync(string configId, string value, CancellationToken ct)
     {
-        var request = ClaudeOptions.Change(Settings, agent.Catalog, configId, value);
+        // Changed on a copy, and kept only once a running Claude took it.
+        var next = Settings.Clone();
+        var request = ClaudeOptions.Change(next, agent.Catalog, configId, value);
         if (process is { Exited.IsCompleted: false } claude)
         {
             try { await claude.ControlAsync(request, TimeSpan.FromSeconds(15), ct); }
@@ -210,6 +335,7 @@ internal sealed class HeadlessSession : IClaudeSession
                 throw new JsonRpcException(JsonRpcException.InternalError, $"Claude did not take the change: {e.Message}");
             }
         }
+        Settings.CopyChoicesFrom(next);
         return ClaudeOptions.ConfigOptions(Settings, agent.Catalog);
     }
 
@@ -241,47 +367,42 @@ internal sealed class HeadlessSession : IClaudeSession
         await launchGate.WaitAsync(ct);
         try
         {
-            if (process is { Exited.IsCompleted: false } running) return running;
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (process is { } previous)
+            {
+                if (!previous.Exited.IsCompleted) return previous;
+                OnExited(previous, previous.Exited.Result); // whichever runs first resets the state
+            }
             await agent.EnsureTrustedAsync(Id, Cwd, ct);
             var claude = Launch();
-            JsonObject? init = null;
-            try { init = await claude.ControlAsync(new JsonObject { ["subtype"] = "initialize" }, TimeSpan.FromSeconds(options.StartupTimeoutSeconds), ct); }
-            catch (Exception e) when (e is ClaudeControlException or TimeoutException or IOException)
+            try
             {
-                // initialize only brings the catalog; the session works without it.
-                agent.Log($"claude {Id}: initialize failed: {e.Message}");
-                if (claude.Exited.IsCompleted)
+                JsonObject init;
+                try { init = await claude.ControlAsync(new JsonObject { ["subtype"] = "initialize" }, TimeSpan.FromSeconds(options.StartupTimeoutSeconds), ct); }
+                catch (Exception e) when (e is ClaudeControlException or TimeoutException or IOException)
+                {
                     throw new JsonRpcException(JsonRpcException.InternalError,
-                        $"Claude exited with code {claude.Exited.Result} as it started. {StderrNote(claude)}");
-            }
-            if (StreamJson.SignedOut(init))
-            {
-                // Never run on without the person's login: should `-p` become bare by default, it
-                // would read no OAuth login (nor hooks, CLAUDE.md or the user's MCP servers).
-                await claude.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
-                throw new JsonRpcException(JsonRpcException.InternalError,
-                    "Claude Code started without your login (its account shows no plan and no token). Sign in with `claude` in a " +
-                    "terminal; if you are signed in, `claude -p` may now run bare by default, which ignores the login, so start the " +
-                    "Gorynych service with --claude-transport tui.");
-            }
-            if (StreamJson.ApiKeySource(init) is { } apiKey)
-            {
-                // An API key wins over the login in `claude -p`: the session would be billed outside the plan.
-                await claude.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
-                throw new JsonRpcException(JsonRpcException.InternalError,
-                    $"Claude Code would run on {apiKey}, billed outside your plan. Gorynych runs Claude on your own plan login only: " +
-                    $"remove {apiKey} from the environment the Gorynych service starts with.");
-            }
-            if (init is not null)
-            {
+                        $"Claude Code did not start: {e.Message}. {StderrNote(claude)}");
+                }
+                // Never run on without the person's plan login (docs/adapters.md, "Failing loudly").
+                if (StreamJson.PlanProblem(init) is { } problem)
+                    throw new JsonRpcException(JsonRpcException.InternalError, problem);
                 Settings.ReportedMode = (string?)init["current_permission_mode"] ?? Settings.ReportedMode;
-                agent.Log($"claude {Id}: Claude Code {(string?)init["claude_code_version"]}, {(string?)init["account"]?["subscriptionType"] ?? "no plan"}");
+                agent.Log($"claude {Id}: Claude Code {(string?)init["claude_code_version"]}, {(string?)init["account"]?["subscriptionType"]}");
                 await agent.OnCatalogAsync(this, ClaudeOptions.Catalog(init));
+                string? title;
+                lock (stateGate) { title = pendingTitle; pendingTitle = null; }
+                if (title is not null) await RenameAsync(claude, title, ct);
+                return claude;
             }
-            string? title;
-            lock (stateGate) { title = pendingTitle; pendingTitle = null; }
-            if (title is not null) await RenameAsync(claude, title, ct);
-            return claude;
+            catch
+            {
+                // Nothing runs that was not checked: a launch that failed, timed out or was cancelled is stopped.
+                lock (stateGate) if (ReferenceEquals(process, claude)) process = null;
+                await claude.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
+                await claude.DisposeAsync();
+                throw;
+            }
         }
         finally { launchGate.Release(); }
     }
@@ -313,36 +434,49 @@ internal sealed class HeadlessSession : IClaudeSession
         if (appended.Length > 0) args.AddRange(["--append-system-prompt", appended]);
         args.AddRange(resume ? ["--resume", Id] : ["--session-id", Id]);
 
-        var previous = process;
-        process = null;
-        if (previous is not null) _ = previous.DisposeAsync().AsTask();
         agent.Log($"claude {Id}: launching headless in {Cwd} ({(resume ? "resume" : "new")})");
         var claude = ClaudeProcess.Start(exe, args, Cwd, ClaudeEnvironment.Clean(), Path.Combine(Folder, "stderr.log"),
             m => OnMessageAsync(m), agent.Log);
-        process = claude;
+        lock (stateGate) process = claude;
         _ = claude.Exited.ContinueWith(t => OnExited(claude, t.Result), TaskScheduler.Default);
         transcript ??= new TranscriptWatcher(TranscriptTitles.ExpectedPath(Cwd, Id, options.ProjectsDirectory), title => _ = agent.OnTitleAsync(Id, title));
         return claude;
     }
 
-    void OnExited(ClaudeProcess claude, int code)
+    /// <summary>
+    /// Gives up a process now, before it has exited: the session is reset at once, so the next
+    /// prompt starts a new process instead of writing into one that is going away.
+    /// </summary>
+    void Abandon(ClaudeProcess claude, string why)
     {
-        agent.Log($"claude {Id}: exited with code {code}");
+        OnExited(claude, -1, why);
+        claude.Kill();
+    }
+
+    /// <summary>Claude's process ended: nothing it was given will run, and the session is idle. Runs once per process.</summary>
+    void OnExited(ClaudeProcess claude, int code, string? why = null)
+    {
         bool own;
-        List<CancellationTokenSource> pendingAsks;
+        List<Note> lost;
+        List<CancellationTokenSource> withdrawn;
         lock (stateGate)
         {
             if (!ReferenceEquals(process, claude)) return;
-            own = ownTurn && ownMarked;
-            busy = false;
-            ownTurn = false;
-            ownMarked = false;
-            unconsumed.Clear();
+            process = null;
+            own = active && activeOwn && activeMarked;
+            active = activeOwn = activeMarked = false;
+            taken.Clear();
+            pending.Clear();
+            lost = notes.Values.ToList();
             notes.Clear();
-            idle.TrySetResult();
-            pendingAsks = asks.Values.ToList();
+            withdrawn = asks.Values.ToList();
+            UpdateIdle();
         }
-        foreach (var cts in pendingAsks) cts.Cancel();
+        agent.Log(why is null ? $"claude {Id}: exited with code {code}" : $"claude {Id}: stopped: {why}");
+        foreach (var note in lost) note.Dropped.TrySetResult();
+        foreach (var cts in withdrawn)
+            try { cts.Cancel(); }
+            catch (ObjectDisposedException) { }
         if (own) _ = MarkOwnTurnAsync("ended");
     }
 
@@ -350,6 +484,7 @@ internal sealed class HeadlessSession : IClaudeSession
 
     async Task OnMessageAsync(JsonObject m)
     {
+        lock (stateGate) lastOutput = Environment.TickCount64;
         switch (StreamJson.Type(m))
         {
             case "stream_event":
@@ -368,7 +503,7 @@ internal sealed class HeadlessSession : IClaudeSession
             }
             case "assistant":
             {
-                if (StreamJson.PlanError(m) is { } planError) lock (stateGate) this.planError = planError;
+                if (StreamJson.PlanError(m) is { } plan) lock (stateGate) planError = plan;
                 if (StreamJson.IsSubagent(m)) return;
                 await TurnActivityAsync();
                 var id = StreamJson.AssistantId(m);
@@ -399,6 +534,11 @@ internal sealed class HeadlessSession : IClaudeSession
             }
             case "system" when StreamJson.Subtype(m) == "init":
             {
+                if (StreamJson.ApiKeySourceOfInit(m) is { } apiKey)
+                {
+                    StopOffThePlan(StreamJson.ApiKeyProblem(apiKey));
+                    return;
+                }
                 var model = (string?)m["model"];
                 var mode = (string?)m["permissionMode"];
                 if (model == Settings.ReportedModel && mode == Settings.ReportedMode) return;
@@ -414,9 +554,32 @@ internal sealed class HeadlessSession : IClaudeSession
                 _ = OnControlRequestAsync(m);
                 return;
             case "control_cancel_request":
-                if ((string?)m["request_id"] is { } withdrawn && asks.TryRemove(withdrawn, out var cts)) cts.Cancel();
+                if ((string?)m["request_id"] is { } withdrawn && asks.TryRemove(withdrawn, out var cts))
+                    try { cts.Cancel(); }
+                    catch (ObjectDisposedException) { }
                 return;
         }
+    }
+
+    /// <summary>A turn about to run on something other than the plan: the client's prompt fails, and Claude is stopped before it calls the API.</summary>
+    void StopOffThePlan(string problem)
+    {
+        Turn? current;
+        ClaudeProcess? claude;
+        lock (stateGate) { current = turn; claude = process; }
+        current?.TryFail(new JsonRpcException(JsonRpcException.InternalError, problem));
+        if (claude is not null) Abandon(claude, problem);
+    }
+
+    /// <summary>Starts a turn in the state when none runs; under stateGate.</summary>
+    void BeginTurn(bool own)
+    {
+        active = true;
+        activeOwn = own;
+        activeMarked = false;
+        taken.Clear();
+        generation++;
+        UpdateIdle();
     }
 
     /// <summary>Output while no turn was counted: a turn Claude began itself (a background task ended, say).</summary>
@@ -425,15 +588,9 @@ internal sealed class HeadlessSession : IClaudeSession
         bool mark;
         lock (stateGate)
         {
-            if (!busy)
-            {
-                busy = true;
-                idle = NewSignal();
-                ownTurn = true;
-                ownMarked = false;
-            }
-            mark = ownTurn && !ownMarked;
-            if (mark) ownMarked = true;
+            if (!active) BeginTurn(own: true);
+            mark = activeOwn && !activeMarked;
+            if (mark) activeMarked = true;
         }
         if (mark) await MarkOwnTurnAsync("started");
     }
@@ -442,22 +599,19 @@ internal sealed class HeadlessSession : IClaudeSession
     {
         var uuid = (string?)m["uuid"] ?? "";
         Note? note;
-        bool mark = false;
+        var mark = false;
         lock (stateGate)
         {
-            unconsumed.Remove(uuid);
-            if (notes.Remove(uuid, out note))
+            pending.Remove(uuid);
+            notes.Remove(uuid, out note);
+            if (!active) BeginTurn(own: turn?.Uuid != uuid);
+            taken.Add(uuid);
+            if (note is not null)
             {
-                if (!busy)
-                {
-                    busy = true;
-                    idle = NewSignal();
-                    ownTurn = true;
-                    ownMarked = false;
-                }
-                mark = ownTurn && !ownMarked;
-                if (mark) ownMarked = true;
+                mark = activeOwn && !activeMarked;
+                if (mark) activeMarked = true;
             }
+            UpdateIdle();
         }
         resume = true; // the conversation now exists in Claude's own store
         if (note is null) return; // the client's own prompt: ACP does not echo it
@@ -470,21 +624,25 @@ internal sealed class HeadlessSession : IClaudeSession
     async Task OnResultAsync(JsonObject m)
     {
         Turn? current;
-        bool own, next;
+        bool own, waiting;
         string? plan;
         lock (stateGate)
         {
-            current = turn;
-            own = ownTurn && ownMarked;
-            // A message written during this turn that it did not take starts the next one.
-            next = unconsumed.Count > 0;
-            busy = next;
-            ownTurn = next;
-            ownMarked = false;
+            // Only the turn that took the client's prompt ends it.
+            current = turn is { } t && taken.Contains(t.Uuid) ? t : null;
+            own = active && activeOwn && activeMarked;
+            active = activeOwn = activeMarked = false;
+            taken.Clear();
+            generation++;
             plan = planError;
             planError = null;
+            waiting = pending.Count > 0;
+            UpdateIdle();
         }
+        streamed.Clear();
+        toolNames.Clear();
         var error = StreamJson.ResultError(m);
+        lock (stateGate) lastResultError = error;
         if (error is not null && current is not { CancelRequested: true })
         {
             // An auth or billing error is never left as a quiet note: the client's prompt fails with the way back.
@@ -500,7 +658,7 @@ internal sealed class HeadlessSession : IClaudeSession
                 current.TryFail(new JsonRpcException(JsonRpcException.InternalError, $"Claude cannot run on your plan ({plan}): {error} {StreamJson.TuiHint}"));
             else current.TryComplete(StreamJson.StopReasonOf(m, current.CancelRequested));
         }
-        lock (stateGate) if (!next) idle.TrySetResult();
+        if (waiting) ScheduleStallCheck();
     }
 
     Task MarkOwnTurnAsync(string mark) => EmitAsync(new SessionInfoUpdate
@@ -540,7 +698,7 @@ internal sealed class HeadlessSession : IClaudeSession
                     break;
             }
         }
-        catch (Exception e) when (e is IOException or ObjectDisposedException)
+        catch (Exception e)
         {
             agent.Log($"claude {Id}: could not answer {(string?)request["subtype"]}: {e.Message}");
         }
@@ -557,12 +715,12 @@ internal sealed class HeadlessSession : IClaudeSession
             await claude.RespondAsync(requestId, StreamJson.Allow(input));
             return;
         }
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         asks[requestId] = cts;
         var toolCallId = (string?)request["tool_use_id"] ?? $"permission-{Interlocked.Increment(ref permissionCount)}";
+        JsonObject answer;
         try
         {
-            JsonObject answer;
             if (tool == "AskUserQuestion")
             {
                 if (!agent.ClientHasForms)
@@ -586,19 +744,24 @@ internal sealed class HeadlessSession : IClaudeSession
                     answer = StreamJson.Deny("The user denied this tool call in Gorynych.");
                 }
             }
-            await claude.RespondAsync(requestId, answer);
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
             agent.Log($"claude {Id}: the approval of {tool} was withdrawn");
+            return; // Claude withdrew it, or Claude is gone: nobody waits for an answer
         }
-        catch (Exception e) when (e is IOException or JsonRpcException)
+        catch (Exception e)
         {
+            // Claude must always get an answer, or its turn waits for ever.
             agent.Log($"claude {Id}: approval failed: {e.Message}");
-            try { await claude.RespondAsync(requestId, StreamJson.Deny("Gorynych could not reach the user for approval.")); }
-            catch (IOException) { }
+            answer = StreamJson.Deny("Gorynych could not reach the user for approval.");
         }
-        finally { asks.TryRemove(requestId, out _); }
+        finally
+        {
+            asks.TryRemove(requestId, out _);
+            cts.Dispose();
+        }
+        await claude.RespondAsync(requestId, answer);
     }
 
     static string StderrNote(ClaudeProcess claude) =>
@@ -615,22 +778,40 @@ internal sealed class HeadlessSession : IClaudeSession
 
     public async ValueTask DisposeAsync()
     {
-        lock (stateGate) turn?.TryComplete(StopReason.Cancelled);
-        lifetime.Cancel();
-        if (transcript is not null) await transcript.DisposeAsync();
-        var running = process;
-        process = null;
-        if (running is not null) await running.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
-        if (running is not null) await running.DisposeAsync();
+        // No launch may start after this; one under way finishes first.
+        var gated = await launchGate.WaitAsync(TimeSpan.FromSeconds(30));
+        try
+        {
+            disposed = true;
+            lock (stateGate) turn?.TryComplete(StopReason.Cancelled);
+            lifetime.Cancel();
+            if (transcript is not null) await transcript.DisposeAsync();
+            ClaudeProcess? running;
+            lock (stateGate) running = process;
+            if (running is not null)
+            {
+                await running.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
+                await running.DisposeAsync();
+            }
+        }
+        finally
+        {
+            if (gated) launchGate.Release();
+        }
     }
 
     /// <summary>A message for the service written into Claude, waiting for its replay.</summary>
-    sealed record Note(string Text, JsonObject Meta);
+    sealed record Note(string Uuid, string Text, JsonObject Meta)
+    {
+        public TaskCompletionSource Dropped { get; } = NewSignal();
+    }
 
     /// <summary>One prompt turn sent by the ACP client.</summary>
-    sealed class Turn
+    sealed class Turn(string uuid)
     {
         readonly TaskCompletionSource<StopReason> done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public string Uuid { get; } = uuid;
+        public bool Written { get; set; }
         public bool CancelRequested { get; set; }
         public Task<StopReason> Task => done.Task;
         public void TryComplete(StopReason reason) => done.TrySetResult(reason);

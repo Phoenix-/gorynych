@@ -24,6 +24,16 @@ public sealed class ClaudeSettings
 
     /// <summary>The permission mode Claude reported last.</summary>
     public string? ReportedMode { get; set; }
+
+    public ClaudeSettings Clone() => (ClaudeSettings)MemberwiseClone();
+
+    /// <summary>Takes the person's choices of <paramref name="other"/>.</summary>
+    public void CopyChoicesFrom(ClaudeSettings other)
+    {
+        Model = other.Model;
+        Effort = other.Effort;
+        Mode = other.Mode;
+    }
 }
 
 /// <summary>

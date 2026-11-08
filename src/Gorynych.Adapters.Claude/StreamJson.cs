@@ -95,6 +95,29 @@ public static class StreamJson
     public static string? ApiKeySource(JsonObject? initialize) =>
         (string?)initialize?["account"]?["apiKeySource"] is { Length: > 0 } source && source != "none" ? source : null;
 
+    /// <summary>The API key a <c>system/init</c> message reports (<c>apiKeySource</c> other than <c>none</c>), or null.</summary>
+    public static string? ApiKeySourceOfInit(JsonObject init) =>
+        (string?)init["apiKeySource"] is { Length: > 0 } source && source != "none" ? source : null;
+
+    public static string ApiKeyProblem(string apiKey) =>
+        $"Claude Code would run on {apiKey}, billed outside your plan. Gorynych runs Claude on your own plan login only: " +
+        $"remove {apiKey} from the environment the Gorynych service starts with.";
+
+    /// <summary>
+    /// Why a launch must not run, from its <c>initialize</c> answer, or null when it runs on the
+    /// person's plan login. Fails closed: an answer without an <c>account</c> does not run either.
+    /// </summary>
+    public static string? PlanProblem(JsonObject initialize)
+    {
+        if (initialize["account"] is not JsonObject)
+            return "Claude Code did not report its account, so Gorynych cannot tell whether it runs on your plan, and does not run it. " + TuiHint;
+        if (SignedOut(initialize))
+            return "Claude Code started without your login (its account shows no plan and no token). Sign in with `claude` in a " +
+                "terminal; if you are signed in, `claude -p` may now run bare by default, which ignores the login, so start the " +
+                "Gorynych service with --claude-transport tui.";
+        return ApiKeySource(initialize) is { } apiKey ? ApiKeyProblem(apiKey) : null;
+    }
+
     /// <summary>The assistant errors that mean Claude cannot run on the person's plan (<c>SDKAssistantMessageError</c>).</summary>
     public static readonly HashSet<string> PlanErrors =
         ["authentication_failed", "oauth_org_not_allowed", "account_on_hold", "verification_required", "billing_error"];

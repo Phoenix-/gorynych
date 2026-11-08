@@ -185,9 +185,10 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 
 ### Cancel
 
-- `session/cancel` sends `interrupt` (without `cancel_queued`, so live notes already queued
-  survive) and ends the prompt with `cancelled` when its `result` arrives, or after 5 s
-  without one.
+- `session/cancel` sends `interrupt` with `cancel_queued`, behind the prompt's own write, and
+  ends the prompt with `cancelled` when its `result` arrives; live notes it cancelled go back to
+  the service as `-32601`, which asks them in a turn. Without a result within 5 s, Claude's
+  process is stopped and the next prompt resumes the conversation in a new one.
 
 ### Modes, models and effort
 
@@ -268,7 +269,10 @@ hit exactly `-p` and the SDK, and `--bare` is to become the default for `-p`. So
 - **An API key** in `initialize` (`account.apiKeySource`, probed with a dummy
   `ANTHROPIC_API_KEY`: `{tokenSource: "claude.ai", apiKeySource: "ANTHROPIC_API_KEY"}`, no plan):
   in `-p` the key wins over the login, so the session would be billed outside the plan. Claude
-  is stopped; the prompt fails, naming the variable to remove.
+  is stopped; the prompt fails, naming the variable to remove. A turn's `system/init` is
+  checked the same way (`apiKeySource`), before Claude calls the API.
+- **Fail closed:** an `initialize` that fails, times out or is cancelled, or an answer without
+  an `account`, stops the launch too; nothing runs unchecked.
 - **Auth or billing errors** during a turn (an assistant message's `error`:
   `authentication_failed`, `billing_error`, `account_on_hold`, `oauth_org_not_allowed`,
   `verification_required`): a note in the feed and the client's prompt fails, both naming
@@ -276,9 +280,9 @@ hit exactly `-p` and the SDK, and `--bare` is to become the default for `-p`. So
 
 ## Build-phase answers
 
-- **Tests.** `ClaudeHeadlessTests` (7, on `Gorynych.FakeClaude -p`) and `StreamJsonTests` (7);
-  the TUI's `ClaudeAdapterTests` run pinned to `Transport = Tui`. The whole suite: 240 tests, 231
-  passed, 9 live skipped.
+- **Tests.** `ClaudeHeadlessTests` (12 cases, on `Gorynych.FakeClaude -p`) and `StreamJsonTests`
+  (7); the TUI's `ClaudeAdapterTests` run pinned to `Transport = Tui`. The whole suite: 245 tests,
+  236 passed, 9 live skipped.
 - **Live, headless** (Haiku 5.5, Claude Code 2.1.302, each on its own pipe and temp data):
   first prompt, Write approval, reload and a live-note opinion answered through `reply`
   (`Claude_FirstPrompt_Approval_Title_Reload_AndOpinion`); a session the service woke for a
@@ -294,6 +298,17 @@ hit exactly `-p` and the SDK, and `--bare` is to become the default for `-p`. So
   test now runs its conductor with `UnloadAfter = 0` and waits for the unload.
 - **Client `uuid`s** come back on replays and in `system/status`, but Claude's transcript keeps
   its own IDs; history is replayed from the service's journal, so the IDs agree there.
+- **A code review** (a separate reviewer, before the coordinator's) found that the first build
+  could run unchecked after a failed or cancelled `initialize`, could stay "busy" for ever after a
+  failed write or a message Claude never replays, and could end a prompt with another turn's
+  `result`. The turn state was rebuilt on `uuid`s: a prompt ends only with the result of the turn
+  that replayed it; the input is claimed in the same step as the idle check; `session/cancel`
+  sends `interrupt` with `cancel_queued` behind the prompt's own write and stops a process that
+  gives no result; messages Claude stays silent on are let go after `StallMs`; a dropped live
+  note goes back to the service as `-32601`; a process given up is reset at once, so the next
+  prompt never writes into it; settings change only once Claude took the change; every approval
+  gets an answer. Tests cover the launch off the plan (four ways), a cancel that drops a queued
+  note, and a message Claude never takes.
 
 ## Not verified, open (after the build)
 

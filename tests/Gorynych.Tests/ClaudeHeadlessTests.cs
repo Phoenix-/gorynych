@@ -35,6 +35,7 @@ public sealed class ClaudeHeadlessTests
         StartupTimeoutSeconds = 20,
         InterruptGraceMs = 3000,
         CloseTimeoutMs = 3000,
+        StallMs = 1500,
         Log = log is null ? null : m => { lock (log) log.Add(m); },
     };
 
@@ -292,15 +293,64 @@ public sealed class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task ALaunchWithoutTheLogin_FailsLoudly_AndNamesTheWayBack()
+    [DataRow("signed-out", "--claude-transport tui")]
+    [DataRow("no-account", "--claude-transport tui")]
+    [DataRow("api-key", "remove ANTHROPIC_API_KEY")]
+    [DataRow("api-key-init", "remove ANTHROPIC_API_KEY")]
+    public async Task ALaunchOffThePlan_FailsLoudly_AndRunsNothing(string marker, string hint)
     {
         var dir = TestDirs.New();
-        File.WriteAllText(Path.Combine(dir, "signed-out"), "");
+        File.WriteAllText(Path.Combine(dir, marker), "");
         await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
         await using var client = await TestClient.ConnectAsync(conductor);
         var sessionId = await NewAsync(client, dir);
         var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "hello"));
-        StringAssert.Contains(failed.Message, "--claude-transport tui");
-        Assert.AreEqual("", client.Text(), "no turn ran");
+        StringAssert.Contains(failed.Message, hint);
+        Assert.AreEqual("", client.Text(), "no answer came");
+        // Still off the plan: the next prompt fails the same way instead of running unchecked.
+        StringAssert.Contains((await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "again"))).Message, hint);
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ACancel_DropsAQueuedLiveNote_AndTheServiceAsksInATurnInstead()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, liveNotes: true)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+        await PromptAsync(client, sessionId, "hello");
+
+        var slow = PromptAsync(client, sessionId, "slow, hold the rest");
+        await Until(() => client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call" && (string?)u["title"] is { } t && t.Contains("sleep", StringComparison.Ordinal)));
+        var opinion = client.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject
+        {
+            ["sessionId"] = sessionId, ["sender"] = "peer_kimi", ["text"] = "Tabs?",
+        });
+        await Task.Delay(300); // the request waits in Claude's queue
+        await client.Rpc.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId });
+        Assert.AreEqual(StopReason.Cancelled, (await slow).StopReason);
+        var interrupt = Controls(sessionId).Last(c => (string?)c["subtype"] == "interrupt");
+        Assert.IsTrue((bool?)interrupt["cancel_queued"] == true);
+
+        // Dropped from the live-note path, the request is asked in a turn: the fake answers it in its text.
+        var answer = (string?)(await opinion)?["text"];
+        StringAssert.Contains(answer, "Tabs?");
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "after")).StopReason);
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task AMessageClaudeNeverTakes_IsLetGo_AndTheSessionGoesOn()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+        await PromptAsync(client, sessionId, "hello");
+        var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "swallow this"));
+        StringAssert.Contains(failed.Message, "did not take the prompt");
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "still here")).StopReason);
+        StringAssert.Contains(client.Text(), "echo: still here");
     }
 }

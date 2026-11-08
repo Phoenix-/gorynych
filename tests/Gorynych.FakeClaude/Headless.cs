@@ -4,11 +4,14 @@
 // turn per prompt. A message that arrives during a "slow" turn joins it. Prompts:
 //   "write"     asks can_use_tool for Write;           "pick a color" asks AskUserQuestion;
 //   "peers"     asks for list_agents and ask_agent;     "think"    streams a thought first;
-//   "slow"      runs a Bash call that waits for an interrupt or 1.5 s;
+//   "slow"      runs a Bash call that waits for an interrupt or 1.5 s ("hold": messages that arrive
+//               meanwhile stay queued instead of joining);  "swallow" is taken in silence: no
+//               replay, no turn, as a message Claude drops;
 //   "on your own" is followed by a turn of Claude's own, as when a background task ends.
 // An opinion request (its text names `message_id "…"`) is answered through the reply route the
-// --mcp-config gives the gorynych server, as the peers server would. A folder holding a file
-// `signed-out` gets an account without a login, as `--bare` gives.
+// --mcp-config gives the gorynych server, as the peers server would. Files in the folder change
+// the account: `signed-out` (no login, as `--bare` gives), `no-account`, `api-key` (initialize
+// shows ANTHROPIC_API_KEY) and `api-key-init` (only system/init shows it).
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -87,9 +90,12 @@ static partial class FakeHeadless
         switch ((string?)request["subtype"])
         {
             case "initialize":
-                var account = File.Exists(Path.Combine(cwd, "signed-out"))
+                JsonNode? account = File.Exists(Path.Combine(cwd, "signed-out"))
                     ? new JsonObject { ["tokenSource"] = "none", ["apiProvider"] = "firstParty" }
-                    : new JsonObject { ["email"] = "fake@example.com", ["subscriptionType"] = "Claude Max", ["apiProvider"] = "firstParty" };
+                    : File.Exists(Path.Combine(cwd, "api-key"))
+                        ? new JsonObject { ["tokenSource"] = "claude.ai", ["apiKeySource"] = "ANTHROPIC_API_KEY", ["apiProvider"] = "firstParty" }
+                        : new JsonObject { ["email"] = "fake@example.com", ["subscriptionType"] = "Claude Max", ["apiProvider"] = "firstParty" };
+                if (File.Exists(Path.Combine(cwd, "no-account"))) account = null;
                 await RespondAsync(id, new JsonObject
                 {
                     ["commands"] = new JsonArray(),
@@ -119,9 +125,16 @@ static partial class FakeHeadless
                 await RespondAsync(id, []);
                 break;
             case "interrupt":
+            {
+                // cancel_queued drops what waits in the queue and lists it.
+                var cancelled = new JsonArray();
+                if ((bool?)request["cancel_queued"] == true)
+                    while (Inbox.Reader.TryRead(out var queued))
+                        cancelled.Add((JsonNode?)(string?)queued["uuid"]);
                 interrupted.TrySetResult();
-                await RespondAsync(id, new JsonObject { ["still_queued"] = new JsonArray() });
+                await RespondAsync(id, new JsonObject { ["still_queued"] = new JsonArray(), ["cancelled"] = cancelled });
                 break;
+            }
             default:
                 await WriteAsync(new JsonObject
                 {
@@ -135,9 +148,11 @@ static partial class FakeHeadless
     static async Task TurnAsync(JsonObject first, string sessionId, HttpClient http, string? replyUrl)
     {
         interrupted = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        await ReplayAsync(first, sessionId);
-        await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "init", ["session_id"] = sessionId, ["model"] = model, ["permissionMode"] = mode, ["apiKeySource"] = "none" });
         var prompt = Text(first);
+        if (prompt.Contains("swallow", StringComparison.OrdinalIgnoreCase)) return;
+        var apiKey = File.Exists(Path.Combine(Environment.CurrentDirectory, "api-key-init")) ? "ANTHROPIC_API_KEY" : "none";
+        await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "init", ["session_id"] = sessionId, ["model"] = model, ["permissionMode"] = mode, ["apiKeySource"] = apiKey });
+        await ReplayAsync(first, sessionId);
         string answer;
         var aborted = false;
         var joined = new List<string>();
@@ -187,7 +202,10 @@ static partial class FakeHeadless
             var wait = Task.Delay(1500);
             while (true)
             {
-                var done = await Task.WhenAny(interrupted.Task, wait, Inbox.Reader.WaitToReadAsync().AsTask());
+                var hold = prompt.Contains("hold", StringComparison.OrdinalIgnoreCase);
+                var done = hold
+                    ? await Task.WhenAny(interrupted.Task, wait)
+                    : await Task.WhenAny(interrupted.Task, wait, Inbox.Reader.WaitToReadAsync().AsTask());
                 if (done == interrupted.Task) { aborted = true; break; }
                 if (done == wait) break;
                 while (Inbox.Reader.TryRead(out var more))

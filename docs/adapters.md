@@ -103,15 +103,24 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 
 #### Prompts and turns
 
-- `session/prompt` waits while a turn runs, then writes one `user` message stamped with a fresh
-  `uuid`; the next `result` ends the turn. Text blocks go as text, `image` blocks as
-  Anthropic image blocks (`promptCapabilities.image`), resource links as `@<uri>`.
+- `session/prompt` waits until no turn runs and nothing written waits, then writes one `user`
+  message stamped with a fresh `uuid`. Text blocks go as text, `image` blocks as Anthropic image
+  blocks (`promptCapabilities.image`), resource links as `@<uri>`.
+- A turn starts with the replay of the first message it takes, or with output Claude produces
+  on its own, and ends with its `result`. The client's prompt ends with the `result` of the turn
+  that replayed its `uuid`, never with another's (a turn Claude began itself, say, whose result
+  was already on its way).
 - `result` → `stopReason`: `success` → `end_turn`, `stop_reason: max_tokens` → `max_tokens`,
   `refusal` → `refusal`, `error_max_turns` → `max_turn_requests`, any result after
   `session/cancel` → `cancelled`. Another error adds a note (`[Claude stopped with an error: …]`)
   and ends the turn.
-- `session/cancel` sends the `interrupt` control request (queued live notes survive it); the
-  turn ends with its `result`, or as `cancelled` 5 s later without one.
+- `session/cancel` sends `interrupt` with `cancel_queued`, after the prompt's own write (one
+  gate orders them), so a prompt Claude has not started yet is dropped too. The turn ends with
+  its `result`; without one within 5 s it ends as `cancelled` and Claude's process is stopped, so
+  the next prompt resumes the conversation in a new one. Live notes the interrupt cancelled go
+  back to the service ([below](#live-notes-opinions-and-reports-on-stdin)).
+- Messages that wait with no turn running while Claude stays silent for 30 s are let go: a
+  prompt among them fails ("Claude did not take the prompt"), so nothing waits for ever.
 - Claude exiting during a turn fails the prompt with the exit code and the end of stderr; the
   next prompt starts a new process with `--resume`.
 
@@ -165,7 +174,9 @@ idle. No development channel, consent question or notice is involved.
 - The note's `uuid` finds its `_meta` when Claude replays it; the `user_message_chunk` carries
   it with `gorynych/origin: "live"` and, for an opinion, `gorynych/opinion`.
 - While Claude's process is not running the adapter answers `-32600`, so the service asks in a
-  turn that starts Claude.
+  turn that starts Claude. An opinion request Claude does not take after all (cancelled with the
+  client's turn, or lost with the process) is answered `-32601`, and the service asks it in a turn
+  instead.
 - `--append-system-prompt` starts with the adapter's authorization for this path: messages
   whose first line starts with `[Opinion request` or `[Report` come from the user's other agents
   through Gorynych; opinions are answered with `reply` and no other action, reports need none.
@@ -204,14 +215,17 @@ deny fails the prompt.
 
 #### Failing loudly
 
-The transport never runs on silently when Claude is not on the person's plan:
+The transport never runs on silently when Claude is not on the person's plan. The check fails
+closed: a launch whose `initialize` fails, times out or is cancelled is stopped, as is one whose
+answer has no `account`.
 
 - `initialize` shows no login (no plan, `tokenSource: "none"`), which is what `--bare` looks
   like: Claude is stopped and the prompt fails, telling the person to sign in or to start the
   service with `--claude-transport tui` (the headless docs say `--bare` will become the default
   for `-p`; it reads no OAuth login).
-- `initialize` shows an API key (`apiKeySource`, which wins over the login in `-p`): Claude is
-  stopped and the prompt fails, naming the variable to remove.
+- `initialize` shows an API key (`apiKeySource`, which wins over the login in `-p`), or a turn's
+  `system/init` does: Claude is stopped before it calls the API, and the prompt fails, naming the
+  variable to remove.
 - An assistant error `authentication_failed`, `billing_error`, `account_on_hold`,
   `oauth_org_not_allowed` or `verification_required` fails the client's prompt and leaves a
   note in the feed, both naming `--claude-transport tui`.
