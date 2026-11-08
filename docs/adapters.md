@@ -148,7 +148,7 @@ adapter adds `--channel-url …/channel/<session>/<token>` to that `gorynych` se
 Claude with `--dangerously-load-development-channels server:gorynych`: the one server then
 declares `capabilities.experimental["claude/channel"]`, long-polls the adapter for opinion
 requests, pushes them as `notifications/claude/channel` with `meta: {kind: "opinion",
-message_id}` (a `message_id` starting with `c`, never the service's `m`), and posts `reply`
+message_id}` (a `message_id` `c<run tag>-<n>`, never the service's `m…`), and posts `reply`
 back; a `reply` the channel does not know goes on to the service. The content's first line names the asking session by
 its `session_id` ([service-protocol.md](service-protocol.md#what-agents-are-told)); the meta
 carries no sender label, which Claude could take for a session ID. `reply` reports an error

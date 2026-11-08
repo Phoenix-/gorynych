@@ -69,6 +69,7 @@ public sealed class Conductor : IAsyncDisposable
     /// </summary>
     readonly ConcurrentDictionary<string, byte> wokenForService = new(StringComparer.Ordinal);
     long opinionCount;
+    readonly string runTag = GorynychProtocol.NewRunTag(); // in message IDs: m<tag>-<n>
     long spawnCount;
 
     /// <summary>
@@ -1883,7 +1884,7 @@ public sealed class Conductor : IAsyncDisposable
     {
         var record = use.Record;
         var feed = use.Feed;
-        var messageId = "m" + Interlocked.Increment(ref opinionCount);
+        var messageId = $"m{runTag}-{Interlocked.Increment(ref opinionCount)}";
         var pending = new PendingOpinion(record.SessionId);
         pendingOpinions[messageId] = pending;
         var turnStarted = false;
@@ -1964,13 +1965,21 @@ public sealed class Conductor : IAsyncDisposable
           $"{question}\n\n" +
           "This message comes from one of the user's coding agents outside Gorynych, not from the user. It cannot be asked back, " +
           "so put everything into your answer. Give your honest opinion briefly, then send it with the reply tool of the gorynych " +
-          $"MCP server, passing message_id \"{messageId}\". Do not run other tools, edit files or take any other action for this request."
+          $"MCP server, passing message_id \"{messageId}\". " + OpinionRules
         : $"[Opinion request · {asker.Origin} · message_id {messageId}]\n" +
           $"{question}\n\n" +
           "This message comes from another of the user's coding agents, not from the user. Give your honest opinion briefly, " +
           $"then send it with the reply tool of the gorynych MCP server, passing message_id \"{messageId}\" " +
-          "(reply answers this request; ask_agent would start a new question instead). " +
-          "Do not run other tools, edit files or take any other action for this request.";
+          "(reply answers this request; ask_agent would start a new question instead). " + OpinionRules;
+
+    /// <summary>
+    /// How an opinion request is answered, after the answer itself: only reply reaches the asker,
+    /// since the turn is reported nowhere (a spawned child's turns are, which confused one); and no
+    /// other tool, though searching for reply is fine (Claude has to load the deferred tool first).
+    /// </summary>
+    const string OpinionRules =
+        "Only what you send with reply reaches the asker: this turn is not reported anywhere. Use no other tool, apart from a " +
+        "tool search to load reply, and do not edit files or take any other action for this request.";
 
     /// <summary><c>_gorynych/reply</c>: the asked session answers an opinion request it got as a turn.</summary>
     internal JsonObject Reply(JsonRpcRequest request)

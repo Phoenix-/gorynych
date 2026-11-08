@@ -162,7 +162,7 @@ How a request reaches the asked agent depends on what it has:
 - **Claude** has a channel. The Claude adapter adds `--channel-url` to the same `gorynych`
   server in its `--mcp-config`, so one server is both its peer tools and its development
   channel: while its Claude process runs, the request arrives as a channel message
-  (`meta.kind: "opinion"` and its `message_id`, which starts with `c`), and `reply` goes back
+  (`meta.kind: "opinion"` and its `message_id`, `c<tag>-<n>` with the adapter's own run tag), and `reply` goes back
   through the channel. While the process is not running, the adapter refuses (`-32600`) and the
   request becomes a turn as for Kimi, which starts Claude.
 - **Kimi** (any agent without a channel) gets the request as an ordinary `session/prompt`
@@ -196,14 +196,22 @@ never in the text. The journal keeps the text exactly as the agent got it.
 - An opinion request delivered as a turn:
 
   ```
-  [Opinion request · from session_id <id> (<agent>, "<title>") · message_id m3]
+  [Opinion request · from session_id <id> (<agent>, "<title>") · message_id mk7q2-3]
   <the question>
 
   This message comes from another of the user's coding agents, not from the user. Give your
   honest opinion briefly, then send it with the reply tool of the gorynych MCP server, passing
-  message_id "m3" (reply answers this request; ask_agent would start a new question instead).
-  Do not run other tools, edit files or take any other action for this request.
+  message_id "mk7q2-3" (reply answers this request; ask_agent would start a new question
+  instead). Only what you send with reply reaches the asker: this turn is not reported
+  anywhere. Use no other tool, apart from a tool search to load reply, and do not edit files or
+  take any other action for this request.
   ```
+
+  The `message_id` is `m`, a random tag of the service's run, `-` and a count:
+  `m<tag>-<n>`. The count starts again when the service does, and the tag keeps a late reply to
+  a request of an earlier run from answering a new one. The last two sentences came from a live
+  test: Kimi wondered whether its final message went to the asker, as a spawned child's does,
+  and Claude has to search for the deferred `reply` tool before it can call it.
 
   Through Claude's channel the content is the first line without the `message_id` (the
   channel message carries it in `meta`) and the question; Claude's appended system prompt
@@ -238,7 +246,7 @@ Errors from the peer tools say how to recover. The peers server returns them to 
 | --- | --- |
 | `ask_agent` with an unknown or deleted `session_id` (`-32002`) | `No session "<x>". Pass an exact session_id from list_agents.` and the first five sessions it can ask, one per line as `- session_id <id> (<agent>, "<title>")`, or `There is no other session to ask now.` |
 | `ask_agent` with its own ID (`-32602`) | `"<x>" is this session's own session_id; ask_agent asks another session.` and the same list |
-| `ask_agent` while answering a request as a turn (`-32600`) | `This session is answering opinion request m3, so it cannot ask another session during this turn. Send your answer with the reply tool, passing message_id "m3"; if another opinion would help, say so in the answer.` |
+| `ask_agent` while answering a request as a turn (`-32600`) | `This session is answering opinion request mk7q2-3, so it cannot ask another session during this turn. Send your answer with the reply tool, passing message_id "mk7q2-3"; if another opinion would help, say so in the answer.` |
 | `ask_agent` to a session that could not be loaded or started, or whose turn failed right after the service started it (the error's own code) | `session_id <id> (<agent>, "<title>") could not be started to answer: <reason>. Ask another session from list_agents, or ask the user to open that session and check it.` A session that is merely not loaded or not running is started instead ([above](#opinions-between-agents)) |
 | `reply` with a `message_id` nothing waits for (the tool's own error) | `No open request with message_id "<x>" for this session; it may have been answered already or withdrawn. reply only answers a request you received, by the message_id in its header. To ask a session something, use ask_agent with its session_id.` |
 | `spawn_session` with an unknown agent (`-32602`) | `No agent "<x>". Pass one of: claude, kimi.` |
@@ -588,8 +596,8 @@ What the service returns for `tools/list`, outside Gorynych.
 > Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare
 > UUID, Kimi's start with session_. status open means the agent has the session loaded now; a
 > saved one is started when asked, so it answers more slowly, and read_session reads it without
-> starting it. Archived sessions are left out unless include_archived is true, and the result
-> says how many.
+> starting it. Archived sessions are left out unless include_archived is true; when some are
+> left out, the result's last line says how many.
 
 - `include_archived`: `also list archived sessions, marked archived: true; default false`.
 - Result: the entries of `_gorynych/peers`, rendered as `list_agents` renders them, with all
@@ -660,13 +668,15 @@ inside Gorynych. Gorynych itself never writes those settings.
 An opinion request from outside, delivered as a turn:
 
 ```
-[Opinion request · from an agent outside Gorynych (Claude Code, D:\work\project) · message_id m3]
+[Opinion request · from an agent outside Gorynych (Claude Code, D:\work\project) · message_id mk7q2-3]
 <the question>
 
 This message comes from one of the user's coding agents outside Gorynych, not from the user.
 It cannot be asked back, so put everything into your answer. Give your honest opinion
-briefly, then send it with the reply tool of the gorynych MCP server, passing message_id "m3".
-Do not run other tools, edit files or take any other action for this request.
+briefly, then send it with the reply tool of the gorynych MCP server, passing message_id
+"mk7q2-3". Only what you send with reply reaches the asker: this turn is not reported anywhere.
+Use no other tool, apart from a tool search to load reply, and do not edit files or take any
+other action for this request.
 ```
 
 - The parenthesis is the host's `client.title` (else `client.name`) and its `folder`. A host
@@ -714,12 +724,18 @@ GUI can use it too.
     text block, each keeping its `messageId` and `_meta`; a block that is not text becomes
     `@<uri>` for a resource or `[<type>]`;
   - `tool_call`, with the `status`, `title` and `kind` of its last `tool_call_update` folded
-    in, and its `content`, locations and raw input and output dropped;
+    in, and its `content`, locations and raw output dropped. Its raw input is dropped too,
+    except for the `gorynych` server's `ask_agent`, `reply`, `spawn_session`,
+    `archive_session` and `restore_session`, whose input says what the session asked, answered,
+    started or archived: kept, each text cut at 300 characters with `…`;
   - `agent_thought_chunk` only with `thoughts: true`.
 
   Plans, usage, `session_info_update` and the other kinds are left out.
 - Paging counts messages (user and agent messages). Each message brings the tool calls and
-  thoughts that follow it, up to the next message.
+  thoughts that follow it, up to the next message, except that an agent message takes those
+  between it and the user message before it: they are its turn's, and Claude's hooks report a
+  tool call before the text that announces it. So a page never splits a turn's first tool
+  calls from its message.
   - `limit`: default 10, clamped to 1–50.
   - `cursor`: return only messages older than this one.
   - `nextCursor`: set when older messages exist. It is opaque to callers, like ACP's
@@ -759,23 +775,47 @@ session_id <id> (<agent>, "<title>") · status saved · messages 31–40 of 40, 
    · tool: <title> · completed
    · tool: <title> · failed
 ── user · opinion request
-[Opinion request · from session_id … · message_id m2]
+[Opinion request · from session_id … · message_id mk7q2-2]
 …
 ── agent
+   · tool: reply (gorynych) · completed · message_id mk7q2-2: <the answer, cut at 300 characters>
 <text>
 (turn in progress)
 Older messages: call read_session with session_id "<id>" and before "<cursor>".
 ```
 
+A turn of Claude's that a report started, as `read_session` shows it (its hooks report the tool
+call first):
+
+```
+── user · report
+[Report · from session_id <child> (kimi, "<title>") · your child session · its turn ended]
+<the child's final message>
+── agent
+   · tool: ask_agent (gorynych) · completed · session_id <child>: <the question>
+Checking with that session as well.
+```
+
 - **Labels.** `── user` is a prompt the person typed (in a client or in Claude's terminal). A
   message the service put there names its origin: `── user · opinion request`, `· report`,
-  `· spawned task` or `· from outside`. Its own text carries the header with the sending
+  `· spawned task` or `· opinion request · from outside`. Its own text carries the header with the sending
   session's ID. The label comes from the message's `_meta`: `gorynych/outside`,
   `gorynych/opinion`, `gorynych/origin`. A message through Claude's channel carries its
   request's keys as one in a turn does, and a report is the channel's only other message; only
   a channel message journaled before it carried them is told by the `kind` in its channel tag,
-  the first line. `── agent thinking`
-  appears only with `thoughts`. A tool call without a status reads `pending`.
+  the first line. A message through the channel is shown without that tag
+  (`<channel source="gorynych" …>` … `</channel>`), which says how it travelled.
+- **The agent's turn.** Tool calls and thoughts are the agent's: a tool call right after a user
+  message opens a `── agent` block, which the agent's text then continues without a second
+  header (Claude's order); a thought opens `── agent thinking`, which appears only with
+  `thoughts` (Kimi's order: thinking, tool calls, then `── agent` and its text). With `thoughts`
+  and none on the page (Claude records none), the header ends with `· no thoughts recorded`.
+- **Tool lines.** `   · tool: <tool> (<server>) · <status>`: an MCP name `mcp__<server>__<tool>`
+  (Kimi's titles) reads as Claude's titles do; a tool call without a status reads `pending`.
+  A `gorynych` tool adds what it said, on one line: `ask_agent` `· session_id <id>: <question>`,
+  `reply` `· message_id <id>: <answer>`, `spawn_session` `· <agent>: <task>`,
+  `archive_session` and `restore_session` `· session_id <id>`. Without input (Kimi may give
+  none) the line ends at the status.
 - **Budget.** At most `limit` messages and about 20,000 characters, filled from the newest
   backwards. A message that does not fit in what is left is cut in the middle with
   `[… <n> characters cut …]` and is the oldest shown, unless less than 500 characters are left

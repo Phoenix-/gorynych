@@ -281,12 +281,13 @@ public sealed class OutsideTests
             "── user · opinion request\n[Opinion request · from session_id k1 (kimi)]\nTabs?\n" +
             "── user · report\n[Report · from session_id c1 (claude)]\nok\n" +
             "── user · spawned task\nDo the task\n" +
-            "── user · from outside\n[Opinion request · from an agent outside Gorynych (Claude Code, D:\\x)]\nWhy?\n" +
-            "── user · report\n<channel source=\"gorynych\" kind=\"report\">\n[Report · from session_id c1 (claude)]\nok\n</channel>\n" +
-            "── user · opinion request\n<channel source=\"gorynych\" kind=\"opinion\" message_id=\"c1\">\n[Opinion request · from session_id k1 (kimi)]\nWhy?\n</channel>\n" +
-            "── user · opinion request\n<channel source=\"gorynych\" kind=\"opinion\" message_id=\"c2\">\n[Opinion request · from session_id k1 (kimi)]\nIs kind=\"report\" an attribute?\n</channel>\n" +
-            "── user · from outside\n<channel source=\"gorynych\" kind=\"opinion\" message_id=\"c3\">\n[Opinion request · from an agent outside Gorynych (Claude Code, D:\\x)]\nWhy?\n</channel>\n" +
-            "── user · report\n<channel source=\"gorynych\" kind=\"report\">\n[Report · from session_id c1 (claude)]\nIt said: from an agent outside Gorynych\n</channel>\n" +
+            "── user · opinion request · from outside\n[Opinion request · from an agent outside Gorynych (Claude Code, D:\\x)]\nWhy?\n" +
+            // Through Claude's channel: without the channel tag, which is how it travelled.
+            "── user · report\n[Report · from session_id c1 (claude)]\nok\n" +
+            "── user · opinion request\n[Opinion request · from session_id k1 (kimi)]\nWhy?\n" +
+            "── user · opinion request\n[Opinion request · from session_id k1 (kimi)]\nIs kind=\"report\" an attribute?\n" +
+            "── user · opinion request · from outside\n[Opinion request · from an agent outside Gorynych (Claude Code, D:\\x)]\nWhy?\n" +
+            "── user · report\n[Report · from session_id c1 (claude)]\nIt said: from an agent outside Gorynych\n" +
             "── agent\nDone.\n" +
             "(turn in progress)", text);
 
@@ -294,6 +295,66 @@ public sealed class OutsideTests
         StringAssert.EndsWith(older, "\nOlder messages: call read_session with session_id \"s1\" and before \"a2\".");
         Assert.AreEqual("session_id s1 (kimi, \"Fix the 'flaky' test\") · status open\nGorynych has no history for this session yet.",
             OutsideService.ReadSessionText(new Conductor.SessionRead(record, true, SessionReader.Read([], null, 10, false), false, false), newest: true));
+    }
+
+    [TestMethod]
+    public void ReadSession_PutsATurnsToolCallsInTheAgentsBlock_InClaudesOrderAndKimis()
+    {
+        static JsonNode Tool(string id, string title, JsonObject? input = null) => new JsonObject
+        {
+            ["sessionUpdate"] = "tool_call", ["toolCallId"] = id, ["title"] = title, ["status"] = "completed", ["rawInput"] = input,
+        };
+        var record = new SessionRecord { SessionId = "s1", Agent = "claude", Title = "Notes" };
+        string Render(List<JsonNode> journal, int limit, bool thoughts = false, string? cursor = null) =>
+            OutsideService.ReadSessionText(new Conductor.SessionRead(record, true, SessionReader.Read(journal, cursor, limit, thoughts), false, false),
+                newest: cursor is null, thoughts);
+
+        // Claude: its hooks report a tool call before the text that announces it.
+        var claude = new List<JsonNode>
+        {
+            User("<channel source=\"gorynych\" kind=\"report\">\n[Report · from session_id k2 (kimi)]\nok\n</channel>", "u1",
+                new JsonObject { [GorynychProtocol.MetaOrigin] = "channel", [GorynychProtocol.MetaSender] = "child_kimi" }),
+            Tool("t1", "ask_agent (gorynych)", new JsonObject { ["session_id"] = "k2", ["question"] = "Did the test\npass?" }),
+            Agent("Checking ask_agent as well.", "a1"),
+            User("Thanks", "u2"),
+            Agent("Done.", "a2"),
+        };
+        Assert.AreEqual(
+            "session_id s1 (claude, \"Notes\") · status open · messages 1–4 of 4, oldest first · no thoughts recorded\n" +
+            "── user · report\n[Report · from session_id k2 (kimi)]\nok\n" +
+            "── agent\n" +
+            "   · tool: ask_agent (gorynych) · completed · session_id k2: Did the test pass?\n" +
+            "Checking ask_agent as well.\n" +
+            "── user\nThanks\n" +
+            "── agent\nDone.", Render(claude, 10, thoughts: true));
+        var newest = Render(claude, 3);
+        StringAssert.Contains(newest, "messages 2–4 of 4");
+        StringAssert.StartsWith(newest[newest.IndexOf('\n')..], "\n── agent\n   · tool: ask_agent (gorynych)", "the tool call stays with its turn's message");
+        Assert.IsFalse(Render(claude, 10, cursor: "a1").Contains("tool:", StringComparison.Ordinal), "and is not on the older page");
+
+        // Kimi: thinking, a tool call, then the answer; its tool titles are MCP names.
+        var kimi = new List<JsonNode>
+        {
+            User("Fix it", "u1"),
+            Chunk("agent_thought_chunk", "Let me look.", "th1"),
+            Tool("t1", "mcp__gorynych__reply", new JsonObject { ["message_id"] = "mab12-3", ["text"] = new string('y', 400) }),
+            Tool("t2", "mcp__gorynych__spawn_session", new JsonObject { ["agent"] = "claude", ["prompt"] = "Write the notes" }),
+            Tool("t3", "mcp__gorynych__archive_session", new JsonObject { ["session_id"] = "c9" }),
+            Tool("t4", "Shell", new JsonObject { ["command"] = "dotnet test" }),
+            Agent("Fixed.", "a1"),
+        };
+        var withThoughts = Render(kimi, 10, thoughts: true);
+        StringAssert.Contains(withThoughts, "── user\nFix it\n── agent thinking\nLet me look.\n   · tool: reply (gorynych) · completed · message_id mab12-3: " +
+            new string('y', 300) + "…\n   · tool: spawn_session (gorynych) · completed · claude: Write the notes\n" +
+            "   · tool: archive_session (gorynych) · completed · session_id c9\n   · tool: Shell · completed\n── agent\nFixed.");
+        Assert.IsFalse(withThoughts.Contains("no thoughts recorded", StringComparison.Ordinal));
+        StringAssert.Contains(Render(kimi, 10), "── user\nFix it\n── agent\n   · tool: reply (gorynych)");
+        var read = SessionReader.Read(kimi, null, 10, false);
+        Assert.IsNull(read.Updates.Single(u => (string?)u["title"] == "Shell")["rawInput"], "only the gorynych tools' input is kept");
+        Assert.AreEqual(301, ((string)read.Updates.Single(u => (string?)u["title"] == "mcp__gorynych__reply")["rawInput"]!["text"]!).Length);
+        Assert.AreEqual(("reply", "gorynych"), SessionReader.ToolName("mcp__gorynych__reply"));
+        Assert.AreEqual(("list_sessions", "gorynych-outside"), SessionReader.ToolName("mcp__gorynych-outside__list_sessions"));
+        Assert.AreEqual(("Read x.cs", (string?)null), SessionReader.ToolName("Read x.cs"));
     }
 
     [TestMethod]
@@ -392,11 +453,13 @@ public sealed class OutsideTests
 
         var (answer, isError) = ToolText(await McpAsync(zed, "tools/call", Call("ask_agent", new JsonObject { ["session_id"] = target, ["question"] = "Tabs or spaces?" })));
         Assert.AreEqual(("ok", false), (answer, isError));
+        var id = System.Text.RegularExpressions.Regex.Match(kimi.Prompts.Last().Text, "message_id (m[a-z0-9]{4}-1)]").Groups[1].Value;
         Assert.AreEqual(
-            $"[Opinion request · from an agent outside Gorynych (Probe Host, {Folder}) · message_id m1]\nTabs or spaces?\n\n" +
+            $"[Opinion request · from an agent outside Gorynych (Probe Host, {Folder}) · message_id {id}]\nTabs or spaces?\n\n" +
             "This message comes from one of the user's coding agents outside Gorynych, not from the user. It cannot be asked back, " +
             "so put everything into your answer. Give your honest opinion briefly, then send it with the reply tool of the gorynych MCP " +
-            "server, passing message_id \"m1\". Do not run other tools, edit files or take any other action for this request.",
+            $"server, passing message_id \"{id}\". Only what you send with reply reaches the asker: this turn is not reported anywhere. " +
+            "Use no other tool, apart from a tool search to load reply, and do not edit files or take any other action for this request.",
             kimi.Prompts.Last().Text);
 
         await using var other = await TestClient.ConnectAsync(conductor, "other");
@@ -409,7 +472,15 @@ public sealed class OutsideTests
         Assert.IsNull(meta[GorynychProtocol.MetaFromSessionId]);
 
         var (read, _) = ToolText(await McpAsync(zed, "tools/call", Call("read_session", new JsonObject { ["session_id"] = target })));
-        StringAssert.StartsWith(read, $"session_id {target} (kimi, \"Fix the flaky test\") · status open · messages 1–4 of 4, oldest first\n── user\nFix the flaky test\n── agent\nok\n── user · from outside\n");
+        StringAssert.StartsWith(read, $"session_id {target} (kimi, \"Fix the flaky test\") · status open · messages 1–4 of 4, oldest first\n── user\nFix the flaky test\n── agent\nok\n── user · opinion request · from outside\n");
+
+        // Another run of the service counts from 1 too, under another tag.
+        await using var restarted = Conductor(kimi.Adapter);
+        await using var later = await TestClient.ConnectAsync(restarted, "later");
+        ToolText(await McpAsync(later, "tools/call", Call("ask_agent", new JsonObject { ["session_id"] = target, ["question"] = "And now?" })));
+        var again = System.Text.RegularExpressions.Regex.Match(kimi.Prompts.Last().Text, "message_id (m[a-z0-9]{4}-1)]").Groups[1].Value;
+        Assert.AreNotEqual("", again);
+        Assert.AreNotEqual(id, again, "a late reply to the first request cannot answer this one");
 
         var (unknown, unknownIsError) = ToolText(await McpAsync(zed, "tools/call", Call("ask_agent", new JsonObject { ["session_id"] = "peer_kimi", ["question"] = "?" })));
         Assert.IsTrue(unknownIsError);

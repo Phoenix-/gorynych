@@ -166,7 +166,7 @@ public sealed class PeersTests
             "status \"saved\": it is saved but not loaded; asking it starts it, so it answers more slowly, and it is closed again after it answers.");
         StringAssert.Contains(Description("list_agents"), "status has nothing to do with archived.");
         Assert.IsFalse(Description("list_agents").Contains("Claude session can", StringComparison.Ordinal), "every agent is started the same way now");
-        StringAssert.Contains(Description("list_agents"), "Archived sessions are left out unless include_archived is true, and the result says how many");
+        StringAssert.Contains(Description("list_agents"), "Archived sessions are left out unless include_archived is true; when some are left out, the result's last line says how many.");
         Assert.AreEqual("boolean", (string?)tools["list_agents"]["inputSchema"]!["properties"]!["include_archived"]!["type"]);
         StringAssert.Contains(Description("archive_session"), "this one included");
         StringAssert.Contains(Description("archive_session"), "Archiving is not deleting: the session keeps all its history, ask_agent still reaches it");

@@ -71,7 +71,7 @@ public sealed partial class OpinionTurnTests
 
     static string MessageId(string text) => MessageIdPattern().Match(text).Groups[1].Value;
 
-    [GeneratedRegex(@"message_id (m\d+)\]")]
+    [GeneratedRegex(@"message_id (m[a-z0-9]{4}-\d+)\]")]
     private static partial Regex MessageIdPattern();
 
     static Task<JsonNode?> Ask(TestClient client, string token, string target, string question) =>
@@ -109,7 +109,11 @@ public sealed partial class OpinionTurnTests
         Assert.AreEqual("Spaces.", (string?)reply!["text"]);
 
         var prompt = kimi.Prompts.Single();
-        StringAssert.StartsWith(prompt, "[Opinion request · from session_id asking (claude) · message_id m1]");
+        var messageId = MessageId(prompt);
+        StringAssert.Matches(messageId, new Regex("^m[a-z0-9]{4}-1$"), "the run's tag, then the count");
+        StringAssert.StartsWith(prompt, $"[Opinion request · from session_id asking (claude) · message_id {messageId}]");
+        StringAssert.Contains(prompt, "Only what you send with reply reaches the asker: this turn is not reported anywhere. Use no other tool, " +
+            "apart from a tool search to load reply, and do not edit files or take any other action for this request.");
         Assert.IsFalse(prompt.Contains("peer_claude", StringComparison.Ordinal), "no label that looks like a session ID");
         StringAssert.Contains(prompt, "Tabs or spaces for C#?");
         StringAssert.Contains(prompt, "reply tool of the gorynych MCP server");
@@ -121,10 +125,10 @@ public sealed partial class OpinionTurnTests
         var asked = client.Snapshot().Single(u => (string?)u["sessionUpdate"] == "user_message_chunk");
         Assert.AreEqual("peer", (string?)asked["_meta"]!["gorynych/origin"]);
         Assert.AreEqual("peer_claude", (string?)asked["_meta"]!["gorynych/sender"]);
-        Assert.AreEqual("m1", (string?)asked["_meta"]!["gorynych/opinion"]);
+        Assert.AreEqual(messageId, (string?)asked["_meta"]!["gorynych/opinion"]);
         Assert.IsFalse(string.IsNullOrEmpty((string?)asked["messageId"]), "the service names the message it writes");
         var answer = client.Snapshot().Single(u => (string?)u["sessionUpdate"] == "agent_message_chunk");
-        Assert.AreEqual("m1", (string?)answer["_meta"]!["gorynych/opinion"]);
+        Assert.AreEqual(messageId, (string?)answer["_meta"]!["gorynych/opinion"]);
     }
 
     [TestMethod]
@@ -262,7 +266,8 @@ public sealed partial class OpinionTurnTests
         await Ask(client, asker.Token!, "kimi-1", "Tabs or spaces?");
         var e = await refused.Task.WaitAsync(Wait);
         Assert.AreEqual(JsonRpcException.InvalidRequest, e.Code);
-        Assert.AreEqual("This session is answering opinion request m1, so it cannot ask another session during this turn. " +
-            "Send your answer with the reply tool, passing message_id \"m1\"; if another opinion would help, say so in the answer.", e.Message);
+        var id = MessageId(kimi.Prompts.Single());
+        Assert.AreEqual($"This session is answering opinion request {id}, so it cannot ask another session during this turn. " +
+            $"Send your answer with the reply tool, passing message_id \"{id}\"; if another opinion would help, say so in the answer.", e.Message);
     }
 }

@@ -158,9 +158,9 @@ answers still come from the new service. Its log is
 
 ### Registering the server
 
-- **Claude Code.** *Unverified:* that the Code tab of Claude Desktop reads the same user
-  configuration. It will be checked when the coordinator session, a Claude Desktop session,
-  registers the server first.
+- **Claude Code.** Checked on 8 November 2026: the Code tab of Claude Desktop reads the same
+  user configuration. For its first seconds the server shows as still connecting, and
+  ToolSearch waits for it.
   ```
   claude mcp add --scope user gorynych-outside -- "C:\Users\<you>\AppData\Local\Programs\Gorynych\outside\Gorynych.Outside.exe"
   ```

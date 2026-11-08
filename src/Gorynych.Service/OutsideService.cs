@@ -131,11 +131,12 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
             var reason = e.Message.TrimEnd().TrimEnd('.');
             throw new JsonRpcException(JsonRpcException.InternalError, $"Could not read {Conductor.Who(e.Record)}: {reason}.");
         }
-        return ReadSessionText(read, newest: before is null);
+        return ReadSessionText(read, newest: before is null, thoughts);
     }
 
     /// <summary>How <c>read_session</c> shows a page to an agent.</summary>
-    internal static string ReadSessionText(Conductor.SessionRead read, bool newest)
+    /// <param name="thoughts">The agent's thinking was asked for: the header says when none was recorded (Claude's never is).</param>
+    internal static string ReadSessionText(Conductor.SessionRead read, bool newest, bool thoughts = false)
     {
         var page = read.Page;
         var text = new StringBuilder(Conductor.Who(read.Record)).Append(" · status ").Append(read.Live ? "open" : "saved");
@@ -143,23 +144,38 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
             return text.Append("\nGorynych has no history for this session yet.").ToString();
         if (page.Count == 1) text.Append($" · message {page.First} of {page.Total}");
         else if (page.Count > 1) text.Append($" · messages {page.First}–{page.First + page.Count - 1} of {page.Total}, oldest first");
+        if (thoughts && !page.Updates.Any(u => (string?)u["sessionUpdate"] == "agent_thought_chunk")) text.Append(" · no thoughts recorded");
         if (read.Trimmed) text.Append("\n(Older history was trimmed from Gorynych's journal.)");
+        // Tool calls and thoughts are the agent's turn: a tool call right after a user message opens
+        // the agent's block, which the agent's text then continues.
+        var block = Block.None;
         foreach (var u in page.Updates)
         {
             var body = (string?)u["content"]?["text"] ?? "";
             switch ((string?)u["sessionUpdate"])
             {
                 case "user_message_chunk":
-                    text.Append("\n── user").Append(Label(u["_meta"] as JsonObject, body)).Append('\n').Append(body.TrimEnd());
+                    var meta = u["_meta"] as JsonObject;
+                    text.Append("\n── user").Append(Label(meta, body)).Append('\n').Append(Unwrapped(meta, body).TrimEnd());
+                    block = Block.User;
                     break;
                 case "agent_message_chunk":
-                    text.Append("\n── agent\n").Append(body.TrimEnd());
+                    text.Append(block == Block.AgentTools ? "\n" : "\n── agent\n").Append(body.TrimEnd());
+                    block = Block.Agent;
                     break;
                 case "agent_thought_chunk":
                     text.Append("\n── agent thinking\n").Append(body.TrimEnd());
+                    block = Block.Thinking;
                     break;
                 case "tool_call":
-                    text.Append("\n   · tool: ").Append((string?)u["title"] ?? "tool").Append(" · ").Append((string?)u["status"] ?? "pending");
+                    if (block is Block.None or Block.User)
+                    {
+                        text.Append("\n── agent");
+                        block = Block.AgentTools;
+                    }
+                    var (tool, server) = SessionReader.ToolName((string?)u["title"]);
+                    text.Append("\n   · tool: ").Append(server is null ? tool : $"{tool} ({server})")
+                        .Append(" · ").Append((string?)u["status"] ?? "pending").Append(PeerDetail(u));
                     break;
             }
         }
@@ -167,6 +183,46 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
         if (page.NextCursor is { } next)
             text.Append($"\nOlder messages: call read_session with session_id \"{read.Record.SessionId}\" and before \"{next}\".");
         return text.ToString();
+    }
+
+    /// <summary>Where the rendering is: after a user message, in the agent's block opened by tool calls, after its text, in its thinking.</summary>
+    enum Block { None, User, AgentTools, Agent, Thinking }
+
+    /// <summary>
+    /// What a tool call of the gorynych server says a session decided or asked, from its input:
+    /// the question and whom it asked, the answer and to which request, the task and for which
+    /// agent, the session archived or restored. Empty for other tools, and without input (Kimi may
+    /// give none).
+    /// </summary>
+    static string PeerDetail(JsonNode u)
+    {
+        if (u["rawInput"] is not JsonObject input || SessionReader.PeerTool((string?)u["title"]) is not { } tool) return "";
+        string? Field(string key) => input[key] is JsonValue v && v.TryGetValue<string>(out var s) && s.Length > 0 ? OneLine(s) : null;
+        var detail = tool switch
+        {
+            "ask_agent" => Join(Field("session_id") is { } asked ? $"session_id {asked}" : null, Field("question")),
+            "reply" => Join(Field("message_id") is { } answered ? $"message_id {answered}" : null, Field("text")),
+            "spawn_session" => Join(Field("agent"), Field("prompt")),
+            _ => Field("session_id") is { } id ? $"session_id {id}" : null,
+        };
+        return string.IsNullOrEmpty(detail) ? "" : " · " + detail;
+
+        static string? Join(string? who, string? what) => what is null ? who : who is null ? what : $"{who}: {what}";
+    }
+
+    static string OneLine(string text) => string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    /// <summary>A message through Claude's channel without its channel tag: the tag is how it travelled, not what it says.</summary>
+    static string Unwrapped(JsonObject? meta, string body)
+    {
+        if ((string?)meta?[GorynychProtocol.MetaOrigin] != "channel") return body;
+        var trimmed = body.Trim();
+        if (!trimmed.StartsWith("<channel", StringComparison.Ordinal)) return body;
+        var open = trimmed.IndexOf('\n');
+        if (open < 0) return body;
+        var inner = trimmed[(open + 1)..];
+        if (inner.EndsWith("</channel>", StringComparison.Ordinal)) inner = inner[..^"</channel>".Length];
+        return inner.Trim();
     }
 
     /// <summary>
@@ -178,7 +234,7 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
     /// </summary>
     static string Label(JsonObject? meta, string body)
     {
-        if (meta?[GorynychProtocol.MetaOutside] is not null) return " · from outside";
+        if (meta?[GorynychProtocol.MetaOutside] is not null) return " · opinion request · from outside";
         if (meta?[GorynychProtocol.MetaOpinion] is not null) return " · opinion request";
         var named = meta?[GorynychProtocol.MetaSender] is not null;
         switch ((string?)meta?[GorynychProtocol.MetaOrigin])

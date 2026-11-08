@@ -323,7 +323,8 @@ public static class PeersServer
                 "parent_session_id (set when another session started it with spawn_session). " +
                 "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare UUID, Kimi's start with session_. " +
                 StatusLegend + " status has nothing to do with archived. " +
-                "Archived sessions are left out unless include_archived is true, and the result says how many; with include_archived " +
+                "Archived sessions are left out unless include_archived is true; when some are left out, the result's last line " +
+                "says how many. With include_archived " +
                 "every entry says whether it is archived. ask_agent reaches archived sessions too.",
             ["inputSchema"] = new JsonObject
             {

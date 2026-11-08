@@ -128,6 +128,15 @@ public static class GorynychProtocol
     public const string MetaOutside = "gorynych/outside";
 
     /// <summary>
+    /// A short random tag for one run, in the message IDs a component counts in memory (the
+    /// service's <c>m…</c>, Claude's channel <c>c…</c>): after a restart the count starts again, and the
+    /// tag keeps a late reply to a request of an earlier run from answering a new one. Four letters
+    /// or digits, so the IDs stay easy for an agent to copy.
+    /// </summary>
+    public static string NewRunTag() =>
+        System.Security.Cryptography.RandomNumberGenerator.GetString("abcdefghijklmnopqrstuvwxyz0123456789", 4);
+
+    /// <summary>
     /// Sets a session's archive flag: <c>{sessionId, archived}</c> → <c>{}</c>. Only a flag: it
     /// closes, cancels and unloads nothing. A call with a peer token also gets <c>text</c>, what the agent is told.
     /// </summary>

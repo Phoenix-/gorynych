@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 namespace Gorynych.Service;
 
@@ -9,7 +10,7 @@ namespace Gorynych.Service;
 /// last status folded in, thoughts on request, newest page first (docs/service-protocol.md,
 /// "Reading a session"). Pure, so it is tested on journals made up in the test.
 /// </summary>
-internal static class SessionReader
+internal static partial class SessionReader
 {
     public const int DefaultLimit = 10;
     public const int MaxLimit = 50;
@@ -35,6 +36,7 @@ internal static class SessionReader
         public string? Title { get; set; }
         public string? ToolKind { get; set; }
         public string? Status { get; set; }
+        public JsonObject? RawInput { get; set; }
         public string Cursor { get; set; } = "";
         public bool IsMessage => Kind is "user_message_chunk" or "agent_message_chunk";
     }
@@ -75,15 +77,24 @@ internal static class SessionReader
             var index = messages.FindIndex(m => $"#{m.Index}" == c);
             return index >= 0 ? index : throw new UnknownCursorException(c);
         }
-        // Each message carries the tool calls and thoughts that follow it, up to the next message.
+        // Each message carries the tool calls and thoughts that follow it, up to the next message, except
+        // that an agent message takes those between it and the user message before it: they are its
+        // turn's (Claude's hooks report a tool call before the text that announces it). The first
+        // message also takes anything before it.
         int Position(int message) => message < messages.Count ? items.IndexOf(messages[message]) : items.Count;
+        var begin = new int[messages.Count + 1];
+        for (var i = 0; i < messages.Count; i++)
+            begin[i] = i == 0 ? 0
+                : messages[i].Kind == "agent_message_chunk" && messages[i - 1].Kind == "user_message_chunk" ? Position(i - 1) + 1
+                : Position(i);
+        begin[messages.Count] = items.Count;
         var cuts = new Dictionary<Item, int>();
         var start = end;
         var left = budget ?? int.MaxValue;
         while (start > 0 && end - start < limit)
         {
             var candidate = start - 1;
-            var segment = items.Skip(Position(candidate)).Take(Position(candidate + 1) - Position(candidate))
+            var segment = items.Skip(begin[candidate]).Take(begin[candidate + 1] - begin[candidate])
                 .Where(i => thoughts || i.Kind != "agent_thought_chunk").ToList();
             var cost = segment.Sum(Cost);
             if (cost <= left) { left -= cost; start = candidate; continue; }
@@ -95,8 +106,8 @@ internal static class SessionReader
             break;
         }
 
-        var from = start == 0 ? 0 : Position(start);
-        var to = cursor is null ? items.Count : Position(end);
+        var from = begin[start];
+        var to = cursor is null ? items.Count : begin[end];
         var updates = items.Skip(from).Take(to - from)
             .Where(i => thoughts || i.Kind != "agent_thought_chunk")
             .Select(i => ToUpdate(i, cuts.TryGetValue(i, out var room) ? room : null))
@@ -143,6 +154,7 @@ internal static class SessionReader
                     tool.Title = (string?)u["title"] ?? tool.Title;
                     tool.ToolKind = (string?)u["kind"] ?? tool.ToolKind;
                     tool.Status = (string?)u["status"] ?? tool.Status;
+                    if (u["rawInput"] is JsonObject raw) tool.RawInput = raw.DeepClone().AsObject();
                     last = null;
                     break;
                 }
@@ -169,6 +181,17 @@ internal static class SessionReader
             update["title"] = i.Title ?? "tool";
             if (i.ToolKind is not null) update["kind"] = i.ToolKind;
             if (i.Status is not null) update["status"] = i.Status;
+            // What a session asked, answered, started or archived through the gorynych server: its input,
+            // each text cut short. Other tools' input stays out.
+            if (i.RawInput is { } raw && PeerTool(i.Title) is not null)
+            {
+                var kept = new JsonObject();
+                foreach (var (key, value) in raw)
+                    kept[key] = value is JsonValue v && v.TryGetValue<string>(out var str) && str.Length > PeerInputLimit
+                        ? str[..PeerInputLimit] + "…"
+                        : value?.DeepClone();
+                update["rawInput"] = kept;
+            }
         }
         else
         {
@@ -179,6 +202,32 @@ internal static class SessionReader
         if (i.Meta is not null) update["_meta"] = i.Meta.DeepClone();
         return update;
     }
+
+    /// <summary>How much of each text in a gorynych tool's input a page keeps.</summary>
+    public const int PeerInputLimit = 300;
+
+    /// <summary>
+    /// A tool's name and its MCP server, from a tool call's title in either form the agents give it:
+    /// <c>mcp__gorynych__reply</c> (Kimi) or <c>reply (gorynych)</c> (Claude); for any other title, the
+    /// title and no server.
+    /// </summary>
+    public static (string Tool, string? Server) ToolName(string? title)
+    {
+        title ??= "tool";
+        if (McpName().Match(title) is { Success: true } m) return (m.Groups[2].Value, m.Groups[1].Value);
+        if (ShownName().Match(title) is { Success: true } s) return (s.Groups[1].Value, s.Groups[2].Value);
+        return (title, null);
+    }
+
+    /// <summary>The gorynych server's tool a title names whose input says what a session decided; null for any other.</summary>
+    public static string? PeerTool(string? title) =>
+        ToolName(title) is ("ask_agent" or "reply" or "spawn_session" or "archive_session" or "restore_session", "gorynych") and var (tool, _) ? tool : null;
+
+    [GeneratedRegex("^mcp__(.+?)__(.+)$")]
+    private static partial Regex McpName();
+
+    [GeneratedRegex(@"^([^\s()]+) \(([^()]+)\)$")]
+    private static partial Regex ShownName();
 
     /// <summary>Keeps the start and the end of a text that is too long, with a note of what was cut.</summary>
     public static string CutMiddle(string text, int room)
