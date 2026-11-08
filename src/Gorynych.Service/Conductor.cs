@@ -1682,7 +1682,8 @@ public sealed class Conductor : IAsyncDisposable
     /// <c>_gorynych/peers {token, includeArchived?}</c>: the sessions the session behind <c>token</c>
     /// can ask; archived ones only with <c>includeArchived</c>, and then every entry says whether it is.
     /// <c>caller</c> names the session behind the token as <see cref="Who"/> does, since the list
-    /// leaves it out and an agent does not know its own ID otherwise.
+    /// leaves it out and an agent does not know its own ID otherwise. Without <c>includeArchived</c>,
+    /// <c>hiddenArchived</c> counts the archived sessions the list would otherwise show (never the caller).
     /// </summary>
     internal JsonObject Peers(JsonRpcRequest request)
     {
@@ -1707,6 +1708,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         var result = new JsonObject { ["sessions"] = sessions };
         if (self is not null && store.Get(self) is { } caller) result["caller"] = Who(caller);
+        if (!includeArchived) result["hiddenArchived"] = Askable(self, includeArchived: true).Count(c => c.Record.Archived);
         return result;
     }
 

@@ -139,10 +139,7 @@ public static class PeersServer
                     var query = new JsonObject { ["token"] = token };
                     if (args?["include_archived"] is JsonValue all && all.TryGetValue<bool>(out var include) && include) query["includeArchived"] = true;
                     await using var service = await ConnectAsync(pipe, ct);
-                    var peers = await service.SendRequestAsync(GorynychProtocol.MethodPeers, query, ct);
-                    var listing = peers?["sessions"]?.ToJsonString(new() { WriteIndented = true }) ?? "[]";
-                    // The list leaves the caller out, so its own ID comes first, in the visible text.
-                    return Text((string?)peers?["caller"] is { } caller ? $"{YouAre(caller)}\n{listing}" : listing);
+                    return Text(ListAgentsText(await service.SendRequestAsync(GorynychProtocol.MethodPeers, query, ct)));
                 }
                 case "archive_session" or "restore_session" when pipe is not null && token is not null:
                 {
@@ -216,8 +213,27 @@ public static class PeersServer
         return rpc;
     }
 
+    /// <summary>
+    /// What <c>list_agents</c> shows, from the service's <c>_gorynych/peers</c> result: the caller
+    /// (which the list leaves out), the list, and how many archived sessions it leaves out. The
+    /// hints are in the result as well as in the schema, since an agent may hold an older schema.
+    /// </summary>
+    internal static string ListAgentsText(JsonNode? peers)
+    {
+        var text = new StringBuilder();
+        if ((string?)peers?["caller"] is { } caller) text.Append(YouAre(caller)).Append('\n');
+        text.Append(peers?["sessions"]?.ToJsonString(new() { WriteIndented = true }) ?? "[]");
+        if ((int?)peers?["hiddenArchived"] is int hidden and > 0) text.Append('\n').Append(ArchivedNotShown(hidden));
+        return text.ToString();
+    }
+
     /// <summary>The first line of <c>list_agents</c>: the calling session, named as the service names sessions to agents.</summary>
     internal static string YouAre(string caller) => $"You are {caller}.";
+
+    /// <summary>The last line of <c>list_agents</c> when it leaves archived sessions out.</summary>
+    internal static string ArchivedNotShown(int count) => count == 1
+        ? "1 archived session is not shown; pass include_archived: true to list it."
+        : $"{count} archived sessions are not shown; pass include_archived: true to list them.";
 
     /// <summary>What <c>reply</c> says when nothing waits for its <c>message_id</c>.</summary>
     internal static string NotDelivered(string messageId) =>
@@ -257,12 +273,16 @@ public static class PeersServer
         var list = new JsonObject
         {
             ["name"] = "list_agents",
-            ["description"] = "List the user's other coding-agent sessions in Gorynych that you can ask with ask_agent: session_id (pass it " +
-                "exactly), agent, title, folder, whether it is open, and parent_session_id for a session another session started with spawn_session. " +
-                "The list leaves this session out; the first line of the result names it instead: \"You are session_id ...\", the ID to " +
-                "pass for this session itself, for example to archive_session. " +
-                "Archived sessions are left out unless include_archived is true; then every entry says whether it is archived. " +
-                "ask_agent reaches archived sessions too.",
+            ["description"] = "List the user's other coding-agent sessions in Gorynych that you can ask with ask_agent. " +
+                "The result's first line names this session, which the list leaves out: \"You are session_id ...\", the ID for this " +
+                "session itself, for example for archive_session. Each entry has session_id, agent, title, cwd, open, updated_at and " +
+                "parent_session_id (set when another session started it with spawn_session). " +
+                "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare UUID, Kimi's start with session_. " +
+                "open is true when the session's agent has it loaded right now; it has nothing to do with archived. A Kimi session that " +
+                "is not open is loaded when asked, so it answers more slowly. A Claude session can be asked only while its agent is " +
+                "running, and only the user's prompt starts it; one that is not open is not running. " +
+                "Archived sessions are left out unless include_archived is true, and the result says how many; with include_archived " +
+                "every entry says whether it is archived. ask_agent reaches archived sessions too.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",

@@ -98,7 +98,7 @@ own fields only under `_meta` with namespaced keys, own methods prefixed with `_
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes through the channel and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards |
-| `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open`, `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")` |
+| `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `open`, `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")`. Without `includeArchived`, `hiddenArchived` counts the archived sessions left out (never the caller) |
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
@@ -115,7 +115,7 @@ random per session and tells the service who is calling. Its tools:
 - `list_agents {include_archived?}` — the user's other sessions (`_gorynych/peers`), archived
   ones only with `include_archived: true`, marked `archived`; a first line,
   `You are session_id <id> (<agent>, "<title>").`, names the caller itself, which the list
-  leaves out;
+  leaves out, and a last line says how many archived sessions it left out;
 - `ask_agent {session_id, question}` — starts a new question to one, by its exact
   `session_id`, and waits for the answer (`_gorynych/opinion`); archived sessions too;
 - `spawn_session {agent, prompt, cwd?, title?, report?}` — starts a child session
@@ -130,7 +130,11 @@ Each description says when to use the tool rather than its neighbour: `ask_agent
 question and points to `reply` for answering one; `reply` only answers and points to
 `ask_agent`; `session_id` is the exact value from `list_agents` or a header, never an agent
 name, a title or a sender label; `list_agents` says its first line names this session, the ID
-to pass for it; `spawn_session` says the child's turns are reported back by
+to pass for it, that IDs differ by agent (Claude's a bare UUID, Kimi's `session_…`) and are
+passed exactly as listed, and what `open` means: the agent has the session loaded right now,
+unrelated to `archived`; a Kimi session that is not open is loaded when asked, so it answers
+more slowly; a Claude session can be asked only while its agent runs, which only the user's
+prompt starts (the wording of the "not running" error below); `spawn_session` says the child's turns are reported back by
 themselves; `archive_session` says archiving is not deleting (the history stays, `ask_agent`
 still reaches it), and `restore_session` that it only changes where the session is shown, so
 asking an archived session needs no restore.
@@ -205,6 +209,7 @@ takes for the session itself). `archive_session` and `restore_session` say what 
 | Case | Text |
 | --- | --- |
 | `list_agents` | first line `You are session_id <id> (<agent>, "<title>").`, then the list as JSON |
+| `list_agents` without `include_archived`, leaving N > 0 archived sessions out (the caller not counted) | a last line `N archived sessions are not shown; pass include_archived: true to list them.`, or for one `1 archived session is not shown; pass include_archived: true to list it.`; nothing when none is left out. The hint is in the result as well as in the schema, because an agent whose conversation was resumed may hold an older schema |
 | archived now | `Archived session_id <id> (<agent>, "<title>"). It is now hidden from list_agents and from the user's session list; nothing in it is lost. ask_agent still reaches it, and restore_session brings it back.` |
 | already archived | `session_id <id> (<agent>, "<title>") was already archived, so nothing changed. ask_agent still reaches it, and restore_session brings it back.` |
 | restored now | `Restored session_id <id> (<agent>, "<title>"). It is back in list_agents and in the user's session list.` |

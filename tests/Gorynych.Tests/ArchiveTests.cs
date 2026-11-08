@@ -243,6 +243,46 @@ public sealed class ArchiveTests
     }
 
     [TestMethod]
+    public async Task ListAgents_EndsWithHowManyArchivedSessionsItLeavesOut()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var asker = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        var sessions = new List<string>();
+        for (var i = 1; i <= 3; i++) sessions.Add(await NewPromptedAsync(zed, "kimi", $"Task {i}"));
+        var token = claude.Tokens[asker];
+        async Task<string> ListAgents(bool includeArchived = false)
+        {
+            var query = new JsonObject { ["token"] = token };
+            if (includeArchived) query["includeArchived"] = true;
+            return PeersServer.ListAgentsText(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodPeers, query));
+        }
+        const string One = "1 archived session is not shown; pass include_archived: true to list it.";
+
+        Assert.IsFalse((await ListAgents()).Contains("archived session", StringComparison.Ordinal), "nothing when none is archived");
+
+        await ArchiveAsync(zed, sessions[0], true);
+        var text = await ListAgents();
+        StringAssert.EndsWith(text, "]\n" + One);
+        Assert.AreEqual(One, text.Split('\n')[^1]);
+        StringAssert.StartsWith(text, $"You are session_id {asker} (claude, \"Coordinate the release\").\n[");
+
+        await ArchiveAsync(zed, sessions[1], true);
+        await ArchiveAsync(zed, sessions[2], true);
+        StringAssert.EndsWith(await ListAgents(), "]\n3 archived sessions are not shown; pass include_archived: true to list them.");
+        StringAssert.EndsWith(await ListAgents(includeArchived: true), "]", "nothing when the archived ones are listed");
+
+        // The caller itself is not in the list, so it is not counted either.
+        await ArchiveAsync(zed, asker, true);
+        StringAssert.EndsWith(await ListAgents(), "]\n3 archived sessions are not shown; pass include_archived: true to list them.");
+        await ArchiveAsync(zed, sessions[1], false);
+        await ArchiveAsync(zed, sessions[2], false);
+        StringAssert.EndsWith(await ListAgents(), "]\n" + One);
+    }
+
+    [TestMethod]
     public async Task ListAgents_NamesTheCallerFirst_WhichTheListLeavesOut()
     {
         var claude = new LifecycleAgent("claude", canDelete: false);
