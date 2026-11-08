@@ -330,7 +330,9 @@ its sessions the service asks the person itself, on the calling session, before
 `restore_session` act. It shows a card and sends `session/request_permission` with allow
 once or decline, the same way it asks before every spawn. A decline fails the tool with a
 sentence for the agent (`The user declined to ask session_id <id>, so it was not asked. …`).
-An archive or restore that would change nothing is not asked.
+An archive or restore that would change nothing is not asked. The asked session is resolved
+first, so a session that only its agent lists yet (one made in that agent's own app) is asked
+about like any other.
 
 Verified live on 7 November 2026: Claude called `list_agents` and, after approval,
 `ask_agent`; Kimi got the marked turn, answered with `reply`, and Claude used the answer.

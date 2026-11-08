@@ -102,6 +102,51 @@ public sealed class UnaskedMcpToolsTests
     }
 
     [TestMethod]
+    public async Task AskAgent_ToASessionOnlyItsAgentListsYet_AsksThePersonToo()
+    {
+        var dsh = new LifecycleAgent("dsh", canDelete: false) { UnaskedMcpTools = true };
+        var kimi = new LifecycleAgent("kimi", canDelete: true, existing: ["kimi-native"], titles: new() { ["kimi-native"] = "From Kimi's own CLI" });
+        await using var conductor = Conductor(dsh.Adapter, kimi.Adapter);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var asker = await NewPromptedAsync(client, "dsh", "hi");
+
+        client.Approve = Choose("decline");
+        var declined = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => AskAsync(client, dsh.Tokens[asker], "kimi-native"));
+
+        StringAssert.Contains(declined.Message, "declined to ask session_id kimi-native");
+        StringAssert.StartsWith(client.Approvals.Single().ToolCall.Title, "Ask session_id kimi-native");
+        Assert.AreEqual(0, PromptsOf(kimi, "kimi-native"), "the session made in Kimi's own CLI got nothing");
+    }
+
+    [TestMethod]
+    public async Task AskAgent_FromAnAgentThatAsksNothing_WaitsForAClient_WhenNoneIsAttached()
+    {
+        var dsh = new LifecycleAgent("dsh", canDelete: false) { UnaskedMcpTools = true };
+        var kimi = new LifecycleAgent("kimi", canDelete: true) { Answer = "later" };
+        await using var conductor = Conductor(dsh.Adapter, kimi.Adapter);
+        string asker, asked;
+        await using (var first = await TestClient.ConnectAsync(conductor, "first"))
+        {
+            asker = await NewPromptedAsync(first, "dsh", "hi");
+            asked = await NewPromptedAsync(first, "kimi", "hello");
+        }
+        await using var peers = await TestClient.ConnectAsync(conductor, "peers");
+
+        var asking = AskAsync(peers, dsh.Tokens[asker], asked);
+        await Task.Delay(300);
+
+        Assert.IsFalse(asking.IsCompleted, "not asked, and not allowed, while nobody can answer");
+        Assert.AreEqual(0, peers.Approvals.Count);
+        Assert.AreEqual(1, PromptsOf(kimi, asked));
+        await using var later = await TestClient.ConnectAsync(conductor, "later");
+        later.Approve = Choose("ask");
+        await later.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, AcpJson.ToNode(new ResumeSessionRequest { SessionId = asker, Cwd = Cwd }));
+        var answer = await asking.WaitAsync(TimeSpan.FromSeconds(10));
+        StringAssert.Contains((string?)answer?["text"], "later");
+        StringAssert.StartsWith(later.Approvals.Single().ToolCall.Title, "Ask session_id " + asked);
+    }
+
+    [TestMethod]
     public async Task AskAgent_FromAnAgentThatAsksItself_IsNotAskedAgain()
     {
         var dsh = new LifecycleAgent("dsh", canDelete: false) { UnaskedMcpTools = true, Answer = "yes" };

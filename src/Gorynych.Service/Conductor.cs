@@ -1160,6 +1160,9 @@ public sealed class Conductor : IAsyncDisposable
         }
     }
 
+    /// <summary>Whether the session's agent runs MCP tools without asking the person (<c>gorynych/unaskedMcpTools</c>).</summary>
+    bool AsksNothing(string sessionId) => store.Get(sessionId) is { } session && HostOf(session).UnaskedMcpTools;
+
     /// <summary>
     /// For a session whose agent runs MCP tools without asking (<c>gorynych/unaskedMcpTools</c>, DSH):
     /// asks the person on that session before a gorynych tool acts for them (<c>ask_agent</c>,
@@ -1169,7 +1172,7 @@ public sealed class Conductor : IAsyncDisposable
     async Task ConfirmForUnaskingAgentAsync(string callerId, string what, JsonObject input, string text, PermissionOption allow, string declineName,
         string declined, CancellationToken ct)
     {
-        if (store.Get(callerId) is not { } caller || !HostOf(caller).UnaskedMcpTools) return;
+        if (!AsksNothing(callerId)) return;
         using var use = await UseAsync(callerId, ct);
         var callId = "gorynych-confirm-" + Interlocked.Increment(ref spawnCount);
         RequestPermissionOutcome outcome;
@@ -1894,11 +1897,25 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.InvalidRequest,
                 $"This session is answering opinion request {answering}, so it cannot ask another session during this turn. " +
                 $"Send your answer with the reply tool, passing message_id \"{answering}\"; if another opinion would help, say so in the answer.");
-        if (from is not null && store.Get(target) is { Deleted: false } askedRecord)
-            await ConfirmForUnaskingAgentAsync(from, $"Ask {Who(askedRecord)} for an opinion",
-                new JsonObject { ["session_id"] = target, ["question"] = text }, text,
-                new PermissionOption { OptionId = "ask", Name = "Ask", Kind = PermissionOptionKind.AllowOnce }, "Don't ask",
-                $"The user declined to ask session_id {target}, so it was not asked. Go on without its opinion, or ask the user.", ct);
+        if (from is not null && AsksNothing(from))
+        {
+            // Resolved first, as asking would resolve it: a session only an agent's own list has yet
+            // (made in its own app) is added now, so it is asked about like any other.
+            SessionRecord? askedRecord = null;
+            try
+            {
+                askedRecord = await FindAsync(target, ct);
+            }
+            catch (JsonRpcException e) when (e.Code == JsonRpcException.ResourceNotFound)
+            {
+                // No such session: nothing to ask the person; asking below fails with the usual hint.
+            }
+            if (askedRecord is not null)
+                await ConfirmForUnaskingAgentAsync(from, $"Ask {Who(askedRecord)} for an opinion",
+                    new JsonObject { ["session_id"] = target, ["question"] = text }, text,
+                    new PermissionOption { OptionId = "ask", Name = "Ask", Kind = PermissionOptionKind.AllowOnce }, "Don't ask",
+                    $"The user declined to ask session_id {target}, so it was not asked. Go on without its opinion, or ask the user.", ct);
+        }
         // The asked agent sees who asks by the asking session's real ID, which it can pass to ask_agent;
         // sender (peer_claude) is only a label for GUIs.
         var origin = from is not null && store.Get(from) is { } asking ? $"from {Who(asking)}" : $"from {sender ?? "a Gorynych client"}";
