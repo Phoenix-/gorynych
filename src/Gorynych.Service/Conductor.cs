@@ -27,6 +27,12 @@ public sealed class ConductorOptions
     /// <c>_gorynych/sessions_changed</c>; the last change in an interval is announced at its end.
     /// </summary>
     public TimeSpan ActivityNoticeInterval { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// While an agent outside Gorynych waits for an answer, how often it gets a progress
+    /// notification at the latest, so its host does not take the call for idle.
+    /// </summary>
+    public TimeSpan OutsideProgressInterval { get; init; } = TimeSpan.FromSeconds(60);
 }
 
 /// <summary>
@@ -87,9 +93,13 @@ public sealed class Conductor : IAsyncDisposable
         store.Changed = OnRecordChanged;
         store.Removed = r => { if (r.Listed) AnnounceList(r.SessionId, r.Agent, "removed"); };
         store.Active = AnnounceActivity;
+        Outside = new OutsideService(this, options.OutsideProgressInterval);
     }
 
     public string DefaultAgent { get; }
+
+    /// <summary>The service's side of the gorynych-outside MCP server, for agents outside Gorynych.</summary>
+    internal OutsideService Outside { get; }
     public string ServiceId => options.ServiceId;
     public IReadOnlyDictionary<string, AgentHost> Agents => agents;
     public SessionStore Store => store;
@@ -1533,6 +1543,113 @@ public sealed class Conductor : IAsyncDisposable
         }, TaskScheduler.Default);
     }
 
+    // ---------------------------------------------------------------- reading a session
+
+    /// <summary>A page of a session's history (<see cref="ReadAsync"/>).</summary>
+    /// <param name="Live">The session's agent has it loaded now (<c>status: open</c>).</param>
+    /// <param name="InProgress">A turn is running.</param>
+    /// <param name="Trimmed">The journal has lost its oldest entries.</param>
+    internal sealed record SessionRead(SessionRecord Record, bool Live, SessionReader.Page Page, bool InProgress, bool Trimmed);
+
+    /// <summary>A session whose history could not be loaded from its agent.</summary>
+    internal sealed class UnreadableException(SessionRecord record, Exception inner) : Exception(inner.Message, inner)
+    {
+        public SessionRecord Record { get; } = record;
+    }
+
+    /// <summary>
+    /// Reads a page of a session's history from the service journal; reading never runs a turn. A
+    /// session the service has never journaled is loaded in its agent first, which replays its
+    /// history into the journal (Kimi), and closed again afterwards when it was loaded only for
+    /// this, as after service turns. A Claude session never needs its agent: the service journals
+    /// every Claude session from its first prompt.
+    /// </summary>
+    /// <exception cref="SessionReader.UnknownCursorException">The cursor names no message of the session.</exception>
+    internal async Task<SessionRead> ReadAsync(string sessionId, string? cursor, int limit, bool thoughts, int? budget, CancellationToken ct)
+    {
+        var use = await UseAsync(sessionId, ct);
+        var loaded = false;
+        try
+        {
+            var feed = use.Feed;
+            var host = HostOf(use.Record);
+            if (!feed.Journal.HasTurns && !host.IsLive(sessionId))
+            {
+                try { loaded = await LoadHistoryAsync(use, ct); }
+                catch (Exception e) when (e is JsonRpcException or IOException) { throw new UnreadableException(use.Record, e); }
+            }
+            var page = SessionReader.Read(feed.Journal.ReadAll(), cursor, limit, thoughts, budget);
+            return new SessionRead(store.Get(sessionId) ?? use.Record, host.IsLive(sessionId), page, feed.TurnGate.CurrentCount == 0, feed.Journal.Trimmed);
+        }
+        finally
+        {
+            use.Dispose();
+            if (loaded) AfterServiceTurn(sessionId);
+        }
+    }
+
+    /// <summary>
+    /// Loads a session the journal has no turn of in its agent, journaling the agent's replay, and
+    /// marks it to be closed again like a session woken for service turns.
+    /// </summary>
+    /// <returns>False when the agent cannot load sessions (Claude), or the session was loaded meanwhile.</returns>
+    async Task<bool> LoadHistoryAsync(SessionUse use, CancellationToken ct)
+    {
+        var record = use.Record;
+        var host = HostOf(record);
+        var rpc = await host.GetAsync(ct);
+        if (!host.CanLoad) return false;
+        await use.Feed.OpenGate.WaitAsync(ct);
+        try
+        {
+            if (host.IsLive(record.SessionId) || use.Feed.Journal.HasTurns) return false;
+            var opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, AcpJson.ToNode(new LoadSessionRequest
+            {
+                SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId), SystemPrompt = SystemPromptFor(host),
+            }), ct) as JsonObject;
+            host.MarkLive(record.SessionId);
+            use.Feed.CaptureState(opened);
+            wokenForService[record.SessionId] = 0;
+            ServiceLog.Info($"{host.Name}: loaded {record.SessionId} to read its history");
+            return true;
+        }
+        finally
+        {
+            use.Feed.OpenGate.Release();
+        }
+    }
+
+    /// <summary><c>_gorynych/read {sessionId, cursor?, limit?, thoughts?}</c> → <c>{updates, nextCursor?, total, inProgress, trimmed}</c>.</summary>
+    internal async Task<JsonNode?> ReadMethodAsync(JsonRpcRequest request, CancellationToken ct)
+    {
+        var sessionId = (string?)request.Params?["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
+        var cursor = (string?)request.Params?["cursor"];
+        var limit = request.Params?["limit"] is JsonValue l && l.TryGetValue<int>(out var n) ? n : SessionReader.DefaultLimit;
+        var thoughts = request.Params?["thoughts"] is JsonValue t && t.TryGetValue<bool>(out var b) && b;
+        SessionRead read;
+        try
+        {
+            read = await ReadAsync(sessionId, cursor, limit, thoughts, budget: null, ct);
+        }
+        catch (SessionReader.UnknownCursorException e)
+        {
+            throw new JsonRpcException(JsonRpcException.InvalidParams, $"Session {sessionId} has no message \"{e.Cursor}\".");
+        }
+        catch (UnreadableException e)
+        {
+            throw e.InnerException as JsonRpcException ?? new JsonRpcException(JsonRpcException.InternalError, e.Message);
+        }
+        var result = new JsonObject
+        {
+            ["updates"] = new JsonArray(read.Page.Updates.Select(u => (JsonNode)u).ToArray()),
+            ["total"] = read.Page.Total,
+            ["inProgress"] = read.InProgress,
+            ["trimmed"] = read.Trimmed,
+        };
+        if (read.Page.NextCursor is { } next) result["nextCursor"] = next;
+        return result;
+    }
+
     // ---------------------------------------------------------------- opinions between agents
 
     /// <summary>
@@ -1557,7 +1674,32 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.InvalidRequest,
                 $"This session is answering opinion request {answering}, so it cannot ask another session during this turn. " +
                 $"Send your answer with the reply tool, passing message_id \"{answering}\"; if another opinion would help, say so in the answer.");
-        var use = await UseAskedAsync(target, from, ct);
+        // The asked agent sees who asks by the asking session's real ID, which it can pass to ask_agent;
+        // sender (peer_claude) is only a label for GUIs.
+        var origin = from is not null && store.Get(from) is { } asking ? $"from {Who(asking)}" : $"from {sender ?? "a Gorynych client"}";
+        return await AskAsync(target, text, new Asker(from, sender ?? "peer_agent", origin, Outside: null), onState: null, ct);
+    }
+
+    /// <summary>
+    /// Who asks for an opinion: a session (<see cref="From"/>, named by its peer token), an agent
+    /// outside Gorynych (<see cref="Outside"/>, the host object of <c>_gorynych/mcp_message</c>), or
+    /// a client. <see cref="Origin"/> is how the request's first line names the asker.
+    /// </summary>
+    internal sealed record Asker(string? From, string Sender, string Origin, JsonObject? Outside)
+    {
+        /// <summary>An agent asks, so errors say how to recover.</summary>
+        public bool IsAgent => From is not null || Outside is not null;
+    }
+
+    /// <summary>
+    /// Asks <paramref name="target"/> for an opinion on behalf of <paramref name="asker"/>: through
+    /// its agent's live-note path when it has one and runs, else in a turn, waking the session for
+    /// it if needed. <paramref name="onState"/> hears each change of state (waiting for the running
+    /// turn, starting the session, asked), for an outside agent's progress notifications.
+    /// </summary>
+    internal async Task<JsonNode?> AskAsync(string target, string text, Asker asker, Action<string>? onState, CancellationToken ct)
+    {
+        var use = await UseAskedAsync(target, asker, ct);
         var turnHasUse = false; // an opinion turn releases the use when the turn ends, which may be after the answer
         try
         {
@@ -1566,19 +1708,22 @@ public sealed class Conductor : IAsyncDisposable
             try
             {
                 // Not loaded in its agent: loaded now, and closed again after the service's turns.
+                if (!HostOf(record).IsLive(target)) onState?.Invoke(StartingState(target));
                 (rpc, _) = await EnsureLiveAsync(record, ct, forService: true);
             }
-            catch (Exception e) when (from is not null && e is not OperationCanceledException)
+            catch (Exception e) when (asker.IsAgent && e is not OperationCanceledException)
             {
-                throw CouldNotStart(record, e);
+                throw CouldNotStart(record, e, asker);
             }
-            ServiceLog.Info($"opinion: {from ?? "client"} asks {record.Agent} {target}");
-            // The asked agent sees who asks by the asking session's real ID, which it can pass to ask_agent;
-            // sender (peer_claude) is only a label for GUIs.
-            var origin = from is not null && store.Get(from) is { } asking ? $"from {Who(asking)}" : $"from {sender ?? "a Gorynych client"}";
-            sender ??= "peer_agent";
-            var forwarded = new JsonObject { ["sessionId"] = target, ["text"] = $"[Opinion request · {origin}]\n{text}", ["sender"] = sender };
-            if (from is not null) forwarded["fromSessionId"] = from;
+            ServiceLog.Info($"opinion: {asker.From ?? asker.Sender} asks {record.Agent} {target}");
+            var forwarded = new JsonObject { ["sessionId"] = target, ["text"] = $"[Opinion request · {asker.Origin}]\n{text}", ["sender"] = asker.Sender };
+            if (asker.From is not null) forwarded["fromSessionId"] = asker.From;
+            // A live-note path answers at once when its agent cannot take the request, so it counts
+            // as asked only after a moment.
+            using var askedLater = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            if (onState is not null)
+                _ = Task.Delay(TimeSpan.FromMilliseconds(500), askedLater.Token)
+                    .ContinueWith(t => { if (!t.IsCanceled) onState(AskedState(target)); }, TaskScheduler.Default);
             try
             {
                 // An agent with its own way in (Claude's channel) answers directly.
@@ -1595,9 +1740,18 @@ public sealed class Conductor : IAsyncDisposable
             {
                 // No live-note path (Kimi), or the agent is not running (Claude refuses while its process
                 // is down): ask in a turn, which in the second case starts the agent just for it.
-                if (e.Code == JsonRpcException.InvalidRequest) wokenForService[target] = 0;
+                askedLater.Cancel();
+                if (e.Code == JsonRpcException.InvalidRequest)
+                {
+                    wokenForService[target] = 0;
+                    onState?.Invoke(StartingState(target));
+                }
                 turnHasUse = true;
-                return await OpinionTurnAsync(use, rpc, sender, from, origin, text, woken: wokenForService.ContainsKey(target), ct);
+                return await OpinionTurnAsync(use, rpc, asker, text, woken: wokenForService.ContainsKey(target), onState, ct);
+            }
+            finally
+            {
+                askedLater.Cancel();
             }
         }
         finally
@@ -1605,6 +1759,10 @@ public sealed class Conductor : IAsyncDisposable
             if (!turnHasUse) EndServiceUse(use);
         }
     }
+
+    static string WaitingState(string sessionId) => $"Waiting for session_id {sessionId} to finish its running turn.";
+    static string StartingState(string sessionId) => $"Starting session_id {sessionId} to answer.";
+    static string AskedState(string sessionId) => $"Asked session_id {sessionId}; waiting for its answer.";
 
     /// <summary>Releases a service turn's use of a session, then closes the session if the service woke it only for its turns.</summary>
     void EndServiceUse(SessionUse use)
@@ -1614,34 +1772,42 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>For an agent that asks: the asked session could not be started (or failed at once after it was).</summary>
-    static JsonRpcException CouldNotStart(SessionRecord record, Exception e)
+    static JsonRpcException CouldNotStart(SessionRecord record, Exception e, Asker asker)
     {
         var reason = e.Message.TrimEnd();
         if (!reason.EndsWith('.')) reason += ".";
         return new JsonRpcException(e is JsonRpcException rpc ? rpc.Code : JsonRpcException.InternalError,
-            $"{Who(record)} could not be started to answer: {reason} Ask another session from list_agents, " +
-            "or ask the user to open that session and check it.");
+            $"{Who(record)} could not be started to answer: {reason} " + (asker.Outside is not null
+                ? "Ask another session from list_sessions, or ask the user to open that session in Gorynych and check it."
+                : "Ask another session from list_agents, or ask the user to open that session and check it."));
     }
 
     /// <summary>The asked session; for an agent that asks, an unknown ID fails with the IDs it can pass instead.</summary>
-    async Task<SessionUse> UseAskedAsync(string target, string? from, CancellationToken ct)
+    async Task<SessionUse> UseAskedAsync(string target, Asker asker, CancellationToken ct)
     {
         try
         {
             return await UseAsync(target, ct);
         }
-        catch (JsonRpcException e) when (from is not null && e.Code == JsonRpcException.ResourceNotFound)
+        catch (JsonRpcException e) when (asker.IsAgent && e.Code == JsonRpcException.ResourceNotFound)
         {
-            throw new JsonRpcException(JsonRpcException.ResourceNotFound,
-                $"No session \"{target}\". Pass an exact session_id from list_agents." + AskableHint(from));
+            throw new JsonRpcException(JsonRpcException.ResourceNotFound, asker.Outside is not null
+                ? UnknownToOutside(target)
+                : $"No session \"{target}\". Pass an exact session_id from list_agents." + AskableHint(asker.From!));
         }
     }
+
+    /// <summary>What an agent outside Gorynych is told for a session ID that names no session.</summary>
+    internal string UnknownToOutside(string target) =>
+        $"No session \"{target}\". Pass an exact session_id from list_sessions." + Hint(" Sessions in Gorynych:",
+            WithHistory().Where(c => !c.Record.Archived).Select(c => c.Record), self: "",
+            "\n- and more: list_sessions shows them all", " There is no session in Gorynych now.");
 
     /// <summary>
     /// How a message the service puts in front of an agent names a session: its exact ID, labelled
     /// <c>session_id</c> so the agent can pass it to <c>ask_agent</c>, then its agent and title.
     /// </summary>
-    static string Who(SessionRecord r) =>
+    internal static string Who(SessionRecord r) =>
         $"session_id {r.SessionId} ({r.Agent}" + (r.Title is { Length: > 0 } title ? $", \"{Shorten(title).Replace('"', '\'')}\"" : "") + ")";
 
     /// <summary>The sessions with history, open ones first, then the newest.</summary>
@@ -1689,8 +1855,8 @@ public sealed class Conductor : IAsyncDisposable
     /// own text. Takes over <paramref name="use"/> and releases it when the turn ends.
     /// </summary>
     /// <param name="woken">The service loaded or started the session for its turns, so a failure here is a failure to start.</param>
-    async Task<JsonNode?> OpinionTurnAsync(SessionUse use, JsonRpcConnection rpc, string sender, string? from, string origin, string question,
-        bool woken, CancellationToken ct)
+    async Task<JsonNode?> OpinionTurnAsync(SessionUse use, JsonRpcConnection rpc, Asker asker, string question,
+        bool woken, Action<string>? onState, CancellationToken ct)
     {
         var record = use.Record;
         var feed = use.Feed;
@@ -1700,20 +1866,22 @@ public sealed class Conductor : IAsyncDisposable
         var turnStarted = false;
         try
         {
+            if (feed.TurnGate.CurrentCount == 0) onState?.Invoke(WaitingState(record.SessionId));
             await feed.TurnGate.WaitAsync(ct);
             Task turnDone;
             try
             {
                 if (feed.Retired) throw NotFound(record.SessionId);
                 record = Promote(record);
-                var text = OpinionPrompt(origin, messageId, question);
+                var text = OpinionPrompt(asker, messageId, question);
                 var meta = new JsonObject
                 {
                     [GorynychProtocol.MetaOrigin] = "peer",
-                    [GorynychProtocol.MetaSender] = sender,
+                    [GorynychProtocol.MetaSender] = asker.Sender,
                     [GorynychProtocol.MetaOpinion] = messageId,
                 };
-                if (from is not null) meta[GorynychProtocol.MetaFromSessionId] = from;
+                if (asker.From is not null) meta[GorynychProtocol.MetaFromSessionId] = asker.From;
+                if (asker.Outside is not null) meta[GorynychProtocol.MetaOutside] = asker.Outside.DeepClone();
                 var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
                 {
                     Content = new TextContent { Text = text }, MessageId = SessionFeed.NewMessageId(), Meta = meta,
@@ -1743,6 +1911,7 @@ public sealed class Conductor : IAsyncDisposable
                     EndServiceUse(use); // the turn may end after the answer: the session is closed again only now
                 }, TaskScheduler.Default);
                 turnStarted = true;
+                onState?.Invoke(AskedState(record.SessionId));
             }
             catch
             {
@@ -1754,7 +1923,7 @@ public sealed class Conductor : IAsyncDisposable
             if (pending.Reply.Task.IsCompleted) return new JsonObject { ["text"] = pending.Reply.Task.Result };
             if (pending.TurnError is { } error)
             {
-                if (woken && from is not null) throw CouldNotStart(record, error);
+                if (woken && asker.IsAgent) throw CouldNotStart(record, error, asker);
                 throw error as JsonRpcException ?? new JsonRpcException(JsonRpcException.InternalError, error.Message);
             }
             var fallback = pending.TurnText?.Trim();
@@ -1767,13 +1936,18 @@ public sealed class Conductor : IAsyncDisposable
         }
     }
 
-    static string OpinionPrompt(string origin, string messageId, string question) =>
-        $"[Opinion request · {origin} · message_id {messageId}]\n" +
-        $"{question}\n\n" +
-        "This message comes from another of the user's coding agents, not from the user. Give your honest opinion briefly, " +
-        $"then send it with the reply tool of the gorynych MCP server, passing message_id \"{messageId}\" " +
-        "(reply answers this request; ask_agent would start a new question instead). " +
-        "Do not run other tools, edit files or take any other action for this request.";
+    static string OpinionPrompt(Asker asker, string messageId, string question) => asker.Outside is not null
+        ? $"[Opinion request · {asker.Origin} · message_id {messageId}]\n" +
+          $"{question}\n\n" +
+          "This message comes from one of the user's coding agents outside Gorynych, not from the user. It cannot be asked back, " +
+          "so put everything into your answer. Give your honest opinion briefly, then send it with the reply tool of the gorynych " +
+          $"MCP server, passing message_id \"{messageId}\". Do not run other tools, edit files or take any other action for this request."
+        : $"[Opinion request · {asker.Origin} · message_id {messageId}]\n" +
+          $"{question}\n\n" +
+          "This message comes from another of the user's coding agents, not from the user. Give your honest opinion briefly, " +
+          $"then send it with the reply tool of the gorynych MCP server, passing message_id \"{messageId}\" " +
+          "(reply answers this request; ask_agent would start a new question instead). " +
+          "Do not run other tools, edit files or take any other action for this request.";
 
     /// <summary><c>_gorynych/reply</c>: the asked session answers an opinion request it got as a turn.</summary>
     internal JsonObject Reply(JsonRpcRequest request)
@@ -1818,6 +1992,12 @@ public sealed class Conductor : IAsyncDisposable
         var token = (string?)request.Params?["token"];
         var self = token is not null && peerTokens.TryGetValue(token, out var sid) ? sid : null;
         var includeArchived = request.Params?["includeArchived"] is JsonValue all && all.TryGetValue<bool>(out var include) && include;
+        return PeerList(self, includeArchived);
+    }
+
+    /// <summary>The list of <see cref="Peers"/>; for an agent outside Gorynych (no <paramref name="self"/>) every session with history.</summary>
+    internal JsonObject PeerList(string? self, bool includeArchived)
+    {
         var sessions = new JsonArray();
         foreach (var (r, live) in Askable(self, includeArchived))
         {

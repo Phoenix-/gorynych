@@ -1,7 +1,5 @@
 using System.ComponentModel;
-using System.Diagnostics;
 using System.IO.Pipes;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -17,7 +15,7 @@ namespace Gorynych.Service;
 /// change it makes is to add <c>_meta["gorynych/agent"]</c> to the client's <c>initialize</c>,
 /// which scopes the connection to that agent, so the client itself stays plain ACP.
 /// </summary>
-public static partial class AcpBridge
+public static class AcpBridge
 {
     static readonly JsonSerializerOptions Wire = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
@@ -96,29 +94,10 @@ public static partial class AcpBridge
         var exe = Environment.ProcessPath ?? throw new InvalidOperationException("no process path");
         List<string> args = ["--pipe", pipe, .. serviceArgs];
         Console.Error.WriteLine($"gorynych acp: starting the service ({exe} {string.Join(' ', args)})");
-        StartDetached(exe, args);
+        if (!Outside.DetachedProcess.Start(exe, args))
+            Console.Error.WriteLine("gorynych acp: the client's job object forbids breaking away, so the service stays in it; " +
+                "closing the client may stop the service and every session");
         return await ConnectAsync(pipe, 20000) ?? throw new TimeoutException("the service did not open its pipe");
-    }
-
-    /// <summary>
-    /// Starts the service so that it outlives the bridge and the client: no inherited handles
-    /// (the client would otherwise wait on its stdout), no console, and on Windows out of the
-    /// client's job object when the job allows it.
-    /// </summary>
-    static void StartDetached(string exe, IReadOnlyList<string> args)
-    {
-        if (!OperatingSystem.IsWindows())
-        {
-            var psi = new ProcessStartInfo(exe) { UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
-            foreach (var a in args) psi.ArgumentList.Add(a);
-            using var p = Process.Start(psi) ?? throw new InvalidOperationException("the service did not start");
-            p.StandardInput.Close();
-            return;
-        }
-        var commandLine = Adapters.Claude.Pty.TerminalText.Quote(exe) + " " + Adapters.Claude.Pty.TerminalText.JoinArguments(args);
-        const uint detached = 0x00000008, newGroup = 0x00000200, breakaway = 0x01000000, unicodeEnv = 0x00000400;
-        if (!Native.Start(commandLine, detached | newGroup | breakaway | unicodeEnv) && !Native.Start(commandLine, detached | newGroup | unicodeEnv))
-            throw new Win32Exception(Marshal.GetLastPInvokeError());
     }
 
     /// <summary>Writes through to stdout and flushes every write, so each message leaves at once.</summary>
@@ -139,43 +118,5 @@ public static partial class AcpBridge
             await inner.WriteAsync(buffer, ct);
             await inner.FlushAsync(ct);
         }
-    }
-
-    static unsafe partial class Native
-    {
-        [StructLayout(LayoutKind.Sequential)]
-        struct StartupInfo
-        {
-            public int cb;
-            public nint lpReserved, lpDesktop, lpTitle;
-            public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
-            public short wShowWindow, cbReserved2;
-            public nint lpReserved2, hStdInput, hStdOutput, hStdError;
-        }
-
-        [StructLayout(LayoutKind.Sequential)] struct ProcessInformation { public nint hProcess, hThread; public int dwProcessId, dwThreadId; }
-
-        public static bool Start(string commandLine, uint flags)
-        {
-            var si = new StartupInfo { cb = sizeof(StartupInfo) };
-            var cmd = (commandLine + '\0').ToCharArray();
-            ProcessInformation pi;
-            fixed (char* p = cmd)
-            {
-                if (!CreateProcessW(null, p, 0, 0, 0, flags, null, null, &si, &pi)) return false;
-            }
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            return true;
-        }
-
-        [LibraryImport("kernel32.dll", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static partial bool CreateProcessW(string? application, char* commandLine, nint processAttributes, nint threadAttributes,
-            int inheritHandles, uint flags, char* environment, char* currentDirectory, StartupInfo* startupInfo, ProcessInformation* processInformation);
-
-        [LibraryImport("kernel32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static partial bool CloseHandle(nint handle);
     }
 }

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Gorynych.Outside</RootNamespace>
+    <AssemblyName>Gorynych.Outside</AssemblyName>
+    <IsAotCompatible>true</IsAotCompatible>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Gorynych.Acp\Gorynych.Acp.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Shared with Gorynych.Service: the outside tools, the ancestry walk, the detached start. -->
+    <Compile Include="..\Shared\*.cs" LinkBase="Shared" />
+  </ItemGroup>
+</Project>

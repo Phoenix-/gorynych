@@ -56,6 +56,15 @@ fallback when the adapter does not provide it.
   per-launch flags, the agent's own protocol, hooks or a terminal.
 - The adapter's name (`IAgentAdapter.Name`, such as `claude`) is what the service records per
   session and what `spawn_session` takes; it MUST be stable.
+- An adapter MUST start its agent as a descendant of the service process, so that the MCP
+  servers the agent starts from the user's own configuration are recognised as inside
+  Gorynych: the `gorynych-outside` server, which the user registers for agents outside
+  Gorynych, hides its tools when a Gorynych service is among its ancestors
+  ([service-protocol.md](service-protocol.md#hiding-from-sessions-inside-gorynych)). An
+  in-process adapter starts its agent as the service's child; an external adapter is one
+  itself. An agent that starts its MCP servers through a separate long-lived process (a daemon
+  that outlives the session) breaks this; its conformance row says so. The walk exists only on
+  Windows yet.
 
 ## 2. Initialization
 
@@ -337,6 +346,8 @@ own JSON-RPC, not ACP, so its adapter translates, like Claude's.
 | Service turns and waking ([§6.1](#61-waking-a-session-and-closing-it-again)) | turns start the process; closed again afterwards | turns; resumed, then closed again | expected the same | expected the same |
 | `gorynych` MCP server ([§6.2](#62-the-gorynych-mcp-server)) | per-launch `--mcp-config` | through ACP `mcpServers` | unknown: how to give one thread an MCP server without editing `~/.codex` | unknown: depends on its MCP client |
 | System prompt ([§6.2](#62-the-gorynych-mcp-server)) | `sessionCapabilities.systemPrompt: {}` (append only): `--append-system-prompt`, after the channel's authorization; other modes and non-text content fail with `-32602` | not advertised by 2.5.2: the MCP instructions and the requests' texts | unknown | expected: append, and override too, since the adapter writes the system message itself |
+| Hidden from `gorynych-outside` ([§1](#1-building-and-starting-an-adapter)) | yes: `claude` is the service's child and starts MCP servers as its own children (probe); the adapter's `--settings` also denies `mcp__gorynych-outside` | yes: `kimi acp` is the service's child and starts MCP servers as its own children (probe) | unknown: whether `codex app-server` starts MCP servers itself or through its daemon | unknown: depends on its MCP client |
+| … on Linux and macOS | only the deny rule would hide it; the adapter itself runs on Windows only yet (ConPTY) | not hidden: the parent walk is Windows only yet, so every caller counts as outside | not hidden, as for Kimi | not hidden, as for Kimi |
 | Message IDs ([§5](#5-prompts-and-turns)) | answers: `MessageDisplay`'s `message_id`; typed and channel messages: the hook's `prompt_id` (the transcript's `promptId`), a new UUID for a channel message within a turn; texts Claude gives no ID: a new UUID | none sent by 2.5.2: the service assigns them | unknown; expected from its item IDs | its own store's IDs |
 | Live-note path ([§6.4](#64-the-live-note-path)) | development channel; `-32600` while not running | none (`-32601`) | none planned; `turn/steer` appends only to an active turn | none |
 | Approvals ([§8](#8-approvals-and-forms)) | PermissionRequest hook; pre-allows the three tools | Kimi's own `session/request_permission`; the service pre-allows | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval` | unknown |

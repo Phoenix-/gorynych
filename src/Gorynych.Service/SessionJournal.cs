@@ -37,6 +37,17 @@ public sealed class SessionJournal
         get { lock (gate) return Load().Count; }
     }
 
+    /// <summary>
+    /// True once compaction has dropped the journal's oldest entries. Kept in a marker file next to
+    /// the journal, so it survives a restart without an entry that clients would be replayed.
+    /// </summary>
+    public bool Trimmed
+    {
+        get { lock (gate) return File.Exists(TrimmedPath); }
+    }
+
+    string TrimmedPath => path + ".trimmed";
+
     /// <summary>True when the journal holds any part of a turn: a message, a thought, a tool call or a plan.</summary>
     public bool HasTurns
     {
@@ -97,6 +108,7 @@ public sealed class SessionJournal
             lines = [];
             turns = false;
             File.Delete(path);
+            File.Delete(TrimmedPath);
         }
     }
 
@@ -134,7 +146,12 @@ public sealed class SessionJournal
         if (pending is not null) merged.Add(pending.ToJsonString(LineOptions));
         // Then drop the oldest entries down to three quarters of the limit.
         var keep = maxEntries * 3 / 4;
-        if (merged.Count > keep) merged.RemoveRange(0, merged.Count - keep);
+        if (merged.Count > keep)
+        {
+            merged.RemoveRange(0, merged.Count - keep);
+            try { File.WriteAllText(TrimmedPath, ""); }
+            catch (IOException) { }
+        }
         all.Clear();
         all.AddRange(merged);
     }

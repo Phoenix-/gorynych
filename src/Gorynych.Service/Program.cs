@@ -42,6 +42,8 @@ if (!owned)
 
 var state = LoadState(Path.Combine(dataDirectory, "service.json"));
 ServiceLog.Info($"service {state.ServiceId} starting, pid {Environment.ProcessId}, pipe {pipeName}, data {dataDirectory}");
+// Started without breaking away from a host's job (the stdio bridge, the outside server): say so.
+if (Gorynych.Outside.DetachedProcess.KillOnCloseJob() is { } job) ServiceLog.Warn($"service: {job}");
 
 var adapters = new List<IAgentAdapter>
 {

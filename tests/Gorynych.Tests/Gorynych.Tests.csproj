@@ -17,6 +17,8 @@
     <ProjectReference Include="..\..\src\Gorynych.Adapters.Claude\Gorynych.Adapters.Claude.csproj" />
     <!-- Built first so the adapter tests can launch it; not referenced as an assembly. -->
     <ProjectReference Include="..\Gorynych.FakeClaude\Gorynych.FakeClaude.csproj" ReferenceOutputAssembly="false" />
+    <!-- Built first so the outside tests can launch it; its shared types are tested through the service. -->
+    <ProjectReference Include="..\..\src\Gorynych.Outside\Gorynych.Outside.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Fixtures\**\*" CopyToOutputDirectory="PreserveNewest" />

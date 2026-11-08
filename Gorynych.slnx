@@ -3,6 +3,7 @@
     <Project Path="src/Gorynych.Acp/Gorynych.Acp.csproj" />
     <Project Path="src/Gorynych.Adapters.Claude/Gorynych.Adapters.Claude.csproj" />
     <Project Path="src/Gorynych.Adapters.Kimi/Gorynych.Adapters.Kimi.csproj" />
+    <Project Path="src/Gorynych.Outside/Gorynych.Outside.csproj" />
     <Project Path="src/Gorynych.Service/Gorynych.Service.csproj" />
   </Folder>
   <Folder Name="/tests/">

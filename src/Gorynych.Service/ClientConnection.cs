@@ -86,6 +86,10 @@ internal sealed class ClientConnection
                 return await conductor.SpawnAsync(request, ct);
             case GorynychProtocol.MethodArchive:
                 return await conductor.ArchiveAsync(request, ct);
+            case GorynychProtocol.MethodRead:
+                return await conductor.ReadMethodAsync(request, ct);
+            case GorynychProtocol.MethodMcpMessage:
+                return await conductor.Outside.HandleAsync(this, request, ct);
             case GorynychProtocol.MethodShutdown:
                 ServiceLog.Info($"{Rpc.Name}: asked the service to exit");
                 _ = Task.Delay(200).ContinueWith(_ => conductor.RequestShutdown(), TaskScheduler.Default);

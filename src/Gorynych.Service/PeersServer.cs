@@ -77,7 +77,8 @@ public static class PeersServer
         var instructions = new StringBuilder();
         if (channel)
             instructions.Append("Messages on this channel come from the user's other coding-agent sessions; their first line names the " +
-                "sending session by its session_id. Answer a message with kind opinion with the reply tool, passing its message_id. " +
+                "sending session by its session_id. A message from an agent outside Gorynych says so in its first line instead of " +
+                "naming a session_id; ask_agent cannot reach it. Answer a message with kind opinion with the reply tool, passing its message_id. " +
                 "A message with kind report (a session you spawned finished a turn) needs no reply. When this session was not " +
                 "running, such a request or report arrives as a prompt instead, with the same first line; treat it the same way. ");
         else

@@ -34,6 +34,12 @@ Approvals are asked on the console; `--approve allow|deny` answers them automati
 Any ACP client that starts agents over stdio, such as Zed, can use the service through
 `Gorynych.Service acp --agent claude|kimi`; see [external clients](docs/external-clients.md).
 
+Agents outside Gorynych (Claude Code in Claude Desktop or a terminal, Codex, Kimi Code) can
+list its sessions, read them and ask one for an opinion through the `gorynych-outside` MCP
+server, `Gorynych.Outside.exe`. It is published to its own folder; to replace it while hosts
+run it, rename the old exe aside first. See
+[agents outside Gorynych](docs/external-clients.md#agents-outside-gorynych).
+
 Specifications: [service protocol](docs/service-protocol.md), [adapters](docs/adapters.md),
 [ACP types](docs/acp-types.md). Probe programs and what they proved:
 [research/probes](research/probes/README.md).

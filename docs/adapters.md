@@ -72,9 +72,12 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
        (--session-id <id> | --resume <id>) -- <first prompt>
 ```
 
-- `settings.json` holds only http hooks posting to
+- `settings.json` holds http hooks posting to
   `http://127.0.0.1:<port>/hook/<session>/<token>` (Kestrel on loopback, a random token
-  per session). They add to the user's global hooks.
+  per session), which add to the user's global hooks, and one permission rule,
+  `"deny": ["mcp__gorynych-outside"]`: the server for agents outside Gorynych, which the user may
+  have registered in their own configuration, is not for a session inside it. The server also
+  hides its tools by its ancestry ([service-protocol.md](service-protocol.md#hiding-from-sessions-inside-gorynych)).
 - `--permission-mode default`, because a global `defaultMode: auto` would decide
   approvals without asking.
 - The session ID is chosen by the adapter at `session/new` and passed as `--session-id`;
@@ -154,8 +157,9 @@ when the channel has no request with that `message_id`. Without a service-given 
 
 `--append-system-prompt` holds two parts. With a channel, the adapter's own authorization
 comes first: it authorizes opinions from the user's agents, forbids actions on their behalf,
-says each channel message names the asking session by its `session_id` and that such a
-message arrives as a prompt when Claude was not running. Then comes the session's ACP
+says each channel message names the asking session by its `session_id` (or says it comes from
+an agent outside Gorynych, which `ask_agent` cannot reach) and that such a message arrives as a
+prompt when Claude was not running. Then comes the session's ACP
 `systemPrompt`: the adapter advertises `sessionCapabilities.systemPrompt: {}` (append only,
 since Claude Code can only add to its own prompt) and takes the text of the latest
 `session/new` or `session/resume`. The service sends its peer instructions there, which tell

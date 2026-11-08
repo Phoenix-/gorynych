@@ -131,3 +131,59 @@ dotnet publish src/Gorynych.Service -c Release -r win-x64 -p:PublishAot=true -o 
 
 For debugging: Zed's `dev: open acp logs` shows the messages between Zed and the bridge; the
 service writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
+
+## Agents outside Gorynych
+
+An agent outside Gorynych, such as Claude Code in Claude Desktop or in a terminal, Codex, or
+Kimi Code, can list Gorynych's sessions, read what they said and ask one for its opinion
+through the `gorynych-outside` MCP server
+([service-protocol.md](service-protocol.md#agents-outside-gorynych)). Gorynych never registers
+it by itself: each command below changes the agent's own configuration, and the user runs it.
+
+### Publishing the server
+
+The server is its own small exe with its own folder, because a host keeps it running for hours
+and Windows cannot overwrite a running exe:
+
+```
+dotnet publish src/Gorynych.Outside -c Release -r win-x64 -p:PublishAot=true -o %LOCALAPPDATA%\Programs\Gorynych\outside
+```
+
+It starts the service from the parent folder (`%LOCALAPPDATA%\Programs\Gorynych\Gorynych.Service.exe`)
+when the service is not running. To replace it while hosts run it, first rename the old
+`Gorynych.Outside.exe` aside (`Gorynych.Outside.old.exe`); Windows allows renaming a running exe
+on the same volume. The hosts keep the old copy until they restart their servers, and its
+answers still come from the new service. Its log is
+`%LOCALAPPDATA%\Gorynych\logs\outside-<date>.log`.
+
+### Registering the server
+
+- **Claude Code.** *Unverified:* that the Code tab of Claude Desktop reads the same user
+  configuration. It will be checked when the coordinator session, a Claude Desktop session,
+  registers the server first.
+  ```
+  claude mcp add --scope user gorynych-outside -- "C:\Users\<you>\AppData\Local\Programs\Gorynych\outside\Gorynych.Outside.exe"
+  ```
+  To undo it: `claude mcp remove --scope user gorynych-outside`.
+- **Codex:**
+  ```
+  codex mcp add gorynych-outside -- "C:\Users\<you>\AppData\Local\Programs\Gorynych\outside\Gorynych.Outside.exe"
+  ```
+  To undo it: `codex mcp remove gorynych-outside`.
+- **Kimi Code:** an entry in the `mcpServers` object of `~/.kimi-code/mcp.json`, from Kimi's
+  docs. *Unverified:* the docs also name a TUI command, `/mcp-config`, that edits that file.
+  Neither has been tried with Kimi Code 2.5.2.
+  ```json
+  { "mcpServers": { "gorynych-outside": { "command": "C:\Users\<you>\AppData\Local\Programs\Gorynych\outside\Gorynych.Outside.exe" } } }
+  ```
+- Keep the name `gorynych-outside`: the Claude adapter's deny rule matches it. Any other name
+  still works, and the server still hides itself inside Gorynych.
+- Optional: allow `mcp__gorynych-outside__list_sessions` and
+  `mcp__gorynych-outside__read_session` in the agent's own permission settings.
+- Timeouts (Claude Code): a question waits as long as the asked session needs, and Gorynych
+  keeps the call alive with progress notifications. Leave `MCP_TOOL_TIMEOUT` (about 28 hours
+  by default) and `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (30 minutes for stdio servers) as they
+  are. A lower `MCP_TOOL_TIMEOUT`, or a per-server `timeout`, cuts long questions off,
+  because progress does not extend it.
+- To try it without changing any configuration, give the server to one run of Claude with
+  `--mcp-config` (a file with `{"mcpServers": {"gorynych-outside": {"type": "stdio", "command": "<path to Gorynych.Outside.exe>"}}}`).

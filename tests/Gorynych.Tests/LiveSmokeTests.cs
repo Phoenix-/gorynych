@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
@@ -285,6 +286,96 @@ public sealed class LiveSmokeTests
             lock (zed.Updates)
                 text = string.Concat(zed.Updates.Where(u => (string?)u["sessionUpdate"] == "agent_message_chunk").Select(u => (string?)u["content"]?["text"]));
             StringAssert.Contains(text, "Blue", "the plain client picked the second option, Blue");
+        }
+        finally
+        {
+            await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodShutdown, new JsonObject());
+        }
+    }
+
+    /// <summary>
+    /// The gorynych-outside server, given to Claude without touching its configuration: inside a
+    /// session of a real Gorynych service (the service exe, its own pipe and data) it offers no
+    /// tools, under the guide's name and under another one, which the adapter's deny rule does not
+    /// match; outside, to <c>claude -p</c> with <c>--mcp-config</c>, it offers its three tools and
+    /// lists that session.
+    /// </summary>
+    [TestMethod]
+    [Timeout(600_000, CooperativeCancellation = true)]
+    public async Task Outside_ClaudeSeesTheOutsideToolsOutside_ButNotInsideAGorynychSession()
+    {
+        RequireLive();
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var root = RepoRoot();
+        var outside = Directory.EnumerateFiles(Path.Combine(root, "src", "Gorynych.Outside", "bin"), "Gorynych.Outside.exe", SearchOption.AllDirectories)
+            .OrderByDescending(File.GetLastWriteTimeUtc).First();
+        var logs = TestDirs.New();
+        var pipe = "gorynych-live-" + Guid.NewGuid().ToString("N")[..8];
+        JsonObject Server(string name) => new()
+        {
+            ["name"] = name, ["command"] = outside, ["args"] = new JsonArray("--pipe", pipe, "--log", logs), ["env"] = new JsonArray(),
+        };
+        string[] Log() => Directory.EnumerateFiles(logs, "outside-*.log").SelectMany(File.ReadAllLines).ToArray();
+        await using var zed = new PlainClient("acp", "--agent", "claude", "--pipe", pipe, "--data", TestDirs.New(), "--claude-model", "haiku");
+        await zed.InitializeAsync();
+        try
+        {
+            var created = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew, new JsonObject
+            {
+                ["cwd"] = root, ["mcpServers"] = new JsonArray(Server("gorynych-outside"), Server("outside-probe")),
+            });
+            var sessionId = (string)created!["sessionId"]!;
+            Task<JsonNode?> Prompt(string text) => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject
+            {
+                ["sessionId"] = sessionId, ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
+            });
+            await Prompt("Reply with exactly READY."); // the first turn may start before the MCP servers are connected
+            await Prompt("Call the tool mcp__gorynych__list_agents once. Then, if you have a tool named mcp__gorynych-outside__list_sessions " +
+                "or mcp__outside-probe__list_sessions, call each of them once too. Then reply with the names of the tools you called.");
+            string[] calls;
+            lock (zed.Updates)
+                calls = zed.Updates.Where(u => (string?)u["sessionUpdate"] == "tool_call").Select(u => (string?)u["title"] ?? "").ToArray();
+            Console.WriteLine($"inside, the tool calls: {string.Join(", ", calls)}");
+            Assert.IsTrue(calls.Any(t => t.Contains("list_agents", StringComparison.Ordinal)), "a control: it has its own gorynych server");
+            Assert.IsFalse(calls.Any(t => t.Contains("list_sessions", StringComparison.Ordinal)), "it has no outside tool to call");
+            var decided = Log().Where(l => l.Contains("inside Gorynych, no tools", StringComparison.Ordinal)).ToArray();
+            Assert.AreEqual(2, decided.Length, string.Join(Environment.NewLine, Log()));
+            Assert.IsTrue(decided.All(l => l.Contains("Gorynych.Service.exe", StringComparison.Ordinal)), "the service is among the ancestors");
+
+            var config = Path.Combine(logs, "mcp.json");
+            File.WriteAllText(config, new JsonObject
+            {
+                ["mcpServers"] = new JsonObject
+                {
+                    ["gorynych-outside"] = new JsonObject { ["type"] = "stdio", ["command"] = outside, ["args"] = new JsonArray("--pipe", pipe, "--log", logs) },
+                },
+            }.ToJsonString());
+            var psi = new ProcessStartInfo("claude")
+            {
+                RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = root,
+            };
+            foreach (var a in new[]
+            {
+                "-p", "Call the tool mcp__gorynych-outside__list_sessions once, then reply with every session_id it lists, one per line.",
+                "--output-format", "stream-json", "--verbose", "--strict-mcp-config", "--mcp-config", config, "--model", "haiku",
+                "--permission-mode", "default", "--allowedTools", "mcp__gorynych-outside__list_sessions",
+            }) psi.ArgumentList.Add(a);
+            // Started from inside another Claude Code session, the child would attach to that one.
+            foreach (var key in psi.Environment.Keys.Where(k => k.StartsWith("CLAUDE", StringComparison.OrdinalIgnoreCase)
+                || k.StartsWith("ANTHROPIC", StringComparison.OrdinalIgnoreCase) || k.StartsWith("MCP_", StringComparison.OrdinalIgnoreCase)).ToList())
+                psi.Environment.Remove(key);
+            using var claude = Process.Start(psi)!;
+            var stderr = claude.StandardError.ReadToEndAsync();
+            var lines = new List<JsonObject>();
+            while (await claude.StandardOutput.ReadLineAsync() is { } line)
+                if (line.StartsWith('{') && JsonNode.Parse(line) is JsonObject o) lines.Add(o);
+            await claude.WaitForExitAsync();
+            var tools = lines.First(l => (string?)l["type"] == "system" && (string?)l["subtype"] == "init")["tools"]!.AsArray().Select(t => (string?)t).ToArray();
+            var answer = (string?)lines.Last(l => (string?)l["type"] == "result")["result"] ?? "";
+            Console.WriteLine($"outside tools: {string.Join(", ", tools.Where(t => t!.Contains("gorynych", StringComparison.Ordinal)))}; answer: {answer}; stderr: {await stderr}");
+            CollectionAssert.IsSubsetOf(new[] { "mcp__gorynych-outside__list_sessions", "mcp__gorynych-outside__read_session", "mcp__gorynych-outside__ask_agent" }, tools);
+            StringAssert.Contains(answer, sessionId, "it listed the session inside");
+            Assert.IsTrue(Log().Any(l => l.Contains("outside Gorynych (", StringComparison.Ordinal)));
         }
         finally
         {

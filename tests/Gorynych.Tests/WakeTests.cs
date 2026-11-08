@@ -97,7 +97,8 @@ public sealed class WakeTests
         Assert.AreEqual("ok", (string?)answer!["text"]);
         await Until(() => kimi.CallsFor(target).Last() == Close, "the close after the turn");
         CollectionAssert.AreEqual(new[] { Resume, Opinion, Prompt, Close }, CallsFrom(kimi, target, Resume));
-        Assert.IsFalse(conductor.Agents["kimi"].IsLive(target), "unloaded again");
+        // The agent records the close before the service hears its answer and marks the session closed.
+        await Until(() => !conductor.Agents["kimi"].IsLive(target), "unloaded again");
         Assert.IsTrue(conductor.Store.Get(target)!.Archived, "an archived session is woken the same way and stays archived");
     }
 
@@ -118,7 +119,7 @@ public sealed class WakeTests
         StringAssert.StartsWith(claude.Prompts.Last().Text, $"[Opinion request · from session_id {asker} (kimi, \"Coordinate the release\") · message_id m");
         await Until(() => claude.CallsFor(target).Last() == Close, "the close after the turn");
         CollectionAssert.AreEqual(new[] { Opinion, Prompt, Close }, CallsFrom(claude, target, Opinion));
-        Assert.IsFalse(conductor.Agents["claude"].IsLive(target));
+        await Until(() => !conductor.Agents["claude"].IsLive(target), "unloaded again");
     }
 
     [TestMethod]

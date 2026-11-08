@@ -45,6 +45,9 @@ public static class ClaudeHooks
     public const string DenyOptionId = "deny";
 
     /// <summary>Builds the per-launch settings JSON that posts every hook event to <paramref name="url"/>.</summary>
+    /// <summary>The permission rule that removes the gorynych-outside server's tools from Claude's list.</summary>
+    public const string OutsideServerDeny = "mcp__gorynych-outside";
+
     public static JsonObject Settings(string url)
     {
         var hooks = new JsonObject();
@@ -57,7 +60,14 @@ public static class ClaudeHooks
                 ["hooks"] = new JsonArray(new JsonObject { ["type"] = "http", ["url"] = url, ["timeout"] = timeout }),
             });
         }
-        return new JsonObject { ["hooks"] = hooks };
+        return new JsonObject
+        {
+            ["hooks"] = hooks,
+            // The gorynych-outside server is for agents outside Gorynych; a session inside Gorynych
+            // that reads it from the user's configuration must not use it. The server hides itself
+            // by its ancestry too; this rule matches the name the guide registers it under.
+            ["permissions"] = new JsonObject { ["deny"] = new JsonArray(OutsideServerDeny) },
+        };
     }
 
     public static string? Name(JsonObject e) => (string?)e["hook_event_name"];

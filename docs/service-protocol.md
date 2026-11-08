@@ -26,6 +26,8 @@ Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent 
 also the `gorynych` MCP server agents start over stdio:
 `peers [--pipe … --token …] [--channel-url …]` (see Opinions below), and the stdio bridge
 for external ACP clients: `acp --agent claude|kimi` (see [external-clients.md](external-clients.md)).
+Agents outside Gorynych use a separate small executable, `Gorynych.Outside.exe`, as their MCP
+server ([Agents outside Gorynych](#agents-outside-gorynych)).
 
 ## Standard methods
 
@@ -105,7 +107,8 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/includeArchived` | `session/list` params `_meta` | `true` lists archived sessions too |
 | `gorynych/parentSessionId` | `SessionInfo._meta` in `session/list`; `session_info_update._meta`; the `_meta` of a spawned session's first `user_message_chunk` | the session that started this one with `spawn_session`; absent for a session a client created |
 | `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel), `spawn` (a spawned session's first prompt), `report` (a child's report delivered as a turn) or `terminal` |
-| `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, `parent_claude` for a spawn, `child_kimi` for a report: a label for GUIs only; the text the agent gets names the session by its ID instead (see [What agents are told](#what-agents-are-told)) |
+| `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, `parent_claude` for a spawn, `child_kimi` for a report, `outside_claude-code` for an agent outside Gorynych (`outside_<client name>`): a label for GUIs only; the text the agent gets names the session by its ID instead (see [What agents are told](#what-agents-are-told)) |
+| `gorynych/outside` | `_meta` of `_gorynych/mcp_message`, and of the opinion request an agent outside Gorynych asked | the host: `client` (MCP `clientInfo`), `folder`, `hostSessionId` (see [Agents outside Gorynych](#agents-outside-gorynych)) |
 | `gorynych/fromSessionId` | `user_message_chunk._meta` of an opinion request or a report delivered as a turn | the session that asked, or the child that reports |
 | `gorynych/opinion` | `_meta` of the request message and of every update of its turn | the request's `message_id`, so a GUI can show the exchange apart from the user's own turns |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
@@ -116,6 +119,8 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
 | `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?}` → `{}` | tells a session's agent something that needs no answer (a child's report); the Claude adapter pushes it through the channel, an agent that answers method not found, or `-32600` because it is not running, gets it as a turn |
+| `_gorynych/mcp_message` | method, outside server → service, `{serverId, requestId, method, params}` → `{result}` or `{error}`; as a notification from the service, a notification of that request | an MCP request of `gorynych-outside`, in the shape of `mcp/message` from ACP's MCP-over-ACP RFD (see [`_gorynych/mcp_message`](#agents-outside-gorynych)) |
+| `_gorynych/read` | method, `{sessionId, cursor?, limit?, thoughts?}` → `{updates, nextCursor?, total, inProgress, trimmed}` | a page of a session's history from the journal (see [Reading a session](#reading-a-session)) |
 | `_gorynych/sessions_changed` | notification to clients, `{sessionId, change}` | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply`, `_gorynych/spawn` and `_gorynych/archive` | which session's `gorynych` MCP server is calling |
 
@@ -384,6 +389,388 @@ a channel note would wake Claude too. That holds also when the parent is archive
 report waits for the parent's running turn. Nothing is kept to send after a restore.
 
 
+## Agents outside Gorynych
+
+An agent the user runs outside Gorynych on the same machine, such as Claude Code in Claude
+Desktop or in a terminal, or Codex, can list Gorynych's sessions, read what they said, and ask
+one of them for an opinion. It does this through a stdio MCP server that the user registers in
+that agent: `gorynych-outside` ([external-clients.md](external-clients.md#agents-outside-gorynych)).
+The answer comes back in the same tool call, so a Gorynych session never has to reach out. An
+outside agent cannot prompt, spawn, archive or reply, and no Gorynych session can ask it
+anything.
+
+### The server
+
+`Gorynych.Outside.exe [--pipe <name>] [--service <path>] [--log <dir>]` is a small Native AOT
+program (`src/Gorynych.Outside`). It is published apart from the service, to
+`%LOCALAPPDATA%\Programs\Gorynych\outside\`. Hosts keep their MCP servers running for hours,
+and Windows cannot overwrite a running exe. If the service's own exe were the server, every
+publish of the service would fail while an outside agent was open. The server changes rarely;
+to replace it while it runs, rename the old file aside first, which Windows allows for a
+running exe on the same volume. `--service` names the service to start (default
+`Gorynych.Service.exe` in the parent folder, as published), and `--log` the log folder
+(default `%LOCALAPPDATA%\Gorynych\logs`); tests use both.
+
+It is thin. Requests go to the service as `_gorynych/mcp_message` (below), on a new pipe
+connection per request (opened with `initialize`, as any client's), and the service's answer
+goes back unchanged. The tools, their descriptions, the texts and the result of every call
+come from the service. A new publish of the service therefore changes them without restarting
+any host. A host keeps the tool schemas it listed until it reconnects; results are always
+fresh, and key hints are repeated in results (see
+[What agents are told](#what-outside-agents-are-told)).
+
+**Both eras of MCP.** MCP revision 2026-07-28 made the protocol stateless. It removes the
+`initialize` handshake, and every request carries its protocol version, client capabilities and
+`clientInfo` in `params._meta` (`io.modelcontextprotocol/protocolVersion`,
+`…/clientCapabilities`, `…/clientInfo`). A client probes a stdio server with `server/discover`
+and falls back to `initialize` on an error. The server serves both eras, per request, as MCP's
+versioning page describes for dual-era servers:
+
+- **Modern hosts** (2026-07-28). The server forwards every request, `server/discover`
+  included, and keeps no state. The service answers `server/discover` with a `DiscoverResult`:
+  `resultType` `complete`, `supportedVersions` `["2026-07-28"]`, `capabilities` `{tools: {}}`,
+  `serverInfo` `gorynych-outside` in `_meta`, and the instructions below. Every modern result
+  has `resultType: "complete"`. `gorynych/outside.client` comes from each request's own
+  `io.modelcontextprotocol/clientInfo`. A version the service does not serve gets MCP's
+  `-32022` with `data.supported` and `data.requested`. Probed: Claude Code 2.1.302 speaks this
+  era to a server that answers `server/discover`, and then sends no `initialize`.
+- **Legacy hosts** (`2025-11-25` and earlier; Kimi Code 2.5.2 starts with `initialize`). The
+  server answers `initialize` itself, with the host's revision when it is one it knows
+  (`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`) and `2025-11-25` otherwise, keeps
+  the host's `clientInfo` for `gorynych/outside.client`, and forwards the other requests.
+  `notifications/initialized` needs nothing. The service tells the eras apart by
+  `io.modelcontextprotocol/protocolVersion` in `params._meta`; a legacy result has no
+  `resultType`.
+- `ping` is answered by the server itself. A request the server does not know is forwarded,
+  and the service answers `-32601` for it.
+- The instructions, in `server/discover` and `initialize`: `Gorynych runs the user's Claude
+  and Kimi coding sessions on this machine. list_sessions lists them, read_session shows what
+  one said, and ask_agent asks one for its opinion. They cannot ask you anything back.`
+
+**Its own copy of the tools.** The tool definitions and texts live in one source file,
+`src/Shared/OutsideTools.cs`, compiled into both the service and the server. The live source is
+still the service: while it can be reached, its answers win, even when they are newer than the
+server's copy. When the service cannot be reached:
+
+- `server/discover`, `initialize` and `tools/list` are answered from the copy, so the host
+  always gets the tools;
+- a tool call returns `isError` with `Gorynych is not running and could not be started:
+  <reason>. Start Gorynych, then call the tool again.`; any other request fails with the same
+  text (`-32603`).
+
+So an agent started before the service (Claude Desktop opened in the morning before Zed)
+still has its tools and gets a useful text, instead of a server that failed. The server never
+exits on such an error, because a host does not restart a server that died.
+
+**Starting the service.** When the pipe is not there, the server starts the service as the
+stdio bridge does (`DetachedProcess.Start`: detached, a new process group, breaking away from
+the host's job and falling back to staying in it), waits up to 20 seconds for its pipe, then
+sends the request.
+
+- It tries to start the service at most once a minute, and connects on every request.
+- The host's environment does not leak into agents: the Claude adapter already strips
+  `CLAUDECODE` and `CLAUDE_CODE_*` (`ClaudeSession.LaunchEnvironment`).
+- **Risk.** If the host's job forbids breakaway, the fallback leaves the service in that job.
+  Closing the host can then kill the service with every session. The server logs this case
+  explicitly, in `%LOCALAPPDATA%\Gorynych\logs\outside-<date>.log`. The service also logs at
+  start when it runs inside a job that kills its processes on close and lets none break away,
+  which covers the bridge as well.
+
+**Cancellation.** MCP's `notifications/cancelled` for a forwarded request becomes ACP's
+`$/cancel_request` for that `_gorynych/mcp_message`. The RFD makes cancellation hop-local and
+best effort. A question that is still waiting (for the asked session's running turn, say) is
+then withdrawn and never reaches the session, and the service answers the request with
+`-32800`.
+
+### `_gorynych/mcp_message`
+
+The server passes MCP requests to the service with the param and result shape of
+`mcp/message` from ACP's draft RFD
+[MCP-over-ACP](https://agentclientprotocol.com/rfds/mcp-over-acp) (checked against the RFD's
+own examples on 8 November 2026). The direction is the other way round: there an agent reaches
+a server that its client provides, while here a client (the outside server) reaches the
+service. So the method carries Gorynych's prefix.
+
+- Params: `serverId` (`gorynych-outside`), `requestId`, `method` and `params` (the MCP
+  request's), and `_meta["gorynych/outside"]`, which describes the host.
+  - `requestId` is the host's MCP request id. The RFD defines it as a caller-generated opaque
+    string that identifies one logical MCP request and serves as the inner MCP JSON-RPC id.
+    MCP ids may be numbers, so the server sends it as a string (`7` becomes `"7"`) and answers
+    the host under its original id.
+  - The host object:
+    - `client`: MCP `clientInfo` (`name`, `title`, `version`), from `initialize` or from the
+      request's own `_meta` (see [The server](#the-server));
+    - `folder`: the server's working directory, which is the host's project folder in both
+      probes;
+    - `hostSessionId`: `CLAUDE_CODE_SESSION_ID` from the server's environment, when present.
+      Claude Code sets it for its MCP servers.
+- Result: exactly one of `result` (the MCP result) or `error` (`code`, `message`, `data?`), an
+  MCP outcome, never to be read as an ACP error.
+- Errors of the outer request are the binding's own, as in the RFD: `-32602` for a malformed
+  envelope, `-33001` for a `serverId` other than `gorynych-outside`, `-32800` for a cancelled
+  request.
+- **Request-scoped notifications**, the RFD's way to carry progress. While a request is
+  active, the service may send `_gorynych/mcp_message` as a notification (no id) with the same
+  `serverId` and `requestId`, and the inner `method` and `params` (`notifications/progress`).
+  The server writes the inner notification to the host. A notification for an unknown or
+  finished request is dropped. None follows the request's final result or error.
+- A server inside Gorynych never sends the method
+  ([below](#hiding-from-sessions-inside-gorynych)).
+
+### Hiding from sessions inside Gorynych
+
+The user registers `gorynych-outside` in their own agent configuration, and the agents that
+Gorynych runs read that configuration too. In the probe, Claude loaded the user's servers next
+to the ones given with `--mcp-config`. So a session inside Gorynych would see
+`gorynych-outside` next to its own `gorynych` server. With it, the session could ask without
+its identity, past the rule that a session answering a request cannot ask, and even ask
+itself, which hangs its turn.
+
+The outside server therefore checks its own ancestry, once, when it starts
+(`src/Shared/Ancestry.cs`):
+
+- It walks its parents. The walk stops at a parent created after its child, which means the
+  ID was reused, or at a process that no longer exists.
+- If any ancestor runs a Gorynych service (image `Gorynych.Service.exe`, the apphost or the AOT
+  build, compared ignoring case), the server runs inside Gorynych. Any service counts, not only
+  the one on the server's pipe, so sessions of a test instance do not see the main instance's
+  outside server either. A service started as `dotnet Gorynych.Service.dll` has the image
+  `dotnet` and is not recognised.
+- Inside, the server forwards nothing. `server/discover` and `initialize` give the hiding text
+  below as their instructions, `tools/list` answers no tools, and a tool call (a host may hold
+  an older list) returns `isError` with: `This is the gorynych-outside server, for agents
+  outside Gorynych. This session runs inside Gorynych: use list_agents and ask_agent of its
+  gorynych server instead.`
+- The result is computed once, because a process's ancestors are fixed when it starts, and
+  logged with the ancestors it saw. The check needs no service, so it also holds while the
+  service is down and the server answers from its own copy of the tools
+  ([The server](#the-server)).
+- Platforms. On Windows the walk uses `Toolhelp32` for parents and `GetProcessTimes` for
+  creation times. On Linux it would read `/proc/<pid>/stat`, and on macOS `sysctl`
+  `kinfo_proc`. Until the walk is written for Linux and macOS, the server builds there but
+  counts every caller as outside, so only the Claude adapter's deny rule (below) protects
+  sessions inside Gorynych. The [conformance table](adapter-contract.md#13-conformance) says so.
+
+This works because every agent descends from the service, and every agent starts its MCP
+servers as its own direct children (probes below). In-process adapters start their agent as a
+child of the service, and an external adapter is itself one
+([adapter-contract.md](adapter-contract.md#1-building-and-starting-an-adapter)).
+
+The check is in the outside server rather than in the service, because the server must decide
+even when the service cannot be reached. Its own PID is all it needs: no pipe client ID, no
+socket peer credentials, no per-PID cache. The code is shared with the service, like the tool
+definitions.
+
+Why not an environment variable that the adapters set: Claude Code 2.1.302 and Kimi Code
+2.5.2 do pass their whole environment to stdio MCP servers today. But the MCP SDKs (TypeScript,
+Python) pass only a short allow-list by default, so an agent built on one of them would drop
+such a variable without a word.
+
+As extra insurance, the Claude adapter adds `"permissions": {"deny": ["mcp__gorynych-outside"]}`
+to its `--settings`. The probe showed that the denied server's tools leave the model's tool
+list, although Claude still starts the server and asks it for `tools/list`. The rule matches
+only the name the guide gives; ancestry covers any name.
+
+### Outside tools
+
+What the service returns for `tools/list`, outside Gorynych.
+
+**`list_sessions {include_archived?}`**
+
+> List the user's coding-agent sessions in Gorynych, which runs Claude and Kimi sessions on
+> this machine. Pass a session_id to read_session to see what that session said, or to
+> ask_agent to ask it something. Each entry has session_id, agent, title, cwd, status,
+> updated_at and parent_session_id (set when another session started it with spawn_session).
+> Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's are a bare
+> UUID, Kimi's start with session_. status open means the agent has the session loaded now; a
+> saved one is started when asked, so it answers more slowly, and read_session reads it without
+> starting it. Archived sessions are left out unless include_archived is true, and the result
+> says how many.
+
+- `include_archived`: `also list archived sessions, marked archived: true; default false`.
+- Result: the entries of `_gorynych/peers`, rendered as `list_agents` renders them, with all
+  sessions and no `You are …` line: what `status` means (when the list is not empty), the
+  list, and the same archived line.
+
+**`read_session {session_id, before?, limit?, thoughts?}`**
+
+> Read what was said in one of the user's Gorynych sessions: its latest messages, oldest
+> first, with each tool call on one line. Use it to see what a session reported, decided or
+> asked. It does not disturb the session and does not start its agent. When older messages
+> exist, the result's last line says how to read them: pass its before value.
+
+- `session_id`: `the exact session_id, from list_sessions`.
+- `before`: `read the messages before this point; pass the value a previous read_session
+  result gave, or leave it out for the latest messages`.
+- `limit`: `how many messages to show, 1 to 50; default 10` (a value outside is clamped).
+- `thoughts`: `also show the agent's thinking; default false`.
+
+Result: see [Reading a session](#reading-a-session).
+
+**`ask_agent {session_id, question}`**
+
+> Ask one of the user's Gorynych sessions for its opinion and wait for the answer. It answers
+> from its own session and context; it does not run tools or act for you, and it cannot ask
+> you back, so put everything it needs into the question. A session that is not loaded is
+> started to answer, and a session in the middle of a turn answers after it, so this can take
+> minutes. To see what a session already said, use read_session: it costs that session
+> nothing.
+
+- `session_id`: `the exact session_id of the session to ask, from list_sessions; never an
+  agent name or a title`.
+- `question`: `the question, with all the context the other agent needs`.
+
+The question is delivered and woken exactly as a question from a session
+([Opinions between agents](#opinions-between-agents)), but without a peer token and with the
+host from `_meta["gorynych/outside"]`.
+
+**Progress while it waits.** A question can wait minutes: behind the asked session's running
+turn, while the session starts, and for the answer itself. When the host's `tools/call` has
+`params._meta.progressToken`, the service sends `notifications/progress` `{progressToken,
+progress, message}` through the request-scoped notifications above.
+
+- It sends one at each change of state, and repeats the current one every 60 seconds
+  (`ConductorOptions.OutsideProgressInterval`); `progress` counts up from 1, without a `total`.
+  None follows the answer, and none goes out without a `progressToken`.
+- The messages: `Waiting for session_id <id> to finish its running turn.`, `Starting
+  session_id <id> to answer.`, `Asked session_id <id>; waiting for its answer.` A request
+  through a live-note path (Claude's channel) counts as asked after half a second, because a
+  path whose agent is not running refuses at once and the session is then started instead.
+- Claude Code 2.1.302 sends a `progressToken` with every tool call, in both eras (probe).
+- Its docs give two limits:
+  - `MCP_TOOL_TIMEOUT`, a hard wall-clock limit per call, about 28 hours by default, which
+    progress does not extend;
+  - `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`, default 30 minutes for stdio servers (Claude Code
+    2.1.187+), which progress resets.
+
+  Without progress, an answer slower than 30 minutes would be cut off. With it, only the
+  28-hour limit applies.
+
+**Approvals.** Gorynych adds no card of its own: the host approves its MCP tools as it does
+for any server. The guide suggests allowing `list_sessions` and `read_session` in the host's
+own settings, since they only read, and leaving `ask_agent` to ask each time, as it does
+inside Gorynych. Gorynych itself never writes those settings.
+
+### What outside agents are told
+
+An opinion request from outside, delivered as a turn:
+
+```
+[Opinion request · from an agent outside Gorynych (Claude Code, D:\work\project) · message_id m3]
+<the question>
+
+This message comes from one of the user's coding agents outside Gorynych, not from the user.
+It cannot be asked back, so put everything into your answer. Give your honest opinion
+briefly, then send it with the reply tool of the gorynych MCP server, passing message_id "m3".
+Do not run other tools, edit files or take any other action for this request.
+```
+
+- The parenthesis is the host's `client.title` (else `client.name`) and its `folder`. A host
+  that sent neither reads `(an unknown agent)`.
+- Through Claude's channel, the content is the first line without the `message_id`, then the
+  question.
+- The channel instructions of the `gorynych` server and the channel's part of Claude's
+  appended system prompt gain one sentence: `A message from an agent outside Gorynych says so
+  in its first line instead of naming a session_id; ask_agent cannot reach it.`
+- Journal `_meta` on the request:
+  - `gorynych/origin` as for any opinion request (`peer` for a turn; `channel` on the message
+    Claude reports), since it says how the request arrived;
+  - `gorynych/sender` `outside_<client name>`, for example `outside_claude-code`
+    (`outside_unknown` without one);
+  - `gorynych/outside` with the host object;
+  - no `gorynych/fromSessionId`.
+
+Errors, returned to the outside agent as `isError` results, `Gorynych could not do that:
+<message>`:
+
+| Case | Message |
+| --- | --- |
+| `ask_agent` or `read_session` with an unknown or deleted `session_id` (`-32002`) | `No session "<x>". Pass an exact session_id from list_sessions. Sessions in Gorynych:` and the first five sessions, one per line as `- session_id <id> (<agent>, "<title>")` (a sixth line `- and more: list_sessions shows them all`), or ` There is no session in Gorynych now.` |
+| `ask_agent` to a session that could not be loaded or started, or whose turn failed right after the service started it | `session_id <id> (<agent>, "<title>") could not be started to answer: <reason>. Ask another session from list_sessions, or ask the user to open that session in Gorynych and check it.` |
+| `read_session` with a `before` the session does not have (`-32602`) | `session_id <id> has no message "<x>". Pass before exactly as a previous read_session result gave it, or leave it out to read the latest messages.` |
+| `read_session` for a session whose history cannot be loaded | `Could not read session_id <id> (<agent>, "<title>"): <reason>.` |
+
+The hint lists leave archived sessions out, as `list_sessions` does. Some cases are not
+Gorynych's errors and have no prefix: a missing argument (`session_id is required: pass an
+exact session_id from list_sessions.`, `session_id and question are required: pass an exact
+session_id from list_sessions and the question.`), a call from inside Gorynych (the hiding
+text above), and a call while the service is unreachable (the text in
+[The server](#the-server)). An unknown tool is MCP's protocol error `-32602`.
+
+### Reading a session
+
+`_gorynych/read {sessionId, cursor?, limit?, thoughts?}` →
+`{updates, nextCursor?, total, inProgress, trimmed}`. It is a method of the service, so a
+GUI can use it too.
+
+- `updates`: ACP `SessionUpdate` objects from the journal, oldest first:
+  - `user_message_chunk` and `agent_message_chunk`, the chunks of one message merged into one
+    text block, each keeping its `messageId` and `_meta`; a block that is not text becomes
+    `@<uri>` for a resource or `[<type>]`;
+  - `tool_call`, with the `status`, `title` and `kind` of its last `tool_call_update` folded
+    in, and its `content`, locations and raw input and output dropped;
+  - `agent_thought_chunk` only with `thoughts: true`.
+
+  Plans, usage, `session_info_update` and the other kinds are left out.
+- Paging counts messages (user and agent messages). Each message brings the tool calls and
+  thoughts that follow it, up to the next message.
+  - `limit`: default 10, clamped to 1–50.
+  - `cursor`: return only messages older than this one.
+  - `nextCursor`: set when older messages exist. It is opaque to callers, like ACP's
+    `session/list` cursors; the service uses the `messageId` of the oldest message it
+    returned.
+  - Entries journaled before `messageId` existed have none. The service then treats
+    consecutive chunks of one kind as one message, and uses `#<journal index>` as its cursor;
+    so it does for an ID that two messages share.
+  - A cursor the session does not have fails with `-32602`.
+- `total`: how many messages the journal holds. `inProgress`: a turn is running. `trimmed`:
+  the journal has lost its oldest entries ([Journal](#journal)).
+- **Source.** The service journal only; reading never runs a turn.
+  - A Claude session never needs its agent. The Claude adapter lists only sessions it created
+    through the service, and the service journals them from their first prompt. No Claude
+    process is started, and Claude's transcript is not read.
+  - A session the service has never journaled (a Kimi session made in Kimi's own UI) is first
+    loaded in its agent. Kimi's `session/load` replays the history and runs no model turn. The
+    service journals the replay, giving its chunks message IDs, and closes the session again
+    afterwards when it opened it only for this, as after service turns
+    ([adapter-contract.md](adapter-contract.md#61-waking-a-session-and-closing-it-again)).
+  - An agent that cannot load such a session yields no updates, with `total: 0`.
+
+How `read_session` shows it to the agent:
+
+```
+session_id <id> (<agent>, "<title>") · status saved · messages 31–40 of 40, oldest first
+── user
+<text>
+── agent
+<text>
+   · tool: <title> · completed
+   · tool: <title> · failed
+── user · opinion request
+[Opinion request · from session_id … · message_id m2]
+…
+── agent
+<text>
+(turn in progress)
+Older messages: call read_session with session_id "<id>" and before "<cursor>".
+```
+
+- **Labels.** `── user` is a prompt the person typed (in a client or in Claude's terminal). A
+  message the service put there names its origin: `── user · opinion request`, `· report`,
+  `· spawned task` or `· from outside`. Its own text carries the header with the sending
+  session's ID. A message Claude reports from its channel is labelled from its text: a report
+  by its `kind="report"`, a request from outside by its first line. `── agent thinking`
+  appears only with `thoughts`. A tool call without a status reads `pending`.
+- **Budget.** At most `limit` messages and about 20,000 characters, filled from the newest
+  backwards. A message that does not fit in what is left is cut in the middle with
+  `[… <n> characters cut …]` and is the oldest shown, unless less than 500 characters are left
+  and a message is already shown; at least one message is always shown. One message reads
+  `message <n> of <total>`.
+- **Edge lines.** With `trimmed`, the first line after the header reads `(Older history was
+  trimmed from Gorynych's journal.)`. `(turn in progress)` closes the newest page while a turn
+  runs. Without any history, the result is the header (without the message count) and
+  `Gorynych has no history for this session yet.`
+
 ## List changes
 
 Clients learn about changes to their session lists from the notification
@@ -499,7 +886,8 @@ version does not know are kept and replayed unchanged, with the `messageId`s cli
 live. Past the limit (default 5000 entries) the journal merges consecutive text chunks of one
 message (the same `messageId`; chunks without one, from journals written before the service
 named every message, are never merged) and then drops the oldest entries down to three
-quarters of the limit. A line torn by a crash is dropped
+quarters of the limit. Once it has dropped any, a marker file next to it
+(`<journal>.trimmed`) says so, for `_gorynych/read`'s `trimmed`. A line torn by a crash is dropped
 when the journal is read back.
 
 ## Overlay

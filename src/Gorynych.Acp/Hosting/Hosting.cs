@@ -111,6 +111,23 @@ public static class GorynychProtocol
     public const string MetaIncludeArchived = "gorynych/includeArchived";
 
     /// <summary>
+    /// An MCP request of the <c>gorynych-outside</c> server for agents outside Gorynych, in the
+    /// shape of <c>mcp/message</c> from ACP's draft MCP-over-ACP RFD: <c>{serverId, requestId,
+    /// method, params}</c> → <c>{result}</c> or <c>{error}</c>; as a notification from the service,
+    /// a notification that belongs to that request (progress).
+    /// </summary>
+    public const string MethodMcpMessage = "_gorynych/mcp_message";
+
+    /// <summary>Reads a session's history from the journal: <c>{sessionId, cursor?, limit?, thoughts?}</c>.</summary>
+    public const string MethodRead = "_gorynych/read";
+
+    /// <summary>
+    /// The agent outside Gorynych behind a <c>_gorynych/mcp_message</c>: <c>{client, folder,
+    /// hostSessionId}</c>; also in the <c>_meta</c> of the opinion request it asked.
+    /// </summary>
+    public const string MetaOutside = "gorynych/outside";
+
+    /// <summary>
     /// Sets a session's archive flag: <c>{sessionId, archived}</c> → <c>{}</c>. Only a flag: it
     /// closes, cancels and unloads nothing. A call with a peer token also gets <c>text</c>, what the agent is told.
     /// </summary>
