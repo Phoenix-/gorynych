@@ -1,9 +1,12 @@
 # DeepSeek Harness adapter: specification
 
-**Draft, first part.** Nothing is built. This part rests on reading DSH's packages and on probes
-that ran without a key, so no model call and nothing in `~/.dsh`. The live probes (contract
-steps 8–15 and the sandbox) are written but not run yet: see
-[Live probes still to run](#live-probes-still-to-run). Sections that depend on them say so.
+**Draft for review.** Nothing is built. It rests on three sources:
+
+- reading DSH's packages;
+- keyless probes in a scratch `DSH_HOME`;
+- live probes on the user's own `~/.dsh` with their key (findings 15–24).
+
+One live probe did not run: sandbox option (b), see [Live probes](#live-probes).
 
 Written 9 November 2026 from:
 
@@ -16,6 +19,12 @@ Written 9 November 2026 from:
   system-prompt packages.
 - **Keyless probes** of `node lib/bin.js --profile acp` with `DSH_HOME` in a scratch folder, in
   [probes/dsh](probes/dsh).
+- **Live probes** of the global 0.2.2-rc.1 on the user's `~/.dsh`:
+  - about 12 short turns on `deepseek-v4-flash` at effort `low`, three sessions and one DSH
+    subagent;
+  - every workspace in a scratch folder, never a repository;
+  - recorded as [Fixtures/dsh](../tests/Gorynych.Tests/Fixtures/dsh), with paths rewritten to
+    `C:\work\probe`.
 
 Decided already by the user (9 November 2026): DSH runs on the user's real `~/.dsh`, like the
 other harnesses (a system-wide install, our settings only per launch). DSH may create its own
@@ -47,11 +56,18 @@ shipped `profiles/acp` template on first boot. Gorynych never writes into `~/.ds
   into `~/.dsh`.
 - **Three properties of DSH need the user's decisions** (see
   [For the user to decide](#for-the-user-to-decide)):
-  - **The Windows sandbox writes standing ACEs and a Low integrity label onto every session's
-    folder tree.** That is the user's repositories.
+  - **The Windows sandbox writes standing ACEs and a Low integrity label onto a session's
+    folder tree** at the first confined shell write. Verified live: after it, a FullControl
+    open of the tree's folders fails. For real sessions, those folders are the user's
+    repositories.
   - **The only approvals DSH asks are sandbox escalations.** MCP tools, the gorynych tools
-    included, run without asking.
+    included, run without asking (verified).
   - **Every turn spends money on the user's API key**, unlike the subscription harnesses.
+- **Two more fixes in the proxy, from the live probes:**
+  - DSH drops a pending approval on cancel without telling the client, so the proxy withdraws
+    it with `$/cancel_request`;
+  - DSH has a `list_agents` tool of its own (its subagents), so the appended prompt names the
+    gorynych tools by their full names.
 
 ## What the probes showed
 
@@ -135,9 +151,94 @@ checks `boot`, `sessions`, `other`, `kill` and `cost`.
 
     A patch replaces a row's whole `config`, so every row we patch restates what it keeps.
 
+Live, on the user's `~/.dsh` with their key (9 November 2026). Checks `basics`, `plain`,
+`default` and `readonly` in the same script:
+
+15. **Models with a key.** `deepseek-v4-flash`, `DeepSeek-V4.1-Flash` and `DeepSeek-V4-Pro`.
+    - DSH lists them from `https://api.deepseek.com/models` at boot, and says so on stderr.
+    - Each turn took 1.5–7 s.
+    - A session's context grew to about 8.5k tokens by its fourth turn: DSH's own system prompt
+      and tool schemas are about 7k.
+16. **The appended system prompt works, per launch.**
+    - With `personaSuffix` in the patch, the model answered the probe word.
+    - The same session resumed by a launch without the patch answered `UNKNOWN`: DSH assembles
+      the system prompt per request from the running composition and keeps none with the session.
+17. **DSH's tools in the acp profile:**
+    - files and search: `read`, `read_image`, `write`, `edit`, `glob`, `grep`;
+    - shell and jobs: `pwsh`, `job_list`, `job_output`, `job_kill`;
+    - web: `web_fetch`, `web_search`;
+    - subagents: `subagent`, `subagent_fork`, `send_message`, `list_agents`, `interrupt_agent`;
+    - goals, todos and skills: `create_goal`, `get_goal`, `update_goal`, `todo_write`, `skill`,
+      `workflow`, `working_directory`;
+    - MCP resources: `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`;
+    - MCP tools: `mcp__<server>__<tool>`.
+
+    There is no ask tool, and the model said so (`NO-ASK-TOOL`).
+    - **DSH's own `list_agents` lists its subagents**, a name the gorynych tool shares.
+18. **Updates as sent.**
+    - Messages and thoughts arrive whole, each as one chunk, after the model step. Thought and
+      text of one assistant message carry **the same `messageId`**.
+    - `tool_call` is `{toolCallId, title: <tool name>, kind: "other", status: "in_progress", rawInput}`.
+      Examples:
+      - `pwsh {description, command, timeoutMs?}`;
+      - `write {file_path, content}`, with a relative path;
+      - `subagent {description, prompt}`;
+      - an escalation retry adds `sandbox_permissions` and `justification`.
+    - `tool_call_update` is `completed` or `failed`, with text content. Two cases are worth noting:
+      - `write` answers `<path>…</path>\n<type>file</type>\n<content>Created file</content>`;
+      - a denied pwsh command is `completed` with its stderr and the sandbox marker
+        `[sandbox: file access denied under read-only mode]`. On this Russian-locale Windows,
+        pwsh's own error text came through in the wrong code page, but the marker did not.
+    - `usage_update` arrives with every model step.
+19. **MCP tools run unasked.** `mcp__gorynych__probe_echo` ran with no permission request; the
+    result came back as text.
+20. **Subagents.**
+    - `subagent` answered `started subagent <id>` at once.
+    - The prompt stayed in flight while the child ran. The child's result started a later
+      root step (`OK`, then `Understood.`), and the prompt ended after it: 6.9 s in all.
+    - The child is a session of its own on disk (`~/.dsh/sessions/…/<child id>`). It is
+      left out of `session/list`.
+21. **Cancel.**
+    - `session/cancel` 2 s into `Start-Sleep -Seconds 60` failed the tool call (`Error: tool
+      call aborted`) within 0.03 s, and the prompt ended `cancelled` within 0.25 s.
+    - No process was left under DSH. The next turn worked.
+22. **Close during a turn.** `session/close` sent during the same command answered `{}`. The
+    prompt ended `cancelled` within 0.25 s, with nothing left running.
+23. **Sandbox (a), DSH's default `workspace-write` with `ask`.**
+    - A pwsh write and a `write`, each inside the workspace, ran with no question.
+    - The workspace's security descriptor (SDDL) before held only the inherited DACL. After
+      the one pwsh write, the root had:
+      ```
+      D:AI(D;CI;DT;;;WD)(A;OICI;0x110156;;;S-1-4-440490996-908936266)(…the inherited ACEs…)S:AI(ML;OICI;NW;;;LW)
+      ```
+      That is a container-inherited deny of `FILE_DELETE_CHILD` for Everyone, an allow for
+      DSH's capability SID, and a Low mandatory label with no-write-up.
+    - All three were inherited by every subfolder and file of the tree.
+    - A FullControl open of the root and of each subfolder failed with error 5 afterwards (it
+      worked before); files still opened.
+    - Left in `%TEMP%`: `dsh-acl-locks`, two `dsh-acl-skill-*` folders and one `dsh-spill-*`.
+24. **Sandbox (c), `read-only` with `ask`** (the patch's `sandbox-policy` and `approval` rows;
+    the session recorded `read-only`).
+    - Every write was denied first. The model retried each once with `sandbox_permissions:
+      workspace-write`, which asked: three writes, three questions.
+      - The request was `{sessionId, toolCall: {toolCallId}, options: [allow-once, reject-once]}`,
+        as the code says.
+      - **Reject** failed the tool (`the user rejected escalating this command …; stop and
+        explain`). The model stopped and explained.
+      - **A question held while the turn was cancelled:** DSH failed the tool (`approval for
+        escalating to "workspace-write" was cancelled`) and ended the prompt `cancelled`. It sent
+        **no `$/cancel_request`** for its own pending request, and ignored the late answer.
+      - **Allow** ran the write.
+    - **The approved pwsh escalation wrote the same standing ACEs and Low label** on that
+      workspace as (a), with a capability SID of its own. A `write` escalation goes through
+      DSH's in-process file sandbox and writes no ACL.
+    - Each denied-then-escalated write cost one more model step (about 2 s and 400 tokens).
+
 ## What the code says
 
-From 0.2.2-rc.1's code and READMEs. These are confirmed only by the live probes.
+From 0.2.2-rc.1's code and READMEs. The live probes confirmed the updates, the permission
+requests, what asks, the descendants and the sandbox (findings 15–24). Option (b) below remains
+from the code only.
 
 - **Updates.**
   - Committed assistant messages arrive whole, not streamed: one `agent_message_chunk` per
@@ -223,6 +324,9 @@ Each has a recommendation; the coordinator and the user decide.
   - `session/list` results: merges the live sessions (D4);
   - `session/update` `tool_call`: records title, input and kind; maps kind, locations and
     content (D6);
+  - `session/update` `tool_call_update` with a final status: withdraws a pending approval for
+    that call (D5);
+  - `session/update` `agent_thought_chunk`: gives the thought an ID of its own (D14);
   - `session/request_permission`: fills the tool call (D5);
   - error results of `session/resume`: rewrites the one-writer error (D11).
 - Anything it does not know passes through, so a DSH update that adds a field reaches the service.
@@ -259,6 +363,12 @@ Each has a recommendation; the coordinator and the user decide.
   ```
 - The text is the service's peer instructions (`PeersServer.SystemPrompt`), handed to the
   adapter's options when the service builds it, so the adapter needs no reference to the service.
+- **DSH has a `list_agents` tool of its own**, which lists its subagents (finding 17), and the
+  instructions say "its tool list_agents". So the adapter appends one line naming the full
+  names: `In this harness the gorynych tools are mcp__gorynych__list_agents,
+  mcp__gorynych__ask_agent, …; your own list_agents lists only your subagents.`
+  Tool texts are UI for agents; without that line the model may call the wrong `list_agents`.
+- Verified: the suffix reaches the model, and only in launches that carry it (finding 16).
 - The adapter checks that the text holds no `{{` (a template would try to resolve it), and
   fails its start if it does.
 - **The adapter does not advertise `sessionCapabilities.systemPrompt`.** DSH applies the text
@@ -293,23 +403,34 @@ Each has a recommendation; the coordinator and the user decide.
   title. DSH never asks for MCP tools, though (D8), so for DSH pre-allowing changes nothing.
 - The options pass through unchanged. They are already distinct ACP kinds, and DSH counts an
   unknown option as a rejection.
+- **Withdrawal.** On a cancel, DSH drops its own pending approval and fails the tool call, but
+  sends no `$/cancel_request` (finding 24). §8 wants the question withdrawn, or the person
+  would still see it.
+  - The proxy keeps each forwarded request's ID per tool call. When that call's
+    `tool_call_update` arrives with `failed` or `completed` while the request is unanswered, or
+    when the prompt ends, the proxy sends `$/cancel_request` for it to the service.
+  - It drops the service's late answer instead of forwarding it.
 
 **D6. Tool kinds, locations and diffs.**
 
-- The proxy maps DSH's tool names to ACP kinds:
-  - `pwsh` / `bash` → `execute`;
-  - `read` → `read`;
-  - `write`, `edit`, `apply_patch` → `edit`;
-  - `grep`, `glob`, `ls` → `search`;
+- The proxy maps DSH's tool names (finding 17) to ACP kinds:
+  - `pwsh` (`bash` on Linux and macOS), `job_kill` → `execute`;
+  - `read`, `read_image`, `read_mcp_resource`, `job_output` → `read`;
+  - `write`, `edit` → `edit`;
+  - `glob`, `grep`, `list_mcp_resources`, `list_mcp_resource_templates`, `web_search` → `search`;
   - `web_fetch` → `fetch`;
-  - `web_search` → `search`;
-  - `subagent`, `subagent_fork`, `send_message` → `other`;
-  - `mcp__*` → `other`.
-- It takes `locations` from the input's path fields.
-- For `edit` and `write` it adds ACP `diff` content from the input (`path`, old and new text)
-  when the input has them.
-- The exact tool names and argument names come from the live probe `basics`, which lists the
-  tools (to confirm).
+  - `todo_write` and the goal tools → `think`;
+  - everything else, the subagent tools and `mcp__*` included → `other`.
+  - An unknown name stays `other`, so a new DSH tool does not break anything.
+- Titles: a pwsh call is titled by its `description` with the command in `rawInput`, so the
+  person reads what it does. Other tools keep their name. `mcp__*` titles are never changed:
+  the service's pre-allow and `read_session` read them.
+- **Locations** come from the input's `file_path` and `path`. A relative path is resolved
+  against the session's `cwd`, as DSH resolves it (finding 18 shows a relative `file_path`).
+  For `pwsh`, the location is `workdir`, or the `cwd`.
+- **Diffs.** `write {file_path, content}` becomes ACP `diff` content with no old text. For `edit`,
+  the argument names are not yet seen live; it gets a diff once they are known, and stays
+  without content until then.
 - Messages stay whole: DSH commits them that way, and the service needs nothing else. A report
   carries the child's final message, its text after its last tool call, as before.
 
@@ -369,6 +490,15 @@ written into the patch as `sandbox-policy` and `approval` rows (examples in
 - DSH's default exports nothing without explicit feedback, which ACP cannot give. Setting the
   variable per launch makes that certain, at no cost.
 
+**D14. Thoughts get IDs of their own.**
+
+- DSH gives the thought and the text of one assistant message the same `messageId` (finding 18).
+  §5 wants one ID per message, never two messages with the same ID, and in ACP a thought and
+  an answer are separate messages.
+- The proxy sends thoughts as `<id>:thought`. That is derived from DSH's ID, so it is stable,
+  and the answer keeps DSH's own ID.
+- Without this, a client that keys messages by ID could merge the thought into the answer.
+
 ## Feature mapping
 
 Section numbers are the contract's.
@@ -383,19 +513,19 @@ Section numbers are the contract's.
 | §3 list | `{sessionId, cwd}`, cursor, `cwd` | D4; no title, no `updatedAt` |
 | §4 open | `session/resume` with `mcpServers`, about 0.2 s | D11 for the one-writer error; no load (D12) |
 | §5 prompt | `session/prompt`: text, resource links, images when the route can | several text blocks are concatenated in one user message (the spawned session's two blocks arrive as one text) |
-| §5 cancel | `session/cancel` | live: time to `cancelled`, what is left running |
+| §5 cancel | `session/cancel`: tool aborted, `cancelled` within 0.25 s, nothing left running (finding 21) | none |
 | §5 stop reasons | as in [What the code says](#what-the-code-says) | `aborted`, `blocked` and `error` end as `end_turn` |
 | §5 echo | none sent | as ACP |
-| §5 message IDs | DSH's `messageId` on message and thought chunks | passed on; DSH does not keep `gorynych/messageId` |
+| §5 message IDs | DSH's `messageId` on message and thought chunks, shared by both halves of one assistant message | answers keep DSH's ID, thoughts get `<id>:thought` (D14); DSH does not keep `gorynych/messageId` |
 | §5 streaming | whole committed messages | none needed (D6) |
 | §6 service turns | ordinary prompts | as Kimi; each costs API tokens |
 | §6.2 gorynych server | `mcpServers` on new and resume; tools `mcp__gorynych__*` | started twice per open (finding 5; harmless, to note in the peers server's log); tools unasked (D8) |
 | §6.2 system prompt | per-launch `personaSuffix` | D3; capability not advertised |
 | §6.4 live notes | none (`-32601`) | turns |
-| §7 close | `session/close`: cancels, drains descendants, flushes | live: a close during a turn ends the prompt `cancelled`? |
+| §7 close | `session/close`: cancels, drains descendants, flushes; during a turn the prompt ends `cancelled` within 0.25 s (finding 22) | meets the §7 MUST as it is |
 | §7 own turns | autonomous root work after a cancel or from children | no marks; the service's fallback (idle since the last update) |
 | §7 idle time | one writer vs `dsh web` | D10 |
-| §8 approvals | sandbox escalations only; `allow-once` / `reject-once` | D5; D7; D8 |
+| §8 approvals | sandbox escalations only; `allow-once` / `reject-once`; no withdrawal on cancel (finding 24) | D5 (fill, withdraw); D7; D8 |
 | §8 forms | none (no elicitation, no ask tool in acp) | nothing to relay |
 | config | `model`, `reasoning_effort` | passed through; no `mode` option (D7 is per launch) |
 | §9 titles | none over ACP | D9 |
@@ -415,6 +545,8 @@ Section numbers are the contract's.
 | Own sessions missing from the list | the proxy's merge (D4) |
 | No tool kinds or locations | the proxy's map (D6) |
 | Bare permission requests | the proxy's fill (D5) |
+| Approvals dropped on cancel without a withdrawal | the proxy's `$/cancel_request` (D5) |
+| One `messageId` for a thought and its answer | the proxy's `:thought` IDs (D14) |
 | No forms, no ask tool | nothing to cover; DSH cannot ask the person anything but approvals |
 | MCP tools unasked | contract change C3 (D8) |
 | No system-prompt capability | the per-launch patch (D3) |
@@ -443,6 +575,9 @@ writes sessions, its projection cache and attachments under `~/.dsh`, as `dsh we
   That includes `ask_agent` opinions, reports from children, DSH's own subagents, and
   autonomous work that continues after a cancel.
   - The acp profile's model is the cheap `deepseek-v4-flash`, but its default effort is `high`.
+  - DSH's own system prompt and tools are about 7k tokens of context per request
+    (finding 15).
+  - Read-only mode adds a model step per write (finding 24).
   - Model titles stay off (D9).
   - The service could show usage (`usage_update`) prominently for DSH sessions.
 - **The Windows sandbox edits ACLs** of every folder DSH works in, standing and not removable
@@ -454,30 +589,50 @@ writes sessions, its projection cache and attachments under `~/.dsh`, as `dsh we
 - **Our rows win.** The user's own `system-prompt` or sandbox settings in DSH's profile and home
   layers are replaced by ours, because a patch replaces a whole row.
 - **Mixed versions on one store.** An older `dsh web` and a newer `dsh acp` on the same
-  `~/.dsh` may disagree on the session format. The coordinator is handling the running
-  0.2.1-rc.2 instance; the adapter can only warn about the version (D2).
+  `~/.dsh` may disagree on the session format. On 9 November an old 0.2.1-rc.2 instance was
+  stopped and the global install updated before the live probes. The adapter can only warn
+  about the version (D2).
+- **ACL residue in `%TEMP%`.** DSH's ACL runner leaves `dsh-acl-locks`, `dsh-acl-skill-*` and
+  `dsh-spill-*` folders behind (finding 23).
 - **Node.** DSH needs a Node runtime on PATH (26 here); the adapter finds `node` like `dsh`.
 
 ## For the user to decide
 
-1. **The sandbox** (D7). The live probes check each option in a scratch tree.
-   - **(a) DSH's default** (`workspace-write`, `ask`). Commands and writes inside the workspace
-     run without asking; anything else is denied, then escalated with a question. The price is
-     the standing ACL and Low label on every repository DSH works in.
+1. **The sandbox** (D7). Probed in scratch trees (findings 23, 24); (b) from the code only.
+   - **(a) DSH's default** (`workspace-write`, `ask`).
+     - Commands and writes inside the workspace run without asking; anything else is denied,
+       then escalated with a question.
+     - The first shell write in a folder puts the standing deny, allow and Low label on its
+       whole tree, verified. FullControl opens of its folders fail from then on, and any Low
+       integrity process of the user may write there.
+     - For real sessions, that is every repository DSH works in.
    - **(b) No Windows sandbox, approvals kept** (patch: `sandbox-policy.mode:
-     danger-full-access`, `approval.policy: ask`). From the code, this asks nothing at all:
-     without a sandbox nothing is denied, so nothing escalates. It is full access without
-     questions, like Codex's `full-access`. To confirm live.
-   - **(c) `read-only`** (`ask`). Every write is denied, then escalated with a question. That
-     costs a second model step per write, and pwsh runs in ConstrainedLanguage. An approved
-     pwsh escalation to `workspace-write` still writes the ACL and label for that workspace;
-     only an escalation straight to `danger-full-access` avoids it.
+     danger-full-access`, `approval.policy: ask`).
+     - From the code, this asks nothing at all: without a sandbox nothing is denied, so
+       nothing escalates.
+     - It is full access to the whole disk without questions, like Codex's `full-access`, and
+       touches no ACL.
+     - Not run live: this session's safety classifier refused to start an agent with full
+       access, even in a scratch folder. The user can run it (`acp_probe.py … --real-home
+       off`) or allow it.
+   - **(c) `read-only`** (`ask`).
+     - Every write asks, verified: three writes, three questions. Each costs a second model
+       step (about 2 s and 400 tokens), and pwsh runs in ConstrainedLanguage.
+     - Reads, searches and the rest run without asking. So do MCP tools.
+     - An approved pwsh escalation to `workspace-write` writes the same standing ACL and label
+       on that workspace, verified. File-tool escalations do not.
 
-   **Recommendation (provisional, until the probes run):** (b) does not give "a question before
-   every command and write". If that is what the person wants, only (c) comes close among
-   DSH's settings, at the cost above. If the person accepts no questions for a coding agent in
-   its own folder, (b) avoids touching ACLs. (a) is the right choice only if the ACL edits are
-   acceptable on the user's repositories.
+   **Recommendation:** none of DSH's settings gives "a question before every command and
+   write" without touching ACLs. (b) asks nothing (from the code), so the coordinator's lean
+   towards (b) does not hold on that ground.
+   - Recommended: **(c)**. It is the only option that asks before writes, and it touches no
+     ACL until the person approves a shell write in that folder. Make the approval card name
+     the escalation (`pwsh`, the command, "workspace-write", the justification; D5) so the
+     person knows what an Allow does.
+   - If the person accepts a coding agent acting without questions, (b) is the choice that
+     leaves ACLs alone. Its reach is the whole disk, not one folder.
+   - (a) only if the ACL edits are acceptable on the user's repositories.
+   - Whichever it is, it applies per launch, to sessions from their first turn on (D7).
 2. **The gorynych tools unasked** (D8): accept, or ask through the service (C3).
 3. **Telemetry off** (D13): recommended.
 4. **Model titles** (D9): off in stage one.
@@ -500,35 +655,67 @@ writes sessions, its projection cache and attachments under `~/.dsh`, as `dsh we
 - **C5. §1: the launch folder.** Add: *an adapter starts its agent in a folder of its own,
   never in a session's folder*, since DSH loads the launch folder's `.env`. Kimi's adapter
   already starts in the user profile.
-- **C6. §13: the DSH column.** Replace "DeepSeek, expected" with these findings once the live
-  probes run.
+- **C6. §8: withdrawing a question the agent dropped.** Add: *where the agent drops its own
+  approval request without `$/cancel_request` (DSH on a cancel), the adapter withdraws it when
+  the tool call ends or the prompt does.*
+- **C7. §5: one ID per message.** Add: *a thought and an answer are separate messages; an adapter
+  whose harness gives both one ID derives a distinct one for the thought (DSH: `<id>:thought`).*
+- **C8. §13: the DSH column.** Replace "DeepSeek, expected" with these findings:
+  - capabilities: list, resume, close; `gorynych/unloadAfter` 120;
+  - new: durable at once, UUID;
+  - list: `{sessionId, cwd}`, its own open sessions merged in by the adapter;
+  - open: `session/resume` with `mcpServers`;
+  - turns: native;
+  - gorynych server: through ACP `mcpServers`, as children of node;
+  - system prompt: per launch, `personaSuffix`;
+  - message IDs: DSH's, plus `:thought`;
+  - live notes: none;
+  - own turns: none marked;
+  - approvals: sandbox escalations only, MCP tools unasked;
+  - forms: none;
+  - titles: none over ACP;
+  - close: native, ends a running prompt `cancelled`;
+  - delete: none (tombstone);
+  - archive: overlay.
 
-## Live probes still to run
+## Live probes
 
-Written in [probes/dsh/acp_probe.py](probes/dsh/acp_probe.py) and checked keyless up to the
-first prompt. They will run with `--real-home` against the global `dsh` once the coordinator
-says the old instance is stopped and the global install is updated. Each runs in a folder under
-the scratch folder, on `deepseek-v4-flash` at effort `low`, and records its session IDs.
+The script is [probes/dsh/acp_probe.py](probes/dsh/acp_probe.py) with `--real-home`, against
+the global `dsh` 0.2.2-rc.1 on 9 November 2026. It ran after the old 0.2.1-rc.2 instance was
+stopped and the global install updated. Every check ran in a folder under a scratch folder, on
+`deepseek-v4-flash` at effort `low`.
 
-| Check | Contract steps | What it settles |
+| Check | Contract steps | Result |
 | --- | --- | --- |
-| `basics` (with `overlays/basics.yml`) | 8, 11, 12, 13, 15 | the probe word from `personaSuffix`; DSH's tool names (D6); an MCP call unasked; whether an ask tool exists; a subagent's updates and how long the prompt stays in flight; the title DSH records |
-| `plain` | 12 | a launch without the overlay resumes that session: is the probe word gone (per launch)? |
-| `default` | 8, 9, 7, sandbox (a) | update mapping for a pwsh and a file-tool write; the tree's DACL and label before and after (SDDL), and a FullControl open of a subfolder; cancel mid-command and what is left running; a turn after the cancel; close during a turn |
-| `readonly` (with `overlays/read-only.yml`) | 10, sandbox (c) | the permission request as sent; reject; a question held while the turn is cancelled (does DSH withdraw it with `$/cancel_request`?); allow, and the tree's ACL after an approved escalation |
-| `off` (with `overlays/sandbox-off.yml`) | sandbox (b) | does anything ask before a pwsh write, a file write or a delete; the tree's ACL unchanged |
+| `basics` (with `overlays/basics.yml`) | 8, 11, 12, 13, 15 | findings 15–20: the probe word from `personaSuffix`; DSH's tool list; an MCP call unasked; no ask tool; a subagent keeps the prompt in flight; model title (switched on for this check only) `Probe word and tool list`, in DSH's projection cache only |
+| `plain` | 12 | finding 16: a launch without the overlay resumed the session (0.72 s) and the probe word was gone |
+| `default` | 7, 8, 9, sandbox (a) | findings 18, 21–23 |
+| `readonly` (with `overlays/read-only.yml`) | 10, sandbox (c) | finding 24 |
+| `off` (with `overlays/sandbox-off.yml`) | sandbox (b) | **not run**: this session's safety classifier refused to start an agent with full access. The user can run `python research/probes/dsh/acp_probe.py <dsh package> <scratch> <log> --real-home off` |
 
-About 12 short turns in all, plus one subagent; 5 sessions. Probe 14 (`dsh web` on the same
-store) is covered by finding 10 for the locking. Whether `dsh web` lists sessions made over
-ACP, and empty ones, is checked by reading its list once a web instance runs. Probe 16 (load
-cost) is finding 9.
+Not covered:
+
+- **`dsh web` on the same store.** The locking is finding 10. Whether `dsh web` lists sessions
+  made over ACP, and empty drafts, needs a web instance; none ran.
+- **`edit`'s argument names** (D6).
+- **The `gorynych` MCP server of the real service:** the probes used a throwaway stdio server
+  under that name.
+
+Probe 16 (load cost) is finding 9.
 
 ## Leftovers
 
 - The keyless probes ran only in a scratch `DSH_HOME`. Nothing was written to `~/.dsh`,
   checked after each run.
-- The live probes will leave up to five sessions in `~/.dsh/sessions/` that DSH cannot delete
-  over ACP. Their IDs go in the report, so the user can delete them in `dsh web`.
-- Probe workspaces under the scratch folder keep the ACEs and label that sandbox (a) and an
-  approved escalation in (c) write. They are temporary folders and go when the scratch
-  folder is cleaned.
+- **The live probes left four sessions in `~/.dsh/sessions/`**, which DSH cannot delete over
+  ACP. The user can delete them in `dsh web`:
+  - `a950bddc-51df-49db-976f-28f4e145b660` (basics);
+  - `82eb54e1-6ec1-4619-a0a0-0116ca0ed53a` (its subagent child);
+  - `dae5c76d-17da-49ec-9ab1-0ea231c8ebde` (default sandbox);
+  - `5f7cb792-987c-4a9a-91e3-77daebf3a560` (read-only sandbox).
+- DSH itself created `~/.dsh/profiles/acp/` (accepted).
+- In `%TEMP%`:
+  - the probe workspaces under the scratch folder keep the ACEs and label that (a) and the
+    approved escalation in (c) wrote;
+  - DSH left `dsh-acl-locks`, `dsh-acl-skill-*` and `dsh-spill-*`.
+  All of these are temporary folders.
