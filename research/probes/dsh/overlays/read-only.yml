@@ -1,0 +1,8 @@
+# Probe (c): sandbox mode read-only for new sessions, approvals `ask`.
+- id: sandbox-policy
+  config:
+    mode: read-only
+    workspaceRoot: !!js process.cwd()
+- id: approval
+  config:
+    policy: ask

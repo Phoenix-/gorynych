@@ -1,0 +1,9 @@
+# Probe (b): no Windows ACL sandbox (mode danger-full-access) with approvals still `ask`.
+# A patch replaces a row's whole config, so the base row's workspaceRoot is restated.
+- id: sandbox-policy
+  config:
+    mode: danger-full-access
+    workspaceRoot: !!js process.cwd()
+- id: approval
+  config:
+    policy: ask

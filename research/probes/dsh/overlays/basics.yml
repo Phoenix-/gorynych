@@ -1,0 +1,10 @@
+# Probes 12 and 13: an appended system prompt (personaSuffix; the row's config is replaced
+# whole, so the acp app's personaPrefix is restated) and model titles switched back on.
+- id: system-prompt
+  config:
+    personaPrefix: >-
+      You are a coding agent powered by the {{model}} model.
+    personaSuffix: >-
+      Gorynych probe: when the user asks for the probe word, answer with the single word PERSIMMON.
+- id: session-title-llm
+  disabled: false

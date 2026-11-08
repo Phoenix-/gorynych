@@ -1,23 +1,26 @@
 """Probe of DeepSeek Harness's ACP server (`dsh --profile acp`) for the DSH adapter.
 
-Usage: python acp_probe.py <dsh package dir> <scratch folder> <wire log> <check> [<check> ...]
+Usage: python acp_probe.py <dsh package dir> <scratch folder> <wire log> [--real-home] <check> [<check> ...]
 
 <dsh package dir> is an installed `@deepseek-ai/dsh` (the folder with lib/bin.js); the probe
 runs `node lib/bin.js --profile acp` directly, with no npm shim in between. Every launch gets:
 
-- `DSH_HOME` = the value of the environment variable of that name if the caller set one, else
-  <scratch folder>/home, so `~/.dsh` is never touched unless the caller points DSH_HOME there;
+- `DSH_HOME` = <scratch folder>/home, so `~/.dsh` is never touched; with `--real-home` the
+  variable is removed instead and DSH uses the user's own `~/.dsh` (its key, its sessions).
+  The probe itself never writes there; it only reads the projection cache of its own sessions;
 - `DSH_TELEMETRY_DISABLED=1`;
 - the launch folder <scratch folder>/launch (empty: no `.env` for DSH's project layer);
-- a `--patch` overlay when a check needs one (written to <scratch folder>, never to DSH_HOME).
+- a `--patch` overlay from `overlays/` when a check needs one.
 
-Sessions use <scratch folder>/ws as `cwd` and get the throwaway stdio MCP server
-`../outside/probe_server.py` under the name `gorynych`. The wire goes to <wire log> as
-`{"from": "client"|"agent", "message": ...}` lines, the format of the recorded Kimi fixture; it
-holds the host's paths and is not kept as is.
+Sessions use folders under <scratch folder> as `cwd`, never a user repository, and get the
+throwaway stdio MCP server `../outside/probe_server.py` under the name `gorynych`. The wire
+goes to <wire log> as `{"from": "client"|"agent", "message": ...}` lines, the format of the
+recorded Kimi fixture; it holds the host's paths and is not kept as is. Live sessions are
+appended to <scratch folder>/live_sessions.txt (DSH cannot delete them over ACP).
 
-Keyless checks (no model call): boot, init, new, list, config, close, resume, eof, kill, cost.
-Checks that prompt (need the user's DeepSeek key in DSH_HOME): see the CHECKS table.
+Keyless checks (no model call): boot, sessions, other, kill, cost.
+Live checks (model turns on deepseek-v4-flash at effort low, need the user's key):
+basics, plain, default, readonly, off. See each function's docstring.
 """
 import ctypes
 import json
@@ -31,11 +34,14 @@ from ctypes import wintypes
 
 pkg, scratch, log_path = sys.argv[1:4]
 checks = sys.argv[4:]
+real_home = "--real-home" in checks
+checks = [c for c in checks if c != "--real-home"]
 bin_js = os.path.join(pkg, "lib", "bin.js")
-home = os.environ.get("DSH_HOME") or os.path.join(scratch, "home")
+home = os.path.join(os.path.expanduser("~"), ".dsh") if real_home else os.path.join(scratch, "home")
+overlays = os.path.join(os.path.dirname(os.path.abspath(__file__)), "overlays")
 launch = os.path.join(scratch, "launch")
 ws = os.path.join(scratch, "ws")
-for d in (home, launch, ws):
+for d in ([launch, ws] if real_home else [home, launch, ws]):
     os.makedirs(d, exist_ok=True)
 server_log = os.path.join(scratch, "mcp_server.jsonl")
 probe_server = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "outside", "probe_server.py"))
@@ -98,7 +104,10 @@ class Dsh:
     def __init__(self, name, extra_args=(), env_extra=None):
         self.name = name
         env = dict(os.environ)
-        env["DSH_HOME"] = home
+        env.pop("DSH_HOME", None)
+        env.pop("DSH_PERMISSION_MODE", None)
+        if not real_home:
+            env["DSH_HOME"] = home
         env["DSH_TELEMETRY_DISABLED"] = "1"
         env.update(env_extra or {})
         self.started = time.monotonic()
@@ -111,6 +120,8 @@ class Dsh:
         self.impure = []
         self.stderr = []
         self.permission = lambda params: {"outcome": {"outcome": "selected", "optionId": "reject-once"}}
+        self.asked = []
+        self.held = []
         threading.Thread(target=self.read, daemon=True).start()
         threading.Thread(target=self.drain, daemon=True).start()
 
@@ -142,7 +153,12 @@ class Dsh:
 
     def answer(self, m):
         if m["method"] == "session/request_permission":
-            self.send({"jsonrpc": "2.0", "id": m["id"], "result": self.permission(m["params"])})
+            self.asked.append((round(time.monotonic() - self.started, 3), m))
+            result = self.permission(m["params"])
+            if result is None:
+                self.held.append(m["id"])  # answered later (or withdrawn by the agent)
+                return
+            self.send({"jsonrpc": "2.0", "id": m["id"], "result": result})
         else:
             self.send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32601, "message": "not offered by the probe"}})
 
@@ -345,12 +361,324 @@ def check_cost():
         d.stop()
 
 
+# ---------------------------------------------------------------- live checks (model turns)
+
+ALLOW = {"outcome": {"outcome": "selected", "optionId": "allow-once"}}
+REJECT = {"outcome": {"outcome": "selected", "optionId": "reject-once"}}
+CANCELLED = {"outcome": {"outcome": "cancelled"}}
+
+
+def workspace(name, tree=False):
+    """A fresh folder under the scratch folder; with tree, a few subfolders and files to see propagation."""
+    path = os.path.join(scratch, name, "ws")
+    os.makedirs(path, exist_ok=True)
+    if tree:
+        for sub in ("sub", os.path.join("sub", "inner"), "other"):
+            os.makedirs(os.path.join(path, sub), exist_ok=True)
+            with open(os.path.join(path, sub, "file.txt"), "w") as f:
+                f.write("probe\n")
+    return path
+
+
+def record(sid, purpose):
+    with open(os.path.join(scratch, "live_sessions.txt"), "a", encoding="utf-8") as f:
+        f.write(f"{sid}\t{purpose}\n")
+
+
+def sddl(path):
+    """The owner-independent part of path's security descriptor as SDDL: DACL and mandatory label (reading only)."""
+    adv = ctypes.windll.advapi32
+    sd = ctypes.c_void_p()
+    DACL, LABEL = 0x4, 0x10
+    err = adv.GetNamedSecurityInfoW(ctypes.c_wchar_p(path), 1, DACL | LABEL, None, None, None, None, ctypes.byref(sd))
+    if err:
+        return f"GetNamedSecurityInfo error {err}"
+    s = ctypes.c_wchar_p()
+    adv.ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, DACL | LABEL, ctypes.byref(s), None)
+    text = s.value
+    ctypes.windll.kernel32.LocalFree(sd)
+    ctypes.windll.kernel32.LocalFree(s)
+    return text
+
+
+def acl(path):
+    """path's DACL and label as SDDL (reading only), and whether a FullControl open of it succeeds for us."""
+    out = sddl(path)
+    k = ctypes.windll.kernel32
+    k.CreateFileW.restype = wintypes.HANDLE
+    h = k.CreateFileW(path, 0x10000000, 0x7, None, 3, 0x02000000, None)  # GENERIC_ALL, share all, OPEN_EXISTING, BACKUP_SEMANTICS
+    if h == wintypes.HANDLE(-1).value:
+        full = f"denied (error {k.GetLastError()})"
+    else:
+        k.CloseHandle(h)
+        full = "ok"
+    return out, full
+
+
+def show_acl(label, path):
+    lines, full = acl(path)
+    note(f"{label}: {os.path.basename(path) or path}: FullControl open {full}; ACL: {lines}")
+
+
+def live_session(d, cwd, purpose, servers=None, effort="low"):
+    m, took = d.request("session/new", {"cwd": cwd, "mcpServers": [gorynych_server()] if servers is None else servers})
+    if "error" in m:
+        note(f"new failed: {summary(m)}")
+        return None
+    sid = m["result"]["sessionId"]
+    record(sid, purpose)
+    if effort:
+        m, _ = d.request("session/set_config_option", {"sessionId": sid, "configId": "reasoning_effort", "value": effort})
+        note(f"session {sid} ({purpose}); effort {effort}: {'ok' if 'result' in m else summary(m)}; models offered: "
+             f"{[o['name'] for g in m.get('result', {}).get('configOptions', [{}])[0].get('options', []) for o in g.get('options', [g])]}")
+    return sid
+
+
+def compact(update, at):
+    u = update.get("update", {})
+    kind = u.get("sessionUpdate")
+    out = {"at": at, "kind": kind}
+    for key in ("messageId", "toolCallId", "title", "status", "used", "size"):
+        if key in u:
+            out[key] = u[key]
+    if kind == "tool_call":
+        out["toolKind"] = u.get("kind")
+        out["locations"] = u.get("locations")
+        out["rawInput"] = json.dumps(u.get("rawInput"))[:300]
+    if "content" in u:
+        c = u["content"]
+        if isinstance(c, dict):
+            out["text"] = (c.get("text") or "")[:160]
+        elif isinstance(c, list):
+            out["content"] = json.dumps(c)[:300]
+    if kind == "config_option_update":
+        out["options"] = [o.get("currentValue") for o in u.get("configOptions", [])]
+    extra = set(u) - {"sessionUpdate", "messageId", "toolCallId", "title", "status", "kind", "rawInput", "content",
+                      "used", "size", "configOptions", "locations"}
+    if extra:
+        out["other"] = sorted(extra)
+    return out
+
+
+def prompt(d, sid, text, cancel_when=None, cancel_after=0.0, timeout=240, cancel_with="cancel"):
+    """Send one prompt; collect updates (compacted, with seconds since the prompt) until its answer.
+
+    cancel_when(update) -> True sends session/cancel (or, with cancel_with="close", session/close)
+    cancel_after seconds after that update."""
+    def stop():
+        if cancel_with == "close":
+            d.next_id += 1
+            q = queue.Queue()
+            d.pending[d.next_id] = q
+            d.send({"jsonrpc": "2.0", "id": d.next_id, "method": "session/close", "params": {"sessionId": sid}})
+            threading.Thread(target=lambda: note(f"   close answered: {summary(q.get(timeout=60))}"), daemon=True).start()
+        else:
+            d.notify("session/cancel", {"sessionId": sid})
+    d.next_id += 1
+    rid = d.next_id
+    q = queue.Queue()
+    d.pending[rid] = q
+    t0 = time.monotonic()
+    d.send({"jsonrpc": "2.0", "id": rid, "method": "session/prompt",
+            "params": {"sessionId": sid, "prompt": [{"type": "text", "text": text}]}})
+    seen, cancelled_at, other = [], None, []
+    while True:
+        try:
+            m = q.get_nowait()
+            break
+        except queue.Empty:
+            pass
+        if time.monotonic() - t0 > timeout:
+            m = {"timeout": True}
+            break
+        try:
+            kind, ev = d.events.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        at = round(time.monotonic() - t0, 2)
+        if kind == "notification" and ev.get("method") == "session/update":
+            c = compact(ev["params"], at)
+            seen.append(c)
+            if cancel_when and cancelled_at is None and cancel_when(c):
+                time.sleep(cancel_after)
+                stop()
+                cancelled_at = round(time.monotonic() - t0, 2)
+        elif kind == "request":
+            other.append({"at": at, "request": ev["method"], "params": json.dumps(ev["params"])[:400]})
+            if cancel_when and cancelled_at is None and cancel_when({"at": at, "kind": "request", "method": ev["method"]}):
+                time.sleep(cancel_after)
+                stop()
+                cancelled_at = round(time.monotonic() - t0, 2)
+        else:
+            other.append({"at": at, kind: ev})
+    took = round(time.monotonic() - t0, 2)
+    note(f"prompt {text[:70]!r}: {took}s, cancel sent at {cancelled_at}: {summary(m) if 'timeout' not in m else 'TIMEOUT'}")
+    for c in seen:
+        note(f"   {json.dumps(c)}")
+    for o in other:
+        note(f"   {json.dumps(o)[:500]}")
+    if "error" in m and ("no api key" in json.dumps(m).lower() or "401" in json.dumps(m)):
+        note("STOP: the turn failed for want of a usable DeepSeek key in this DSH home")
+        raise SystemExit(2)
+    late = d.updates(1.0)
+    for kind, ev in late:
+        if kind == "notification" and ev.get("method") == "session/update":
+            note(f"   after the answer: {json.dumps(compact(ev['params'], 'late'))}")
+        else:
+            note(f"   after the answer: {kind} {json.dumps(ev)[:300]}")
+    return m, seen
+
+
+def read_title(sid):
+    """The title row of DSH's own projection cache for a probe session (reading only)."""
+    path = os.path.join(home, "storages", "session_projcache", "sessions", f"{sid}.json")
+    try:
+        rows = json.load(open(path, encoding="utf-8"))["record"]["rows"]
+        return rows.get("title", {}).get("val"), rows.get("sandboxMode", {}).get("val"), rows.get("approvalState", {}).get("val")
+    except (OSError, KeyError, ValueError) as e:
+        return f"unreadable: {e}", None, None
+
+
+def check_basics():
+    """Probes 8, 11, 12, 13, 15 in one session, launched with overlays/basics.yml (persona suffix with a
+    probe word, model titles back on): the probe word and the tool list; an MCP call and the ask tool;
+    a subagent. Then the title, if any, in DSH's projection cache."""
+    d = Dsh("basics", ["--patch", os.path.join(overlays, "basics.yml")])
+    d.initialize()
+    cwd = workspace("basics")
+    sid = live_session(d, cwd, "basics: probe word, tools, MCP, ask tool, subagent, title")
+    if not sid:
+        return
+    d.permission = lambda p: ALLOW
+    prompt(d, sid, "What is the probe word? Answer it, then on a new line list the exact names of all tools you can call, comma-separated. No other text.")
+    prompt(d, sid, "Call the tool mcp__gorynych__probe_echo once. Then, if you have a tool for asking the user a question, use it to ask me to pick red or blue; if you have none, say NO-ASK-TOOL. Keep it short.")
+    prompt(d, sid, "Use your subagent tool to start one child agent whose only task is to reply with the word OK. Then tell me in one word what it said.")
+    time.sleep(5)
+    note(f"basics: permission requests: {len(d.asked)}; title/sandbox/approval rows: {read_title(sid)}")
+    m, _ = d.request("session/list", {"cwd": cwd})
+    note(f"basics: list while open: {summary(m)}")
+    d.request("session/close", {"sessionId": sid})
+    m, _ = d.request("session/list", {"cwd": cwd})
+    note(f"basics: list after close (children left out?): {summary(m)}")
+    d.stop()
+    with open(os.path.join(scratch, "basics_session.txt"), "w") as f:
+        f.write(f"{sid}\n{cwd}")
+
+
+def check_plain():
+    """Probe 12, second half: a launch without the overlay resumes the basics session and asks for the probe word."""
+    sid, cwd = open(os.path.join(scratch, "basics_session.txt")).read().split("\n")
+    d = Dsh("plain")
+    d.initialize()
+    m, took = d.request("session/resume", {"sessionId": sid, "cwd": cwd, "mcpServers": [gorynych_server()]})
+    note(f"plain: resume {took:.2f}s: {'ok' if 'result' in m else summary(m)}")
+    prompt(d, sid, "What is the probe word? One word; say UNKNOWN if you were not told one.")
+    note(f"plain: title/sandbox/approval rows: {read_title(sid)}")
+    d.request("session/close", {"sessionId": sid})
+    d.stop()
+
+
+def check_default():
+    """Probes 8, 9 and sandbox (a): the default sandbox (workspace-write, ask) in a scratch tree: a pwsh
+    write and a file-tool write, with the tree's ACL and label before and after; then a cancel during a
+    long pwsh command, the processes left, and a turn after the cancel."""
+    cwd = workspace("sbx-default", tree=True)
+    for p in (cwd, os.path.join(cwd, "sub"), os.path.join(cwd, "sub", "inner")):
+        show_acl("default: before", p)
+    d = Dsh("default")
+    d.initialize()
+    sid = live_session(d, cwd, "default sandbox: writes, ACL, cancel")
+    if not sid:
+        return
+    d.permission = lambda p: ALLOW
+    t = time.monotonic()
+    prompt(d, sid, "Run this with your pwsh tool: Set-Content -Path probe.txt -Value x . Then create probe2.txt containing y with your file-writing tool. Reply DONE.")
+    note(f"default: permission requests: {len(d.asked)}")
+    for p in (cwd, os.path.join(cwd, "sub"), os.path.join(cwd, "sub", "inner"), os.path.join(cwd, "sub", "inner", "file.txt")):
+        show_acl("default: after", p)
+    note(f"default: files: {sorted(os.listdir(cwd))}")
+    before = {p for p, _, _ in descendants(d.proc.pid)}
+    prompt(d, sid, "Run this with your pwsh tool and wait for it to finish: Start-Sleep -Seconds 60",
+           cancel_when=lambda c: c["kind"] == "tool_call", cancel_after=2.0, timeout=120)
+    time.sleep(2)
+    left = [(p, e) for p, e, _ in descendants(d.proc.pid) if p not in before]
+    note(f"default: processes under node 2s after the cancelled turn: {left}")
+    prompt(d, sid, "Reply with the single word OK.")
+    note(f"default: title/sandbox/approval rows: {read_title(sid)}")
+    prompt(d, sid, "Run this with your pwsh tool and wait for it to finish: Start-Sleep -Seconds 60",
+           cancel_when=lambda c: c["kind"] == "tool_call", cancel_after=2.0, timeout=120, cancel_with="close")
+    time.sleep(2)
+    note(f"default: processes under node after a close during a turn: {[(p, e) for p, e, _ in descendants(d.proc.pid) if p not in before]}")
+    d.stop()
+    tmp = os.environ.get("TEMP", "")
+    note(f"default: dsh-like folders left in %TEMP%: {[n for n in os.listdir(tmp) if n.lower().startswith('dsh')][:10]}")
+
+
+def check_readonly():
+    """Probe 10 and sandbox (c): new sessions in read-only (overlays/read-only.yml). A pwsh write is
+    denied and escalated: reject it. A file-tool write: hold the question and cancel the turn, to see
+    whether DSH withdraws it ($/cancel_request), then answer cancelled. A pwsh write: allow it, and look
+    at the tree's ACL after the approved escalation."""
+    cwd = workspace("sbx-readonly", tree=True)
+    show_acl("readonly: before", cwd)
+    d = Dsh("readonly", ["--patch", os.path.join(overlays, "read-only.yml")])
+    d.initialize()
+    sid = live_session(d, cwd, "read-only sandbox: permission reject, withdraw, allow")
+    if not sid:
+        return
+    d.permission = lambda p: REJECT
+    prompt(d, sid, "Run this with your pwsh tool: Set-Content -Path probe.txt -Value x . If the sandbox denies it, retry it once as the tool result tells you. Then say what happened in one line.")
+    note(f"readonly: questions so far: {len(d.asked)}; files: {sorted(os.listdir(cwd))}")
+    d.permission = lambda p: None
+    prompt(d, sid, "Create probe2.txt containing y with your file-writing tool. If the sandbox denies it, retry once as the result tells you.",
+           cancel_when=lambda c: c["kind"] == "request", cancel_after=2.0, timeout=120)
+    for rid in list(d.held):
+        d.send({"jsonrpc": "2.0", "id": rid, "result": CANCELLED})
+    d.held.clear()
+    note(f"readonly: questions so far: {len(d.asked)}; files: {sorted(os.listdir(cwd))}")
+    d.permission = lambda p: ALLOW
+    prompt(d, sid, "Run this with your pwsh tool: Set-Content -Path probe.txt -Value x . If the sandbox denies it, retry it once as the tool result tells you. Reply DONE.")
+    note(f"readonly: questions: {len(d.asked)}; files: {sorted(os.listdir(cwd))}")
+    for at, q in d.asked:
+        note(f"readonly: question at {at}: {json.dumps(q['params'])[:500]}")
+    for p in (cwd, os.path.join(cwd, "sub")):
+        show_acl("readonly: after", p)
+    note(f"readonly: title/sandbox/approval rows: {read_title(sid)}")
+    d.request("session/close", {"sessionId": sid})
+    d.stop()
+
+
+def check_off():
+    """Sandbox (b): overlays/sandbox-off.yml (danger-full-access, approvals ask): does anything ask before
+    a pwsh write, a file-tool write or a delete? And the tree's ACL stays as it was."""
+    cwd = workspace("sbx-off", tree=True)
+    show_acl("off: before", cwd)
+    d = Dsh("off", ["--patch", os.path.join(overlays, "sandbox-off.yml")])
+    d.initialize()
+    sid = live_session(d, cwd, "sandbox off with approvals ask")
+    if not sid:
+        return
+    d.permission = lambda p: ALLOW
+    prompt(d, sid, "Run this with your pwsh tool: Set-Content -Path probe.txt -Value x . Then create probe2.txt containing y with your file-writing tool. Then run with pwsh: Remove-Item probe.txt . Reply DONE.")
+    note(f"off: permission requests: {len(d.asked)}; files: {sorted(os.listdir(cwd))}")
+    for p in (cwd, os.path.join(cwd, "sub")):
+        show_acl("off: after", p)
+    note(f"off: title/sandbox/approval rows: {read_title(sid)}")
+    d.request("session/close", {"sessionId": sid})
+    d.stop()
+
+
 CHECKS = {
     "boot": check_boot,
     "sessions": check_sessions,
     "other": check_other_process,
     "kill": check_kill,
     "cost": check_cost,
+    "basics": check_basics,
+    "plain": check_plain,
+    "default": check_default,
+    "readonly": check_readonly,
+    "off": check_off,
 }
 
 for name in checks:
