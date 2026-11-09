@@ -431,10 +431,12 @@ sealed class CodexAgent : IAsyncDisposable
             {
                 var p = request.ParamsAs<ResumeSessionRequest>();
                 var t = await OpenAsync(p.SessionId, p.McpServers ?? [], p.SystemPrompt, ct);
-                var resumed = AcpJson.ToNode(new ResumeSessionResponse { ConfigOptions = ConfigOptions(t.Effective, models) })!.AsObject();
-                if (p.Meta?[GorynychProtocol.MetaReplayFrom] is JsonObject from && await ReplayFromAsync(p.SessionId, from, ct) is { } replayed)
-                    resumed["_meta"] = new JsonObject { [GorynychProtocol.MetaReplay] = replayed };
-                return resumed;
+                var replayed = p.Meta?[GorynychProtocol.MetaReplayFrom] is JsonObject from ? await ReplayFromAsync(p.SessionId, from, ct) : null;
+                return AcpJson.ToNode(new ResumeSessionResponse
+                {
+                    ConfigOptions = ConfigOptions(t.Effective, models),
+                    Meta = replayed is null ? null : new JsonObject { [GorynychProtocol.MetaReplay] = replayed },
+                });
             }
             case AcpMethods.Agent.SessionLoad:
             {
@@ -579,19 +581,22 @@ sealed class CodexAgent : IAsyncDisposable
     }
 
     /// <summary>
-    /// Replays the thread's turns after the mark, a turn ID (docs/adapter-contract.md, §4): Codex's
-    /// turns newest first, with their items, until the marked one, then sent oldest first. When the
-    /// mark is not among them (a rollback dropped it) or none was given, every turn. Answers
-    /// <c>gorynych/replay</c> with the newest turn as the new mark, or null when Codex could not list them.
+    /// Replays the thread's turns after the mark, a turn ID (docs/adapter-contract.md, §4). Codex's
+    /// turns are listed newest first without their items until the marked one; then the newer
+    /// ones are replayed oldest first, their items read turn by turn (<c>thread/items/list</c>), so
+    /// nothing before the mark is read and the replay is never held whole. When the mark is not among
+    /// them (a rollback dropped it) or none was given, every turn. Answers <c>gorynych/replay</c> with
+    /// the newest completed turn as the new mark (none for a thread without turns), or null when the
+    /// history could not be read: the service then keeps its journal as it is.
     /// </summary>
     async Task<JsonObject?> ReplayFromAsync(string id, JsonObject from, CancellationToken ct)
     {
         var mark = (string?)from["type"] == GorynychProtocol.ReplayAfterMark ? (string?)from["mark"] : null;
-        var newer = new List<Turn>();
-        var found = false;
-        string? newest = null;
         try
         {
+            var newer = new List<string>();
+            var found = false;
+            string? newest = null;
             string? cursor = null;
             for (var page = 0; page < 100_000 && !found; page++)
             {
@@ -599,31 +604,52 @@ sealed class CodexAgent : IAsyncDisposable
                 {
                     ThreadId = id,
                     SortDirection = SortDirection.Desc,
-                    ItemsView = TurnItemsView.Full,
-                    Limit = 20,
+                    ItemsView = TurnItemsView.NotLoaded,
+                    Limit = 50,
                     Cursor = cursor,
                 }, CodexJsonContext.Default.ThreadTurnsListParams), ct), CodexJsonContext.Default.ThreadTurnsListResponse);
                 foreach (var turn in turns.Data)
                 {
-                    newest ??= turn.Id;
+                    // A turn still running is no point to resume from: the next catch-up sees it whole.
+                    if (turn.Status != TurnStatus.InProgress) newest ??= turn.Id;
                     if (turn.Id == mark) { found = true; break; }
-                    newer.Add(turn);
+                    newer.Add(turn.Id);
                 }
                 cursor = turns.NextCursor;
                 if (cursor is null) break;
             }
+            newer.Reverse();
+            var sent = 0;
+            foreach (var turnId in newer)
+            {
+                string? itemsCursor = null;
+                for (var page = 0; page < 100_000; page++)
+                {
+                    var items = From(await app.SendRequestAsync(CodexMethods.Client.ThreadItemsList, ToNode(new ThreadItemsListParams
+                    {
+                        ThreadId = id,
+                        TurnId = turnId,
+                        Limit = 100,
+                        Cursor = itemsCursor is null ? null : JsonValue.Create(itemsCursor),
+                    }, CodexJsonContext.Default.ThreadItemsListParams), ct), CodexJsonContext.Default.ThreadItemsListResponse);
+                    foreach (var entry in items.Data)
+                        if (ReplayOf(entry.Item) is { } update)
+                        {
+                            await rpc.SendUpdateAsync(id, update);
+                            sent++;
+                        }
+                    itemsCursor = items.NextCursor;
+                    if (itemsCursor is null) break;
+                }
+            }
+            Log($"codex: thread {id}: {newer.Count} turns ({sent} updates) replayed {(found ? "after " + mark : "from the start")}");
+            return new JsonObject { ["from"] = found ? "mark" : "start", ["mark"] = newest };
         }
-        catch (JsonRpcException e)
+        catch (Exception e) when (e is not OperationCanceledException)
         {
-            Log($"codex: thread {id}: its turns could not be listed, so the service's journal is not caught up: {e.Message}");
+            Log($"codex: thread {id}: its history could not be read, so the service's journal is not caught up: {e.Message}");
             return null;
         }
-        newer.Reverse();
-        foreach (var turn in newer)
-            foreach (var item in turn.Items)
-                if (ReplayOf(item) is { } update) await rpc.SendUpdateAsync(id, update);
-        Log($"codex: thread {id}: {newer.Count} turns replayed {(found ? "after " + mark : "from the start")}");
-        return new JsonObject { ["from"] = found ? "mark" : "start", ["mark"] = newest ?? mark };
     }
 
     static SessionUpdate? ReplayOf(ThreadItem item) => item switch

@@ -427,7 +427,8 @@ public sealed class CodexAdapterTests
         Assert.AreEqual("completed", (string?)Of(zed, "tool_call")[0]["status"]);
         Assert.IsTrue(zed.Snapshot().All(u => u["_meta"]?["gorynych/origin"] is null), "a first import is just that: not marked native");
         var listed = fake.Last("thread/turns/list");
-        Assert.AreEqual(("desc", "full"), ((string?)listed["sortDirection"], (string?)listed["itemsView"]));
+        Assert.AreEqual(("desc", "notLoaded"), ((string?)listed["sortDirection"], (string?)listed["itemsView"]), "turns listed without items");
+        Assert.AreEqual("turn-0", (string?)fake.Last("thread/items/list")["turnId"], "then its items, turn by turn");
         Assert.AreEqual("turn-0", conductor.Feed("t1").Journal.NativeMark, "the thread's newest turn");
     }
 
@@ -489,8 +490,29 @@ public sealed class CodexAdapterTests
 
         CollectionAssert.AreEqual(new[] { "user: Ask 4", "agent: Answer 4", "user: Ask 5", "agent: Answer 5" }, Texts(updates));
         Assert.AreEqual(("mark", turns[4]), ((string?)replay?["from"], (string?)replay?["mark"]));
-        Assert.AreEqual(2, fake.All("thread/turns/list").Length, "newest first, until the marked turn: not the thread's six turns");
+        var listed = fake.All("thread/turns/list");
+        Assert.AreEqual(2, listed.Length, "newest first, until the marked turn: not the thread's six turns");
+        Assert.IsTrue(listed.All(l => (string?)l["itemsView"] == "notLoaded"), "without their items");
+        CollectionAssert.AreEqual(new[] { turns[3], turns[4] }, fake.All("thread/items/list").Select(l => (string?)l["turnId"]).Distinct().ToArray(),
+            "items only of the turns after the mark");
         Assert.AreEqual($"{turns[3]}-u", (string?)updates[0]["messageId"], "Codex's own IDs");
+    }
+
+    [TestMethod]
+    public async Task TheNewMark_IsTheNewestCompletedTurn_AndAThreadWithoutTurnsHasNone()
+    {
+        var fake = new FakeAppServer();
+        fake.Existing("t1", Cwd);
+        var done = fake.AddTurn("t1", "Ask", "Answer");
+        var running = fake.AddTurn("t1", "Still going", "…");
+        fake.Threads["t1"].Running.Add(running);
+
+        var (replay, _) = await ResumeDirectAsync(fake, "t1", After("turn-0"));
+        Assert.AreEqual(done, (string?)replay?["mark"], "not the turn still running");
+
+        fake.Threads["t1"].Items.Clear();
+        var (empty, updates) = await ResumeDirectAsync(fake, "t1", After(done));
+        Assert.AreEqual(("start", null, 0), ((string?)empty?["from"], (string?)empty?["mark"], updates.Count), "nothing to point at: no mark");
     }
 
     [TestMethod]

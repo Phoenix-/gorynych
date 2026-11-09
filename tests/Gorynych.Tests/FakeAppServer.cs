@@ -31,6 +31,8 @@ sealed class FakeAppServer
         public bool OpenElsewhere { get; set; }
         public long UpdatedAt { get; set; } = 1_794_000_000;
         public List<(string TurnId, JsonObject Item)> Items { get; } = [];
+        /// <summary>Turns <c>thread/turns/list</c> shows as still running.</summary>
+        public HashSet<string> Running { get; } = [];
         public JsonObject Settings { get; set; } = DefaultSettings();
     }
 
@@ -197,7 +199,9 @@ sealed class FakeAppServer
             case "thread/items/list":
             {
                 var t = Threads[(string)p["threadId"]!];
-                var entries = t.Items.Select(i => (JsonNode)new JsonObject { ["turnId"] = i.TurnId, ["item"] = i.Item.DeepClone() }).ToList();
+                var turn = (string?)p["turnId"];
+                var entries = t.Items.Where(i => turn is null || i.TurnId == turn)
+                    .Select(i => (JsonNode)new JsonObject { ["turnId"] = i.TurnId, ["item"] = i.Item.DeepClone() }).ToList();
                 return Done(Page(entries, (string?)p["cursor"]));
             }
             case "thread/turns/list":
@@ -209,7 +213,7 @@ sealed class FakeAppServer
                 var full = (string?)p["itemsView"] == "full";
                 var turns = ids.Select(id => (JsonNode)new JsonObject
                 {
-                    ["id"] = id, ["status"] = "completed", ["itemsView"] = full ? "full" : "notLoaded",
+                    ["id"] = id, ["status"] = t.Running.Contains(id) ? "inProgress" : "completed", ["itemsView"] = full ? "full" : "notLoaded",
                     ["items"] = new JsonArray(full ? t.Items.Where(i => i.TurnId == id).Select(i => (JsonNode)i.Item.DeepClone()).ToArray() : []),
                 }).ToList();
                 return Done(Page(turns, (string?)p["cursor"]));
