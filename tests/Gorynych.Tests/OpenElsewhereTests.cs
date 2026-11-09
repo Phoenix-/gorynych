@@ -35,6 +35,16 @@ public sealed class OpenElsewhereTests
         return id;
     }
 
+    static async Task Until(Func<bool> condition, string what)
+    {
+        for (var i = 0; i < 250; i++)
+        {
+            if (condition()) return;
+            await Task.Delay(20);
+        }
+        Assert.Fail($"timed out waiting for {what}");
+    }
+
     static JsonObject Entry(JsonNode? peers, string sessionId) =>
         peers!["sessions"]!.AsArray().Single(s => (string?)s!["session_id"] == sessionId)!.AsObject();
 
@@ -101,13 +111,19 @@ public sealed class OpenElsewhereTests
         await using var conductor = Conductor(TestDirs.New(), codex.Adapter);
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var id = await NewPromptedAsync(zed, "codex", "Fix the flaky test");
-        var before = zed.ChangeLog().Count(c => c == "updated " + id);
+        // The prompt's own notices (its title) reach the client through its notice queue, after the
+        // prompt's answer may have: a later session's "added" comes after them all.
+        var later = await NewPromptedAsync(zed, "codex", "Write the notes");
+        await Until(() => zed.ChangeLog().Contains("added " + later), "the later session's notice");
+        int Updates() => zed.ChangeLog().Count(c => c == "updated " + id);
+        var before = Updates();
 
         await codex.Adapter.Current!.Rpc.SendNotificationAsync(GorynychProtocol.MethodSessionsChanged, new JsonObject { ["sessionId"] = id, ["change"] = "updated" });
         await codex.Adapter.Current!.Rpc.SendNotificationAsync(GorynychProtocol.MethodSessionsChanged, new JsonObject { ["sessionId"] = id, ["change"] = "removed" });
-        await Task.Delay(300);
+        await Task.Delay(300); // what is not passed on has had time to arrive
+        if (advertised) await Until(() => Updates() == before + 1, "the update passed on");
 
-        Assert.AreEqual(before + (advertised ? 1 : 0), zed.ChangeLog().Count(c => c == "updated " + id));
+        Assert.AreEqual(before + (advertised ? 1 : 0), Updates());
         Assert.IsFalse(zed.ChangeLog().Contains("removed " + id), "only updated is taken");
     }
 
