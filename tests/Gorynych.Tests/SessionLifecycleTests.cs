@@ -678,6 +678,7 @@ sealed class LifecycleAgent
                         ProtocolVersion = 1,
                         AgentCapabilities = new AgentCapabilities
                         {
+                            LoadSession = LoadsWithoutIds,
                             SessionCapabilities = new SessionCapabilities
                             {
                                 List = new SessionListCapabilities(),
@@ -690,6 +691,7 @@ sealed class LifecycleAgent
                             {
                                 [GorynychProtocol.CapOpenElsewhere] = TellsOpenElsewhere,
                                 [GorynychProtocol.MetaSessionsChanged] = TellsListChanges,
+                                [GorynychProtocol.CapReplayFrom] = KeepsHistory,
                             },
                         },
                         AgentInfo = new Implementation { Name = name, Version = "1" },
@@ -717,10 +719,16 @@ sealed class LifecycleAgent
                     lock (Prompts) { Prompts.Add((sessionId!, text)); firstBlocks.TryAdd(sessionId!, blocks); }
                     if (BeforePrompt is { } beforePrompt) await beforePrompt(sessionId!);
                     lock (sessions) this.titles.TryAdd(sessionId!, blocks[0]);
+                    var turn = KeepsHistory || LoadsWithoutIds ? $"t{Interlocked.Increment(ref nativeTurns)}" : null;
                     if (AnswerUpdates is { } updates)
                         foreach (var u in updates) await agent.Update(sessionId!, u);
-                    else if (Answer is { } answer) await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = answer } });
-                    return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn });
+                    else if (Answer is { } answer)
+                        await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = answer }, MessageId = KeepsHistory ? turn + "-answer" : null });
+                    // Its turn goes into its own history, the prompt under the service's ID as Codex keeps it.
+                    if (turn is not null) Record(sessionId!, turn, text, (string?)req.Params?["_meta"]?[GorynychProtocol.MetaMessageId], Answer);
+                    var prompted = AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn })!.AsObject();
+                    if (KeepsHistory) prompted["_meta"] = new JsonObject { [GorynychProtocol.MetaHistoryMark] = turn };
+                    return prompted;
                 case AcpMethods.Agent.SessionResume when HolderOf(sessionId!) is { } holder:
                     throw new JsonRpcException(JsonRpcException.InvalidRequest, $"This thread is open in {holder}; close it there, then try again.");
                 case GorynychProtocol.MethodOpenElsewhere when TellsOpenElsewhere && OpenElsewhereFails:
@@ -733,8 +741,22 @@ sealed class LifecycleAgent
                     return new JsonObject { ["sessions"] = held };
                 }
                 case AcpMethods.Agent.SessionResume:
+                {
                     lock (SystemPrompts) SystemPrompts.Add((req.Method, sessionId!, req.Params?["systemPrompt"]?.DeepClone()));
                     if (BeforeResume is { } beforeResume) await beforeResume(sessionId!);
+                    var resumed = WithModes([], sessionId!);
+                    if (KeepsHistory && req.Params?["_meta"]?[GorynychProtocol.MetaReplayFrom] is JsonObject from)
+                    {
+                        lock (Replays) Replays.Add((sessionId!, from.DeepClone()));
+                        if (HistoryUnreadable) return resumed;
+                        var (turns, whence) = TurnsAfter(sessionId!, (string?)from["type"] == GorynychProtocol.ReplayAfterMark ? (string?)from["mark"] : null);
+                        foreach (var u in turns.SelectMany(t => t.Updates)) await SendUpdateAsync(agent, sessionId!, u);
+                        resumed["_meta"] = new JsonObject { [GorynychProtocol.MetaReplay] = new JsonObject { ["from"] = whence, ["mark"] = LastTurn(sessionId!) } };
+                    }
+                    return resumed;
+                }
+                case AcpMethods.Agent.SessionLoad when LoadsWithoutIds:
+                    foreach (var u in TurnsAfter(sessionId!, null).Turns.SelectMany(t => t.Updates)) await SendUpdateAsync(agent, sessionId!, u);
                     return WithModes([], sessionId!);
                 case AcpMethods.Agent.SessionSetConfigOption when ReportsModes && Equals((string?)req.Params?["configId"], "mode"):
                     lock (Modes) Modes[sessionId!] = (string)req.Params!["value"]!;
@@ -858,6 +880,94 @@ sealed class LifecycleAgent
     public Func<string, Task>? BeforePrompt { get; set; }
     public Func<string, Task>? BeforeResume { get; set; }
     public Func<string, Task>? BeforeDelete { get; set; }
+
+    // ---------------------------------------------------------------- its own history
+
+    readonly Dictionary<string, List<(string Turn, List<JsonObject> Updates)>> history = [];
+    int nativeTurns;
+
+    /// <summary>
+    /// Keeps each session's history as its own, turn by turn with IDs, as Codex does: advertises
+    /// <c>gorynych/replayFrom</c>, ends every prompt with the turn's ID as its mark, and replays the
+    /// turns after a mark on <c>session/resume</c>. Set before the first use.
+    /// </summary>
+    public bool KeepsHistory { get; set; }
+
+    /// <summary>
+    /// Keeps each session's history without IDs and replays all of it on <c>session/load</c>, as
+    /// Kimi does (it advertises <c>loadSession</c>). Set before the first use.
+    /// </summary>
+    public bool LoadsWithoutIds { get; set; }
+
+    /// <summary>With <see cref="KeepsHistory"/>: answers a replay without <c>gorynych/replay</c>, as an adapter that cannot read the history.</summary>
+    public bool HistoryUnreadable { get; set; }
+
+    /// <summary>The <c>gorynych/replayFrom</c> of every resume that had one.</summary>
+    public List<(string SessionId, JsonNode ReplayFrom)> Replays { get; } = [];
+
+    void Record(string sessionId, string turn, string user, string? userId, string? answer)
+    {
+        var updates = new List<JsonObject>
+        {
+            new() { ["sessionUpdate"] = "user_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = user } },
+        };
+        if (KeepsHistory) updates[0]["messageId"] = userId ?? turn + "-user";
+        if (answer is not null)
+        {
+            updates.Add(new JsonObject { ["sessionUpdate"] = "agent_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = answer } });
+            if (KeepsHistory) updates[1]["messageId"] = turn + "-answer";
+        }
+        lock (history)
+        {
+            if (!history.TryGetValue(sessionId, out var turns)) history[sessionId] = turns = [];
+            turns.Add((turn, updates));
+        }
+    }
+
+    /// <summary>A turn made outside Gorynych (Codex Desktop, the CLI): in the history only. Returns its ID.</summary>
+    public string AddNativeTurn(string sessionId, string user, string answer)
+    {
+        var turn = $"n{Interlocked.Increment(ref nativeTurns)}";
+        Record(sessionId, turn, user, null, answer);
+        return turn;
+    }
+
+    /// <summary>Drops the last turns of the history, as a rollback or an undo does.</summary>
+    public void DropNativeTurns(string sessionId, int count)
+    {
+        lock (history) history[sessionId].RemoveRange(history[sessionId].Count - count, count);
+    }
+
+    /// <summary>Replaces the history by a summary and its last turns, as Kimi's compaction does.</summary>
+    public void CompactNatively(string sessionId, int keep)
+    {
+        lock (history)
+        {
+            var turns = history[sessionId];
+            var kept = turns.Skip(turns.Count - keep).ToList();
+            turns.Clear();
+            turns.Add(("c", [new JsonObject { ["sessionUpdate"] = "agent_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = "Summary of the earlier work." } }]));
+            turns.AddRange(kept);
+        }
+    }
+
+    (List<(string Turn, List<JsonObject> Updates)> Turns, string From) TurnsAfter(string sessionId, string? mark)
+    {
+        lock (history)
+        {
+            var turns = history.GetValueOrDefault(sessionId) ?? [];
+            var at = mark is null ? -1 : turns.FindIndex(t => t.Turn == mark);
+            return mark is not null && at >= 0 ? (turns.Skip(at + 1).ToList(), "mark") : (turns.ToList(), "start");
+        }
+    }
+
+    string? LastTurn(string sessionId)
+    {
+        lock (history) return history.GetValueOrDefault(sessionId)?.LastOrDefault().Turn;
+    }
+
+    static Task SendUpdateAsync(ScriptedAgent agent, string sessionId, JsonObject update) =>
+        agent.Rpc.SendNotificationAsync(AcpMethods.Client.SessionUpdate, new JsonObject { ["sessionId"] = sessionId, ["update"] = update.DeepClone() });
 
     /// <summary>The agent forgets the session on its own, as if deleted from its own CLI.</summary>
     public void LoseNatively(string sessionId)

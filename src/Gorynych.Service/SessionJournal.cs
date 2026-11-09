@@ -106,8 +106,83 @@ public sealed class SessionJournal
         {
             lines = [];
             turns = false;
+            mark = null;
+            markRead = true;
             File.Delete(path);
             File.Delete(TrimmedPath);
+            File.Delete(MarkPath);
+            foreach (var kept in KeptHistories()) File.Delete(kept);
+        }
+    }
+
+    string MarkPath => path + ".native";
+    string? mark;
+    bool markRead;
+
+    /// <summary>
+    /// How far into the agent's own history the journal goes: the adapter's opaque mark
+    /// (<c>gorynych/historyMark</c>), or null when none is known. Kept in a file next to the journal.
+    /// </summary>
+    public string? NativeMark
+    {
+        get
+        {
+            lock (gate)
+            {
+                if (!markRead)
+                {
+                    try { mark = File.Exists(MarkPath) ? File.ReadAllText(MarkPath, Encoding.UTF8) : null; }
+                    catch (IOException) { mark = null; }
+                    markRead = true;
+                }
+                return mark is { Length: > 0 } ? mark : null;
+            }
+        }
+        set
+        {
+            lock (gate)
+            {
+                if (markRead && mark == value) return;
+                if (value is null) File.Delete(MarkPath);
+                else Gorynych.Acp.Hosting.AtomicFile.WriteAllText(MarkPath, value, Encoding.UTF8);
+                mark = value;
+                markRead = true;
+            }
+        }
+    }
+
+    /// <summary>How many earlier journals <see cref="Replace"/> keeps.</summary>
+    public const int KeptHistoryCount = 3;
+
+    /// <summary>The earlier journals <see cref="Replace"/> kept, oldest first.</summary>
+    public IReadOnlyList<string> KeptHistories()
+    {
+        var dir = Path.GetDirectoryName(path)!;
+        if (!Directory.Exists(dir)) return [];
+        return Directory.GetFiles(dir, Path.GetFileName(path) + ".*.before").Order(StringComparer.Ordinal).ToList();
+    }
+
+    /// <summary>
+    /// Replaces the journal with <paramref name="entries"/> (the agent's history imported again),
+    /// keeping the one it replaces next to it as <c>&lt;journal&gt;.&lt;UTC time&gt;.before</c>, the
+    /// last <see cref="KeptHistoryCount"/> of them.
+    /// </summary>
+    public void Replace(IEnumerable<JsonNode> entries, DateTimeOffset now)
+    {
+        lock (gate)
+        {
+            if (File.Exists(path))
+            {
+                File.Copy(path, $"{path}.{now.UtcDateTime:yyyyMMdd'T'HHmmssfff'Z'}.before", overwrite: true);
+                var kept = KeptHistories();
+                for (var i = 0; i < kept.Count - KeptHistoryCount; i++) File.Delete(kept[i]);
+            }
+            var all = entries.Select(e => e.ToJsonString(LineOptions)).ToList();
+            turns = all.Select(TryParse).Any(IsTurn);
+            File.Delete(TrimmedPath); // the whole history again, unless it is trimmed once more
+            if (all.Count > maxEntries) Compact(all);
+            Rewrite(all);
+            lines = all;
         }
     }
 

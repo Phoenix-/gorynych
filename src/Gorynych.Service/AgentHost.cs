@@ -130,6 +130,9 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// <summary>The adapter tells which sessions another app has open (<c>_gorynych/open_elsewhere</c>).</summary>
     public bool TellsOpenElsewhere => Flag(GorynychProtocol.CapOpenElsewhere);
 
+    /// <summary>The adapter replays its own history after a mark on <c>session/resume</c> (<c>gorynych/replayFrom</c>).</summary>
+    public bool ReplaysFrom => Flag(GorynychProtocol.CapReplayFrom);
+
     /// <summary>The agent keeps nothing durable before a session's first prompt.</summary>
     public bool DraftsNotDurable => Flag(GorynychProtocol.CapDraftsNotDurable);
 

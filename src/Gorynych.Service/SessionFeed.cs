@@ -19,8 +19,38 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
 
     static readonly TimeSpan SendTimeout = TimeSpan.FromSeconds(15);
 
-    /// <summary>Non-zero while the agent replays history the service already has.</summary>
-    public int SuppressReplay;
+    List<JsonObject>? replay; // under clientsGate
+
+    /// <summary>
+    /// From now until <see cref="EndReplay"/>, the agent's updates are its history replayed for a
+    /// catch-up (<see cref="HistoryCatchUp"/>): kept aside, neither journaled nor sent.
+    /// </summary>
+    public void BeginReplay()
+    {
+        lock (clientsGate) replay = [];
+    }
+
+    /// <summary>Keeps <paramref name="update"/> aside while a replay is collected; false otherwise.</summary>
+    public bool CollectReplay(JsonObject update)
+    {
+        lock (clientsGate)
+        {
+            if (replay is null) return false;
+            replay.Add((JsonObject)update.DeepClone());
+            return true;
+        }
+    }
+
+    /// <summary>The updates collected since <see cref="BeginReplay"/>.</summary>
+    public List<JsonObject> EndReplay()
+    {
+        lock (clientsGate)
+        {
+            var got = replay ?? [];
+            replay = null;
+            return got;
+        }
+    }
 
     /// <summary>Orders a prompt and a later <c>session/cancel</c> on their way to the agent.</summary>
     public SemaphoreSlim ForwardGate { get; } = new(1, 1);
@@ -470,6 +500,28 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             foreach (var client in Clients())
                 if (!ReferenceEquals(client, except))
                     await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update.DeepClone()));
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Replaces the journal with the agent's history imported again (<see cref="SessionJournal.Replace"/>)
+    /// and sends the new entries to the attached clients, which saw the earlier ones.
+    /// </summary>
+    public async Task ReplaceHistoryAsync(List<JsonObject> entries, DateTimeOffset now)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (Retired) return;
+            runKind = null;
+            Journal.Replace(entries, now);
+            foreach (var client in Clients())
+                foreach (var entry in entries)
+                    if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(entry.DeepClone()))) break;
         }
         finally
         {

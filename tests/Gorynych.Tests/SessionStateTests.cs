@@ -88,10 +88,13 @@ public sealed class SessionStateTests
         CollectionAssert.Contains(kimi.Methods, AcpMethods.Agent.SessionLoad);
         Assert.AreEqual("k3", Model(loaded), "what the restarted agent reports");
 
-        await kimi.Adapter.Current!.Rpc.DisposeAsync(); // dies again; session/resume reopens with the agent's resume
+        // Dies again. An agent that loads but keeps no marks is reopened with its load every time, so
+        // the journal can be caught up with what it replays (HistoryCatchUp), also by a session/resume.
+        await kimi.Adapter.Current!.Rpc.DisposeAsync();
         await Task.Delay(100);
         var resumed = await ResumeAsync(first);
-        CollectionAssert.Contains(kimi.Methods, AcpMethods.Agent.SessionResume);
+        Assert.AreEqual(2, kimi.Methods.Count(m => m == AcpMethods.Agent.SessionLoad));
+        CollectionAssert.DoesNotContain(kimi.Methods, AcpMethods.Agent.SessionResume);
         Assert.AreEqual("k3", Model(resumed));
     }
 

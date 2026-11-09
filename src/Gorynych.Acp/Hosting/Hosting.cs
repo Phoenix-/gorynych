@@ -190,6 +190,47 @@ public static class GorynychProtocol
     /// <summary>In <c>agentCapabilities._meta</c>: <c>true</c> when the adapter takes <see cref="MethodOpenElsewhere"/>.</summary>
     public const string CapOpenElsewhere = "gorynych/openElsewhere";
 
+    /// <summary>
+    /// In <c>agentCapabilities._meta</c>: <c>true</c> when the adapter takes <see cref="MetaReplayFrom"/>
+    /// on <c>session/resume</c> and reports <see cref="MetaHistoryMark"/> (docs/adapter-contract.md, §4).
+    /// </summary>
+    public const string CapReplayFrom = "gorynych/replayFrom";
+
+    /// <summary>
+    /// In <c>session/resume</c> params <c>_meta</c>: replay the agent's own history as
+    /// <c>session/update</c>s before answering, from <c>{"type": "start"}</c> or after a mark,
+    /// <c>{"type": "gorynych/after", "mark": "…"}</c>. The shape of the <c>replayFrom</c> of ACP v2's
+    /// session-resume-replay draft.
+    /// </summary>
+    public const string MetaReplayFrom = "gorynych/replayFrom";
+
+    /// <summary>The <c>type</c> of a <see cref="MetaReplayFrom"/> cursor that replays everything.</summary>
+    public const string ReplayFromStart = "start";
+
+    /// <summary>The <c>type</c> of a <see cref="MetaReplayFrom"/> cursor that replays what follows its <c>mark</c>.</summary>
+    public const string ReplayAfterMark = "gorynych/after";
+
+    /// <summary>
+    /// In a <c>session/resume</c> result's <c>_meta</c>, answering <see cref="MetaReplayFrom"/>:
+    /// <c>{"from": "mark" | "start", "mark": "…"}</c>. <c>from: "start"</c> after a request from a mark
+    /// says the mark is no longer in the history (it was rewritten), so all of it was sent.
+    /// </summary>
+    public const string MetaReplay = "gorynych/replay";
+
+    /// <summary>
+    /// The point of the agent's own history that the session's journal holds up to, opaque to the
+    /// service: in a <c>session/prompt</c> result's <c>_meta</c> at the end of every turn the service
+    /// ran, and on the update that ends a turn of the agent's own (<see cref="MetaAgentTurn"/>).
+    /// </summary>
+    public const string MetaHistoryMark = "gorynych/historyMark";
+
+    /// <summary>
+    /// What an entry the service writes into a journal says, on a <c>user_message_chunk</c> with
+    /// <c>gorynych/origin: "notice"</c>: <c>historyRewritten</c>, where the agent's history no longer
+    /// held what the journal showed and was imported again.
+    /// </summary>
+    public const string MetaNotice = "gorynych/notice";
+
     /// <summary><c>spawn_session</c> of the service's <c>gorynych</c> MCP server, as agents name it.</summary>
     public const string SpawnTool = "mcp__gorynych__spawn_session";
 

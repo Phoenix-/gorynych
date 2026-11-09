@@ -188,11 +188,16 @@ public sealed class Conductor : IAsyncDisposable
             feed.ApplyStateUpdate(update);
             feed.Active(options.Time.GetUtcNow()); // an agent that sends something is not idle (UnloadIfIdleAsync)
             AgentTurn(feed, update);
-            if (feed.SuppressReplay > 0) return; // the agent is replaying history we already journal
+            if (feed.CollectReplay(update)) return; // the agent's history, replayed for a catch-up (OpenAsync)
             KeepSpawnTitle(sessionId, update);
-            if (feed.IsRepeatedTitle(update)) return;
-            feed.TagOpinionTurn(update);
-            await feed.PublishAsync(update, except: null, () => Remember(host, sessionId, update));
+            // The end of a turn of the agent's own may carry the mark of its history (KeepMark).
+            var mark = update["_meta"]?[GorynychProtocol.MetaHistoryMark]?.DeepClone();
+            if (!feed.IsRepeatedTitle(update))
+            {
+                feed.TagOpinionTurn(update);
+                await feed.PublishAsync(update, except: null, () => Remember(host, sessionId, update));
+            }
+            SetMark(feed, mark);
             return;
         }
         foreach (var c in feed.Clients())
@@ -414,10 +419,9 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
-    /// Makes sure the agent has the session open in its current instance. Prefers
-    /// <c>session/resume</c>; falls back to <c>session/load</c> with the agent's replay
-    /// suppressed, since the history comes from the service's own journal. Called under a use of
-    /// the session, whose end starts its idle timer (<see cref="IdleFromNow"/>).
+    /// Makes sure the agent has the session open in its current instance, its journal caught up
+    /// with the agent's own history first (<see cref="OpenAsync"/>). Called under a use of the
+    /// session, whose end starts its idle timer (<see cref="IdleFromNow"/>).
     /// </summary>
     internal async Task<(JsonRpcConnection Rpc, JsonObject? Opened)> EnsureLiveAsync(SessionRecord record, CancellationToken ct)
     {
@@ -439,21 +443,65 @@ public sealed class Conductor : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Opens the session in its agent and, before anything runs in it, catches its journal up with the
+    /// agent's own history, which may have grown outside Gorynych (<see cref="HistoryCatchUp"/>): so a
+    /// turn the service starts next lands after it in the journal, as it did in the agent. An adapter
+    /// that advertises <c>gorynych/replayFrom</c> replays what follows the journal's mark on
+    /// <c>session/resume</c>; an agent that loads but has no marks (Kimi) replays everything on
+    /// <c>session/load</c>, which the service aligns with the journal; any other just resumes.
+    /// </summary>
     async Task<JsonObject?> OpenAsync(AgentHost host, JsonRpcConnection rpc, SessionRecord record, CancellationToken ct)
     {
+        var feed = Feed(record.SessionId);
         JsonNode? opened;
-        if (host.CanResume)
+        HistoryCatchUp.Replayed? replayed = null;
+        string? newMark = null;
+        List<JsonObject> history = [];
+        if (host.CanResume && (host.ReplaysFrom || !host.CanLoad))
         {
-            opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionResume,
-                AcpJson.ToNode(new ResumeSessionRequest
+            var resume = new ResumeSessionRequest
+            {
+                SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId), SystemPrompt = SystemPromptFor(host),
+            };
+            var mark = host.ReplaysFrom ? feed.Journal.NativeMark : null;
+            if (host.ReplaysFrom)
+            {
+                resume.Meta = new JsonObject
                 {
-                    SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId), SystemPrompt = SystemPromptFor(host),
-                }), ct);
+                    [GorynychProtocol.MetaReplayFrom] = mark is null
+                        ? new JsonObject { ["type"] = GorynychProtocol.ReplayFromStart }
+                        : new JsonObject { ["type"] = GorynychProtocol.ReplayAfterMark, ["mark"] = mark },
+                };
+                feed.BeginReplay();
+            }
+            try
+            {
+                opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, AcpJson.ToNode(resume), ct);
+            }
+            finally
+            {
+                if (host.ReplaysFrom) history = feed.EndReplay();
+            }
+            if (host.ReplaysFrom)
+            {
+                if (opened?["_meta"]?[GorynychProtocol.MetaReplay] is JsonObject reply)
+                {
+                    replayed = mark is null ? HistoryCatchUp.Replayed.All
+                        : (string?)reply["from"] == "mark" ? HistoryCatchUp.Replayed.AfterMark
+                        : HistoryCatchUp.Replayed.MarkLost;
+                    newMark = reply["mark"] is JsonValue m && m.TryGetValue<string>(out var text) ? text : null;
+                }
+                else
+                {
+                    // The adapter could not read the history: the journal stays as it is.
+                    ServiceLog.Warn($"{host.Name} {record.SessionId}: opened without its own history; the journal is not caught up");
+                }
+            }
         }
         else if (host.CanLoad)
         {
-            var feed = Feed(record.SessionId);
-            Interlocked.Increment(ref feed.SuppressReplay);
+            feed.BeginReplay();
             try
             {
                 opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
@@ -464,16 +512,43 @@ public sealed class Conductor : IAsyncDisposable
             }
             finally
             {
-                Interlocked.Decrement(ref feed.SuppressReplay);
+                history = feed.EndReplay();
             }
+            replayed = HistoryCatchUp.Replayed.All;
         }
         else
         {
             throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"{host.Name} cannot reopen session {record.SessionId}");
         }
         host.MarkLive(record.SessionId);
-        Feed(record.SessionId).CaptureState(opened);
+        feed.CaptureState(opened);
+        if (replayed is { } how) await CatchUpAsync(host, feed, history, how, newMark);
         return opened as JsonObject;
+    }
+
+    /// <summary>Applies what the agent replayed of its own history to the journal, then keeps its new mark.</summary>
+    async Task CatchUpAsync(AgentHost host, SessionFeed feed, List<JsonObject> history, HistoryCatchUp.Replayed replayed, string? mark)
+    {
+        try
+        {
+            var plan = HistoryCatchUp.Make(feed.Journal.ReadAll(), history, replayed, host.DisplayName);
+            switch (plan.Kind)
+            {
+                case HistoryCatchUp.Kind.Append:
+                    foreach (var update in plan.Updates) await feed.PublishAsync(update, except: null, () => { });
+                    ServiceLog.Info($"{host.Name} {feed.SessionId}: {plan.Updates.Count} updates of its own history added to the journal");
+                    break;
+                case HistoryCatchUp.Kind.Replace:
+                    await feed.ReplaceHistoryAsync(plan.Updates, options.Time.GetUtcNow());
+                    ServiceLog.Warn($"{host.Name} {feed.SessionId}: its own history was rewritten; the journal was imported again ({plan.Updates.Count - 1} updates), the earlier one kept");
+                    break;
+            }
+            if (mark is not null && !feed.Retired) feed.Journal.NativeMark = mark;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            ServiceLog.Warn($"{host.Name} {feed.SessionId}: the journal could not be caught up: {e.Message}");
+        }
     }
 
     internal async Task<JsonNode?> LoadAsync(ClientConnection client, LoadSessionRequest request, CancellationToken ct)
@@ -483,32 +558,17 @@ public sealed class Conductor : IAsyncDisposable
         var record = use.Record;
         var host = HostOf(record);
         var feed = use.Feed;
-        JsonObject? opened = null;
-        if (feed.Journal.Count == 0 && !host.IsLive(record.SessionId))
-        {
-            // History the service has never seen: let the agent replay it, and journal it.
-            var rpc = await host.GetAsync(ct);
-            if (host.CanLoad)
-            {
-                feed.Attach(client);
-                opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
-                    AcpJson.ToNode(new LoadSessionRequest
-                    {
-                        SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId), SystemPrompt = SystemPromptFor(host),
-                    }), ct) as JsonObject;
-                host.MarkLive(record.SessionId);
-                feed.CaptureState(opened);
-                return opened ?? [];
-            }
-        }
         JsonObject response;
         try
         {
-            (_, opened) = await EnsureLiveAsync(record, ct);
+            // Opening it catches the journal up with the agent's own history first (OpenAsync); a
+            // session the journal has never seen is imported so.
+            var (_, opened) = await EnsureLiveAsync(record, ct);
             response = opened ?? feed.State();
         }
         catch (Exception e) when (e is JsonRpcException or IOException)
         {
+            if (feed.Journal.Count == 0) throw; // no history to show without the agent
             // The history is still worth showing even if the agent cannot take the session now.
             ServiceLog.Warn($"{host.Name}: cannot reopen {record.SessionId}: {e.Message}");
             response = [];
@@ -594,7 +654,20 @@ public sealed class Conductor : IAsyncDisposable
         {
             feed.ForwardGate.Release();
         }
-        return await response;
+        var result = await response;
+        KeepMark(feed, result);
+        return result;
+    }
+
+    /// <summary>
+    /// Keeps the mark a turn's result carries (<c>gorynych/historyMark</c>): the journal now holds the
+    /// agent's own history up to there. Its updates came before the result, so they are journaled.
+    /// </summary>
+    static void KeepMark(SessionFeed feed, JsonNode? result) => SetMark(feed, result?["_meta"]?[GorynychProtocol.MetaHistoryMark]);
+
+    static void SetMark(SessionFeed feed, JsonNode? mark)
+    {
+        if (mark is JsonValue v && v.TryGetValue<string>(out var text) && text.Length > 0 && !feed.Retired) feed.Journal.NativeMark = text;
     }
 
     /// <summary>
@@ -1450,6 +1523,7 @@ public sealed class Conductor : IAsyncDisposable
                 feed.ForwardGate.Release();
             }
             var result = await response;
+            KeepMark(feed, result);
             ReportTurnEnd(record.SessionId, Outcome(result), feed.EndTurnText());
         }
         catch (Exception e)
@@ -1711,7 +1785,7 @@ public sealed class Conductor : IAsyncDisposable
             {
                 feed.ForwardGate.Release();
             }
-            await response;
+            KeepMark(feed, await response);
         }
         finally
         {
@@ -2313,6 +2387,7 @@ public sealed class Conductor : IAsyncDisposable
                 }
                 turnDone = response.ContinueWith(t =>
                 {
+                    if (t.IsCompletedSuccessfully) KeepMark(feed, t.Result);
                     pending.TurnText = feed.EndOpinionTurn();
                     pending.TurnError = t.Exception?.InnerException;
                     feed.TurnEnded();
