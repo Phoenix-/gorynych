@@ -162,6 +162,9 @@ public sealed class CodexThreadHoldersTests
     [DataRow(@"C:\Users\u\AppData\Local\Programs\Microsoft VS Code\Code.exe", @"C:\Users\u\AppData\Local\Programs\Microsoft VS Code\Code.exe", null, DisplayName = "VS Code itself")]
     [DataRow(@"C:\Program Files\WindowsApps\OpenAI.Codex_26.1029.0_x64\app\helper.exe", null, "Codex Desktop", DisplayName = "anything of Codex Desktop's own")]
     [DataRow(@"C:\Users\u\AppData\Local\Temp\notcodex.exe", @"C:\Program Files\WindowsApps\OpenAI.Codex_26.1029.0_x64\app\ChatGPT.exe", null, DisplayName = "another child of ChatGPT.exe")]
+    [DataRow(@"c:/users/U/appdata/local/openai/codex/bin/CODEX.EXE", null, "Codex Desktop", DisplayName = "forward slashes, any case")]
+    [DataRow(@"C:/Users/u/.vscode/extensions/openai.chatgpt-0.4.1/bin/codex.exe", null, "VS Code", DisplayName = "an extension's, forward slashes")]
+    [DataRow(@"D:\tools\codex-x86_64-pc-windows-msvc.exe", @"C:\Windows\System32\cmd.exe", "a terminal codex (pid 4242)", DisplayName = "a renamed release binary")]
     public void AHolder_IsNamedByItsImageOrItsParent(string? image, string? parent, string? expected)
     {
         Assert.AreEqual(expected, CodexThreadHolders.Classify(4242, image, parent, @"C:\Users\u\AppData\Local"));

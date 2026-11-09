@@ -83,24 +83,35 @@ internal sealed partial class CodexThreadHolders(string? locksDirectory, Func<IR
     /// Code.exe. Otherwise a <c>codex*.exe</c> is a codex in a terminal, by its process ID; any other
     /// image, or none (the process could not be read), is not a holder.
     /// </summary>
+    /// <remarks>
+    /// It reads Windows image paths, the same on any OS it runs on (the tests run on Linux too): it
+    /// splits them at <c>\</c> and <c>/</c> itself and compares them ignoring case, never through <see cref="Path"/>.
+    /// </remarks>
     internal static string? Classify(int pid, string? image, string? parentImage, string localAppData)
     {
         if (image is null) return null;
-        var name = Path.GetFileName(image);
+        var path = Slashed(image);
+        var name = FileName(path);
         var codex = name.StartsWith("codex", StringComparison.OrdinalIgnoreCase) && name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
-        var parent = parentImage is null ? null : Path.GetFileName(parentImage);
-        if (image.StartsWith(Path.Combine(localAppData, "OpenAI", "Codex") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-            || image.Contains(@"\WindowsApps\OpenAI.Codex", StringComparison.OrdinalIgnoreCase)
+        var parent = parentImage is null ? null : FileName(Slashed(parentImage));
+        if (path.StartsWith(Slashed(localAppData).TrimEnd('\\') + @"\OpenAI\Codex\", StringComparison.OrdinalIgnoreCase)
+            || path.Contains(@"\WindowsApps\OpenAI.Codex", StringComparison.OrdinalIgnoreCase)
             || (codex && string.Equals(parent, "ChatGPT.exe", StringComparison.OrdinalIgnoreCase)))
             return "Codex Desktop";
         if (!codex) return null;
-        if (image.Contains(@"\.vscode\extensions\", StringComparison.OrdinalIgnoreCase)
-            || image.Contains(@"\.vscode-insiders\extensions\", StringComparison.OrdinalIgnoreCase)
+        if (path.Contains(@"\.vscode\extensions\", StringComparison.OrdinalIgnoreCase)
+            || path.Contains(@"\.vscode-insiders\extensions\", StringComparison.OrdinalIgnoreCase)
             || string.Equals(parent, "Code.exe", StringComparison.OrdinalIgnoreCase)
             || string.Equals(parent, "Code - Insiders.exe", StringComparison.OrdinalIgnoreCase))
             return "VS Code";
         return $"a terminal codex (pid {pid})";
     }
+
+    /// <summary>A Windows path with its separators as backslashes.</summary>
+    static string Slashed(string path) => path.Replace('/', '\\');
+
+    /// <summary>The last part of a backslashed path.</summary>
+    static string FileName(string path) => path[(path.LastIndexOf('\\') + 1)..];
 
     static unsafe partial class Windows
     {
