@@ -34,7 +34,8 @@ public sealed class CodexLockWatcherTests
         }
     }
 
-    static async Task<Rig> StartAsync(TimeSpan recheck, bool folder = true, params string[] threads)
+    static async Task<Rig> StartAsync(TimeSpan recheck, bool folder = true, Func<IEnumerable<string>, ConcurrentDictionary<string, string>, IReadOnlyDictionary<string, string>>? find = null,
+        params string[] threads)
     {
         var locks = Path.Combine(TestDirs.New(), "thread-writer-locks");
         if (folder) Directory.CreateDirectory(locks);
@@ -50,7 +51,7 @@ public sealed class CodexLockWatcherTests
         {
             Launch = fake.StartAsync,
             ClientVersion = "test",
-            FindHolders = ids => ids.Where(held.ContainsKey).ToDictionary(id => id, id => held[id]),
+            FindHolders = ids => find is not null ? find(ids, held) : ids.Where(held.ContainsKey).ToDictionary(id => id, id => held[id]),
             LocksDirectory = locks,
             LockSettle = TimeSpan.FromMilliseconds(100),
             LockRecheck = recheck,
@@ -114,16 +115,20 @@ public sealed class CodexLockWatcherTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task FilesThatChangeNoHolder_TellNothing()
+    public async Task FilesThatChangeNoHolder_TellNothing_WhileAChangeIsToldAtOnce()
     {
-        await using var rig = await StartAsync(TimeSpan.FromMilliseconds(300), threads: ["t1"]);
+        await using var rig = await StartAsync(TimeSpan.FromHours(1), threads: ["t1"]);
 
         File.WriteAllBytes(Path.Combine(rig.Locks, "t1.lock"), []); // the user's own app-server, say: no other holder
         File.WriteAllBytes(Path.Combine(rig.Locks, ".coordination.lock"), []);
         File.Delete(Path.Combine(rig.Locks, "t1.lock"));
         await Task.Delay(1000);
-
         Assert.AreEqual(0, rig.Updates("t1"));
+
+        // The watcher is alive: a real change in the same folder is told (no timer: an hour).
+        rig.Held["t1"] = "Codex Desktop";
+        File.WriteAllBytes(Path.Combine(rig.Locks, "t1.lock"), []);
+        await Until(() => rig.Updates("t1") == 1, "the change");
     }
 
     [TestMethod]
@@ -131,13 +136,74 @@ public sealed class CodexLockWatcherTests
     public async Task AFolderThatIsNotThereYet_IsWatchedOnceItIs()
     {
         await using var rig = await StartAsync(TimeSpan.FromMilliseconds(200), folder: false, threads: ["t1"]);
-        await Task.Delay(300);
 
         Directory.CreateDirectory(rig.Locks); // Codex's first thread ever
-        await Task.Delay(600); // the timer finds the folder
         rig.Held["t1"] = "Codex Desktop";
         File.WriteAllBytes(Path.Combine(rig.Locks, "t1.lock"), []);
 
+        // Told by the file's event once the timer has found the folder, or by the look at every
+        // thread seen that follows a new watcher, whichever comes first.
         await Until(() => rig.Updates("t1") == 1, "the notice once the folder is watched");
+        await Task.Delay(500);
+        Assert.AreEqual(1, rig.Updates("t1"), "once");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AFolderThatGoesAndComesBack_IsWatchedAgain()
+    {
+        await using var rig = await StartAsync(TimeSpan.FromMilliseconds(200), threads: ["t1"]);
+        await Task.Delay(300);
+
+        Directory.Delete(rig.Locks, recursive: true); // Codex's folder removed: the watcher may not say so
+        await Task.Delay(500);
+        Directory.CreateDirectory(rig.Locks);
+        rig.Held["t1"] = "Codex Desktop";
+        File.WriteAllBytes(Path.Combine(rig.Locks, "t1.lock"), []);
+
+        await Until(() => rig.Updates("t1") == 1, "the notice from the new watcher");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task HoldersThatCouldNotBeFound_AreLookedAtAgain_OnTheNextTick()
+    {
+        var failures = 0; // the list at the start finds them; then one look fails
+        await using var rig = await StartAsync(TimeSpan.FromMilliseconds(300), find: (ids, held) =>
+        {
+            var list = ids.ToList();
+            if (list.Contains("t1") && Interlocked.Decrement(ref failures) >= 0) throw new IOException("the lock folder could not be read");
+            return list.Where(held.ContainsKey).ToDictionary(id => id, id => held[id]);
+        }, threads: ["t1"]);
+        Volatile.Write(ref failures, 1);
+
+        rig.Held["t1"] = "Codex Desktop";
+        File.WriteAllBytes(Path.Combine(rig.Locks, "t1.lock"), []); // its look fails once
+
+        await Until(() => rig.Updates("t1") == 1, "the change, found on the next tick");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task StoppingDuringAStormOfChanges_ThrowsNowhere()
+    {
+        var rig = await StartAsync(TimeSpan.FromMilliseconds(50), threads: ["t1"]);
+        var stopped = false;
+        var storm = Task.Run(async () =>
+        {
+            for (var i = 0; !Volatile.Read(ref stopped) && i < 2000; i++)
+            {
+                var file = Path.Combine(rig.Locks, $"019a0000-0000-7000-8000-{i:D12}.lock");
+                File.WriteAllBytes(file, []);
+                File.Delete(file);
+                if (i % 50 == 0) await Task.Yield();
+            }
+        });
+        await Task.Delay(200);
+
+        await rig.DisposeAsync(); // the adapter stops while its app-server deletes its lock files
+        Volatile.Write(ref stopped, true);
+        await storm;
+        await Task.Delay(300); // callbacks already queued run now; one that threw would end the test run
     }
 }

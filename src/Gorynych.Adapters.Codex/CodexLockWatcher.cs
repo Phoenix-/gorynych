@@ -7,9 +7,11 @@ namespace Gorynych.Adapters.Codex;
 /// (docs/adapters.md, "One writer"). It watches Codex's lock folder: a thread's lock file appears
 /// when an app takes it and is usually deleted when it lets go. Once a burst of changes settles,
 /// the holders of the threads they touched are found again; the threads last seen held are looked
-/// at again on a timer too, for a holder that went away without its file going (it crashed) and
-/// for changes the watcher missed. Only a real change of holder is reported. Fail-open: with no
-/// folder nothing is watched until it appears, and a watcher that fails leaves the timer alone.
+/// at again on a timer too, for a holder that went away without its file going (it crashed). When
+/// the watcher may have missed something (its buffer overflowed, it was made again), every thread
+/// seen is looked at. Only a real change of holder is reported. Fail-open: with no folder nothing
+/// is watched until it appears, a watcher that fails leaves the timer alone, and threads whose
+/// holders could not be found are looked at again on the next tick.
 /// </summary>
 internal sealed class CodexLockWatcher : IAsyncDisposable
 {
@@ -21,11 +23,15 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
     readonly Action<string>? log;
     readonly Lock gate = new();
     readonly Dictionary<string, string> told = new(StringComparer.Ordinal); // the holder clients were last told, per thread
+    readonly HashSet<string> seen = new(StringComparer.Ordinal); // every thread a list or an open showed
     readonly HashSet<string> touched = new(StringComparer.Ordinal);
+    // Never disposed: a callback of the watcher that is already queued may still release it.
     readonly SemaphoreSlim signal = new(0);
     readonly CancellationTokenSource stop = new();
     readonly Task loop;
-    FileSystemWatcher? watcher;
+    FileSystemWatcher? watcher; // under gate
+    bool disposed; // under gate
+    int disposing;
 
     /// <param name="report">Says that a thread's holder changed (the service then tells its clients).</param>
     public CodexLockWatcher(string? directory, Func<IEnumerable<string>, IReadOnlyDictionary<string, string>> holders,
@@ -48,13 +54,18 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
     {
         lock (gate)
             foreach (var id in threadIds)
+            {
+                seen.Add(id);
                 if (found.TryGetValue(id, out var holder)) told[id] = holder;
                 else told.Remove(id);
+            }
     }
+
+    long Due() => Stopwatch.GetTimestamp() + (long)(recheck.TotalSeconds * Stopwatch.Frequency);
 
     async Task RunAsync()
     {
-        var due = Stopwatch.GetTimestamp() + (long)(recheck.TotalSeconds * Stopwatch.Frequency);
+        var due = Due();
         while (!stop.IsCancellationRequested)
         {
             Watch();
@@ -69,21 +80,15 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
             {
                 return;
             }
+            while (signal.CurrentCount > 0) signal.Wait(0);
             List<string> ids;
-            if (touchedNow)
+            lock (gate)
             {
-                while (signal.CurrentCount > 0) signal.Wait(0);
-                lock (gate)
-                {
-                    ids = [.. touched];
-                    touched.Clear();
-                }
+                // A tick also takes up what is still to do: threads whose holders could not be found before.
+                ids = touchedNow ? [.. touched] : [.. touched.Union(told.Keys)];
+                touched.Clear();
             }
-            else
-            {
-                lock (gate) ids = [.. told.Keys];
-                due = Stopwatch.GetTimestamp() + (long)(recheck.TotalSeconds * Stopwatch.Frequency);
-            }
+            if (!touchedNow) due = Due();
             if (ids.Count > 0) await ReportAsync(ids);
         }
     }
@@ -97,7 +102,9 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
         }
         catch (Exception e) when (e is not OutOfMemoryException)
         {
-            return; // not known: nothing to tell
+            // Not known now: looked at again on the next tick.
+            lock (gate) touched.UnionWith(ids);
+            return;
         }
         var changed = new List<string>();
         lock (gate)
@@ -123,14 +130,32 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
         }
     }
 
-    /// <summary>Starts watching once the folder exists; any failure leaves the timer to it.</summary>
+    /// <summary>
+    /// Keeps a working watcher, and makes one when there is none or the one there stopped (its
+    /// folder went, which it may not report); after making one, every thread seen is looked at,
+    /// since changes before it were not watched. Any failure leaves the timer to it.
+    /// </summary>
     void Watch()
     {
-        if (Volatile.Read(ref watcher) is not null || directory is null) return;
+        if (directory is null) return;
+        FileSystemWatcher? current;
+        lock (gate) current = watcher;
         try
         {
-            if (!Directory.Exists(directory)) return;
-            var w = new FileSystemWatcher(directory, "*.lock") { NotifyFilter = NotifyFilters.FileName, IncludeSubdirectories = false };
+            var there = Directory.Exists(directory);
+            if (current is not null)
+            {
+                if (there && current.EnableRaisingEvents) return;
+                lock (gate) if (watcher == current) watcher = null;
+                current.Dispose();
+            }
+            if (!there) return;
+            var w = new FileSystemWatcher(directory, "*.lock")
+            {
+                NotifyFilter = NotifyFilters.FileName,
+                IncludeSubdirectories = false,
+                InternalBufferSize = 64 * 1024,
+            };
             w.Created += (_, e) => Touch(e.Name);
             w.Deleted += (_, e) => Touch(e.Name);
             w.Renamed += (_, e) =>
@@ -138,9 +163,20 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
                 Touch(e.OldName);
                 Touch(e.Name);
             };
-            w.Error += (_, e) => Lost(e.GetException());
+            w.Error += (_, e) => Missed(e.GetException());
             w.EnableRaisingEvents = true;
-            Volatile.Write(ref watcher, w);
+            lock (gate)
+            {
+                if (disposed)
+                {
+                    w.Dispose();
+                    return;
+                }
+                watcher = w;
+                touched.UnionWith(seen);
+                touched.UnionWith(told.Keys);
+            }
+            signal.Release();
         }
         catch (Exception e) when (e is not OutOfMemoryException)
         {
@@ -151,27 +187,50 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
     void Touch(string? name)
     {
         if (Path.GetFileNameWithoutExtension(name) is not { Length: > 0 } id) return;
-        lock (gate) touched.Add(id);
+        lock (gate)
+        {
+            if (disposed) return;
+            touched.Add(id);
+        }
         signal.Release();
     }
 
-    /// <summary>The watcher lost events (its buffer overflowed) or failed: every thread told held is looked at now, and the folder watched again.</summary>
-    void Lost(Exception e)
+    /// <summary>
+    /// The watcher lost events (its buffer overflowed) or failed: every thread seen is looked at
+    /// now. A watcher that still runs is kept; the next round makes a new one if it stopped.
+    /// </summary>
+    void Missed(Exception e)
     {
-        log?.Invoke($"codex: the lock folder's watcher failed, looking again: {e.Message}");
-        Interlocked.Exchange(ref watcher, null)?.Dispose();
-        lock (gate) touched.UnionWith(told.Keys);
+        lock (gate)
+        {
+            if (disposed) return;
+            touched.UnionWith(seen);
+            touched.UnionWith(told.Keys);
+        }
+        log?.Invoke($"codex: the lock folder's watcher missed changes, looking at every thread: {e.Message}");
         signal.Release();
     }
 
     public async ValueTask DisposeAsync()
     {
-        if (stop.IsCancellationRequested) return;
+        if (Interlocked.Exchange(ref disposing, 1) != 0) return;
+        FileSystemWatcher? w;
+        lock (gate)
+        {
+            disposed = true;
+            w = watcher;
+            watcher = null;
+        }
+        w?.Dispose();
         stop.Cancel();
-        Interlocked.Exchange(ref watcher, null)?.Dispose();
-        try { await loop; }
-        catch (OperationCanceledException) { }
+        try
+        {
+            await loop;
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            log?.Invoke($"codex: the lock folder's watcher had failed: {e.Message}");
+        }
         stop.Dispose();
-        signal.Dispose();
     }
 }

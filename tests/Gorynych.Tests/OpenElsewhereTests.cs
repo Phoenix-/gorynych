@@ -93,6 +93,50 @@ public sealed class OpenElsewhereTests
     }
 
     [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public async Task AnAdaptersListChange_IsPassedOn_OnlyFromOneThatSaysItSendsThem(bool advertised)
+    {
+        var codex = new LifecycleAgent("codex", canDelete: true) { TellsListChanges = advertised };
+        await using var conductor = Conductor(TestDirs.New(), codex.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var id = await NewPromptedAsync(zed, "codex", "Fix the flaky test");
+        var before = zed.ChangeLog().Count(c => c == "updated " + id);
+
+        await codex.Adapter.Current!.Rpc.SendNotificationAsync(GorynychProtocol.MethodSessionsChanged, new JsonObject { ["sessionId"] = id, ["change"] = "updated" });
+        await codex.Adapter.Current!.Rpc.SendNotificationAsync(GorynychProtocol.MethodSessionsChanged, new JsonObject { ["sessionId"] = id, ["change"] = "removed" });
+        await Task.Delay(300);
+
+        Assert.AreEqual(before + (advertised ? 1 : 0), zed.ChangeLog().Count(c => c == "updated " + id));
+        Assert.IsFalse(zed.ChangeLog().Contains("removed " + id), "only updated is taken");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AChangeOfHolder_DoesNotHoldBackTheNextActivityNotice()
+    {
+        var codex = new LifecycleAgent("codex", canDelete: true) { TellsListChanges = true };
+        await using var conductor = new Conductor(new ConductorOptions
+        {
+            DataDirectory = TestDirs.New(), ServiceId = "t", PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"],
+            ActivityNoticeInterval = TimeSpan.FromSeconds(1),
+        }, [codex.Adapter]);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var id = await NewPromptedAsync(zed, "codex", "Fix the flaky test");
+        await Task.Delay(2500); // past the first prompt's activity notices
+        int Updates() => zed.ChangeLog().Count(c => c == "updated " + id);
+        await codex.Adapter.Current!.Rpc.SendNotificationAsync(GorynychProtocol.MethodSessionsChanged, new JsonObject { ["sessionId"] = id, ["change"] = "updated" });
+        for (var i = 0; i < 100 && Updates() == 0; i++) await Task.Delay(20);
+        var told = Updates();
+
+        await zed.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = "And now?" }] });
+        await Task.Delay(400);
+
+        Assert.IsTrue(Updates() > told, "the new activity is told at once, not a second after the change of holder");
+    }
+
+    [TestMethod]
     public async Task AnAgentThatIsNotRunning_IsNotStartedForTheList()
     {
         var codex = new LifecycleAgent("codex", canDelete: true) { TellsOpenElsewhere = true };

@@ -686,7 +686,11 @@ sealed class LifecycleAgent
                                 Delete = canDelete ? new SessionDeleteCapabilities() : null,
                                 SystemPrompt = TakesSystemPrompt ? new SessionSystemPromptCapabilities() : null,
                             },
-                            Meta = TellsOpenElsewhere ? new JsonObject { [GorynychProtocol.CapOpenElsewhere] = true } : null,
+                            Meta = new JsonObject
+                            {
+                                [GorynychProtocol.CapOpenElsewhere] = TellsOpenElsewhere,
+                                [GorynychProtocol.MetaSessionsChanged] = TellsListChanges,
+                            },
                         },
                         AgentInfo = new Implementation { Name = name, Version = "1" },
                     });
@@ -786,6 +790,9 @@ sealed class LifecycleAgent
 
     /// <summary>Advertises <c>gorynych/openElsewhere</c> and answers <c>_gorynych/open_elsewhere</c> from <see cref="OpenElsewhere"/>; set before the first use.</summary>
     public bool TellsOpenElsewhere { get; set; }
+
+    /// <summary>Advertises <c>gorynych/sessionsChanged</c>, as the Codex adapter does; set before the first use.</summary>
+    public bool TellsListChanges { get; set; }
 
     /// <summary>Fails every <c>_gorynych/open_elsewhere</c>, as a broken adapter would.</summary>
     public bool OpenElsewhereFails { get; set; }

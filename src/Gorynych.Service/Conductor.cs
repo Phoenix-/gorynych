@@ -1850,12 +1850,14 @@ public sealed class Conductor : IAsyncDisposable
     /// An adapter's <c>_gorynych/sessions_changed {sessionId, change: "updated"}</c>: a row of its
     /// list changed outside any session (the Codex adapter: another Codex app took the thread or let
     /// it go, <c>gorynych/openElsewhere</c>). Passed on as <c>updated</c> for a session clients list,
-    /// so they list it again; the adapter sends it only for a real change. Other changes are not taken.
+    /// so they list it again; the adapter sends it only for a real change. Only from an adapter that
+    /// advertises <c>gorynych/sessionsChanged</c>; other changes are not taken. It is no activity, so it
+    /// does not hold back the next activity notice (<see cref="AnnounceActivity"/>).
     /// </summary>
     void OnAgentListChanged(AgentHost host, JsonNode? @params)
     {
-        if ((string?)@params?["sessionId"] is not { } sessionId || (string?)@params?["change"] != "updated") return;
-        store.Inspect(sessionId, r => { if (r is { Listed: true } && r.Agent == host.Name) AnnounceList(sessionId, r.Agent, "updated"); });
+        if (!host.TellsListChanges || (string?)@params?["sessionId"] is not { } sessionId || (string?)@params?["change"] != "updated") return;
+        store.Inspect(sessionId, r => { if (r is { Listed: true } && r.Agent == host.Name) AnnounceList(sessionId, r.Agent, "updated", activity: false); });
     }
 
     /// <summary>
@@ -1863,10 +1865,11 @@ public sealed class Conductor : IAsyncDisposable
     /// store's lock only, which orders the notices; each client sends its own queue
     /// (<see cref="ClientConnection.Notify"/>), so one slow client holds up no other.
     /// </summary>
-    void AnnounceList(string sessionId, string agent, string change)
+    /// <param name="activity">Counts for <see cref="AnnounceActivity"/>'s interval; a change that is not about the session's work does not.</param>
+    void AnnounceList(string sessionId, string agent, string change, bool activity = true)
     {
         if (change == "removed") lastUpdateNotice.TryRemove(sessionId, out _);
-        else lastUpdateNotice[sessionId] = options.Time.GetTimestamp(); // "added" is news enough for the interval
+        else if (activity) lastUpdateNotice[sessionId] = options.Time.GetTimestamp(); // "added" is news enough for the interval
         foreach (var client in clients.Keys)
         {
             if (client.Init is null || (client.AgentScope is not null && client.AgentScope != agent)) continue;

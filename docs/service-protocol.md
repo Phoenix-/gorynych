@@ -983,8 +983,9 @@ app-server until it is closed there. An adapter that can tell who holds a sessio
   sends its own clients, and advertises it the same way, `gorynych/sessionsChanged: true` in
   its `agentCapabilities._meta`; it sends it only when the holder really changed. The service
   passes it on to its clients as `updated` for a session they list ([List changes](#list-changes)),
-  and they list it again to see the new `gorynych/openElsewhere`. Other changes from an adapter
-  are not taken. A GUI that lists only on such notices (Zed lists on connect and on
+  and they list it again to see the new `gorynych/openElsewhere`. It takes the notification only
+  from an adapter that advertises `gorynych/sessionsChanged`, and only `updated`; it is no
+  activity, so it does not hold back the session's next `updatedAt` notice. A GUI that lists only on such notices (Zed lists on connect and on
   `sessions_changed`) keeps the mark current this way.
 
 Which app holds a session is a heuristic on the agent's insides; an adapter that cannot tell
