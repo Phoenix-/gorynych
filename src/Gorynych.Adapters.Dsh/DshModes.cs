@@ -20,12 +20,12 @@ internal static class DshModes
 
     public static readonly DshMode ReadOnly = new(
         "read-only", "Read only",
-        "DeepSeek Harness reads and searches; each file write asks you, and its shell cannot write.",
+        "Each file write asks you, and the shell cannot write. This protects files from changes; it does not stop DeepSeek Harness from reading secrets or sending them over the network.",
         "read-only", DshAdapter.PatchFile);
 
     public static readonly DshMode FullAccess = new(
         "full-access", "Full access",
-        "DeepSeek Harness runs anything without asking, outside this folder too.",
+        "DeepSeek Harness asks nothing at all: it runs any command and writes any file, outside this folder too.",
         "danger-full-access", "gorynych.full-access.patch.yml");
 
     public static readonly DshMode[] All = [ReadOnly, FullAccess];

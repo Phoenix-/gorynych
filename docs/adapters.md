@@ -642,7 +642,7 @@ with Codex's IDs and names, so a client draws one selector for both:
 
 - `read-only` ("Read only"), the default for every new session: a read-only shell and approved
   file writes ([Read only](#read-only-a-read-only-shell-approved-file-writes)).
-- `full-access` ("Full access"): DSH runs anything without asking
+- `full-access` ("Full access"): DSH asks nothing at all
   ([Full access](#full-access)). An explicit choice per session.
 
 DSH has no auto mode that is safe on Windows: its `workspace-write` sandbox edits the
@@ -686,6 +686,9 @@ with icacls. Gorynych's read-only DSH sessions never let that happen:
 
 - The process runs DSH's `read-only` sandbox. Reads, searches and commands that only read
   run without asking.
+- It protects files from changes, not secrets: DSH's Windows sandbox (`WRITE_RESTRICTED`)
+  confines writes and deletes only, so a command can still read any file the user can read and
+  open network connections.
 - DSH asks only to escalate a denied call, never otherwise. Only an allowlist reaches the
   person: a running call of DSH's `write` or `edit` (by the tool name DSH announced, ignoring
   case) whose arguments are a file tool's, a `file_path` and no `command`. The proxy refuses every

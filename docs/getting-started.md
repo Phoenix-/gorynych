@@ -173,7 +173,8 @@ mode selectors.
 is `read-only` for every new thread, or `full-access`, which you choose per thread.
 
 In `read-only` its shell is read-only, so DSH's Windows sandbox never changes a folder's
-permissions:
+permissions. `read-only` protects your files from changes; it does not stop the agent from
+reading secrets or sending them over the network.
 
 - Commands that only read run without asking: searches, `git status`, `git diff`, `git log`.
 - Commands that write cannot run, so builds, tests and package installs are not available in a
