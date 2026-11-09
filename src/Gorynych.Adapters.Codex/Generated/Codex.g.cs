@@ -2613,6 +2613,48 @@ public sealed partial class ThreadItemEntry
     public string TurnId { get; set; } = "";
 }
 
+public sealed partial class ThreadTurnsListParams
+{
+    /// <summary>
+    /// Opaque cursor to pass to the next call to continue after the last turn.
+    /// </summary>
+    [JsonPropertyName("cursor")]
+    public string? Cursor { get; set; }
+    /// <summary>
+    /// How much item detail to include for each returned turn; defaults to summary.
+    /// </summary>
+    [JsonPropertyName("itemsView")]
+    public TurnItemsView? ItemsView { get; set; }
+    /// <summary>
+    /// Optional turn page size.
+    /// </summary>
+    [JsonPropertyName("limit")]
+    public uint? Limit { get; set; }
+    /// <summary>
+    /// Optional turn pagination direction; defaults to descending.
+    /// </summary>
+    [JsonPropertyName("sortDirection")]
+    public SortDirection? SortDirection { get; set; }
+    [JsonPropertyName("threadId")]
+    public string ThreadId { get; set; } = "";
+}
+
+public sealed partial class ThreadTurnsListResponse
+{
+    /// <summary>
+    /// Opaque cursor to pass as `cursor` when reversing `sortDirection`. This is only populated when the page contains at least one turn. Use it with the opposite `sortDirection` to include the anchor turn again and catch updates to that turn.
+    /// </summary>
+    [JsonPropertyName("backwardsCursor")]
+    public string? BackwardsCursor { get; set; }
+    [JsonPropertyName("data")]
+    public List<Turn> Data { get; set; } = [];
+    /// <summary>
+    /// Opaque cursor to pass to the next call to continue after the last turn. if None, there are no more turns to return.
+    /// </summary>
+    [JsonPropertyName("nextCursor")]
+    public string? NextCursor { get; set; }
+}
+
 public sealed partial class ThreadUnsubscribeParams
 {
     [JsonPropertyName("threadId")]
@@ -4217,6 +4259,8 @@ public readonly partial record struct McpServerElicitationAction(string Value) :
 [JsonSerializable(typeof(ItemThreadItemsListAnchor))]
 [JsonSerializable(typeof(ThreadItemsListResponse))]
 [JsonSerializable(typeof(ThreadItemEntry))]
+[JsonSerializable(typeof(ThreadTurnsListParams))]
+[JsonSerializable(typeof(ThreadTurnsListResponse))]
 [JsonSerializable(typeof(ThreadUnsubscribeParams))]
 [JsonSerializable(typeof(ThreadUnsubscribeResponse))]
 [JsonSerializable(typeof(ThreadDeleteParams))]

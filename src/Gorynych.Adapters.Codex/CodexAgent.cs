@@ -419,6 +419,8 @@ sealed class CodexAgent : IAsyncDisposable
                             [GorynychProtocol.CapOpenElsewhere] = true,
                             // It tells when a thread's list row changes: another Codex app took it or let it go.
                             [GorynychProtocol.MetaSessionsChanged] = true,
+                            // It replays a thread's turns after the last one the service saw (ReplayFromAsync).
+                            [GorynychProtocol.CapReplayFrom] = true,
                         },
                     },
                     AuthMethods = [],
@@ -429,7 +431,10 @@ sealed class CodexAgent : IAsyncDisposable
             {
                 var p = request.ParamsAs<ResumeSessionRequest>();
                 var t = await OpenAsync(p.SessionId, p.McpServers ?? [], p.SystemPrompt, ct);
-                return AcpJson.ToNode(new ResumeSessionResponse { ConfigOptions = ConfigOptions(t.Effective, models) });
+                var resumed = AcpJson.ToNode(new ResumeSessionResponse { ConfigOptions = ConfigOptions(t.Effective, models) })!.AsObject();
+                if (p.Meta?[GorynychProtocol.MetaReplayFrom] is JsonObject from && await ReplayFromAsync(p.SessionId, from, ct) is { } replayed)
+                    resumed["_meta"] = new JsonObject { [GorynychProtocol.MetaReplay] = replayed };
+                return resumed;
             }
             case AcpMethods.Agent.SessionLoad:
             {
@@ -571,6 +576,54 @@ sealed class CodexAgent : IAsyncDisposable
             cursor = items.NextCursor;
             if (cursor is null) return;
         }
+    }
+
+    /// <summary>
+    /// Replays the thread's turns after the mark, a turn ID (docs/adapter-contract.md, §4): Codex's
+    /// turns newest first, with their items, until the marked one, then sent oldest first. When the
+    /// mark is not among them (a rollback dropped it) or none was given, every turn. Answers
+    /// <c>gorynych/replay</c> with the newest turn as the new mark, or null when Codex could not list them.
+    /// </summary>
+    async Task<JsonObject?> ReplayFromAsync(string id, JsonObject from, CancellationToken ct)
+    {
+        var mark = (string?)from["type"] == GorynychProtocol.ReplayAfterMark ? (string?)from["mark"] : null;
+        var newer = new List<Turn>();
+        var found = false;
+        string? newest = null;
+        try
+        {
+            string? cursor = null;
+            for (var page = 0; page < 100_000 && !found; page++)
+            {
+                var turns = From(await app.SendRequestAsync(CodexMethods.Client.ThreadTurnsList, ToNode(new ThreadTurnsListParams
+                {
+                    ThreadId = id,
+                    SortDirection = SortDirection.Desc,
+                    ItemsView = TurnItemsView.Full,
+                    Limit = 20,
+                    Cursor = cursor,
+                }, CodexJsonContext.Default.ThreadTurnsListParams), ct), CodexJsonContext.Default.ThreadTurnsListResponse);
+                foreach (var turn in turns.Data)
+                {
+                    newest ??= turn.Id;
+                    if (turn.Id == mark) { found = true; break; }
+                    newer.Add(turn);
+                }
+                cursor = turns.NextCursor;
+                if (cursor is null) break;
+            }
+        }
+        catch (JsonRpcException e)
+        {
+            Log($"codex: thread {id}: its turns could not be listed, so the service's journal is not caught up: {e.Message}");
+            return null;
+        }
+        newer.Reverse();
+        foreach (var turn in newer)
+            foreach (var item in turn.Items)
+                if (ReplayOf(item) is { } update) await rpc.SendUpdateAsync(id, update);
+        Log($"codex: thread {id}: {newer.Count} turns replayed {(found ? "after " + mark : "from the start")}");
+        return new JsonObject { ["from"] = found ? "mark" : "start", ["mark"] = newest ?? mark };
     }
 
     static SessionUpdate? ReplayOf(ThreadItem item) => item switch
@@ -728,7 +781,9 @@ sealed class CodexAgent : IAsyncDisposable
             }
             if (change is not null) t.Applied(change);
             Named(t, started.Turn.Id);
-            return AcpJson.ToNode(new PromptResponse { StopReason = StopOf(await done.Task) });
+            var reason = StopOf(await done.Task);
+            // The turn is the thread's newest: the journal now holds the thread up to it.
+            return AcpJson.ToNode(new PromptResponse { StopReason = reason, Meta = new JsonObject { [GorynychProtocol.MetaHistoryMark] = started.Turn.Id } });
         }
         finally
         {

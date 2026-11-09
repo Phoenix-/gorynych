@@ -46,7 +46,7 @@ sealed class Generator(JsonObject bundle, string version)
         "InitializeParams", "InitializeResponse",
         "ThreadStartParams", "ThreadStartResponse", "ThreadResumeParams", "ThreadResumeResponse",
         "ThreadListParams", "ThreadListResponse", "ThreadReadParams", "ThreadReadResponse",
-        "ThreadItemsListParams", "ThreadItemsListResponse",
+        "ThreadItemsListParams", "ThreadItemsListResponse", "ThreadTurnsListParams", "ThreadTurnsListResponse",
         "ThreadUnsubscribeParams", "ThreadUnsubscribeResponse", "ThreadDeleteParams", "ThreadDeleteResponse",
         "ThreadSetNameParams", "ThreadSetNameResponse",
         "TurnStartParams", "TurnStartResponse", "TurnInterruptParams", "TurnInterruptResponse",

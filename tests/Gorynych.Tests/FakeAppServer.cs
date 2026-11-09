@@ -101,6 +101,28 @@ sealed class FakeAppServer
         return t;
     }
 
+    /// <summary>A turn made in another Codex app (Codex Desktop, the CLI): in the thread's history only. Returns its ID.</summary>
+    public string AddTurn(string threadId, string user, string answer)
+    {
+        var t = Threads[threadId];
+        var turnId = $"desktop-{Interlocked.Increment(ref next)}";
+        t.Items.Add((turnId, new JsonObject
+        {
+            ["type"] = "userMessage", ["id"] = $"{turnId}-u", ["clientId"] = null,
+            ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = user }),
+        }));
+        t.Items.Add((turnId, new JsonObject { ["type"] = "agentMessage", ["id"] = $"{turnId}-msg", ["text"] = answer }));
+        return turnId;
+    }
+
+    /// <summary>Drops the thread's last turns, as a rollback in Codex's TUI does.</summary>
+    public void DropLastTurns(string threadId, int count)
+    {
+        var t = Threads[threadId];
+        var dropped = t.Items.Select(i => i.TurnId).Distinct().TakeLast(count).ToHashSet();
+        t.Items.RemoveAll(i => dropped.Contains(i.TurnId));
+    }
+
     public Task<AgentInstance> StartAsync(CancellationToken ct)
     {
         var link = new DuplexLink();
@@ -177,6 +199,20 @@ sealed class FakeAppServer
                 var t = Threads[(string)p["threadId"]!];
                 var entries = t.Items.Select(i => (JsonNode)new JsonObject { ["turnId"] = i.TurnId, ["item"] = i.Item.DeepClone() }).ToList();
                 return Done(Page(entries, (string?)p["cursor"]));
+            }
+            case "thread/turns/list":
+            {
+                // Turns newest first by default, with their items when asked for them in full.
+                var t = Threads[(string)p["threadId"]!];
+                var ids = t.Items.Select(i => i.TurnId).Distinct().ToList();
+                if ((string?)p["sortDirection"] != "asc") ids.Reverse();
+                var full = (string?)p["itemsView"] == "full";
+                var turns = ids.Select(id => (JsonNode)new JsonObject
+                {
+                    ["id"] = id, ["status"] = "completed", ["itemsView"] = full ? "full" : "notLoaded",
+                    ["items"] = new JsonArray(full ? t.Items.Where(i => i.TurnId == id).Select(i => (JsonNode)i.Item.DeepClone()).ToArray() : []),
+                }).ToList();
+                return Done(Page(turns, (string?)p["cursor"]));
             }
             case "thread/loaded/list":
                 return Done(new JsonObject { ["data"] = new JsonArray(Threads.Values.Where(t => t.Loaded).Select(t => (JsonNode?)t.Id).ToArray()) });

@@ -411,7 +411,7 @@ public sealed class CodexAdapterTests
     }
 
     [TestMethod]
-    public async Task Load_OfAThreadMadeInCodex_ReplaysItsHistoryFromItemsList()
+    public async Task Load_OfAThreadMadeInCodex_ImportsItsHistory_FromItsTurns()
     {
         var fake = new FakeAppServer();
         fake.Existing("t1", Cwd, name: "Made in Codex Desktop");
@@ -425,7 +425,129 @@ public sealed class CodexAdapterTests
         Assert.AreEqual(("t1-u1", "Fix the flaky test"), ((string?)Of(zed, "user_message_chunk")[0]["messageId"], (string?)Of(zed, "user_message_chunk")[0]["content"]!["text"]));
         Assert.AreEqual("t1-msg1", (string?)Of(zed, "agent_message_chunk")[0]["messageId"]);
         Assert.AreEqual("completed", (string?)Of(zed, "tool_call")[0]["status"]);
-        Assert.IsTrue(fake.All("thread/items/list").Length >= 2, "followed nextCursor");
+        Assert.IsTrue(zed.Snapshot().Where(u => (string?)u["sessionUpdate"] != "config_option_update").All(u => (string?)u["_meta"]?["gorynych/origin"] == "native"));
+        var listed = fake.Last("thread/turns/list");
+        Assert.AreEqual(("desc", "full"), ((string?)listed["sortDirection"], (string?)listed["itemsView"]));
+        Assert.AreEqual("turn-0", conductor.Feed("t1").Journal.NativeMark, "the thread's newest turn");
+    }
+
+    // ---------------------------------------------------------------- the journal caught up with the thread
+
+    /// <summary>The adapter alone, its updates kept: a resume with gorynych/replayFrom.</summary>
+    static async Task<(JsonObject? Replay, List<JsonObject> Updates)> ResumeDirectAsync(FakeAppServer fake, string id, JsonObject replayFrom)
+    {
+        var agent = await new CodexAdapter(Options(fake)).StartAsync(CancellationToken.None);
+        var updates = new List<JsonObject>();
+        var acp = new JsonRpcConnection(agent.Input, agent.Output, "direct-client")
+        {
+            NotificationHandler = (method, p) =>
+            {
+                if (method == AcpMethods.Client.SessionUpdate) lock (updates) updates.Add((JsonObject)p!["update"]!.DeepClone());
+                return Task.CompletedTask;
+            },
+        };
+        acp.Start();
+        try
+        {
+            var resumed = await acp.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject
+            {
+                ["sessionId"] = id, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray(),
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaReplayFrom] = replayFrom },
+            });
+            lock (updates) return (resumed?["_meta"]?[GorynychProtocol.MetaReplay] as JsonObject, updates.ToList());
+        }
+        finally
+        {
+            await acp.DisposeAsync();
+            await agent.DisposeAsync();
+        }
+    }
+
+    static JsonObject After(string mark) => new() { ["type"] = GorynychProtocol.ReplayAfterMark, ["mark"] = mark };
+
+    /// <summary>The user's and the agent's messages, "user: …" or "agent: …", a message's chunks joined.</summary>
+    static string[] Texts(IEnumerable<JsonObject> updates)
+    {
+        var texts = new List<(string Kind, string? Id, string Text)>();
+        foreach (var u in updates.Where(u => (string?)u["sessionUpdate"] is "user_message_chunk" or "agent_message_chunk"))
+        {
+            var (kind, id, text) = (((string)u["sessionUpdate"]!).Split('_')[0], (string?)u["messageId"], (string?)u["content"]?["text"] ?? "");
+            if (texts.Count > 0 && texts[^1].Kind == kind && texts[^1].Id == id) texts[^1] = (kind, id, texts[^1].Text + text);
+            else texts.Add((kind, id, text));
+        }
+        return texts.Select(t => $"{t.Kind}: {t.Text}").ToArray();
+    }
+
+    [TestMethod]
+    public async Task AResumeAfterAMark_ReplaysTheNewerTurnsInOrder_ReadingBackOnlyToTheMark()
+    {
+        var fake = new FakeAppServer(); // two turns a page
+        fake.Existing("t1", Cwd);
+        var turns = Enumerable.Range(1, 5).Select(i => fake.AddTurn("t1", $"Ask {i}", $"Answer {i}")).ToList();
+
+        var (replay, updates) = await ResumeDirectAsync(fake, "t1", After(turns[2]));
+
+        CollectionAssert.AreEqual(new[] { "user: Ask 4", "agent: Answer 4", "user: Ask 5", "agent: Answer 5" }, Texts(updates));
+        Assert.AreEqual(("mark", turns[4]), ((string?)replay?["from"], (string?)replay?["mark"]));
+        Assert.AreEqual(2, fake.All("thread/turns/list").Length, "newest first, until the marked turn: not the thread's six turns");
+        Assert.AreEqual($"{turns[3]}-u", (string?)updates[0]["messageId"], "Codex's own IDs");
+    }
+
+    [TestMethod]
+    public async Task AResumeAfterAMarkCodexNoLongerHas_ReplaysEveryTurn()
+    {
+        var fake = new FakeAppServer();
+        fake.Existing("t1", Cwd);
+        var second = fake.AddTurn("t1", "Ask", "Answer");
+        fake.DropLastTurns("t1", 1); // rolled back in Codex's TUI
+        var third = fake.AddTurn("t1", "Instead", "Another answer");
+
+        var (replay, updates) = await ResumeDirectAsync(fake, "t1", After(second));
+
+        CollectionAssert.AreEqual(new[] { "user: Fix the flaky test", "agent: Fixed it.", "user: Instead", "agent: Another answer" }, Texts(updates));
+        Assert.AreEqual(("start", third), ((string?)replay?["from"], (string?)replay?["mark"]));
+    }
+
+    [TestMethod]
+    public async Task APrompt_EndsWithItsTurnAsTheMark()
+    {
+        var fake = new FakeAppServer();
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+
+        var result = await PromptDirectAsync(acp, id, "hello");
+
+        Assert.AreEqual(fake.LastTurnId, (string?)result?["_meta"]?[GorynychProtocol.MetaHistoryMark]);
+    }
+
+    [TestMethod]
+    public async Task ATurnMadeInCodexDesktop_LandsBeforeTheNextPrompt_OnceInTheJournal()
+    {
+        var time = new ManualTime();
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake, time);
+        string id;
+        await using (var zed = await ZedAsync(conductor))
+        {
+            id = await NewAsync(zed);
+            await PromptAsync(zed, id, "hello");
+        }
+        await conductor.CleanupsIdleAsync().WaitAsync(Wait);
+        time.Advance(TimeSpan.FromMinutes(2)); // Codex's idle time: the adapter lets the thread go
+        await conductor.CleanupsIdleAsync().WaitAsync(Wait);
+        var desktop = fake.AddTurn(id, "Continue in Desktop", "Done in Desktop");
+
+        await using (var zed = await ZedAsync(conductor, "zed-again"))
+            await PromptAsync(zed, id, "Next");
+
+        await using var viewer = await ZedAsync(conductor, "viewer");
+        await viewer.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject { ["sessionId"] = id, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
+        CollectionAssert.AreEqual(new[] { "user: hello", "agent: ok", "user: Continue in Desktop", "agent: Done in Desktop", "user: Next", "agent: ok" },
+            Texts(viewer.Snapshot()), string.Join(" | ", Texts(viewer.Snapshot())));
+        Assert.AreEqual(fake.LastTurnId, conductor.Feed(id).Journal.NativeMark, "the last prompt's turn");
+        Assert.AreNotEqual(desktop, fake.LastTurnId);
     }
 
     [TestMethod]
