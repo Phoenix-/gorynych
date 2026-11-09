@@ -220,14 +220,15 @@ public sealed class WakeTests
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var kimiParent = await NewPromptedAsync(zed, "kimi", "Coordinate the release");
         var claudeParent = await NewPromptedAsync(zed, "claude", "Plan the docs");
-        string? kimiChild = null, claudeChild = null;
-        kimi.BeforePrompt = id => id == claudeChild ? holdChildren.Task : Task.CompletedTask;
-        claude.BeforePrompt = id => id == kimiChild ? holdChildren.Task : Task.CompletedTask;
-        kimiChild = (string)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, new JsonObject
+        // Every prompt but the parents' own is a child's first turn, held until both parents are
+        // closed: a child's turn may begin before its spawn returns its ID.
+        kimi.BeforePrompt = id => id != kimiParent ? holdChildren.Task : Task.CompletedTask;
+        claude.BeforePrompt = id => id != claudeParent ? holdChildren.Task : Task.CompletedTask;
+        await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, new JsonObject
         {
             ["agent"] = "claude", ["prompt"] = "Write the notes", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = kimi.Tokens[kimiParent] },
-        }))!["sessionId"]!;
-        claudeChild = (string)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, new JsonObject
+        });
+        var claudeChild = (string)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, new JsonObject
         {
             ["agent"] = "kimi", ["prompt"] = "Fix the flaky test", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = claude.Tokens[claudeParent] },
         }))!["sessionId"]!;
@@ -236,7 +237,9 @@ public sealed class WakeTests
 
         holdChildren.SetResult();
         await conductor.BackgroundTurnsIdleAsync();
-        await Until(() => kimi.CallsFor(kimiParent).Last() == Close && claude.CallsFor(claudeParent).Last() == Close, "both parents closed again");
+        // Woken and closed again: the close before the wake does not count.
+        static bool ClosedAgain(LifecycleAgent agent, string id) => agent.CallsFor(id) is var calls && calls.Contains(Resume) && calls.Last() == Close;
+        await Until(() => ClosedAgain(kimi, kimiParent) && ClosedAgain(claude, claudeParent), "both parents woken and closed again");
 
         CollectionAssert.AreEqual(new[] { Resume, Note, Prompt, Close }, CallsFrom(kimi, kimiParent, Resume));
         CollectionAssert.AreEqual(new[] { Resume, Note, Prompt, Close }, CallsFrom(claude, claudeParent, Resume));
