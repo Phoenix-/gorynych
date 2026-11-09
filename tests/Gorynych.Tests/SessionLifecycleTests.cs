@@ -912,10 +912,12 @@ sealed class LifecycleAgent
             new() { ["sessionUpdate"] = "user_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = user } },
         };
         if (KeepsHistory) updates[0]["messageId"] = userId ?? turn + "-user";
+        // Kimi replays a user message with a system reminder of its own after the text.
+        if (LoadsWithoutIds) updates.Add(new JsonObject { ["sessionUpdate"] = "user_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = "<system-reminder> Plan mode is the exception. </system-reminder>" } });
         if (answer is not null)
         {
             updates.Add(new JsonObject { ["sessionUpdate"] = "agent_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = answer } });
-            if (KeepsHistory) updates[1]["messageId"] = turn + "-answer";
+            if (KeepsHistory) updates[^1]["messageId"] = turn + "-answer";
         }
         lock (history)
         {

@@ -39,8 +39,9 @@ internal static class HistoryCatchUp
     /// <param name="agent">The agent's display name, for the notice of a rewrite.</param>
     public static Plan Make(IReadOnlyList<JsonNode> journal, IReadOnlyList<JsonObject> replay, Replayed replayed, string agent)
     {
-        // Only a turn's parts are history; a replayed mode or command list is state.
-        var history = replay.Where(u => SessionJournal.IsTurnKind((string?)u["sessionUpdate"])).ToList();
+        // Only a turn's parts are history; a replayed mode or command list is state. Text the agent
+        // put into a user message itself (Kimi's system reminders) was not typed and is left out.
+        var history = replay.Where(u => SessionJournal.IsTurnKind((string?)u["sessionUpdate"]) && !IsInjected(u)).ToList();
         var known = KnownIds(journal);
         switch (replayed)
         {
@@ -177,6 +178,11 @@ internal static class HistoryCatchUp
             if (IdOf(entry) is { } id) known.Add(id);
         return known;
     }
+
+    /// <summary>A part of a user message that the agent added to it, as Kimi adds a system reminder to each.</summary>
+    static bool IsInjected(JsonObject update) =>
+        (string?)update["sessionUpdate"] == "user_message_chunk"
+        && ((string?)update["content"]?["text"])?.TrimStart().StartsWith("<system-reminder>", StringComparison.Ordinal) == true;
 
     static bool IsAgentPart(JsonObject update) => (string?)update["sessionUpdate"] is "agent_message_chunk" or "agent_thought_chunk" or "tool_call" or "tool_call_update";
 
