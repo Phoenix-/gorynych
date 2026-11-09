@@ -64,7 +64,7 @@ public sealed partial class DshLiveTests
 
     [TestMethod]
     [Timeout(600_000, CooperativeCancellation = true)]
-    public async Task Dsh_PeerTools_AskBeforeAskAgent_ReadOnlyShell_AndApprovedFileWrites_WithoutTouchingTheAcl()
+    public async Task Dsh_PeerTools_AskOnlyIntoFullAccess_ReadOnlyShell_AndApprovedFileWrites_WithoutTouchingTheAcl()
     {
         RequireLive();
         var dir = TestDirs.New();
@@ -72,7 +72,7 @@ public sealed partial class DshLiveTests
         Directory.CreateDirectory(folder);
         var pipe = "gorynych-live-" + Guid.NewGuid().ToString("N")[..8];
         var log = new List<string>();
-        var echo = new LifecycleAgent("echo", canDelete: true) { Answer = "pong" };
+        var echo = new LifecycleAgent("echo", canDelete: true) { Answer = "pong", ReportsModes = true };
         await using var conductor = new Conductor(new ConductorOptions
         {
             DataDirectory = dir,
@@ -132,12 +132,24 @@ public sealed partial class DshLiveTests
             StringAssert.Contains(listed["content"]?.ToJsonString(), target, "the list came from the service");
             Assert.AreEqual(0, client.Approvals.Count, "list_agents asks nobody");
 
-            // 2. ask_agent from DSH, which asks nothing itself: the service asks the person, who declines.
+            // 2. ask_agent from DSH (read-only, not full access) to the echo session (not either): nobody is asked.
             await PromptAsync($"Call the tool mcp__gorynych__ask_agent once with session_id \"{target}\" and question \"ping\". Then reply in one short sentence with what the tool returned.");
-            var ask = client.Approvals.SingleOrDefault(a => a.ToolCall.Title?.StartsWith("Ask ", StringComparison.Ordinal) == true);
-            Assert.IsNotNull(ask, "the person was asked before ask_agent");
-            Assert.AreEqual(id, ask.SessionId);
-            lock (echo.Prompts) Assert.AreEqual(1, echo.Prompts.Count, "the declined question reached no one");
+            Assert.AreEqual(0, client.Approvals.Count, "ask_agent asks nobody");
+            lock (echo.Prompts) Assert.AreEqual(2, echo.Prompts.Count, "the echo session got the question");
+            var answered = Calls("mcp__gorynych__ask_agent").Select(c => client.Snapshot().Last(u => (string?)u["toolCallId"] == (string?)c["toolCallId"])).Single();
+            Assert.AreEqual("completed", (string?)answered["status"]);
+            StringAssert.Contains(answered["content"]?.ToJsonString(), "pong", "the answer came back");
+
+            // 2b. The echo session goes into full access: the service asks the person first, who declines.
+            await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
+                new JsonObject { ["sessionId"] = target, ["configId"] = "mode", ["value"] = "full" });
+            await PromptAsync($"Call the tool mcp__gorynych__ask_agent once with session_id \"{target}\" and question \"ping again\". Then reply in one short sentence with what the tool returned.");
+            var ask = client.Approvals.SingleOrDefault(a => a.ToolCall.Title?.StartsWith("Ask session_id", StringComparison.Ordinal) == true);
+            Assert.IsNotNull(ask, "the person was asked before a question into full access");
+            Assert.AreEqual(id, ask.SessionId, "asked on the asking session");
+            lock (echo.Prompts) Assert.AreEqual(2, echo.Prompts.Count, "the declined question reached no one");
+            var refused = Calls("mcp__gorynych__ask_agent").Select(c => client.Snapshot().Last(u => (string?)u["toolCallId"] == (string?)c["toolCallId"])).Last();
+            StringAssert.Contains(refused["content"]?.ToJsonString(), "declined to let this session ask", "DSH was told why");
 
             // 3. The shell cannot write, and its escalation is refused without asking.
             var asked = client.Approvals.Count;

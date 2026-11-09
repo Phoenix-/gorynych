@@ -278,7 +278,8 @@ public sealed class LiveSmokeTests
             Assert.AreEqual(StopReason.EndTurn, asked.StopReason);
             var claudeText = client.Text()[mark..];
             StringAssert.Contains(claudeText, "ANSWER");
-            Assert.IsTrue(client.Approvals.Any(a => a.ToolCall.Title == "ask_agent (gorynych)"), "Claude's ask_agent asked for approval");
+            Assert.IsFalse(client.Approvals.Any(a => a.ToolCall.Title?.Contains("ask_agent", StringComparison.Ordinal) == true),
+                "Claude's ask_agent asks nobody: " + string.Join(" | ", client.Approvals.Select(a => a.ToolCall.Title)));
             var request = client.Snapshot().FirstOrDefault(u => (string?)u["sessionUpdate"] == "user_message_chunk"
                 && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == "peer");
             Assert.IsNotNull(request, "the question reached Kimi as a marked turn");
@@ -288,7 +289,7 @@ public sealed class LiveSmokeTests
                 && (string?)u["_meta"]?[GorynychProtocol.MetaOpinion] == opinion && ((string?)u["title"] ?? "").Contains("reply", StringComparison.Ordinal));
             Console.WriteLine($"Claude asked Kimi; Kimi answered {(replied ? "with the reply tool" : "in the turn's text")}: {claudeText.Trim()}");
 
-            // Kimi asks Claude: the question reaches Claude through its channel.
+            // Kimi asks Claude: the question reaches Claude through its live-note path.
             var before = client.Text().Length;
             var result = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt, new PromptRequest
             {
@@ -303,9 +304,13 @@ public sealed class LiveSmokeTests
             StringAssert.Contains(kimiText, "ANSWER");
             Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call" && ((string?)u["title"] ?? "").Contains("ask_agent", StringComparison.OrdinalIgnoreCase)),
                 "Kimi called ask_agent");
+            Assert.IsFalse(client.Approvals.Any(a => a.ToolCall.Title?.Contains("ask_agent", StringComparison.Ordinal) == true),
+                "Kimi's approval of ask_agent is answered by the service: " + string.Join(" | ", client.Approvals.Select(a => a.ToolCall.Title)));
+            // Its live-note path: the channel in the TUI, its input (gorynych/origin "live") headless.
+            var origin = LiveClaudeTransport() == ClaudeTransport.Tui ? "channel" : "live";
             Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "user_message_chunk"
-                && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == "channel" && ((string?)u["content"]?["text"] ?? "").Contains($"from session_id {kimi}")),
-                "the question reached Claude through the channel, naming Kimi's session");
+                && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == origin && ((string?)u["content"]?["text"] ?? "").Contains($"from session_id {kimi}")),
+                $"the question reached Claude through its live-note path ({origin}), naming Kimi's session");
         }
         finally
         {
