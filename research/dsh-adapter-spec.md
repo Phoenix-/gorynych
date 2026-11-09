@@ -17,7 +17,7 @@ The user's decisions at approval:
    - Checked live: on the refusal DSH tells the model `the user rejected …; stop and explain`.
      The turn ends `end_turn`, and the model explains. ACP's rejection carries no reason, so
      the prompt says in advance that this text is Gorynych's policy.
-   - No full-access option in this version (later work).
+   - No full-access option in this version (later work; added the same day, see below).
    - The guard and the read-only patch apply per launch only.
 2. **C3:** `gorynych/unaskedMcpTools`; the service asks before `ask_agent`, `archive_session`
    and `restore_session`, as before every spawn.
@@ -25,6 +25,35 @@ The user's decisions at approval:
 4. **Titles:** the service's provisional title or the spawn name; no model titles (D9).
 
 C1–C8 as proposed.
+
+**Later the same day: full access per session.** The user approved option (b),
+`danger-full-access`, as an explicit choice per session next to (c), so that DSH can build and
+test. (a) stays out: it edits the repository's ACL. The modes share Codex's IDs (`read-only`,
+`full-access`); DSH on Windows has no safe auto mode. Built on branch `claude/dsh-full-access`
+and described in [docs/adapters.md](../docs/adapters.md#permission-modes). What reading DSH
+0.2.2-rc.1 settled first:
+
+- **No switch over ACP.** `dsh-acp` offers only `model` and `reasoning_effort` as config
+  options, no session modes, and DSH's slash commands (`/permission`) have no ACP adapter
+  (`dsh-commands`: "ACP automation do[es] not provide this command surface").
+- **Pins win over the process.** `dsh-permission-presets` handles `agent/created` for new and
+  resumed sessions alike: a session with no permission facts gets `permission/preset`,
+  `sandbox/mode` and `approval/policy` events from the default preset; a session that has
+  them keeps them. `dsh-sandbox-policy` resolves a call's mode as an approved one-call grant,
+  else the session's last `sandbox/mode` event, else the process's `sandbox-policy.mode`. So a
+  session resumed in another process keeps its pinned sandbox: moving it alone switches nothing.
+  Every session the shipped adapter made is pinned `read-only`/`ask` (seen in DSH's
+  projection cache).
+- **The presets can be switched off.** Only the presets (and the experimental auto review, not
+  in the acp profile) write those events. With the `permission` row disabled in the patch, a
+  new session has no `sandbox/mode` event and runs in the sandbox of the process that has it
+  open. Checked without a key: a session made that way has `sandboxMode: null` and no
+  `permissions` row in its projection cache (session `1fa7134f-27b0-4d7a-a464-568da915ae15`).
+  Subagents follow: DSH copies only a parent's explicit sandbox override into a child.
+- **Cost.** A session DSH pinned keeps its pin, whatever Gorynych shows: one made in `dsh web`,
+  one made by Gorynych before this change, and one of Gorynych's opened once in `dsh web`, which
+  pins its own default (usually `workspace-write`, with the ACL edits) into it. The adapter
+  reads the pin from DSH's projection cache and shows it, and refuses to switch such a session.
 
 Deviation found while building: D2 removed `DSH_HOME` and `DSH_PERMISSION_MODE` from the launch
 environment. The adapter keeps both as inherited instead:
@@ -466,13 +495,15 @@ Each has a recommendation; the coordinator and the user decide.
 - Messages stay whole: DSH commits them that way, and the service needs nothing else. A report
   carries the child's final message, its text after its last tool call, as before.
 
-**D7. The sandbox: to decide.** See [For the user to decide](#for-the-user-to-decide). It is
-written into the patch as `sandbox-policy` and `approval` rows (examples in
-[probes/dsh/overlays](probes/dsh/overlays)).
+**D7. The sandbox: decided (c), and (b) per session.** See [For the user to decide](#for-the-user-to-decide)
+and the later decision at the top. It is written into the patch as `sandbox-policy` and
+`approval` rows (examples in [probes/dsh/overlays](probes/dsh/overlays)), one patch and one
+DSH process per mode.
 
-- DSH pins the mode into a session at its first turn (finding 13). So the choice applies to
-  sessions created by Gorynych from then on. Sessions made earlier, or in `dsh web`, keep their
-  own mode.
+- DSH's permission presets pin the mode into a session when it is made (finding 13 saw the pin
+  after the first turn), and a pinned session keeps it in any process. The patches disable the
+  presets, so Gorynych's sessions run in the sandbox of their process. Sessions DSH pinned keep
+  their own mode; the adapter shows it.
 
 **D8. The gorynych tools run without asking.**
 
@@ -559,7 +590,7 @@ Section numbers are the contract's.
 | §7 idle time | one writer vs `dsh web` | D10 |
 | §8 approvals | sandbox escalations only; `allow-once` / `reject-once`; no withdrawal on cancel (finding 24) | D5 (fill, withdraw); D7; D8 |
 | §8 forms | none (no elicitation, no ask tool in acp) | nothing to relay |
-| config | `model`, `reasoning_effort` | passed through; no `mode` option (D7 is per launch) |
+| config | `model`, `reasoning_effort` | passed through; the adapter adds `mode` (`read-only`, `full-access`), one DSH process per mode (D7) |
 | §9 titles | none over ACP | D9 |
 | §10 delete | none (`-32601`) | tombstone; the user can delete in `dsh web` |
 | §11 archive | none in acp | overlay |
@@ -590,7 +621,7 @@ Section numbers are the contract's.
 | Command | `node <dsh>/lib/bin.js --profile acp --patch <data>/dsh/gorynych.patch.yml` |
 | Launch folder | `<data>/dsh` (no `.env`) |
 | Environment | inherited, minus `DSH_HOME` and `DSH_PERMISSION_MODE`, plus `DSH_TELEMETRY_DISABLED=1` |
-| Patch | `system-prompt` (D3), `sandbox-policy` and `approval` (D7) |
+| Patch | `system-prompt` (D3), `sandbox-policy` and `approval` (D7), `permission` disabled (D7) |
 | Per session | `cwd`, `mcpServers` with `gorynych` (new and every resume), config options as the person sets them |
 
 DSH itself creates `~/.dsh/profiles/acp/` once and rewrites its `cordis.yml` on every boot. It
@@ -723,7 +754,7 @@ stopped and the global install updated. Every check ran in a folder under a scra
 | `plain` | 12 | finding 16: a launch without the overlay resumed the session (0.72 s) and the probe word was gone |
 | `default` | 7, 8, 9, sandbox (a) | findings 18, 21–23 |
 | `readonly` (with `overlays/read-only.yml`) | 10, sandbox (c) | finding 24 |
-| `off` (with `overlays/sandbox-off.yml`) | sandbox (b) | **not run**: this session's safety classifier refused to start an agent with full access. The user can run `python research/probes/dsh/acp_probe.py <dsh package> <scratch> <log> --real-home off` |
+| `off` (with `overlays/sandbox-off.yml`) | sandbox (b) | **not run**: this session's safety classifier refused to start an agent with full access, again when the full-access mode was built. The user can run `python research/probes/dsh/acp_probe.py <dsh package> <scratch> <log> --real-home off`, or the adapter's own check: `GORYNYCH_LIVE=1 dotnet test tests/Gorynych.Tests --filter FullyQualifiedName~Dsh_FullAccess --output detailed` (a shell write and a file write in full access with no question, the folder's SDDL and `icacls` unchanged, then read-only again after switching back) |
 
 Not covered:
 
@@ -745,6 +776,9 @@ Probe 16 (load cost) is finding 9.
   - `82eb54e1-6ec1-4619-a0a0-0116ca0ed53a` (its subagent child);
   - `dae5c76d-17da-49ec-9ab1-0ea231c8ebde` (default sandbox);
   - `5f7cb792-987c-4a9a-91e3-77daebf3a560` (read-only sandbox).
+- Building the full-access mode left two more: `1fa7134f-27b0-4d7a-a464-568da915ae15` (the keyless
+  no-pin check, never prompted) and `211b02ad-517d-47a5-964f-20851827b04a` (the read-only live check
+  through the router).
 - DSH itself created `~/.dsh/profiles/acp/` (accepted).
 - In `%TEMP%`:
   - the probe workspaces under the scratch folder keep the ACEs and label that (a) and the

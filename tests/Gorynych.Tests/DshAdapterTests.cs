@@ -6,20 +6,41 @@ using Gorynych.Adapters.Dsh;
 
 namespace Gorynych.Tests;
 
+/// <summary>What DSH keeps on disk, shared by the DSH processes of one test: sessions and their writers.</summary>
+sealed class FakeDshStore
+{
+    public Dictionary<string, string> Cwds { get; } = [];
+    public Dictionary<string, FakeDsh> Writers { get; } = [];
+    public int Next;
+}
+
 /// <summary>
 /// A scripted <c>dsh --profile acp</c>, as DSH 0.2.2-rc.1 answers (research/dsh-adapter-spec.md):
 /// a session is durable at once, <c>session/list</c> leaves out the sessions open in this process and
 /// gives only <c>sessionId</c> and <c>cwd</c>, a session has one writer, and permission requests name
 /// the tool call by ID alone.
 /// </summary>
-sealed class FakeDsh
+sealed class FakeDsh(FakeDshStore? shared = null)
 {
-    readonly Dictionary<string, string> cwds = [];
+    /// <summary>DSH's own options of a session, which the adapter keeps beside its mode.</summary>
+    public const string ModelOption = """{"id":"model","name":"Model","category":"model","type":"select","currentValue":"flash","options":[{"value":"flash","name":"Flash"}]}""";
+
+    readonly FakeDshStore store = shared ?? new FakeDshStore();
     readonly HashSet<string> open = [];
-    int next;
 
     public JsonRpcConnection Rpc { get; private set; } = null!;
     public string? PatchPath { get; private set; }
+
+    /// <summary>The sandbox its patch gives it.</summary>
+    public bool FullAccess => PatchPath is not null && File.ReadAllText(PatchPath).Contains("mode: danger-full-access", StringComparison.Ordinal);
+
+    /// <summary>A resume fails here, as DSH's would for a reason of its own.</summary>
+    public bool ResumeFails { get; set; }
+
+    public bool IsOpen(string sessionId)
+    {
+        lock (store) return open.Contains(sessionId);
+    }
     public List<(string Method, JsonNode? Params)> Calls { get; } = [];
 
     /// <summary>Runs a prompt: sends updates and requests through <see cref="Rpc"/>; the prompt ends when it returns.</summary>
@@ -56,6 +77,15 @@ sealed class FakeDsh
         Rpc.RequestHandler = HandleAsync;
         Rpc.NotificationHandler = (method, p) => { lock (Calls) Calls.Add((method, p?.DeepClone())); return Task.CompletedTask; };
         Rpc.Start();
+        // A process that ends lets go of its sessions.
+        _ = Rpc.Completion.ContinueWith(_ =>
+        {
+            lock (store)
+            {
+                foreach (var held in store.Writers.Where(kv => kv.Value == this).Select(kv => kv.Key).ToList()) store.Writers.Remove(held);
+                open.Clear();
+            }
+        }, TaskScheduler.Default);
         var (ci, co) = link.ClientEnd;
         return Task.FromResult(new AgentInstance(ci, co, Rpc.Completion, () => Rpc.DisposeAsync()));
     }
@@ -73,25 +103,42 @@ sealed class FakeDsh
                        "sessionCapabilities":{"close":{},"list":{},"resume":{}}},"authMethods":[]}
                     """);
             case AcpMethods.Agent.SessionNew:
-                var id = $"s-{Interlocked.Increment(ref next)}";
-                lock (cwds) { cwds[id] = (string)req.Params!["cwd"]!; open.Add(id); }
-                return new JsonObject { ["sessionId"] = id, ["configOptions"] = new JsonArray() };
+                string id;
+                lock (store)
+                {
+                    id = $"s-{++store.Next}";
+                    store.Cwds[id] = (string)req.Params!["cwd"]!;
+                    store.Writers[id] = this;
+                    open.Add(id);
+                }
+                return new JsonObject { ["sessionId"] = id, ["configOptions"] = new JsonArray(JsonNode.Parse(ModelOption)) };
             case AcpMethods.Agent.SessionList:
                 var filter = (string?)req.Params?["cwd"];
-                lock (cwds)
+                lock (store)
                     return new JsonObject
                     {
-                        ["sessions"] = new JsonArray(cwds.Where(kv => !open.Contains(kv.Key) && (filter is null || kv.Value == filter))
+                        ["sessions"] = new JsonArray(store.Cwds.Where(kv => !open.Contains(kv.Key) && (filter is null || kv.Value == filter))
                             .Select(kv => (JsonNode)new JsonObject { ["sessionId"] = kv.Key, ["cwd"] = kv.Value }).ToArray()),
                     };
             case AcpMethods.Agent.SessionResume:
-                if (OwnedElsewhere.Contains(sessionId!))
-                    throw new JsonRpcException(JsonRpcException.InternalError, "Internal error",
-                        new JsonObject { ["details"] = $"session \"{sessionId}\" is already owned by an active write handle" });
-                lock (cwds) open.Add(sessionId!);
-                return new JsonObject { ["configOptions"] = new JsonArray() };
+                lock (store)
+                {
+                    if (OwnedElsewhere.Contains(sessionId!) || store.Writers.GetValueOrDefault(sessionId!) is { } writer && writer != this)
+                        throw new JsonRpcException(JsonRpcException.InternalError, "Internal error",
+                            new JsonObject { ["details"] = $"session \"{sessionId}\" is already owned by an active write handle" });
+                    if (open.Contains(sessionId!)) throw new JsonRpcException(JsonRpcException.InvalidParams, $"Invalid params: session is already active: {sessionId}");
+                    if (ResumeFails) throw new JsonRpcException(JsonRpcException.InternalError, "Internal error: resume failed");
+                    store.Cwds.TryAdd(sessionId!, (string?)req.Params?["cwd"] ?? "");
+                    store.Writers[sessionId!] = this;
+                    open.Add(sessionId!);
+                }
+                return new JsonObject { ["configOptions"] = new JsonArray(JsonNode.Parse(ModelOption)) };
             case AcpMethods.Agent.SessionClose:
-                lock (cwds) open.Remove(sessionId!);
+                lock (store)
+                {
+                    open.Remove(sessionId!);
+                    if (store.Writers.GetValueOrDefault(sessionId!) == this) store.Writers.Remove(sessionId!);
+                }
                 return new JsonObject();
             case AcpMethods.Agent.SessionPrompt:
                 if (Unknown.Contains(sessionId!)) throw new JsonRpcException(JsonRpcException.InvalidParams, $"Invalid params: unknown session: {sessionId}");
@@ -115,7 +162,7 @@ sealed class FakeDsh
 
 /// <summary>The DSH adapter's proxy against a scripted DSH (docs/adapters.md, "DeepSeek Harness").</summary>
 [TestClass]
-public sealed class DshAdapterTests
+public sealed partial class DshAdapterTests
 {
     static readonly string Work = Path.Combine(Path.GetTempPath(), "dsh-work");
     static readonly string Other = Path.Combine(Path.GetTempPath(), "dsh-other");

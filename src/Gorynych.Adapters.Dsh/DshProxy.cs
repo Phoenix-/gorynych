@@ -4,6 +4,7 @@ using System.Text.Json.Nodes;
 using System.Threading.Channels;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
+using static Gorynych.Adapters.Dsh.DshLines;
 
 namespace Gorynych.Adapters.Dsh;
 
@@ -27,8 +28,6 @@ internal sealed class DshProxy
     /// <summary>What a resume of a session open in another DSH process (<c>dsh web</c>) answers.</summary>
     public const string OpenElsewhere =
         "This DeepSeek Harness session is open in another DSH app (dsh web or another dsh); close it there, then try again.";
-
-    static readonly JsonSerializerOptions Wire = AcpJson.TextOptions;
 
     /// <summary>The service's requests whose answers the proxy reads, kept as little as it needs.</summary>
     readonly record struct Asked(string Method, string? SessionId, string? Cwd, bool Cursor);
@@ -215,12 +214,7 @@ internal sealed class DshProxy
         if (Str(message["method"]) == AcpMethods.Client.SessionRequestPermission)
             ToDsh(Reject(id));
         else
-            ToDsh(new JsonObject
-            {
-                ["jsonrpc"] = "2.0",
-                ["id"] = id.DeepClone(),
-                ["error"] = new JsonObject { ["code"] = -32603, ["message"] = "Gorynych could not read this request." },
-            });
+            ToDsh(Error(id, -32603, "Gorynych could not read this request."));
     }
 
     /// <summary>DSH's answer to a service request, rewritten where the method needs it.</summary>
@@ -352,7 +346,7 @@ internal sealed class DshProxy
             lock (gate) tool = tools.GetValueOrDefault((sessionId, callId));
         if (DshMap.Refused(tool) || request?["options"] is not JsonArray)
         {
-            options.Log?.Invoke($"dsh {sessionId}: refused the sandbox escalation of {tool?.Name ?? "an unknown call"} {callId} without asking (Gorynych's read-only shell)");
+            options.Log?.Invoke($"dsh {sessionId}: refused the sandbox escalation of {tool?.Name ?? "an unknown call"} {callId} without asking");
             ToDsh(Reject(id, request?["options"] as JsonArray));
             return;
         }
@@ -408,18 +402,6 @@ internal sealed class DshProxy
 
     // ---------------------------------------------------------------- framing
 
-    static JsonNode? Parse(string line)
-    {
-        try { return JsonNode.Parse(line); }
-        catch (JsonException) { return null; }
-    }
-
-    /// <summary>A string value, or null for anything else (a number, an object, nothing): DSH's output is read, never trusted.</summary>
-    static string? Str(JsonNode? node) => node is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
-
-    static string Key(JsonNode id) => id.ToJsonString(Wire);
-
-    static string Shorten(string line) => line.Length > 300 ? line[..300] + "…" : line;
 
     Task ToServiceAsync(JsonObject message) => ToServiceAsync(message.ToJsonString(Wire));
 

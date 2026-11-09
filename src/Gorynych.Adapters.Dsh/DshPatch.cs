@@ -4,7 +4,7 @@ namespace Gorynych.Adapters.Dsh;
 
 /// <summary>
 /// The per-launch <c>--patch</c> overlay Gorynych gives <c>dsh --profile acp</c>: the appended
-/// system prompt and the read-only sandbox with approvals. A patch replaces a row's whole config, so
+/// system prompt and the sandbox of a mode with approvals. A patch replaces a row's whole config, so
 /// each row restates what it keeps (docs/adapters.md, "DeepSeek Harness").
 /// </summary>
 internal static class DshPatch
@@ -27,11 +27,22 @@ internal static class DshPatch
         "Change files only with your write and edit tools, and pass sandbox_permissions \"workspace-write\" with a one-sentence " +
         "justification on each such call: the person approves every write.";
 
-    /// <summary>The overlay's text. <paramref name="instructions"/> is the service's peer text, or null without the peers server.</summary>
+    /// <summary>What a full-access session may do, said up front: nothing asks the person any more.</summary>
+    public const string FullAccessShell =
+        "In Gorynych this session has full access: pwsh commands and file writes run without asking anyone, anywhere on the disk, " +
+        "so builds, tests and package installs work. Nobody reviews a command before it runs, so keep to the folder and the task " +
+        "the user gave you, and ask the user before anything that reaches beyond them.";
+
+    /// <summary>
+    /// The overlay's text for a process of <paramref name="mode"/>. <paramref name="instructions"/> is the
+    /// service's peer text, or null without the peers server.
+    /// </summary>
     /// <exception cref="ArgumentException">The text holds <c>{{</c>, which DSH would take for a template variable.</exception>
-    public static string Text(string? instructions)
+    public static string Text(string? instructions, DshMode? mode = null)
     {
-        var suffix = instructions is null ? ReadOnlyShell : $"{instructions}\n\n{ToolNames}\n\n{ReadOnlyShell}";
+        mode ??= DshModes.ReadOnly;
+        var shell = mode == DshModes.FullAccess ? FullAccessShell : ReadOnlyShell;
+        var suffix = instructions is null ? shell : $"{instructions}\n\n{ToolNames}\n\n{shell}";
         if (suffix.Contains("{{", StringComparison.Ordinal))
             throw new ArgumentException("The appended system prompt contains \"{{\", which DSH reads as a template variable.", nameof(instructions));
         var text = new StringBuilder();
@@ -40,8 +51,11 @@ internal static class DshPatch
         text.Append("    personaSuffix: |-\n");
         foreach (var line in suffix.ReplaceLineEndings("\n").Split('\n'))
             text.Append(line.Length == 0 ? "" : "      " + line).Append('\n');
-        text.Append("- id: sandbox-policy\n  config:\n    mode: read-only\n    workspaceRoot: !!js process.cwd()\n");
+        text.Append("- id: sandbox-policy\n  config:\n    mode: ").Append(mode.Sandbox).Append("\n    workspaceRoot: !!js process.cwd()\n");
         text.Append("- id: approval\n  config:\n    policy: ask\n");
+        // DSH's permission presets pin a sandbox into each new session, and a pinned session keeps it
+        // in any process. Without them, a session runs in the sandbox of the process that has it open.
+        text.Append("- id: permission\n  disabled: true\n");
         return text.ToString();
     }
 }

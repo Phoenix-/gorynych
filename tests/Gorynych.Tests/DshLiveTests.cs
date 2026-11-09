@@ -169,5 +169,80 @@ public sealed partial class DshLiveTests
         }
     }
 
+    /// <summary><c>icacls</c>'s view of a folder, label included: what a person would compare by hand.</summary>
+    static string Icacls(string path)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo("icacls", [path]) { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
+        using var process = System.Diagnostics.Process.Start(psi)!;
+        var text = process.StandardOutput.ReadToEnd();
+        process.WaitForExit();
+        return text;
+    }
+
+    /// <summary>
+    /// Full access: the session switches to the second DSH process, where a shell write and a file write
+    /// run without any question and the folder's ACL and label stay as they were; switched back, the
+    /// shell is read-only again. Three short turns on <c>deepseek-v4-flash</c> at effort low.
+    /// </summary>
+    [TestMethod]
+    [Timeout(600_000, CooperativeCancellation = true)]
+    public async Task Dsh_FullAccess_WritesWithoutAsking_WithoutTouchingTheAcl_AndSwitchesBack()
+    {
+        RequireLive();
+        var dir = TestDirs.New();
+        var folder = Path.Combine(dir, "work");
+        Directory.CreateDirectory(folder);
+        var log = new List<string>();
+        await using var conductor = new Conductor(new ConductorOptions { DataDirectory = dir, ServiceId = "live" },
+            [new DshAdapter(new DshAdapterOptions { DataDirectory = Path.Combine(dir, "dsh"), Log = m => { lock (log) log.Add(m); } })]);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = "reject-once" });
+
+        var sddl = Sddl(folder);
+        var icacls = Icacls(folder);
+        var id = (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+        {
+            Cwd = folder, McpServers = [], Meta = new JsonObject { [GorynychProtocol.MetaAgent] = "dsh" },
+        })).SessionId;
+        Directory.CreateDirectory(Path.GetDirectoryName(SessionsFile)!);
+        File.AppendAllText(SessionsFile, $"{DateTime.Now:O}\t{id}\t{folder}\n");
+        await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
+            new JsonObject { ["sessionId"] = id, ["configId"] = "reasoning_effort", ["value"] = "low" });
+
+        async Task<JsonNode?> ModeAsync(string mode) => await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
+            new JsonObject { ["sessionId"] = id, ["configId"] = "mode", ["value"] = mode });
+        async Task<PromptResponse> PromptAsync(string text)
+        {
+            var response = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = text }] });
+            var answer = (string?)client.Snapshot().LastOrDefault(u => (string?)u["sessionUpdate"] == "agent_message_chunk")?["content"]?["text"];
+            Console.WriteLine($"> {text}\n< {response.StopReason}: {answer}");
+            return response;
+        }
+
+        // 1. Full access: the shell and the write tool write, and nobody is asked.
+        var full = await ModeAsync("full-access");
+        Assert.AreEqual("full-access", (string?)full!["configOptions"]![0]!["currentValue"]);
+        await PromptAsync("Using your pwsh tool, run exactly: Set-Content -Path shell.txt -Value x . Then reply DONE.");
+        await PromptAsync("Create the file note.txt containing exactly the word hi, with your write tool. Then reply DONE.");
+        Assert.IsTrue(File.Exists(Path.Combine(folder, "shell.txt")), "pwsh wrote: " + string.Join(" | ", log));
+        Assert.IsTrue(File.Exists(Path.Combine(folder, "note.txt")), "the write tool wrote");
+        Assert.AreEqual(0, client.Approvals.Count, "full access asks nothing: " + string.Join(" | ", client.Approvals.Select(a => a.ToolCall.Title)));
+        lock (log) Assert.IsFalse(log.Any(l => l.Contains("refused the sandbox escalation", StringComparison.Ordinal)), "DSH sent no permission request the guard refused either");
+        Assert.AreEqual(sddl, Sddl(folder), "the folder's DACL and label are as they were");
+        Assert.AreEqual(icacls, Icacls(folder), "icacls sees no change either");
+        Assert.IsFalse(Sddl(Path.Combine(folder, "shell.txt")).Contains("ML;", StringComparison.Ordinal), "no integrity label on what the shell wrote");
+
+        // 2. Back to read-only: the shell cannot write again.
+        var back = await ModeAsync("read-only");
+        Assert.AreEqual("read-only", (string?)back!["configOptions"]![0]!["currentValue"]);
+        await PromptAsync("Using your pwsh tool, run exactly: Set-Content -Path again.txt -Value x . Do not retry. Then reply DONE.");
+        Assert.IsFalse(File.Exists(Path.Combine(folder, "again.txt")), "read-only again");
+        Assert.AreEqual(sddl, Sddl(folder));
+        lock (log) Console.WriteLine($"dsh session {id}\n" + string.Join("\n", log.Where(l => !l.StartsWith("dsh: [", StringComparison.Ordinal))));
+
+        await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+    }
+
     static string SessionsFile => Path.Combine(Path.GetTempPath(), "gorynych-tests", "dsh-live-sessions.txt");
 }

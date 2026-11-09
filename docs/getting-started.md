@@ -169,14 +169,25 @@ A new thread starts with your own Codex defaults, and a change applies from the 
 ([adapters.md](adapters.md#modes-models-and-effort)). **Kimi** has its own model, thinking and
 mode selectors.
 
-**DeepSeek Harness** has two selectors, **model** and **reasoning effort**. In Gorynych its
-shell is read-only, so DSH's Windows sandbox never changes a folder's permissions:
+**DeepSeek Harness** has three selectors: **mode**, **model** and **reasoning effort**. The mode
+is `read-only` for every new thread, or `full-access`, which you choose per thread.
+
+In `read-only` its shell is read-only, so DSH's Windows sandbox never changes a folder's
+permissions:
 
 - Commands that only read run without asking: searches, `git status`, `git diff`, `git log`.
 - Commands that write cannot run, so builds, tests and package installs are not available in a
   DeepSeek session. Gorynych refuses them without asking you, and the agent is told so up front.
 - Every file the agent writes or edits with its file tools asks you first. The card names the
   file, shows the change, and says why the agent wants to write it.
+
+**`full-access` asks you nothing.** The agent runs any command and writes any file, anywhere
+on your disk, without a single question, as Codex's `full-access` does: builds, tests and
+installs work. It changes no folder's permissions. Gorynych still asks you before the agent
+asks another session, archives or restores one. Switch the mode between turns; a thread
+made in `dsh web`, or in Gorynych before full access existed, keeps the permissions DSH gave it
+and shows them instead.
+
 - Its sessions are DSH's own and live in `~/.dsh`, so `dsh web` shows them too. A session can be
   open in only one of them at a time: Gorynych lets go of an idle one after two minutes. DSH
   cannot delete a session through Gorynych; deleting one in Gorynych hides it, and `dsh web`
@@ -254,7 +265,8 @@ If a file is still in use, look for processes that are left over:
   - `claude\`: the Claude adapter's session list (with each session's selector choices),
     `trusted.json` (folders you trusted in Gorynych), `channels.json` (TUI only), and per session
     the launch files and `stderr.log` (headless) or `terminal.log` (TUI).
-  - `dsh\`: `gorynych.patch.yml`, the overlay Gorynych gives DSH, rewritten at every start.
+  - `dsh\`: `gorynych.patch.yml` and `gorynych.full-access.patch.yml`, the overlays Gorynych gives
+    its two DSH processes, rewritten at every start; `modes.json`, the threads in full access.
   - `logs\`: `service-<date>.log` and `outside-<date>.log`.
 - **The agents' own state** stays in their folders (`~/.claude`, `~/.codex`, `~/.kimi-code`,
   `~/.dsh`).

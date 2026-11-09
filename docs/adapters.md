@@ -595,7 +595,8 @@ ACP config options, applied with the next `turn/start`, which Codex keeps for la
 DeepSeek Harness (DSH) speaks ACP itself (`dsh --profile acp`), so the adapter is not a
 translator. It starts DSH with a per-launch patch and puts a thin ACP proxy between DSH and the
 service. The proxy forwards every frame with its IDs and fields, and rewrites only what DSH's ACP
-lacks. The design, the probes and the decisions the user took are in
+lacks. DSH's sandbox is per process, so there is one DSH process per permission mode, each
+behind its own proxy, and a router in front of them ([Permission modes](#permission-modes)). The design, the probes and the decisions the user took are in
 [research/dsh-adapter-spec.md](../research/dsh-adapter-spec.md); the probes are in
 `research/probes/dsh`. Built and checked against DSH 0.2.2-rc.1 on 9 November 2026. DSH is a
 developer preview that runs on the user's own DeepSeek API key, so every turn costs money.
@@ -607,8 +608,10 @@ developer preview that runs on the user's own DeepSeek API key, so every turn co
     with `<data>/dsh` as the working folder. DSH loads its launch folder's `.env` into its
     environment, so that is never a repository.
   - It adds `DSH_TELEMETRY_DISABLED=1` to the environment and changes nothing else.
-  - One process serves every session, and DSH starts the sessions' stdio MCP servers as its own
-    children, inside Gorynych for the `gorynych-outside` walk.
+  - One process serves every read-only session. A second one, with
+    `gorynych.full-access.patch.yml`, serves the full-access sessions: it starts when a session
+    first needs it and stops when it holds none. DSH starts the sessions' stdio MCP servers as
+    its own children, inside Gorynych for the `gorynych-outside` walk.
   - Starting and initializing takes about 3.7 s. Closing stdin ends DSH in under 0.1 s when it
     is idle; the adapter waits up to 6 s, then kills the tree.
   - The package's version is logged, with a warning when it is not one the adapter was checked
@@ -617,8 +620,8 @@ developer preview that runs on the user's own DeepSeek API key, so every turn co
   - DSH runs on the user's own `~/.dsh`: its key, its sessions, the same store `dsh web` uses.
   - On first boot DSH creates its shipped `acp` profile in `~/.dsh/profiles/acp` and rewrites
     that profile's `cordis.yml` on every boot. The user accepted this. Gorynych writes nothing there.
-  - Everything of Gorynych's is in the patch, rewritten before each start. A patch replaces a
-    row's whole config, so its rows restate what they keep. It holds:
+  - Everything of Gorynych's is in the patches, rewritten before each start. A patch replaces a
+    row's whole config, so its rows restate what they keep. Each holds:
     - **`system-prompt`.** The acp app's `personaPrefix`, restated, and a `personaSuffix`:
       the service's peer instructions; a line naming the gorynych tools in full (DSH has a
       `list_agents` of its own, for its subagents); and what a Gorynych DSH session can do
@@ -626,18 +629,62 @@ developer preview that runs on the user's own DeepSeek API key, so every turn co
       that launch and for no other. The adapter does not advertise
       `sessionCapabilities.systemPrompt`, and refuses to start if the text holds `{{`, which DSH
       reads as a template variable.
-    - **`sandbox-policy`: `read-only`; `approval`: `ask`.**
+    - **`sandbox-policy`: `read-only` or `danger-full-access`; `approval`: `ask`.**
+    - **`permission`: disabled.** DSH's permission presets would pin a sandbox into each new
+      session, and a pinned session keeps it in any process ([Permission modes](#permission-modes)).
   - The user's own layers (`~/.dsh/cordis.patch.yml`, the acp profile's `cordis.patch.yml`)
-    still apply, but these three rows are replaced by Gorynych's.
+    still apply, but these rows are replaced by Gorynych's.
 
-### Sandbox: a read-only shell, approved file writes
+### Permission modes
+
+Like Codex's, a DSH session has an ACP config option `mode` (category `mode`, "Permissions"),
+with Codex's IDs and names, so a client draws one selector for both:
+
+- `read-only` ("Read only"), the default for every new session: a read-only shell and approved
+  file writes ([Read only](#read-only-a-read-only-shell-approved-file-writes)).
+- `full-access` ("Full access"): DSH runs anything without asking
+  ([Full access](#full-access)). An explicit choice per session.
+
+DSH has no auto mode that is safe on Windows: its `workspace-write` sandbox edits the
+repository's ACL. DSH 0.2.2 cannot switch a session's sandbox over ACP either: its config options
+are the model and the effort, and its `/permission` command has no ACP surface. So:
+
+- **One process per mode.** The sandbox is a patch row, so each mode has its own process. The
+  router sends a session's messages to the process that has it open, and the service never knows.
+- **Switching** closes the session in its process and resumes it in the other; DSH's resume
+  brings back its model and effort, and the answer carries both with the new mode.
+  - Refused while a turn of the session is running.
+  - Should the other process refuse the resume, the session is resumed where it was and the
+    client hears why.
+- **No pins.** DSH's permission presets pin a sandbox and an approval policy into each session
+  when it is made, and a pinned session keeps them in any process. The patches disable the
+  presets, so Gorynych's sessions are not pinned and run in the sandbox of their process.
+  - Sessions DSH did pin (made in `dsh web`, or by Gorynych before this mode existed, or opened
+    once in `dsh web`, which pins its own default into them) keep their pin. The router reads it
+    from DSH's projection cache (`storages/session_projcache/sessions/<id>.json` in DSH's home,
+    read only, format 7 only) and shows it: a `read-only` pin as Read only, a
+    `danger-full-access` pin as Full access (that session goes to the full-access process), any
+    other pin as "Set in DeepSeek Harness" with its sandbox. Such a session cannot switch; the
+    answer says to change it in `dsh web` with `/permission`.
+- **Kept by Gorynych.** DSH keeps no mode for an unpinned session, so the adapter keeps the
+  full-access ones in `<data>/dsh/modes.json`; a resume goes to the process of the session's
+  mode, also after a restart.
+- **The list** comes from the read-only process. DSH lists every session but those open in the
+  same process, so it shows the full-access process's open sessions; the router adds any it
+  leaves out, once, on the first page.
+- **IDs.** Each process numbers its own requests, so the router gives DSH's requests to the
+  service IDs of its own and maps the answers back.
+- **A process that ends.** When the full-access process ends, its sessions are gone, the
+  service's requests to it fail and its questions are withdrawn; the next resume starts it
+  again. The read-only process ending ends the adapter.
+
+### Read only: a read-only shell, approved file writes
 
 DSH's Windows sandbox would write a standing allow ACE, a `FILE_DELETE_CHILD` deny and a Low
 integrity label onto a workspace tree at its first shell write. These edits cannot be removed
-with icacls. Gorynych's DSH sessions never let that happen:
+with icacls. Gorynych's read-only DSH sessions never let that happen:
 
-- New sessions run in DSH's `read-only` mode (DSH pins the mode into a session at its first
-  turn; sessions made in `dsh web` keep their own). Reads, searches and commands that only read
+- The process runs DSH's `read-only` sandbox. Reads, searches and commands that only read
   run without asking.
 - DSH asks only to escalate a denied call, never otherwise. Only an allowlist reaches the
   person: a running call of DSH's `write` or `edit` (by the tool name DSH announced, ignoring
@@ -659,15 +706,28 @@ with icacls. Gorynych's DSH sessions never let that happen:
   write, so a write asks once instead of failing first.
 - The appended prompt says that builds, tests and installs are not available, that files are
   changed with the file tools, and that `git status`, `git diff` and `git log` work.
-- A full-access option is not in this version.
+
+### Full access
+
+The full-access process runs DSH's `danger-full-access` sandbox with approval `ask`:
+
+- Nothing confines a command, so nothing is denied, nothing escalates and **nothing asks the
+  person**: the shell and the file tools write anywhere on the disk, as Codex's `full-access`
+  does. Builds, tests and installs work.
+- No ACL changes: without a sandbox DSH writes no ACE and no label.
+- The guard stays as it is: should DSH still ask, the same allowlist applies.
+- The service still asks the person before `ask_agent`, `archive_session` and
+  `restore_session` (`gorynych/unaskedMcpTools`).
+- The appended prompt says that the session has full access, that nobody reviews a command, and
+  to keep to the task's folder and ask before reaching beyond it.
 
 ### Sessions
 
 | ACP | DSH, through the proxy |
 | --- | --- |
 | `session/new` | DSH's own: a bare UUID, durable at once (it writes the session log before any prompt). DSH lists no title for it ever, and cannot delete it, so an unused draft gets a tombstone; it stays in `~/.dsh`, where `dsh web` can delete it |
-| `session/list` | DSH's `{sessionId, cwd}`, newest-created first, with its cursor and `cwd` filter. DSH leaves out the sessions open in its own process, so the proxy adds back the sessions it has open, on the first page and in the requested folder. No `title` and no `updatedAt`: the service shows its provisional title |
-| `session/resume` | DSH's own, with the request's `mcpServers` (about 0.2 s). A session open in another DSH process fails with `-32603`, which the proxy words as "This DeepSeek Harness session is open in another DSH app (dsh web or another dsh); close it there, then try again." |
+| `session/list` | The read-only process's `{sessionId, cwd}`, newest-created first, with its cursor and `cwd` filter. DSH leaves out the sessions open in its own process, so the proxy adds back the sessions it has open, and the router those the full-access process has open, on the first page and in the requested folder. No `title` and no `updatedAt`: the service shows its provisional title |
+| `session/resume` | DSH's own, in the process of the session's mode, with the request's `mcpServers` (about 0.2 s). A session open in another DSH process fails with `-32603`, which the proxy words as "This DeepSeek Harness session is open in another DSH app (dsh web or another dsh); close it there, then try again." |
 | `session/load`, `session/delete` | not supported (`-32601`); history comes from the service's journal, delete is a tombstone |
 | `session/close` | DSH's own: it cancels a running prompt (`cancelled`), drains DSH's subagents and flushes |
 
@@ -719,7 +779,7 @@ with icacls. Gorynych's DSH sessions never let that happen:
 
 ### Not done yet
 
-- A full-access option (DSH's `danger-full-access`, which would ask nothing).
+- Switching a session DSH pinned (DSH 0.2.2 has no ACP surface for `/permission`).
 - Titles from DSH: its acp app switches its model titles off, and the title it keeps is in its
   projection cache, not on the wire.
 - History for sessions made in `dsh web` (no `session/load`).

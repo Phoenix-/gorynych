@@ -29,8 +29,17 @@ public sealed class DshAdapterOptions
     /// </summary>
     public TimeSpan UnloadAfter { get; init; } = TimeSpan.FromMinutes(2);
 
-    /// <summary>Connects to an agent instead of starting DSH, given the patch file's path. For tests (a fake DSH).</summary>
+    /// <summary>
+    /// Connects to an agent instead of starting DSH, given the patch file's path (one per mode:
+    /// <c>gorynych.patch.yml</c>, <c>gorynych.full-access.patch.yml</c>). For tests (a fake DSH).
+    /// </summary>
     public Func<string, CancellationToken, Task<AgentInstance>>? Launch { get; init; }
+
+    /// <summary>
+    /// DSH's home, read (never written) to see whether DSH pinned a session's permissions;
+    /// <c>DSH_HOME</c> or <c>~/.dsh</c> when null. Tests point it elsewhere.
+    /// </summary>
+    public string? DshHome { get; init; }
 
     public Action<string>? Log { get; init; }
 }
@@ -38,15 +47,19 @@ public sealed class DshAdapterOptions
 /// <summary>
 /// The DeepSeek Harness adapter: DSH speaks ACP itself (<c>dsh --profile acp</c>), so this adapter
 /// starts it with a per-launch patch and puts a thin ACP proxy between it and the service
-/// (docs/adapters.md, "DeepSeek Harness").
+/// (docs/adapters.md, "DeepSeek Harness"). DSH's sandbox is per process, so a second process with
+/// its own patch runs the full-access sessions, behind a router.
 /// </summary>
 public sealed class DshAdapter(DshAdapterOptions options) : IAgentAdapter
 {
     /// <summary>The DSH versions this adapter was checked against; another one is used, with a warning.</summary>
     public static readonly string[] CheckedVersions = ["0.2.2-rc.1"];
 
-    /// <summary>The patch file's name in <see cref="DshAdapterOptions.DataDirectory"/>.</summary>
+    /// <summary>The read-only process's patch file in <see cref="DshAdapterOptions.DataDirectory"/>.</summary>
     public const string PatchFile = "gorynych.patch.yml";
+
+    /// <summary>The modes Gorynych keeps for DSH sessions, in <see cref="DshAdapterOptions.DataDirectory"/>.</summary>
+    public const string ModesFile = "modes.json";
 
     public string Name => "dsh";
     public string DisplayName => "DeepSeek Harness";
@@ -54,22 +67,39 @@ public sealed class DshAdapter(DshAdapterOptions options) : IAgentAdapter
     public async Task<AgentInstance> StartAsync(CancellationToken ct)
     {
         Directory.CreateDirectory(options.DataDirectory);
-        var patch = Path.Combine(options.DataDirectory, PatchFile);
-        AtomicFile.WriteAllText(patch, DshPatch.Text(options.Instructions));
-        var dsh = options.Launch is { } launch ? await launch(patch, ct) : StartDsh(patch);
+        var main = await StartLaneAsync(DshModes.ReadOnly, ct);
+        var link = new DuplexLink();
+        var modes = new DshModeStore(Path.Combine(options.DataDirectory, ModesFile), options.Log);
+        var router = new DshRouter(options, link.AgentEnd, main, mode => StartLaneAsync(mode, CancellationToken.None), modes,
+            new DshPins(options.DshHome ?? DshPins.DefaultHome()));
+        router.Start();
+        var (input, output) = link.ClientEnd;
+        return new AgentInstance(input, output, router.Completion, async () =>
+        {
+            // Each DSH's stdin ends, DSH drains and exits, and the read-only one's output ending completes the router.
+            await router.StopAsync();
+            try { await output.DisposeAsync(); } catch (Exception e) when (e is IOException or ObjectDisposedException) { }
+        });
+    }
+
+    /// <summary>Writes the mode's patch, starts its DSH and puts a proxy in front of it.</summary>
+    async Task<DshLane> StartLaneAsync(DshMode mode, CancellationToken ct)
+    {
+        var patch = Path.Combine(options.DataDirectory, mode.PatchFile);
+        AtomicFile.WriteAllText(patch, DshPatch.Text(options.Instructions, mode));
+        var dsh = options.Launch is { } launch ? await launch(patch, ct) : StartDsh(patch, mode);
         var link = new DuplexLink();
         var proxy = new DshProxy(options, link.AgentEnd, dsh);
         proxy.Start();
         var (input, output) = link.ClientEnd;
-        return new AgentInstance(input, output, proxy.Completion, async () =>
+        return new DshLane(mode, input, output, proxy.Completion, async () =>
         {
-            // DSH's stdin ends, DSH drains and exits, and its output ending completes the proxy.
             await dsh.DisposeAsync();
             try { await output.DisposeAsync(); } catch (Exception e) when (e is IOException or ObjectDisposedException) { }
         });
     }
 
-    AgentInstance StartDsh(string patch)
+    AgentInstance StartDsh(string patch, DshMode mode)
     {
         var package = options.Package ?? FindPackage() ?? throw new InvalidOperationException("dsh was not found on PATH (npm install -g @deepseek-ai/dsh)");
         var bin = Path.Combine(package, "lib", "bin.js");
@@ -92,12 +122,12 @@ public sealed class DshAdapter(DshAdapterOptions options) : IAgentAdapter
         // DSH exports only after explicit feedback, which ACP cannot give; this makes it certain.
         psi.Environment["DSH_TELEMETRY_DISABLED"] = "1";
         var process = Process.Start(psi) ?? throw new InvalidOperationException("dsh --profile acp did not start");
-        options.Log?.Invoke($"dsh: started {node} {bin} --profile acp, pid {process.Id}");
+        options.Log?.Invoke($"dsh: started {node} {bin} --profile acp ({mode.Id}), pid {process.Id}");
         _ = Task.Run(async () =>
         {
             string? line;
             while ((line = await process.StandardError.ReadLineAsync()) is not null)
-                options.Log?.Invoke("dsh: " + line);
+                options.Log?.Invoke((mode == DshModes.ReadOnly ? "dsh: " : "dsh full-access: ") + line);
         }, CancellationToken.None);
         var exited = process.WaitForExitAsync(CancellationToken.None);
         return new AgentInstance(process.StandardOutput.BaseStream, process.StandardInput.BaseStream, exited, async () =>
