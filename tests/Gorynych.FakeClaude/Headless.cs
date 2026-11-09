@@ -19,7 +19,11 @@
 // no tool, a running process enters it only when it started in it or with
 // --allow-dangerously-skip-permissions, and a PreToolUse hook registered in initialize is called
 // back (hook_callback) before a matching tool in every mode, with the mode (`no-mode` leaves it out).
-// Prompt `gorynych tools` calls ask_agent, archive_session and restore_session.
+// Precedence as Claude's documentation gives it: a hook's deny, then its ask (which asks through
+// can_use_tool even where an allow rule matches), then its allow; then allow rules (`permissions.allow`
+// of --settings and of the folder's .claude/settings.json); then the mode: bypassPermissions and auto
+// let the call run, the others ask. Prompt `gorynych tools` calls ask_agent, archive_session and
+// restore_session.
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -36,6 +40,7 @@ static partial class FakeHeadless
     static bool canBypass;
     static string cwdNow = "";
     static readonly List<(Regex Matcher, string Id)> PreToolUse = [];
+    static readonly List<string> AllowRules = [];
     static string model = "claude-fake-1";
     static int messages;
     static int tools;
@@ -60,6 +65,9 @@ static partial class FakeHeadless
         if (mode == "bypassPermissions" && File.Exists(Path.Combine(cwd, "no-bypass"))) mode = "default";
         if (File.Exists(Path.Combine(cwd, "force-bypass"))) mode = "bypassPermissions";
         cwdNow = cwd;
+        foreach (var settings in new[] { Arg("--settings"), Path.Combine(cwd, ".claude", "settings.json") })
+            if (settings is not null && File.Exists(settings) && JsonNode.Parse(File.ReadAllText(settings))?["permissions"]?["allow"] is JsonArray allow)
+                AllowRules.AddRange(allow.Select(r => (string?)r).OfType<string>());
         canBypass = mode == "bypassPermissions" || args.Contains("--allow-dangerously-skip-permissions") || args.Contains("--dangerously-skip-permissions");
         model = Arg("--model") ?? model;
         var replyUrl = ReplyUrl(Arg("--mcp-config"));
@@ -325,7 +333,8 @@ static partial class FakeHeadless
 
     static async Task<JsonObject> AskAsync(string tool, JsonObject input, string toolUseId)
     {
-        // Hooks first, in every mode: an allow or a deny of theirs settles it.
+        // Hooks first, in every mode.
+        var decisions = new List<string>();
         foreach (var (matcher, callback) in PreToolUse.Where(h => h.Matcher.IsMatch(tool)).ToList())
         {
             var hookInput = new JsonObject
@@ -341,12 +350,17 @@ static partial class FakeHeadless
                 ["type"] = "control_request", ["request_id"] = hookId,
                 ["request"] = new JsonObject { ["subtype"] = "hook_callback", ["callback_id"] = callback, ["input"] = hookInput, ["tool_use_id"] = toolUseId },
             });
-            var decision = (string?)(await hookAnswer.Task)["response"]?["hookSpecificOutput"]?["permissionDecision"];
-            if (decision == "allow") return new JsonObject { ["behavior"] = "allow", ["updatedInput"] = input.DeepClone() };
-            if (decision == "deny") return new JsonObject { ["behavior"] = "deny", ["message"] = "denied by a hook" };
+            if ((string?)(await hookAnswer.Task)["response"]?["hookSpecificOutput"]?["permissionDecision"] is { } decision) decisions.Add(decision);
         }
-        // bypassPermissions: no question for any tool.
-        if (mode == "bypassPermissions" && tool != "AskUserQuestion") return new JsonObject { ["behavior"] = "allow", ["updatedInput"] = input.DeepClone() };
+        var allowed = new JsonObject { ["behavior"] = "allow", ["updatedInput"] = input.DeepClone() };
+        if (decisions.Contains("deny")) return new JsonObject { ["behavior"] = "deny", ["message"] = "denied by a hook" };
+        if (!decisions.Contains("ask"))
+        {
+            if (decisions.Contains("allow")) return allowed;
+            if (AllowRules.Any(r => r == tool || tool.StartsWith(r + "__", StringComparison.Ordinal))) return allowed;
+            // bypassPermissions asks for no tool; auto's classifier lets these through.
+            if (mode is "bypassPermissions" or "auto" && tool != "AskUserQuestion") return allowed;
+        }
         var id = $"ask-{++asks}";
         var waiting = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
         Pending[id] = waiting;

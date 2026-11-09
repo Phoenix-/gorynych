@@ -105,6 +105,69 @@ public sealed partial class ClaudeLiveTests
     }
 
     /// <summary>
+    /// In Ask (no full access), with a project allow rule that would let the gorynych tools run
+    /// unasked (<c>.claude/settings.json</c> of the folder): <c>ask_agent</c> is still asked once, by
+    /// Claude's <c>can_use_tool</c> after the adapter's hook answered <c>ask</c>. One short turn on <c>haiku</c>.
+    /// </summary>
+    [TestMethod]
+    [Timeout(300_000, CooperativeCancellation = true)]
+    public async Task Claude_AskAgent_IsAskedOnce_EvenWithAProjectAllowRule()
+    {
+        RequireLive();
+        var dir = TestDirs.New();
+        var folder = Path.Combine(dir, "work");
+        Directory.CreateDirectory(Path.Combine(folder, ".claude"));
+        File.WriteAllText(Path.Combine(folder, ".claude", "settings.json"), """{"permissions":{"allow":["mcp__gorynych","mcp__gorynych__ask_agent"]}}""");
+        var pipe = "gorynych-live-" + Guid.NewGuid().ToString("N")[..8];
+        var log = new List<string>();
+        var echo = new LifecycleAgent("echo", canDelete: true) { Answer = "pong" };
+        await using var conductor = new Conductor(new ConductorOptions
+        {
+            DataDirectory = dir,
+            ServiceId = "live",
+            PeerServerCommand = [ServiceExe(), "peers", "--pipe", pipe],
+        }, [new ClaudeAdapter(new ClaudeAdapterOptions
+        {
+            DataDirectory = Path.Combine(dir, "claude"),
+            Model = "haiku",
+            ClaudeStatePath = Path.Combine(dir, "no-claude-state.json"),
+            Log = m => { lock (log) log.Add(m); },
+        }), echo.Adapter]);
+        using var stop = new CancellationTokenSource();
+        var listening = PipeListener.RunAsync(conductor, pipe, stop.Token);
+        try
+        {
+            await using var client = await TestClient.ConnectAsync(conductor);
+            client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome
+            {
+                OptionId = r.ToolCall.Title?.StartsWith("ask_agent", StringComparison.Ordinal) == true ? ClaudeHooks.DenyOptionId : r.Options[0].OptionId,
+            });
+            var target = (await NewAsync(client, folder, "echo")).SessionId;
+            await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = target, Prompt = [new TextContent { Text = "hello" }] });
+            var id = (await NewAsync(client, folder)).SessionId;
+
+            var r = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt, new PromptRequest
+            {
+                SessionId = id,
+                Prompt = [new TextContent { Text = $"Call the tool mcp__gorynych__ask_agent once with session_id \"{target}\" and question \"ping\". Then reply in one sentence with what it returned." }],
+            });
+
+            var titles = client.Approvals.Select(a => a.ToolCall.Title).ToArray();
+            Console.WriteLine($"< {r.StopReason}; approvals: {string.Join(" | ", titles)}");
+            Assert.AreEqual(1, titles.Count(t => t?.StartsWith("ask_agent", StringComparison.Ordinal) == true), "asked once, despite the allow rule");
+            lock (log) Assert.IsFalse(log.Any(l => l.Contains("asking the person before", StringComparison.Ordinal)), "Claude asked, after the hook's ask");
+            lock (echo.Prompts) Assert.AreEqual(1, echo.Prompts.Count, "declined, so the other session got nothing");
+            Console.WriteLine($"claude session {id}");
+        }
+        finally
+        {
+            stop.Cancel();
+            await listening;
+        }
+    }
+
+    /// <summary>
     /// Full access on <c>haiku</c>: a shell write runs with no question, <c>ask_agent</c> is still asked,
     /// by the adapter from Claude's PreToolUse hook (declined here, so the other session gets nothing),
     /// and back in Ask a write asks again. Three short turns in a temporary folder.

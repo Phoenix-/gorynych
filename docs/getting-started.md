@@ -137,8 +137,8 @@ Anthropic's terms allow today ([adapters.md](adapters.md#claude-code)). Its thre
 selectors: **mode** (`Ask`, `Accept edits`, `Plan`, `Auto` where the model has it, and `Full
 access`), **model** and **reasoning effort**. A change applies at once and stays with the session.
 **Claude's `Full access` asks you nothing:** any command, any file, outside the folder too; you
-choose it per thread, between turns, and Gorynych still asks you before Claude asks another
-session, archives or restores one. The first time
+choose it per thread, between turns. Gorynych's own cross-session tools always ask, whatever the
+mode or allow rules: before Claude asks another session, archives or restores one. The first time
 Claude works in a folder you have not trusted in Claude Code, Gorynych asks in the thread
 whether to trust it.
 

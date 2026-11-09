@@ -243,18 +243,30 @@ adapter's own default is never Full access (a configured `bypassPermissions` is 
   turn it off with `permissions.disableBypassPermissionsMode`); either fails the prompt with the
   reason.
 - `claude -p` asks no one to accept bypass mode, and the adapter writes nothing for it.
-- **The gorynych tools.** Every launch's `initialize` registers a PreToolUse hook callback for
-  `mcp__gorynych__ask_agent`, `archive_session` and `restore_session`. Claude calls it before
-  each, in every mode, with the mode it runs in at that moment (`permission_mode`).
-  - In `default`, `acceptEdits` and `plan` the hook decides nothing and Claude asks through
-    `can_use_tool`, as before.
-  - In Full access, `auto`, or a mode Claude does not name, nobody would be asked, so the adapter
-    asks the person itself (the same approval card) and answers allow or deny.
+- **The gorynych tools.** Gorynych's own cross-session tools always ask, whatever the mode or allow
+  rules. Every launch's `initialize` registers a PreToolUse hook callback for
+  `mcp__gorynych__ask_agent`, `archive_session` and `restore_session` (timeout 86400 s, a day,
+  so a person may take their time). Claude calls it before each, in every mode, with the mode it
+  runs in at that moment (`permission_mode`).
+  - In `default`, `acceptEdits` and `plan` the hook answers `ask`. Claude evaluates hooks
+    before deny, ask and allow rules, and among hooks `ask` outranks `allow`, so an allow rule
+    of the person's or a project's settings (`.claude/settings.json` allowing `mcp__gorynych`)
+    or another hook's allow does not let the call run unasked: Claude asks through
+    `can_use_tool`, once.
+  - In Full access, `auto`, or a mode Claude does not name, the adapter asks the person itself
+    (the same approval card) and answers allow or deny. (In `auto` a hook's `ask` would usually
+    reach the prompt too, but Claude's classifier may deny some calls first.)
+  - A dismissed question, a failure while asking, or a callback Claude withdraws all end in no:
+    the call does not run. When a callback outlives its timeout, Claude withdraws it
+    (`control_cancel_request`) and does not run the call.
   - So the question follows the mode the running Claude is really in, not what a client last
-    heard. Checked live in `claude -p` (default mode): the callback comes with
-    `permission_mode`, `tool_name`, `tool_input` and `tool_use_id`. That it fires in bypass
-    rests on Claude Code's documentation ("hooks still execute"); the live check of Full access
-    covers it.
+    heard.
+  - Checked live in `claude -p` (2.1.302, default mode): the callback comes with
+    `permission_mode`, `tool_name`, `tool_input` and `tool_use_id`; the matcher's
+    `timeout` is in seconds (one of 3 was withdrawn after 3.0 s and the call blocked); and with a
+    project allow rule for `mcp__gorynych`, `ask_agent` was asked exactly once. That the
+    callback fires in bypass rests on Claude Code's documentation ("hooks still execute"); the
+    live check of Full access covers it.
   - The per-launch deny rule that hides `gorynych-outside` still holds: Claude enforces deny
     rules in every mode.
 - The mode is kept in the session's record like the other choices, so a resumed session starts

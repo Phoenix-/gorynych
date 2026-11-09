@@ -877,9 +877,11 @@ internal sealed class HeadlessSession : IClaudeSession
 
     /// <summary>
     /// The PreToolUse hook on <c>ask_agent</c>, <c>archive_session</c> and <c>restore_session</c>, which
-    /// Claude calls in every mode with the mode it runs in now (<c>permission_mode</c>). Where Claude
-    /// asks for tools itself it decides nothing, and <c>can_use_tool</c> asks. In any other mode
-    /// (Full access, auto, or one Claude did not name) nobody would be asked, so the person is asked here.
+    /// Claude calls in every mode with the mode it runs in now (<c>permission_mode</c>). These three
+    /// always ask the person, whatever the mode or allow rules. Where Claude asks for tools itself
+    /// the hook answers <c>ask</c>, which outranks allow rules and other hooks' allow, and
+    /// <c>can_use_tool</c> asks once. In any other mode (Full access, auto, or one Claude did not name)
+    /// Claude would ask nobody, so the person is asked here.
     /// </summary>
     async Task AskHookAsync(ClaudeProcess claude, string requestId, JsonObject request)
     {
@@ -887,7 +889,7 @@ internal sealed class HeadlessSession : IClaudeSession
         var mode = (string?)input["permission_mode"];
         if (StreamJson.AsksForTools(mode))
         {
-            await claude.RespondAsync(requestId, StreamJson.NoHookDecision());
+            await claude.RespondAsync(requestId, StreamJson.HookAsk("Gorynych asks the user before this tool, whatever allow rules say."));
             return;
         }
         var tool = (string?)input["tool_name"] ?? "";

@@ -33,6 +33,12 @@ public static class StreamJson
     public const string AskedToolsMatcher = "^mcp__gorynych__(ask_agent|archive_session|restore_session)$";
 
     /// <summary>
+    /// How long, in seconds, Claude waits for the hook's answer: the person may take their time, as
+    /// with any approval (a day, as the TUI transport's PermissionRequest hook waits).
+    /// </summary>
+    public const int AskHookTimeoutSeconds = 86400;
+
+    /// <summary>
     /// A session launch's <c>initialize</c>: Claude calls the adapter back (<c>hook_callback</c>) before
     /// each of <see cref="AskedToolsMatcher"/>, in every permission mode.
     /// </summary>
@@ -41,15 +47,34 @@ public static class StreamJson
         ["subtype"] = "initialize",
         ["hooks"] = new JsonObject
         {
-            ["PreToolUse"] = new JsonArray(new JsonObject { ["matcher"] = AskedToolsMatcher, ["hookCallbackIds"] = new JsonArray(AskHookId) }),
+            ["PreToolUse"] = new JsonArray(new JsonObject
+            {
+                ["matcher"] = AskedToolsMatcher,
+                ["hookCallbackIds"] = new JsonArray(AskHookId),
+                ["timeout"] = AskHookTimeoutSeconds,
+            }),
         },
     };
 
-    /// <summary>The permission modes in which Claude asks for the gorynych tools itself, through <c>can_use_tool</c>.</summary>
+    /// <summary>
+    /// The permission modes in which a hook's <c>ask</c> makes Claude ask through <c>can_use_tool</c>.
+    /// In any other (Full access, auto, one not named) the adapter asks the person itself.
+    /// </summary>
     public static bool AsksForTools(string? mode) => mode is "default" or "manual" or "acceptEdits" or "plan";
 
-    /// <summary>A PreToolUse hook answer: no decision, so Claude's own permission check goes on.</summary>
-    public static JsonObject NoHookDecision() => [];
+    /// <summary>
+    /// A PreToolUse hook answer that makes Claude ask, through <c>can_use_tool</c>, even where an allow
+    /// rule (the person's or a project's settings) or another hook would let the call run unasked.
+    /// </summary>
+    public static JsonObject HookAsk(string reason) => new()
+    {
+        ["hookSpecificOutput"] = new JsonObject
+        {
+            ["hookEventName"] = "PreToolUse",
+            ["permissionDecision"] = "ask",
+            ["permissionDecisionReason"] = reason,
+        },
+    };
 
     /// <summary>A PreToolUse hook answer that lets the call run, or blocks it with what the model is told.</summary>
     public static JsonObject HookDecision(bool allow, string reason) => new()
