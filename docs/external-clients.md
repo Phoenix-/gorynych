@@ -50,8 +50,9 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
 - Sessions created but never prompted (drafts) are deleted when the client closes them or
   goes away, and are not listed ([service-protocol.md](service-protocol.md#drafts-and-deletion)).
 - A session an agent spawned is an ordinary session in `session/list`, with its parent in
-  `_meta["gorynych/parentSessionId"]`. The service asks the person to approve each spawn with
-  a `session/request_permission` on the parent session
+  `_meta["gorynych/parentSessionId"]`. The service asks the person to approve a spawn with
+  a `session/request_permission` on the parent session, unless the user asked for it in their
+  own turn
   ([service-protocol.md](service-protocol.md#child-sessions)). If the spawn is withdrawn
   first, the service sends `$/cancel_request` for that question; a client that ignores it
   keeps the card, and its answer changes nothing. Whether Zed handles `$/cancel_request` for

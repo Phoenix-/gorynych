@@ -728,6 +728,7 @@ sealed class LifecycleAgent
                 case GorynychProtocol.MethodOpinion when HasChannel:
                     if (!Running) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running; prompt it first.");
                     lock (Opinions) Opinions.Add(req.Params!.DeepClone().AsObject());
+                    if (HoldOpinions is { } hold) await hold.Task;
                     return new JsonObject { ["text"] = Answer ?? "" };
                 case GorynychProtocol.MethodNote when HasChannel:
                     if (!Running) throw new JsonRpcException(JsonRpcException.InvalidRequest, "The Claude session is not running.");
@@ -805,6 +806,9 @@ sealed class LifecycleAgent
 
     /// <summary>The <c>_gorynych/opinion</c> params received through the channel (with <see cref="HasChannel"/>).</summary>
     public List<JsonObject> Opinions { get; } = [];
+
+    /// <summary>While set, a request through the channel is answered only once this completes.</summary>
+    public TaskCompletionSource? HoldOpinions { get; set; }
 
     /// <summary>False refuses notes and opinions as the Claude adapter does while Claude's process is not running.</summary>
     public bool Running { get; set; } = true;

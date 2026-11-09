@@ -38,7 +38,7 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
 - Kimi has no way for a client to set a session's title, so a name given to `spawn_session`
   lives in the service's overlay and wins over the title Kimi takes from the first prompt.
   The service answers Kimi's approval of `spawn_session` itself, since it asks the person
-  before it spawns ([service-protocol.md](service-protocol.md#child-sessions)). Kimi does not
+  itself where needed ([service-protocol.md](service-protocol.md#child-sessions)). Kimi does not
   know `_gorynych/note`, so a child's report reaches a Kimi parent as a marked turn. A Kimi
   session that is not loaded is resumed for an opinion request or a report and unloaded again
   after the service's idle time ([adapter-contract.md](adapter-contract.md#61-waking-a-session-and-closing-it-again)).
@@ -261,7 +261,8 @@ They run without asking the person, in every mode ([service-protocol.md](service
 - Every launch's `--settings` allows `mcp__gorynych__list_agents`, `reply`, `ask_agent`,
   `archive_session` and `restore_session` (`permissions.allow`). Claude applies allow rules
   before auto mode's classifier, so `auto` does not judge them either. `spawn_session` is not in
-  the rule: the service asks the person before every spawn.
+  the rule, as it was not before: the service asks the person itself before a spawn they did
+  not ask for, and Claude's own approval of it is answered yes.
 - Claude may still ask for one through `can_use_tool`, and the adapter answers allow without
   asking the person: `plan` asks for MCP tools whatever the allow rules say, and so does an ask
   rule of the person's or a project's settings. `can_use_tool` does not say why it asks, so the
@@ -458,7 +459,8 @@ Claude about `list_agents`, `ask_agent` (by exact `session_id`; `reply` only ans
 with `-32602`, as ACP requires. Without a channel and without a `systemPrompt` there is no
 `--append-system-prompt`. The gorynych tools ask nothing, as headless
 ([above](#the-gorynych-tools)): the launch's `--settings` allows them, and the PermissionRequest
-hook allows any of them without asking (the service asks the person before every spawn).
+hook allows any of them without asking (the service asks the person itself before a spawn they
+did not ask for).
 
 `_gorynych/note` (a child's report to its parent) becomes a channel message with
 `meta: {kind: "report"}` and no `message_id`; the peer instructions say it needs no reply. The

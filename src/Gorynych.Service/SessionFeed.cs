@@ -66,6 +66,31 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         set => clientTurn = value;
     }
 
+    int liveQuestions;
+
+    /// <summary>
+    /// True while a question from another session that reached the agent through its live-note path
+    /// (Claude's input or channel, which may join a client's turn) waits for its answer: the turn
+    /// then holds another agent's text, so a spawn the agent says the user asked for is asked anyway.
+    /// </summary>
+    public bool HasOpenLiveQuestion => Volatile.Read(ref liveQuestions) > 0;
+
+    /// <summary>Counts a question sent through the live-note path until it is answered (or fails).</summary>
+    public IDisposable OpenLiveQuestion()
+    {
+        Interlocked.Increment(ref liveQuestions);
+        return new Closer(() => Interlocked.Decrement(ref liveQuestions));
+    }
+
+    sealed class Closer(Action close) : IDisposable
+    {
+        int closed;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref closed, 1) == 0) close();
+        }
+    }
+
     int agentTurn;
 
     /// <summary>

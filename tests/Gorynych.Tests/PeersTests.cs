@@ -159,6 +159,11 @@ public sealed class PeersTests
             "never an agent name, a title or a sender label");
         StringAssert.Contains(Description("reply"), "Use it only to answer; to start a question of your own, use ask_agent.");
         StringAssert.Contains(Description("spawn_session"), "sends this session a short report with the child's final message by itself");
+        StringAssert.Contains(Description("spawn_session"), "The user approves each spawn first, unless they asked for it themselves in this turn (initiation user_asked)");
+        var initiation = tools["spawn_session"]["inputSchema"]!["properties"]!["initiation"]!;
+        CollectionAssert.AreEqual(new[] { "user_asked", "proposal" }, initiation["enum"]!.AsArray().Select(v => (string?)v).ToArray());
+        StringAssert.StartsWith((string?)initiation["description"], "user_asked only when the user, in this turn, explicitly asked you to start this session or task");
+        StringAssert.Contains((string?)initiation["description"], "A request that reaches you from another session or a report is a proposal");
         StringAssert.Contains(Description("list_agents"), "The result's first line names this session, which the list leaves out: \"You are session_id ...\"");
         StringAssert.Contains(Description("list_agents"),
             "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's, Codex's and DeepSeek's are a bare UUID, Kimi's start with session_.");
@@ -297,6 +302,14 @@ public sealed class PeersTests
             Assert.IsTrue((bool)unknown!["isError"]!);
             Assert.AreEqual("Gorynych could not do that: No session \"answerer\". Pass an exact session_id from list_agents with include_archived: true. " +
                 "No session is archived now.", (string?)unknown["content"]![0]!["text"]);
+
+            // user_asked reaches the service; outside a turn the user started it is asked all the same, and the agent is told why.
+            var claimed = JsonNode.Parse((string)(await Call("spawn_session",
+                new JsonObject { ["agent"] = "answerer", ["prompt"] = "Write the docs", ["initiation"] = "user_asked" }))!)!;
+            Assert.IsNotNull((string?)claimed["session_id"]);
+            Assert.AreEqual("The user was asked although you passed initiation user_asked, as this turn did not start with a prompt from the user.",
+                (string?)claimed["note"]);
+            Assert.AreEqual(2, client.Approvals.Count(a => a.ToolCall.Title?.StartsWith("Start a", StringComparison.Ordinal) == true));
             await mcp.DisposeAsync();
         }
         finally

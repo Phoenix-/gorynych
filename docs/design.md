@@ -300,10 +300,10 @@ sequenceDiagram
   waits for the session's running turn, because ACP cannot inject into a turn.
 - A session that is answering a request cannot ask another meanwhile, so two agents cannot wait
   on each other.
-- No gorynych tool needs the agent's own approval. The service asks the person itself before
-  every spawn, and before a session that is not in full access asks one that is, since the asked
-  agent runs anything unasked and so could lend the asker its rights
-  ([service-protocol.md](service-protocol.md#approvals)).
+- No gorynych tool needs the agent's own approval. The service asks the person itself before a
+  spawn they did not ask for in their own turn, and before a session that is not in full access
+  asks one that is, since the asked agent runs anything unasked and so could lend the asker its
+  rights ([service-protocol.md](service-protocol.md#approvals)).
 
 ### Child sessions
 
@@ -320,8 +320,10 @@ sequenceDiagram
   participant G as GUI (the person)
   participant C as child agent
   P->>S: spawn_session(agent, prompt) through its gorynych server
-  S->>G: tool_call and session/request_permission on the parent
-  G-->>S: Start
+  opt not asked for by the user in their own turn
+    S->>G: tool_call and session/request_permission on the parent
+    G-->>S: Start
+  end
   S->>C: session/new
   S-->>G: _gorynych/sessions_changed added, with the parent
   S-->>P: session_id
@@ -335,8 +337,11 @@ sequenceDiagram
 ```
 
 Each finished turn of the child (its first, or one the person prompted) is reported to the
-parent with its final message, unless the spawn said `report: false`. Every spawn is asked; the
-answer is never "always". Details: [service-protocol.md](service-protocol.md#child-sessions).
+parent with its final message, unless the spawn said `report: false`. A spawn is asked unless
+the agent says the user asked for it (`initiation: user_asked`) and the turn began with the
+user's own prompt, with no other session's question open in it; the answer is never "always".
+The child starts in its agent's default mode, never in its parent's full access. Details:
+[service-protocol.md](service-protocol.md#child-sessions).
 
 When the scheme settles, the parent link is a candidate for its own ACP RFD (**planned**).
 

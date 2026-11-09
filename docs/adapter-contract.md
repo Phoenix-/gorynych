@@ -235,8 +235,9 @@ prompt and a spawned session's first turn are not service turns.
   that approves tools on its own MUST allow them without asking (Claude: a per-launch allow
   rule and its own approvals; Codex: the server's `default_tools_approval_mode`), and MUST
   leave the person's own deny rules in force. Fallback: the person is asked for each.
-- The service asks the person itself where the person must decide: before every spawn, and
-  before a session that is not in full access asks one that is. For that an adapter whose agent
+- The service asks the person itself where the person must decide: before a spawn the user
+  did not ask for in their own turn, and before a session that is not in full access asks one
+  that is. A child starts with no mode in its `session/new`, so in its agent's default. For that an adapter whose agent
   has a mode in which it runs anything without asking MUST mark that mode's value with
   `_meta["gorynych/fullAccess"]: true` in its mode option (category `mode`) or `SessionMode`,
   in every state it reports (Claude's `bypassPermissions`, DSH's and Codex's `full-access`).

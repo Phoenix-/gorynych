@@ -1030,11 +1030,18 @@ public sealed class Conductor : IAsyncDisposable
 
     // ---------------------------------------------------------------- child sessions
 
+    /// <summary><c>spawn_session</c>'s <c>initiation</c>: the user asked for this session in this turn.</summary>
+    const string UserAsked = "user_asked";
+
+    /// <summary><c>spawn_session</c>'s <c>initiation</c> by default: the agent proposes the session.</summary>
+    const string Proposal = "proposal";
+
     /// <summary>
     /// <c>_gorynych/spawn</c>, from the peers MCP server's <c>spawn_session</c>. Asks the person on
-    /// the calling session, then creates a session in the chosen agent with the caller as its
-    /// parent and starts its first prompt in the background. Returns the new session's ID at once.
-    /// A spawned session is never a draft.
+    /// the calling session, unless the user asked for the session themselves (below); then creates a
+    /// session in the chosen agent with the caller as its parent and starts its first prompt in the
+    /// background. Returns the new session's ID at once. A spawned session is never a draft; it
+    /// starts in its agent's default mode, whatever the caller's.
     /// </summary>
     internal async Task<JsonNode?> SpawnAsync(JsonRpcRequest request, CancellationToken ct)
     {
@@ -1049,34 +1056,46 @@ public sealed class Conductor : IAsyncDisposable
                 (agentName is null ? "agent is required." : $"No agent \"{agentName}\".") + $" Pass one of: {string.Join(", ", agents.Keys)}.");
         var title = ((string?)request.Params?["title"])?.Trim() is { Length: > 0 } named ? Shorten(named) : null;
         var report = request.Params?["report"] is not JsonValue flag || !flag.TryGetValue<bool>(out var r) || r;
+        var initiation = (string?)request.Params?["initiation"] ?? Proposal;
+        if (initiation is not (UserAsked or Proposal))
+            throw new JsonRpcException(JsonRpcException.InvalidParams,
+                $"No initiation \"{initiation}\". Pass \"{UserAsked}\" only when the user asked in this turn to start this session; otherwise \"{Proposal}\".");
 
         using var parentUse = await UseAsync(parentId, ct);
         var parent = parentUse.Record;
         var cwd = ResolveFolder(parent.Cwd, (string?)request.Params?["cwd"]);
-        var callId = "gorynych-spawn-" + Interlocked.Increment(ref spawnCount);
-        var what = $"Start a {host.DisplayName} session" + (title is null ? "" : $": {title}");
-        RequestPermissionOutcome outcome;
-        try
+        // The user's own request, in their own turn, needs no second yes; anything else is asked.
+        var askedAnyway = initiation == UserAsked ? WhyAskedAnyway(parentUse.Feed) : null;
+        var asks = initiation == Proposal || askedAnyway is not null;
+        string? callId = null;
+        if (asks)
         {
-            outcome = await AskToSpawnAsync(parentUse.Feed, parent, callId, what, host, cwd, prompt, title, ct);
-        }
-        catch (Exception e) when (e is OperationCanceledException or JsonRpcException)
-        {
-            // Withdrawn (the agent's tool call was cancelled, its peers server went away) or the caller was deleted.
-            await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed,
-                e is OperationCanceledException ? "Not started: the request was withdrawn." : $"Not started: {e.Message}");
-            throw;
-        }
-        if (outcome is RequestPermissionOutcomeCancelled)
-        {
-            // The client cancelled the caller's turn (session/cancel), which answers its pending approvals so.
-            await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, "Not started: the turn was cancelled.");
-            throw new JsonRpcException(JsonRpcException.RequestCancelled, "The turn was cancelled, so the session was not started.");
-        }
-        if (outcome is not SelectedPermissionOutcome { OptionId: "start" })
-        {
-            await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, "Not started: the user declined.");
-            throw new JsonRpcException(JsonRpcException.InvalidRequest, "The user declined to start the session.");
+            callId = "gorynych-spawn-" + Interlocked.Increment(ref spawnCount);
+            var what = $"Start a {host.DisplayName} session" + (title is null ? "" : $": {title}");
+            var why = askedAnyway is null ? null : $"The agent says you asked for this; Gorynych asks you all the same, as {askedAnyway}.";
+            RequestPermissionOutcome outcome;
+            try
+            {
+                outcome = await AskToSpawnAsync(parentUse.Feed, parent, callId, what, host, cwd, prompt, title, why, ct);
+            }
+            catch (Exception e) when (e is OperationCanceledException or JsonRpcException)
+            {
+                // Withdrawn (the agent's tool call was cancelled, its peers server went away) or the caller was deleted.
+                await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed,
+                    e is OperationCanceledException ? "Not started: the request was withdrawn." : $"Not started: {e.Message}");
+                throw;
+            }
+            if (outcome is RequestPermissionOutcomeCancelled)
+            {
+                // The client cancelled the caller's turn (session/cancel), which answers its pending approvals so.
+                await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, "Not started: the turn was cancelled.");
+                throw new JsonRpcException(JsonRpcException.RequestCancelled, "The turn was cancelled, so the session was not started.");
+            }
+            if (outcome is not SelectedPermissionOutcome { OptionId: "start" })
+            {
+                await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, "Not started: the user declined.");
+                throw new JsonRpcException(JsonRpcException.InvalidRequest, "The user declined to start the session." + AskedAnywayNote(askedAnyway));
+            }
         }
         // The caller may have been deleted while the person decided.
         if (parentUse.Feed.Retired || store.Get(parent.SessionId) is not { Deleted: false })
@@ -1084,17 +1103,35 @@ public sealed class Conductor : IAsyncDisposable
         string childId;
         try
         {
-            childId = await CreateChildAsync(parent, host, cwd, prompt, title, report, ct);
+            childId = await CreateChildAsync(parent, host, cwd, prompt, title, report, approved: asks, ct);
         }
         catch (Exception e)
         {
-            await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, $"Not started: {e.Message}");
+            if (callId is not null) await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, $"Not started: {e.Message}");
             throw;
         }
-        await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Completed, $"Started {host.DisplayName} session {childId}.");
-        ServiceLog.Info($"{parent.Agent} {parent.SessionId}: spawned {host.Name} session {childId} in {cwd}");
-        return new JsonObject { ["sessionId"] = childId };
+        if (callId is not null) await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Completed, $"Started {host.DisplayName} session {childId}.");
+        ServiceLog.Info($"{parent.Agent} {parent.SessionId}: spawned {host.Name} session {childId} in {cwd}" + (asks ? "" : ", as the user asked"));
+        var result = new JsonObject { ["sessionId"] = childId };
+        if (askedAnyway is not null) result["note"] = AskedAnywayNote(askedAnyway).TrimStart();
+        return result;
     }
+
+    /// <summary>
+    /// Why a spawn the agent says the user asked for (<c>initiation: user_asked</c>) is asked all the
+    /// same, or null when it need not be: the caller's turn must have started with a client's prompt,
+    /// the user's own, and no question from another session may be open in it. Otherwise the request
+    /// could come from another agent's text, whatever the agent believes.
+    /// </summary>
+    static string? WhyAskedAnyway(SessionFeed feed) =>
+        feed.CurrentOpinion is not null ? "this turn answers another session's question"
+        : !feed.ClientTurn ? "this turn did not start with a prompt from the user"
+        : feed.HasOpenLiveQuestion ? "a question from another session came into this turn and is not answered yet"
+        : null;
+
+    /// <summary>What the agent is told when its <c>user_asked</c> spawn was asked all the same.</summary>
+    static string AskedAnywayNote(string? why) =>
+        why is null ? "" : $" The user was asked although you passed initiation user_asked, as {why}.";
 
     /// <summary>The spawned session's folder: the caller's by default; a relative path is taken from the caller's.</summary>
     static string ResolveFolder(string parentCwd, string? cwd)
@@ -1115,11 +1152,11 @@ public sealed class Conductor : IAsyncDisposable
     /// always: every spawn is asked). Waits for a client if none is attached.
     /// </summary>
     Task<RequestPermissionOutcome> AskToSpawnAsync(SessionFeed feed, SessionRecord parent, string callId, string what, AgentHost host, string cwd,
-        string prompt, string? title, CancellationToken ct)
+        string prompt, string? title, string? why, CancellationToken ct)
     {
         var input = new JsonObject { ["agent"] = host.Name, ["cwd"] = cwd, ["prompt"] = prompt };
         if (title is not null) input["title"] = title;
-        return AskPersonAsync(feed, parent, callId, what, input, $"{prompt}\n\nFolder: {cwd}",
+        return AskPersonAsync(feed, parent, callId, what, input, $"{prompt}\n\nFolder: {cwd}" + (why is null ? "" : $"\n\n{why}"),
             new PermissionOption { OptionId = "start", Name = "Start", Kind = PermissionOptionKind.AllowOnce },
             new PermissionOption { OptionId = "decline", Name = "Don't start", Kind = PermissionOptionKind.RejectOnce }, ct);
     }
@@ -1242,11 +1279,13 @@ public sealed class Conductor : IAsyncDisposable
     /// follows the notice runs after the spawn's. A child that fails before that is closed and
     /// deleted again, as is one whose spawn is withdrawn while its agent creates it.
     /// </summary>
-    async Task<string> CreateChildAsync(SessionRecord parent, AgentHost host, string cwd, string prompt, string? title, bool report, CancellationToken ct)
+    async Task<string> CreateChildAsync(SessionRecord parent, AgentHost host, string cwd, string prompt, string? title, bool report, bool approved,
+        CancellationToken ct)
     {
         var rpc = await host.GetAsync(ct);
         var token = NewToken();
         // Not cancelled with the spawn: the agent may create the session anyway, and only its answer names it.
+        // No mode is passed: the child starts in its agent's default, never in the caller's full access.
         var creating = await rpc.StartRequestAsync(AcpMethods.Agent.SessionNew,
             AcpJson.ToNode(new NewSessionRequest { Cwd = cwd, McpServers = WithPeers([], token), SystemPrompt = SystemPromptFor(host) }),
             CancellationToken.None);
@@ -1305,7 +1344,7 @@ public sealed class Conductor : IAsyncDisposable
             await AbandonChildAsync(host, id, cwd);
             throw;
         }
-        Track(Task.Run(() => SpawnedTurnAsync(feed, record, parent, prompt)));
+        Track(Task.Run(() => SpawnedTurnAsync(feed, record, parent, prompt, approved)));
         return id;
     }
 
@@ -1361,7 +1400,7 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>The first turn of a spawned session. Holds the session's turn gate, taken before the spawn returned.</summary>
-    async Task SpawnedTurnAsync(SessionFeed feed, SessionRecord record, SessionRecord parent, string prompt)
+    async Task SpawnedTurnAsync(SessionFeed feed, SessionRecord record, SessionRecord parent, string prompt, bool approved)
     {
         try
         {
@@ -1371,7 +1410,7 @@ public sealed class Conductor : IAsyncDisposable
             // The task, then what the child needs to know about where it came from: two blocks, so
             // the task stays the first one; the journal keeps both as the one message the agent got.
             var task = new TextContent { Text = prompt };
-            var context = new TextContent { Text = SpawnContext(store.Get(parent.SessionId) ?? parent, use.Record.ReportToParent) };
+            var context = new TextContent { Text = SpawnContext(store.Get(parent.SessionId) ?? parent, use.Record.ReportToParent, approved) };
             var meta = new JsonObject
             {
                 [GorynychProtocol.MetaOrigin] = "spawn",
@@ -1647,10 +1686,11 @@ public sealed class Conductor : IAsyncDisposable
     /// What a spawned session is told after its task: who started it, how its answer reaches that
     /// session (its final message, reported by itself, and what of it), and the ID to ask that
     /// session by. It follows the task, so an agent that titles a session from its first prompt
-    /// (Kimi) takes the task as the title.
+    /// (Kimi) takes the task as the title. <paramref name="approved"/>: the user approved the spawn;
+    /// otherwise they asked for it in their own turn of that session.
     /// </summary>
-    internal static string SpawnContext(SessionRecord parent, bool report) =>
-        $"[About this session · started by {Who(parent)} with spawn_session, approved by the user]\n" +
+    internal static string SpawnContext(SessionRecord parent, bool report, bool approved = true) =>
+        $"[About this session · started by {Who(parent)} with spawn_session, {(approved ? "approved by the user" : "at the user's request")}]\n" +
         (report
             ? $"Answer in your final message: when your turn ends, Gorynych sends that message to session_id {parent.SessionId} as a " +
               "report by itself. Do not use reply or ask_agent for it. The report carries only that last message, your text after " +
@@ -1982,7 +2022,8 @@ public sealed class Conductor : IAsyncDisposable
             try
             {
                 // An agent with its own way in (Claude's channel) answers directly.
-                var answer = await rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, forwarded, ct);
+                JsonNode? answer;
+                using (use.Feed.OpenLiveQuestion()) answer = await rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, forwarded, ct);
                 if (record.Draft)
                 {
                     // It answered, so it has history now.

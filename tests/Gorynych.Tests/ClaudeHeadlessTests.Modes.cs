@@ -272,6 +272,34 @@ public sealed partial class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task AChildOfASessionInFullAccess_StartsInAsk()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = new Gorynych.Service.Conductor(new Gorynych.Service.ConductorOptions
+        {
+            DataDirectory = dir, ServiceId = "test-service", PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"],
+        }, [new ClaudeAdapter(Options(dir, fetchCatalog: false))]);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var parent = await NewAsync(client, dir);
+        await SetModeAsync(client, parent, ClaudeOptions.FullAccess);
+        await PromptAsync(client, parent, "hello");
+        var args = LaunchArgs(parent);
+        var peers = JsonNode.Parse(File.ReadAllText(args[args.IndexOf("--mcp-config") + 1]))!["mcpServers"]!["gorynych"]!["args"]!.AsArray().Select(a => (string)a!).ToList();
+
+        var spawned = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, new JsonObject
+        {
+            ["agent"] = "claude", ["prompt"] = "hello", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = peers[peers.IndexOf("--token") + 1] },
+        });
+        await conductor.BackgroundTurnsIdleAsync();
+
+        var child = (string)spawned!["sessionId"]!;
+        var childArgs = LaunchArgs(child);
+        Assert.AreEqual("default", childArgs[childArgs.IndexOf("--permission-mode") + 1], "the child's own first launch, in Ask, not its parent's full access");
+        Assert.AreEqual(ClaudeOptions.FullAccess, args[args.IndexOf("--permission-mode") + 1]);
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task APersistedFullAccess_AfterARestart_IsReportedMarked_AndStartsInIt()
     {
         var dir = TestDirs.New();

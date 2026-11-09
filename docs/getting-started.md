@@ -207,8 +207,11 @@ Every session gets a `gorynych` MCP server with these tools:
   you first, in the asking session's thread.
 - `archive_session` and `restore_session`: hide a session from the lists or bring it back,
   without asking you; nothing in it is lost.
-- `spawn_session`: start a child session in another agent. You approve each spawn, and by
-  default the child reports each finished turn to its parent.
+- `spawn_session`: start a child session in another agent. When you ask for it yourself, in
+  your own message, it starts right away; any other spawn (one the agent proposes, or one in a
+  turn that answers another session) you approve first. The child starts in its agent's default
+  mode, never in full access, and by default the child reports each finished turn to its
+  parent.
 
 A child is an ordinary session you can open and prompt yourself. How it works:
 [design.md](design.md#sessions-that-talk-to-each-other).
