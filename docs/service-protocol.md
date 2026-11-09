@@ -56,7 +56,7 @@ server ([Agents outside Gorynych](#agents-outside-gorynych)).
 | `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`, and its extension flags in `agentCapabilities._meta`, as ACP's extensibility rules advertise custom capabilities: `gorynych/sessionsChanged: true` (see [List changes](#list-changes)) and `gorynych/archive: true` (see [Archive](#archive)). The result's own `_meta` has the data `gorynych/serviceId` and `gorynych/agents`, and, deprecated and kept for one release for clients built before the flags moved, the two flags again. No `sessionCapabilities.systemPrompt` yet ([adapter-contract.md](adapter-contract.md#15-open-questions)). |
 | `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`, and a spawned session also `_meta["gorynych/parentSessionId"]` (absent for a session a client created). A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out, and so are archived sessions unless the request has `_meta["gorynych/includeArchived"]: true`; then an archived one carries `_meta["gorynych/archived"]: true`. |
 | `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers` and, for an adapter that advertises `sessionCapabilities.systemPrompt`, the peer instructions as `systemPrompt` in `append` mode (see [What agents are told](#what-agents-are-told)), forwards, records the session as a draft, attaches the client. A client's own `systemPrompt` is refused with `-32602`, here and on `session/load` and `session/resume`: the service does not advertise the capability. |
-| `session/load` | Opens the session in the agent (`session/resume`, or `session/load` with the agent's replay dropped), replays the service journal as `session/update`, then attaches the client. A session the journal has never seen is loaded from the agent instead, and journaled. Returns the session state (below). |
+| `session/load` | Opens the session in the agent, catching the journal up with the agent's own history first ([History made outside Gorynych](#history-made-outside-gorynych); a session the journal has never seen is imported so), replays the service journal as `session/update`, then attaches the client. Returns the session state (below). |
 | `session/resume` | Opens the session in the agent and attaches the client, without replay. Returns the session state (below). |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
@@ -127,7 +127,11 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/archived` | `SessionInfo._meta` in `session/list`; `session_info_update._meta` | `true` for an archived session in a list (absent otherwise); in a `session_info_update`, `true` or `false` whenever the flag changes |
 | `gorynych/includeArchived` | `session/list` params `_meta` | `true` lists archived sessions too |
 | `gorynych/parentSessionId` | `SessionInfo._meta` in `session/list`; `session_info_update._meta`; the `_meta` of a spawned session's first `user_message_chunk` | the session that started this one with `spawn_session`; absent for a session a client created |
-| `gorynych/origin` | `user_message_chunk._meta` | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel, TUI), `live` (one written into a running headless Claude on its input), `spawn` (a spawned session's first prompt), `report` (a child's report delivered as a turn) or `terminal` |
+| `gorynych/origin` | `user_message_chunk._meta`; with `native`, the `_meta` of any update | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel, TUI), `live` (one written into a running headless Claude on its input), `spawn` (a spawned session's first prompt), `report` (a child's report delivered as a turn) or `terminal`; `native` on every update the journal took from the agent's own history, made outside Gorynych; `notice` on an entry the service wrote into the journal itself ([History made outside Gorynych](#history-made-outside-gorynych)) |
+| `gorynych/notice` | `_meta` of a `user_message_chunk` with `gorynych/origin: "notice"` | what the service's entry says: `historyRewritten` |
+| `gorynych/replayFrom` | an adapter's `agentCapabilities._meta`; `session/resume` params `_meta`, service → adapter | in capabilities, `true`: the adapter replays its own history after a mark. On a resume, where to replay from: `{"type": "gorynych/after", "mark": "<mark>"}` or `{"type": "start"}` ([History made outside Gorynych](#history-made-outside-gorynych)) |
+| `gorynych/replay` | `session/resume` result `_meta`, adapter → service | what was replayed: `{"from": "mark" \| "start", "mark": "<new mark>"}` |
+| `gorynych/historyMark` | `session/prompt` result `_meta`; the `_meta` of the update that ends a turn of the agent's own (`gorynych/agentTurn: "ended"`) | the adapter's opaque mark of how far into its own history the journal now goes |
 | `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, `parent_claude` for a spawn, `child_kimi` for a report, `outside_claude-code` for an agent outside Gorynych (`outside_<client name>`): a label for GUIs only; the text the agent gets names the session by its ID instead (see [What agents are told](#what-agents-are-told)) |
 | `gorynych/outside` | `_meta` of `_gorynych/mcp_message`, and of the opinion request an agent outside Gorynych asked | the host: `client` (MCP `clientInfo`), `folder`, `hostSessionId` (see [Agents outside Gorynych](#agents-outside-gorynych)) |
 | `gorynych/fromSessionId` | `user_message_chunk._meta` of an opinion request or a report delivered as a turn | the session that asked, or the child that reports |
@@ -956,6 +960,58 @@ Checking with that session as well.
   trimmed from Gorynych's journal.)`. `(turn in progress)` closes the newest page while a turn
   runs. Without any history, the result is the header (without the message count) and
   `Gorynych has no history for this session yet.`
+
+## History made outside Gorynych
+
+A session can be continued outside Gorynych: in Codex Desktop or `codex resume`, with
+`claude --resume`, in the Kimi CLI. Its agent's own history is the source of truth, so whenever
+the service opens a session that its agent does not have loaded (a client's `session/load` or
+`session/resume`, a prompt, an `ask_agent` that wakes it, a report), it first catches the
+session's journal up with that history, before anything runs in it. A turn the service starts
+next lands after the turns made outside, as it did in the agent. The contract is in
+[adapter-contract.md §4](adapter-contract.md#4-opening-a-session-that-is-not-loaded).
+
+- **The mark.** An adapter that advertises `gorynych/replayFrom` names how far into its history
+  the journal goes with an opaque mark, in `_meta["gorynych/historyMark"]` of every
+  `session/prompt` result and of the update that ends a turn of the agent's own. The service
+  keeps the latest next to the journal (`<journal>.native`).
+- **The catch-up.** The service opens such a session with `session/resume` and
+  `_meta["gorynych/replayFrom"]`: `{"type": "gorynych/after", "mark": "<mark>"}`, or
+  `{"type": "start"}` without a mark (a journal from before marks). The adapter replays its
+  history after the mark as `session/update`s before it answers, and answers with
+  `_meta["gorynych/replay"]: {"from": "mark" | "start", "mark": "<new mark>"}`. The shape is
+  `replayFrom` of ACP v2's draft
+  [session-resume-replay](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/v2/session-resume-replay.mdx);
+  in ACP v1, whose `session/resume` replays nothing, it lives in `_meta`.
+- **An agent without marks** that loads (Kimi) is opened with `session/load`, and its replay,
+  the whole session, is aligned with the journal: by the journal's last three user messages in
+  a row, compared without white space, else two, else the last alone (a compaction may keep only
+  that). A user part that is the agent's own `<system-reminder>` is left out: nobody typed it.
+- **What is added.** What follows the mark, or what follows the journal's last messages in a
+  whole replay (a journal without a mark is aligned by the agent's message IDs first), is
+  appended to the journal and sent to the clients attached. Every such update has
+  `_meta["gorynych/origin"]: "native"` and the agent's own `messageId`; a chunk without one
+  gets one, as live. A message or tool call whose `messageId` or `toolCallId` the journal already
+  has is skipped, so a mark lost in a crash repeats nothing.
+- **A rewritten history.** When the mark is no longer in the agent's history (a Codex rollback,
+  a Claude rewind, a Kimi undo), or a whole replay does not hold the journal's last messages,
+  the session is imported again. The journal becomes a notice entry, a `user_message_chunk`
+  with `_meta["gorynych/origin"]: "notice"` and `"gorynych/notice": "historyRewritten"`, whose
+  text starts `[Gorynych: <agent>'s own history of this session no longer holds what this
+  session showed before …]`, followed by the agent's history as it is now. Messages that are
+  still there keep their `messageId`. The journal it replaces is kept next to it as
+  `<journal>.<UTC time>.before`, the last three, and deleted with the session. The notice is the
+  service's own entry: clients get it, the agent never does. (An ACP `notice` update is live
+  only and not replayed, so it cannot stand in a journal.)
+- **Failing open.** An adapter that cannot read its history answers without `gorynych/replay`,
+  and the journal stays as it is. A session its agent no longer has shows its journal, as before.
+- **Not caught up.** A session its agent has loaded now: Codex and DSH let one writer hold a
+  session, so nothing else wrote it meanwhile. And a session nobody opens: `_gorynych/read`, so
+  `read_session` for agents outside Gorynych, and `list_agents` show the journal as it is. They
+  may lag behind turns made outside Gorynych until the session is opened again; catching up
+  there would load the session, which for Codex takes its one writer.
+- **DSH has no catch-up yet**: its ACP replays nothing, so turns taken in `dsh web` or the
+  `dsh` TUI do not appear in the journal ([adapters.md](adapters.md#not-done-yet-2)).
 
 ## Sessions open in another app
 

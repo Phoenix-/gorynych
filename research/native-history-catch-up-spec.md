@@ -1,6 +1,33 @@
 # Catching the journal up with the agent's own history: specification
 
-Draft for review, 9 November 2026. Nothing is built yet.
+Approved on 9 November 2026, with changes, and built on branch `claude/native-catch-up` for
+Codex, Claude and Kimi. The mechanism as built is in
+[docs/service-protocol.md](../docs/service-protocol.md#history-made-outside-gorynych) and
+[docs/adapter-contract.md §4](../docs/adapter-contract.md#4-opening-a-session-that-is-not-loaded).
+The adapters are in [docs/adapters.md](../docs/adapters.md). This file keeps the design as
+reviewed.
+
+Changes made when it was approved:
+
+- **Every open catches up, not only a client's `session/load`.** That covers a prompt into an
+  unloaded session, an `ask_agent` wake and a report. A turn the service starts there lands after
+  the turns made outside, in the journal too.
+- **`read_session` and `list_agents` read the journal as it is.** service-protocol.md says that
+  they may lag until the session is opened.
+- **The notice entry says `[Gorynych: …]`.** It is the service's own and is never sent to the agent.
+- **DSH would read only `~/.dsh/sessions/**`**, checked in code, never DSH's config or key.
+  It is not built yet and comes on a branch of its own: it needs a zstd decoder (.NET 10 has
+  none), the first runtime dependency (the user's decision), and a probe of the log's format.
+  Until then, turns taken in `dsh web` or the `dsh` TUI do not appear in the journal.
+
+Found while building it:
+
+- **Kimi 2.5.2 adds a `<system-reminder>` part of its own to every replayed user message.**
+  Such parts are left out of the alignment.
+- **Codex's app-server keeps a thread's writer lock for a while after it is unloaded.** This
+  was seen live.
+
+## Draft as reviewed
 
 ## Problem
 

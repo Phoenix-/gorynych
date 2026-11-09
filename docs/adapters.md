@@ -56,6 +56,16 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   not checked). Restoring it in Kimi brings it back.
 - Also seen in the 2.5.2 code, not tried: Kimi's ACP `session/list` ignores the request's
   `cursor`, so if it ever returned a `nextCursor`, following it would repeat the first page.
+- **History made in the Kimi CLI.** Kimi keeps no marks and `kimi acp` replays a session only
+  whole, on `session/load`, without message IDs. So the service reopens a Kimi session with
+  `session/load` (not `session/resume`) and aligns the replay with its journal by user text
+  ([service-protocol.md](service-protocol.md#history-made-outside-gorynych)). Kimi 2.5.2 puts a
+  `<system-reminder>` part of its own after every replayed user message; the service leaves
+  those out. The replay is Kimi's context, so after a compaction it is a summary and a kept
+  tail; the journal's last user messages are found in that tail. An undo (`context.undone`)
+  drops them, and the session is imported again. `/clear` in the Kimi CLI starts a new session.
+  Verified live on 10 November 2026: a turn taken with `kimi -S <id> -p` showed once, marked
+  `native`, and a second open added nothing.
 - Verified live on 7 November 2026 after logging in: first prompt, a Write approval, the
   title, replay through the service journal, and `ask_agent` to a Claude session. Before
   the login every turn failed with `-32000 Authentication required: 403`, which the service
@@ -317,6 +327,37 @@ stopped.
   `oauth_org_not_allowed` or `verification_required` fails the client's prompt and leaves a
   note in the feed, both naming `--claude-transport tui`.
 
+### History made outside Gorynych
+
+Both transports advertise `gorynych/replayFrom`
+([service-protocol.md](service-protocol.md#history-made-outside-gorynych)). The adapter reads
+Claude's transcript, `~/.claude/projects/<folder>/<session>.jsonl` (append-only; read, never
+written):
+
+- **The mark** is `<uuid>@<offset>`: the last entry of the conversation and the byte offset
+  where its line starts. The conversation is the chain from the file's last main entry (not a
+  subagent's `isSidechain` one) back by `parentUuid`, and by `logicalParentUuid` across a
+  compaction. It is not the file's order: a rewind or a checkpoint restore starts a new branch
+  further down. Every prompt's result carries the mark, and so does the `ended` update of a
+  turn of Claude's own.
+- **A catch-up** reads the mark's line and what follows it. If the chain from the last entry
+  reaches the mark, the entries after it are replayed. Otherwise another branch is the
+  conversation now: the whole chain is replayed, as `from: "start"`. A mark whose line moved is
+  looked for in the whole file. A missing transcript answers without `gorynych/replay`.
+- **Entries become updates** as the live stream maps them, through the same code (`StreamJson`):
+  - user text by `uuid`;
+  - assistant text and thinking by the API's `msg_…` ID;
+  - `tool_use` as a tool call;
+  - `tool_result` as its update.
+
+  Left out: subagents' entries, slash commands and their output (`<command-…>`,
+  `<local-command-…>`), meta notes (`isMeta`), `[Request interrupted by user]`, a compaction's
+  summary, and a torn last line.
+- `/clear` continues in a new session ID, so this session's transcript does not change.
+  `claude --resume <id>` keeps the ID (`--fork-session` would not).
+- Verified live on 10 November 2026: a turn taken with `claude -p --resume <id>` showed once,
+  marked `native`, and a second open added nothing.
+
 ### TUI transport
 
 The fallback: the interactive `claude` TUI in a Windows pseudo console, fed by http hooks and
@@ -529,8 +570,8 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 | --- | --- |
 | `session/new` | `thread/start {cwd, config, developerInstructions}`. Nothing is on disk before the first turn, and the thread is not listed until then (`gorynych/draftsNotDurable`: the service drops an unused draft instead of hiding it) |
 | `session/list` | `thread/list {cwd, cursor, limit 50, archived: false, sortKey: updated_at, useStateDbOnly: true}`; `title` is the thread's `name` (none until a name is set or generated: the service shows its provisional title), `updatedAt` from unix seconds |
-| `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}` |
-| `session/load` | the same, then the history from `thread/items/list`, page by page, as the updates below (only for a thread the journal has not seen: one made in Codex's own apps) |
+| `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}`; with `gorynych/replayFrom`, then the thread's turns after the mark (below) |
+| `session/load` | the same, then the history from `thread/items/list`, page by page, as the updates below. The service no longer uses it: a thread the journal has not seen is imported through the replay from the start |
 | `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), up to 5 s for the turn to end, then `thread/unsubscribe`, which unloads an idle thread at once. A turn that has not ended by then ends `cancelled`: Codex sends nothing more of an unsubscribed thread |
 | `session/delete` | stops a running turn as `session/close` does, then `thread/delete`; a thread Codex no longer has answers `-32002` |
 | `_gorynych/set_title` | `thread/name/set` (works before the first turn too) |
@@ -614,6 +655,21 @@ over app-server's JSON-RPC. The design and the probes behind it are in
   Desktop is not mirrored. A thread archived there after Gorynych knew it fails to open with
   `This Codex thread is archived in Codex. Unarchive it there (codex unarchive <id>), then try
   again.`
+
+- **History made outside Gorynych** (Codex Desktop, `codex resume`, VS Code;
+  [service-protocol.md](service-protocol.md#history-made-outside-gorynych)):
+  - The adapter advertises `gorynych/replayFrom`. Its mark is the thread's newest turn ID:
+    every prompt's result carries the ID of the turn it ran.
+  - A resume with a mark lists the thread's turns newest first (`thread/turns/list`,
+    `sortDirection: desc`, `itemsView: full`, 20 a page) until the marked turn. It replays the
+    newer ones oldest first, mapped as `session/load` maps items, with Codex's own IDs (a prompt
+    of the service's under its `clientUserMessageId`), so nothing before the mark is read. A
+    mark Codex no longer has (a rollback) or none replays every turn.
+  - Verified live on 10 November 2026: a turn taken with `codex exec resume <id>` showed once,
+    marked `native`, and a second open added nothing.
+  - Codex's app-server keeps a thread's writer lock for a while after `thread/unsubscribe`
+    (over 30 s, seen live). So `codex exec resume` right after Gorynych let go of the thread
+    fails with "active writer"; the live check stops the service first.
 
 ### Prompts and turns
 
@@ -874,7 +930,7 @@ The full-access process runs DSH's `danger-full-access` sandbox with approval `a
 | `session/new` | DSH's own: a bare UUID, durable at once (it writes the session log before any prompt). DSH lists no title for it ever, and cannot delete it, so an unused draft gets a tombstone; it stays in `~/.dsh`, where `dsh web` can delete it |
 | `session/list` | The read-only process's `{sessionId, cwd}`, newest-created first, with its cursor and `cwd` filter. DSH leaves out the sessions open in its own process, so the proxy adds back the sessions it has open, and the router those the full-access process has open, on the first page and in the requested folder. No `title` and no `updatedAt`: the service shows its provisional title |
 | `session/resume` | DSH's own, in the process of the session's mode, with the request's `mcpServers` (about 0.2 s). A session open in another DSH process fails with `-32603`, which the proxy words as "This DeepSeek Harness session is open in another DSH app (dsh web or another dsh); close it there, then try again." |
-| `session/load`, `session/delete` | not supported (`-32601`); history comes from the service's journal, delete is a tombstone |
+| `session/load`, `session/delete` | not supported (`-32601`); history comes from the service's journal (not caught up yet, below), delete is a tombstone |
 | `session/close` | DSH's own: it cancels a running prompt (`cancelled`), drains DSH's subagents and flushes |
 
 - **Idle time.** `gorynych/unloadAfter` is 120 s: a session has one writer, so while Gorynych
@@ -927,5 +983,9 @@ The full-access process runs DSH's `danger-full-access` sandbox with approval `a
 - Switching a session DSH pinned (DSH 0.2.2 has no ACP surface for `/permission`).
 - Titles from DSH: its acp app switches its model titles off, and the title it keeps is in its
   projection cache, not on the wire.
-- History for sessions made in `dsh web` (no `session/load`).
+- History made outside Gorynych: sessions made in `dsh web`, and turns taken there or in the
+  `dsh` TUI. DSH's ACP replays nothing. Its session log
+  (`~/.dsh/sessions/<project>/<id>/session.v4.jsonl.zstd`) is append-only zstd JSONL with a
+  contiguous `seq` and could give a catch-up after a mark. Reading it needs a zstd decoder,
+  which .NET 10 does not have.
 - Images in prompts (DSH offers them only for an image-capable route).
