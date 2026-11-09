@@ -206,7 +206,8 @@ public sealed class SpawnInitiationTests
         var armed = 0;
         claude.BeforePrompt = async id =>
         {
-            if (id != parent || armed == 0) return;
+            // The user's prompts only: a child's report reaches this parent (no channel) as a turn of its own.
+            if (id != parent || armed == 0 || LastPrompt(claude).StartsWith("[Report", StringComparison.Ordinal)) return;
             armed--;
             spawned.Add(await SpawnAsync(zed, claude.Tokens[parent], "user_asked"));
         };
@@ -220,6 +221,8 @@ public sealed class SpawnInitiationTests
         Assert.AreEqual(1, SpawnCards(zed).Length, "the user joined a turn they did not start");
         Assert.AreEqual($"The user was asked although you passed initiation user_asked, as {OtherText}.", (string?)spawned[0]!["note"]);
         Assert.IsTrue(conductor.Feed(parent).HasOtherSessionText, "the user's prompt ended, Claude's turn goes on");
+        // The child it started reports its first turn to this parent when it likes; done before the next turn.
+        await conductor.BackgroundTurnsIdleAsync();
 
         await claude.Adapter.Current!.Update(parent, new SessionInfoUpdate { Meta = AgentTurnMark("ended") });
         await Until(() => !conductor.Feed(parent).HasOtherSessionText, "idle again");
