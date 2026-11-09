@@ -152,7 +152,10 @@ it is; after an adapter restart, or a `session/close`, it is not.
   key and a message that says to close it there, and MAY advertise `gorynych/openElsewhere` and
   answer `_gorynych/open_elsewhere {sessionIds}` ([service-protocol.md](service-protocol.md#sessions-open-in-another-app)).
   A guess on the agent's insides MUST fail open: when it cannot tell, it marks nothing and lets
-  the agent answer. (Codex)
+  the agent answer. When another app takes such a session or lets it go, the adapter SHOULD tell
+  the service with `_gorynych/sessions_changed {sessionId, change: "updated"}`, advertised by
+  `gorynych/sessionsChanged: true` in its `agentCapabilities._meta`, and only for a real
+  change; the service passes it on to its clients. (Codex)
 
 ## 5. Prompts and turns
 
@@ -437,7 +440,7 @@ DSH speaks ACP, and its adapter is a thin proxy.
 
 | Feature | Claude Code, headless (default: in-process adapter over `claude -p` with stream-json) | Claude Code, TUI (fallback, `--claude-transport tui`: the TUI in a pseudo console) | Kimi Code 2.5.2 (`kimi acp`, native ACP) | Codex 0.167 (in-process adapter over `codex app-server`) | DeepSeek Harness 0.2.2-rc.1 (`dsh --profile acp`, native ACP, in-process proxy; one process per permission mode) |
 | --- | --- | --- | --- | --- | --- |
-| Capabilities | list, resume, close, systemPrompt; `gorynych/setTitle`; image prompts | list, resume, close, systemPrompt | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable`, `gorynych/openElsewhere` | list, resume, close; `gorynych/unloadAfter` 120 |
+| Capabilities | list, resume, close, systemPrompt; `gorynych/setTitle`; image prompts | list, resume, close, systemPrompt | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable`, `gorynych/openElsewhere`, `gorynych/sessionsChanged` | list, resume, close; `gorynych/unloadAfter` 120 |
 | New ([§3](#3-new-sessions-the-list-and-discovery)) | UUID from the adapter; recorded at the first prompt | UUID from the adapter; recorded at the first prompt | `session_…`; a real session at once, listed untitled | `thread/start`; nothing on disk before the first turn | UUID from DSH; durable at once, never titled, so an unused draft gets a tombstone |
 | List | the adapter's own list of the sessions it started | the adapter's own list of the sessions it started | Kimi's list; leaves natively archived sessions out; ignores `cursor` | `thread/list` (`cursor`, `limit`, exact `cwd`); archived left out; title = the thread's `name` | the read-only process's `{sessionId, cwd}` with cursor and `cwd`; the sessions open in either process added back by the proxy and the router; no title or `updatedAt` |
 | Open not loaded ([§4](#4-opening-a-session-that-is-not-loaded)) | `session/resume` only registers; the process starts with the next prompt | `session/resume` only registers; the process starts with the next prompt | `session/resume` | `thread/resume`, `excludeTurns`; `session/load` replays `thread/items/list`; refused at once, naming the holder, while another Codex app has the thread (one writer; Windows), else by app-server; fails when it is archived in Codex | `session/resume` in the process of the session's mode, about 0.2 s; fails while `dsh web` or another DSH process has the session (one writer); no `session/load` |

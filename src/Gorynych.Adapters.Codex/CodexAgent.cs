@@ -313,6 +313,10 @@ sealed class CodexAgent : IAsyncDisposable
 
     /// <summary>Which of some threads another Codex app holds, and who (<see cref="CodexThreadHolders"/>).</summary>
     readonly Func<IEnumerable<string>, IReadOnlyDictionary<string, string>> holders;
+    readonly string locksDirectory;
+
+    /// <summary>Tells the service when another Codex app takes a thread or lets it go; started with the adapter.</summary>
+    CodexLockWatcher? lockWatcher;
     readonly ConcurrentDictionary<string, CodexThread> threads = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, CancellationTokenSource> asking = new(StringComparer.Ordinal);
 
@@ -325,12 +329,13 @@ sealed class CodexAgent : IAsyncDisposable
     int disposed;
 
     public CodexAgent(CodexAdapterOptions options, JsonRpcConnection rpc, AgentInstance appServer,
-        Func<IEnumerable<string>, IReadOnlyDictionary<string, string>> holders)
+        Func<IEnumerable<string>, IReadOnlyDictionary<string, string>> holders, string locksDirectory)
     {
         this.options = options;
         this.rpc = rpc;
         this.appServer = appServer;
         this.holders = holders;
+        this.locksDirectory = locksDirectory;
         app = new JsonRpcConnection(appServer.Input, appServer.Output, "codex-app-server")
         {
             RequestHandler = OnServerRequestAsync,
@@ -376,6 +381,10 @@ sealed class CodexAgent : IAsyncDisposable
             Log($"codex: models or config not read: {e.Message}");
         }
         rpc.Start();
+        // A thread changing hands changes its row in the service's list (gorynych/openElsewhere).
+        lockWatcher = new CodexLockWatcher(locksDirectory, holders,
+            id => rpc.SendNotificationAsync(GorynychProtocol.MethodSessionsChanged, new JsonObject { ["sessionId"] = id, ["change"] = "updated" }),
+            options.LockSettle, options.LockRecheck, Log);
     }
 
     // ---------------------------------------------------------------- ACP from the service
@@ -408,6 +417,8 @@ sealed class CodexAgent : IAsyncDisposable
                             [GorynychProtocol.CapDraftsNotDurable] = true,
                             [GorynychProtocol.CapUnloadAfter] = options.UnloadAfter.TotalSeconds,
                             [GorynychProtocol.CapOpenElsewhere] = true,
+                            // It tells when a thread's list row changes: another Codex app took it or let it go.
+                            [GorynychProtocol.MetaSessionsChanged] = true,
                         },
                     },
                     AuthMethods = [],
@@ -497,7 +508,9 @@ sealed class CodexAgent : IAsyncDisposable
         var instructions = Instructions(systemPrompt);
         if (threads.TryGetValue(id, out var known) && known.Loaded) return known;
         // App-server would refuse it anyway (one writer); said at once, naming the app that has it.
-        if (holders([id]).GetValueOrDefault(id) is { } holder) throw OpenElsewhere(holder);
+        var held = holders([id]);
+        lockWatcher?.Saw([id], held);
+        if (held.GetValueOrDefault(id) is { } holder) throw OpenElsewhere(holder);
         ThreadResumeResponse resumed;
         try
         {
@@ -583,6 +596,7 @@ sealed class CodexAgent : IAsyncDisposable
         }, CodexJsonContext.Default.ThreadListParams), ct), CodexJsonContext.Default.ThreadListResponse);
         // Read once for the page: the threads another Codex app has open, which this app-server cannot load.
         var held = holders(listed.Data.Select(th => th.Id));
+        lockWatcher?.Saw(listed.Data.Select(th => th.Id), held);
         return AcpJson.ToNode(new ListSessionsResponse
         {
             Sessions = listed.Data.Select(th => new SessionInfo
@@ -1268,6 +1282,7 @@ sealed class CodexAgent : IAsyncDisposable
             t.Fail(new JsonRpcException(JsonRpcException.InternalError, "Codex's app-server stopped during the turn."));
         foreach (var cts in asking.Values)
             try { cts.Cancel(); } catch (ObjectDisposedException) { }
+        if (lockWatcher is { } watching) await watching.DisposeAsync();
         await rpc.DisposeAsync();
         await app.DisposeAsync();
         try { await appServer.DisposeAsync(); }

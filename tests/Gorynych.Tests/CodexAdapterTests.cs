@@ -35,6 +35,7 @@ public sealed class CodexAdapterTests
         Log = log is null ? null : m => { lock (log) log.Add(m); },
         // No other Codex app holds a fake thread; the user's own Codex folder is never read.
         FindHolders = holders ?? (_ => new Dictionary<string, string>()),
+        LocksDirectory = Path.Combine(Path.GetTempPath(), "gorynych-no-codex-locks"), // never there: nothing watched
     };
 
     /// <summary>The adapter alone, without the service: an ACP connection straight to it.</summary>

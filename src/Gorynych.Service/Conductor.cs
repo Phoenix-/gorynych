@@ -174,6 +174,11 @@ public sealed class Conductor : IAsyncDisposable
 
     internal async Task OnAgentNotificationAsync(AgentHost host, string method, JsonNode? @params)
     {
+        if (method == GorynychProtocol.MethodSessionsChanged)
+        {
+            OnAgentListChanged(host, @params);
+            return;
+        }
         var sessionId = (string?)@params?["sessionId"];
         if (sessionId is null || removed.ContainsKey(sessionId)) return;
         var feed = Feed(sessionId);
@@ -1839,6 +1844,18 @@ public sealed class Conductor : IAsyncDisposable
         else if (before!.Title != after.Title || before.ParentSessionId != after.ParentSessionId || before.Archived != after.Archived)
             AnnounceList(after.SessionId, after.Agent, "updated");
         else if (before.UpdatedAt != after.UpdatedAt) AnnounceActivity(after.SessionId, after.Agent);
+    }
+
+    /// <summary>
+    /// An adapter's <c>_gorynych/sessions_changed {sessionId, change: "updated"}</c>: a row of its
+    /// list changed outside any session (the Codex adapter: another Codex app took the thread or let
+    /// it go, <c>gorynych/openElsewhere</c>). Passed on as <c>updated</c> for a session clients list,
+    /// so they list it again; the adapter sends it only for a real change. Other changes are not taken.
+    /// </summary>
+    void OnAgentListChanged(AgentHost host, JsonNode? @params)
+    {
+        if ((string?)@params?["sessionId"] is not { } sessionId || (string?)@params?["change"] != "updated") return;
+        store.Inspect(sessionId, r => { if (r is { Listed: true } && r.Agent == host.Name) AnnounceList(sessionId, r.Agent, "updated"); });
     }
 
     /// <summary>

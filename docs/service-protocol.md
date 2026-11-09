@@ -150,7 +150,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?, _meta}` → `{}` | tells a session's agent something that needs no answer (a child's report), with `gorynych/sender` and `gorynych/fromSessionId` in `_meta` for the user message the agent reports for it; the Claude adapter writes it into a running Claude (headless) or pushes it through the channel (TUI), an agent that answers method not found, or `-32600` because it is not running, gets it as a turn |
 | `_gorynych/mcp_message` | method, outside server → service, `{serverId, requestId, method, params}` → `{result}` or `{error}`; as a notification from the service, a notification of that request | an MCP request of `gorynych-outside`, in the shape of `mcp/message` from ACP's MCP-over-ACP RFD (see [`_gorynych/mcp_message`](#agents-outside-gorynych)) |
 | `_gorynych/read` | method, `{sessionId, cursor?, limit?, thoughts?}` → `{updates, nextCursor?, total, inProgress, trimmed}` | a page of a session's history from the journal (see [Reading a session](#reading-a-session)) |
-| `_gorynych/sessions_changed` | notification to clients, `{sessionId, change}` | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
+| `_gorynych/sessions_changed` | notification to clients, `{sessionId, change}`; from an adapter that advertises `gorynych/sessionsChanged`, `updated` only | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply`, `_gorynych/spawn` and `_gorynych/archive` | which session's `gorynych` MCP server is calling |
 
 ## Opinions between agents
@@ -978,6 +978,14 @@ app-server until it is closed there. An adapter that can tell who holds a sessio
   `open_elsewhere: "<holder> has it open; it cannot be asked until it is closed there"`.
 - `ask_agent` to such a session fails at once with what to do (the error table above), since the
   question cannot be delivered: neither as a note nor as a turn.
+- When another app takes a session or lets it go, an adapter that can tell sends the service
+  `_gorynych/sessions_changed {sessionId, change: "updated"}`, the notification the service
+  sends its own clients, and advertises it the same way, `gorynych/sessionsChanged: true` in
+  its `agentCapabilities._meta`; it sends it only when the holder really changed. The service
+  passes it on to its clients as `updated` for a session they list ([List changes](#list-changes)),
+  and they list it again to see the new `gorynych/openElsewhere`. Other changes from an adapter
+  are not taken. A GUI that lists only on such notices (Zed lists on connect and on
+  `sessions_changed`) keeps the mark current this way.
 
 Which app holds a session is a heuristic on the agent's insides; an adapter that cannot tell
 marks nothing, and the agent's own refusal still says that something else has it open.
@@ -994,10 +1002,11 @@ reflects what `session/list` shows:
 
 - `added`: a session appears: spawned, a draft's first prompt (or an opinion it answered),
   or a session the service finds in an agent's own list for the first time;
-- `updated`: a listed session's title, parent or archive flag changed (announced at once), or
-  its `updatedAt` (at most once per 10 seconds per session, the `added` counting as the
-  interval's first notice; a change inside an interval is announced at its end, unless the
-  session is gone by then);
+- `updated`: a listed session's title, parent or archive flag changed (announced at once), its
+  `gorynych/openElsewhere` changed (another app took it or let it go: announced as its adapter
+  tells, [below](#sessions-open-in-another-app)), or its `updatedAt` (at most once per 10 seconds
+  per session, the `added` counting as the interval's first notice; a change inside an interval
+  is announced at its end, unless the session is gone by then);
 - `removed`: a listed session was deleted. Archiving is `updated`, not `removed`: a client
   that lists archived sessions still shows it.
 

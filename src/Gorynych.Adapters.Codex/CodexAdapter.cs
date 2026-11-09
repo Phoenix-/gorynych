@@ -43,6 +43,15 @@ public sealed class CodexAdapterOptions
     /// </summary>
     internal Func<IEnumerable<string>, IReadOnlyDictionary<string, string>>? FindHolders { get; init; }
 
+    /// <summary>Codex's lock folder, watched for threads changing hands; <c>CODEX_HOME</c>'s by default. For tests.</summary>
+    internal string? LocksDirectory { get; init; }
+
+    /// <summary>How long a burst of lock-folder changes is let settle before the holders are found again.</summary>
+    internal TimeSpan LockSettle { get; init; } = TimeSpan.FromMilliseconds(750);
+
+    /// <summary>How often the threads last seen held are looked at again, for a holder that left no event.</summary>
+    internal TimeSpan LockRecheck { get; init; } = TimeSpan.FromSeconds(60);
+
     public Action<string>? Log { get; init; }
 }
 
@@ -64,9 +73,9 @@ public sealed class CodexAdapter(CodexAdapterOptions options) : IAgentAdapter
         var link = new DuplexLink();
         var (agentIn, agentOut) = link.AgentEnd;
         // The app-server's own locks are the threads Gorynych has open: they do not count.
-        var holders = options.FindHolders
-            ?? new CodexThreadHolders(CodexThreadHolders.DefaultDirectory(), () => appServerPid is { } pid ? [pid] : []).Find;
-        var agent = new CodexAgent(options, new JsonRpcConnection(agentIn, agentOut, "codex-adapter"), appServer, holders);
+        var locks = options.LocksDirectory ?? CodexThreadHolders.DefaultDirectory();
+        var holders = options.FindHolders ?? new CodexThreadHolders(locks, () => appServerPid is { } pid ? [pid] : []).Find;
+        var agent = new CodexAgent(options, new JsonRpcConnection(agentIn, agentOut, "codex-adapter"), appServer, holders, locks);
         try
         {
             await agent.StartAsync(ct);

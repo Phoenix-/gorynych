@@ -579,6 +579,17 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     `_meta["gorynych/openElsewhere"]`, the folder read once per page, and the adapter answers
     `_gorynych/open_elsewhere` for the service's session lists
     ([service-protocol.md](service-protocol.md#sessions-open-in-another-app)).
+  - **Changes as they happen.** While the adapter runs it watches the lock folder
+    (`FileSystemWatcher`, file names only): a lock file appears when an app takes a thread and
+    is usually deleted when it lets go. Once a burst of changes settles (0.75 s), it finds the
+    holders of the threads they touched again; the threads it last saw held, in a list, an open
+    or an event, it looks at again every 60 s, for a holder that went away without deleting its
+    file (it crashed) and for events the watcher lost (its buffer overflowed: then it looks at
+    them all at once and watches again). For each real change of holder it sends the service
+    `_gorynych/sessions_changed {sessionId, change: "updated"}` (`gorynych/sessionsChanged`),
+    which the service passes on to its clients, so Zed lists the thread again and shows the
+    new mark. With no folder it watches nothing until the folder appears (looked for at the
+    same 60 s); a watcher that fails leaves the timer alone.
   - **A heuristic on Codex's insides.** Any failure (no folder, a file that does not open, a
     status other than success, a holder that is not Codex or cannot be read) means "not known":
     nothing is marked and the open goes on to app-server. Outside Windows nothing is known. App-server's own refusal, `thread <id> already
