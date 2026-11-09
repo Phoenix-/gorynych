@@ -654,8 +654,12 @@ are the model and the effort, and its `/permission` command has no ACP surface. 
 - **Switching** closes the session in its process and resumes it in the other; DSH's resume
   brings back its model and effort, and the answer carries both with the new mode.
   - Refused while a turn of the session is running.
-  - Should the other process refuse the resume, the session is resumed where it was and the
-    client hears why.
+  - Should the other process not start (it must answer `initialize` within 30 s), refuse the
+    resume or fail in between, the session is resumed where it was and the client hears why. A
+    second process left holding nothing is stopped.
+  - Read-only is saved before the switch: if it cannot be saved, the switch is refused and the
+    session stays in full access, as the client still shows it. Full access is saved after; if
+    that fails, the session opens read-only next time.
 - **No pins.** DSH's permission presets pin a sandbox and an approval policy into each session
   when it is made, and a pinned session keeps them in any process. The patches disable the
   presets, so Gorynych's sessions are not pinned and run in the sandbox of their process.
@@ -670,13 +674,20 @@ are the model and the effort, and its `/permission` command has no ACP surface. 
   full-access ones in `<data>/dsh/modes.json`; a resume goes to the process of the session's
   mode, also after a restart.
 - **The list** comes from the read-only process. DSH lists every session but those open in the
-  same process, so it shows the full-access process's open sessions; the router adds any it
-  leaves out, once, on the first page.
+  same process, so it shows the full-access process's open sessions on whichever page. On a list
+  that fits one page the router adds any it leaves out, once; DSH's entries carry only
+  `sessionId` and `cwd`, so these do too.
+- **A second resume** of a session open in one process goes to that process, which refuses it,
+  as DSH does.
+- **Forks.** DSH 0.2.2 offers no `session/fork`. Should it answer one, the fork stays in its
+  parent's process, with its parent's mode.
 - **IDs.** Each process numbers its own requests, so the router gives DSH's requests to the
   service IDs of its own and maps the answers back.
 - **A process that ends.** When the full-access process ends, its sessions are gone, the
-  service's requests to it fail and its questions are withdrawn; the next resume starts it
-  again. The read-only process ending ends the adapter.
+  service's requests to it fail and its questions are withdrawn. A request to such a session
+  says that the full-access process stopped, until the session is opened again, which starts the
+  process again. The read-only process ending ends the adapter, and stopping the adapter stops
+  both, also one still starting.
 
 ### Read only: a read-only shell, approved file writes
 

@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
+using static Gorynych.Adapters.Dsh.DshLines;
 
 namespace Gorynych.Adapters.Dsh;
 
@@ -116,7 +117,6 @@ internal sealed class DshPins(string? home)
         }
     }
 
-    static string? Str(JsonNode? node) => node is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
 }
 
 /// <summary>

@@ -15,9 +15,17 @@ sealed class FakeDshHost
     /// <summary>Resumes fail in the full-access processes launched from now on.</summary>
     public bool FullAccessResumeFails { get; set; }
 
+    /// <summary>The full-access processes launched from now on never answer `initialize`.</summary>
+    public bool FullAccessHangs { get; set; }
+
+    /// <summary>How many full-access processes start; launching more fails, as a `dsh` that cannot start.</summary>
+    public int FullAccessStarts { get; set; } = int.MaxValue;
+
     public async Task<AgentInstance> LaunchAsync(string patch, CancellationToken ct)
     {
-        var dsh = new FakeDsh(Store) { ResumeFails = FullAccessResumeFails && patch.Contains("full-access", StringComparison.Ordinal) };
+        var full = patch.Contains("full-access", StringComparison.Ordinal);
+        if (full && FullAccessLaunches >= FullAccessStarts) throw new InvalidOperationException("dsh --profile acp did not start");
+        var dsh = new FakeDsh(Store) { ResumeFails = FullAccessResumeFails && full, HangInitialize = FullAccessHangs && full };
         var instance = await dsh.LaunchAsync(patch, ct);
         lock (Launched) Launched.Add(dsh);
         return instance;
@@ -42,7 +50,8 @@ sealed class FakeDshHost
 /// <summary>The DSH adapter's permission modes: one DSH process per sandbox, behind a router (docs/adapters.md, "DeepSeek Harness").</summary>
 public sealed partial class DshAdapterTests
 {
-    static async Task<(Service Service, FakeDshHost Host, string Data)> StartModesAsync(string? data = null, string? dshHome = null, FakeDshHost? host = null)
+    static async Task<(Service Service, FakeDshHost Host, string Data)> StartModesAsync(string? data = null, string? dshHome = null, FakeDshHost? host = null,
+        List<string>? log = null, TimeSpan? startTimeout = null)
     {
         host ??= new FakeDshHost();
         data ??= TestDirs.New();
@@ -52,6 +61,8 @@ public sealed partial class DshAdapterTests
             Instructions = "Peer instructions.",
             Launch = host.LaunchAsync,
             DshHome = dshHome ?? TestDirs.New(),
+            StartTimeout = startTimeout ?? TimeSpan.FromSeconds(30),
+            Log = log is null ? null : m => { lock (log) log.Add(m); },
         });
         var instance = await adapter.StartAsync(CancellationToken.None);
         var rpc = new JsonRpcConnection(instance.Input, instance.Output, "service");
@@ -351,6 +362,8 @@ public sealed partial class DshAdapterTests
         await Assert.ThrowsAsync<JsonRpcException>(() => PromptAsync(service, b));
 
         Assert.IsFalse(service.Instance.Exited.IsCompleted, "the adapter goes on");
+        var lost = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(service, b));
+        StringAssert.Contains(lost.Message, "full access DeepSeek Harness process stopped");
         var ran = false;
         host.ReadOnly.OnPrompt = _ => { ran = true; return Task.CompletedTask; };
         await PromptAsync(service, a);

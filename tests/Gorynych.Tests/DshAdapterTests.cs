@@ -37,6 +37,12 @@ sealed class FakeDsh(FakeDshStore? shared = null)
     /// <summary>A resume fails here, as DSH's would for a reason of its own.</summary>
     public bool ResumeFails { get; set; }
 
+    /// <summary>`initialize` is never answered, as by a DSH that hangs at boot.</summary>
+    public bool HangInitialize { get; set; }
+
+    /// <summary>Runs when a session is closed, before the answer.</summary>
+    public Func<string, Task>? OnClose { get; set; }
+
     public bool IsOpen(string sessionId)
     {
         lock (store) return open.Contains(sessionId);
@@ -97,6 +103,7 @@ sealed class FakeDsh(FakeDshStore? shared = null)
         switch (req.Method)
         {
             case AcpMethods.Agent.Initialize:
+                if (HangInitialize) await Task.Delay(Timeout.Infinite, ct);
                 return JsonNode.Parse("""
                     {"protocolVersion":1,"agentInfo":{"name":"deepseek-harness-acp","version":"0.0.1"},
                      "agentCapabilities":{"mcpCapabilities":{"http":true},"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false},
@@ -133,7 +140,18 @@ sealed class FakeDsh(FakeDshStore? shared = null)
                     open.Add(sessionId!);
                 }
                 return new JsonObject { ["configOptions"] = new JsonArray(JsonNode.Parse(ModelOption)) };
+            case "session/fork":
+                string fork;
+                lock (store)
+                {
+                    fork = $"s-{++store.Next}";
+                    store.Cwds[fork] = store.Cwds[sessionId!];
+                    store.Writers[fork] = this;
+                    open.Add(fork);
+                }
+                return new JsonObject { ["sessionId"] = fork, ["configOptions"] = new JsonArray(JsonNode.Parse(ModelOption)) };
             case AcpMethods.Agent.SessionClose:
+                if (OnClose is { } closing) await closing(sessionId!);
                 lock (store)
                 {
                     open.Remove(sessionId!);

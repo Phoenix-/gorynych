@@ -29,8 +29,16 @@ internal sealed class DshLane(DshMode mode, Stream input, Stream output, Task co
         lock (stopGate) return stopping ??= stop().AsTask();
     }
 
-    /// <summary>Set under the router's lock once the lane holds nothing and is being stopped; nothing new goes to it.</summary>
+    // The router's state of the lane, read and written under the router's lock.
+
+    /// <summary>Holds nothing and is being stopped: nothing new goes to it.</summary>
     public bool Stopping { get; set; }
+
+    /// <summary>Its output has ended: the process is gone.</summary>
+    public bool Ended { get; set; }
+
+    /// <summary>Switches that need the lane until they end; a held lane is not stopped as idle.</summary>
+    public int Holds { get; set; }
 }
 
 /// <summary>
@@ -42,13 +50,16 @@ internal sealed class DshLane(DshMode mode, Stream input, Stream output, Task co
 /// <item>sends a session's messages to the process that has it open, and a resume to the process of the mode Gorynych keeps for it;</item>
 /// <item>adds the <c>mode</c> config option, and switches a session's mode by closing it in one process and resuming it in the other;</item>
 /// <item>numbers DSH's own requests anew, so two processes' IDs never meet at the service;</item>
-/// <item>adds the sessions open in the second process to <c>session/list</c>.</item>
+/// <item>adds the sessions open in the second process to a one-page <c>session/list</c>.</item>
 /// </list>
 /// </summary>
 internal sealed class DshRouter
 {
     /// <summary>The IDs of the router's own requests to a process.</summary>
     const string OwnPrefix = "gorynych-dsh:";
+
+    /// <summary>ACP's unstable fork. DSH 0.2.2 does not offer it; a fork, should DSH answer one, runs where its parent does.</summary>
+    const string SessionFork = "session/fork";
 
     /// <summary>A service request sent to a process, kept until it is answered.</summary>
     readonly record struct Pending(DshLane Lane, string Method, string? SessionId, JsonNode? Params, DshPin? Pin);
@@ -73,18 +84,24 @@ internal sealed class DshRouter
     readonly Stream fromService, toService;
     readonly SemaphoreSlim serviceGate = new(1, 1);
     readonly Lock gate = new();
+    /// <summary>Per mode, its running process or the start of one.</summary>
     readonly Dictionary<DshMode, Task<DshLane>> lanes = [];
+    /// <summary>Every process started and not ended yet, also one still initializing.</summary>
+    readonly HashSet<DshLane> all = [];
     readonly Dictionary<string, Pending> pending = [];
     /// <summary>DSH's requests to the service, by the router's ID.</summary>
     readonly Dictionary<string, (DshLane Lane, JsonNode Id)> laneRequests = [];
     readonly Dictionary<(DshLane Lane, string Id), string> routerIds = [];
     readonly Dictionary<string, (DshLane Lane, TaskCompletionSource<JsonObject> Answer)> own = [];
     readonly Dictionary<string, Live> live = [];
+    /// <summary>Sessions that were open in a process that ended, with its mode, until they are opened again.</summary>
+    readonly Dictionary<string, DshMode> lost = [];
     readonly Dictionary<string, int> prompting = [];
     /// <summary>Per session, the work on its last message: the next one waits for it, so a session's messages keep their order.</summary>
     readonly Dictionary<string, Task> busy = [];
     readonly TaskCompletionSource done = new(TaskCreationOptions.RunContinuationsAsynchronously);
     JsonNode? initializeParams;
+    bool shuttingDown;
     long next;
 
     public DshRouter(DshAdapterOptions options, (Stream Input, Stream Output) service, DshLane main,
@@ -97,6 +114,7 @@ internal sealed class DshRouter
         this.modes = modes;
         this.pins = pins;
         lanes[main.Mode] = Task.FromResult(main);
+        all.Add(main);
     }
 
     /// <summary>Completes when the read-only process's output ends and everything from it has reached the service.</summary>
@@ -108,13 +126,22 @@ internal sealed class DshRouter
         _ = Task.Run(() => FromLaneAsync(main));
     }
 
-    /// <summary>Stops every process.</summary>
+    /// <summary>Stops every process, also one still starting; none starts after this.</summary>
     public async Task StopAsync()
     {
-        List<Task<DshLane>> all;
-        lock (gate) all = [.. lanes.Values];
-        foreach (var lane in all)
-            if (lane.IsCompletedSuccessfully) await lane.Result.StopAsync();
+        foreach (var lane in BeginShutdown())
+            try { await lane.StopAsync(); }
+            catch (Exception e) { options.Log?.Invoke($"dsh: stopping the {lane.Mode.Id} process failed: {e.Message}"); }
+    }
+
+    /// <summary>From now on no process starts; the ones there are.</summary>
+    List<DshLane> BeginShutdown()
+    {
+        lock (gate)
+        {
+            shuttingDown = true;
+            return [.. all];
+        }
     }
 
     // ---------------------------------------------------------------- service -> DSH
@@ -142,12 +169,10 @@ internal sealed class DshRouter
         }
         finally
         {
-            // The service let go: each process's stdin ends, and each DSH exits.
-            List<Task<DshLane>> all;
-            lock (gate) all = [.. lanes.Values];
-            foreach (var lane in all)
-                if (lane.IsCompletedSuccessfully)
-                    try { await lane.Result.Output.DisposeAsync(); } catch (Exception e) when (e is IOException or ObjectDisposedException) { }
+            // The service let go: each process's stdin ends, and each DSH exits. One still
+            // starting sees the shutdown and stops itself.
+            foreach (var lane in BeginShutdown())
+                try { await lane.Output.DisposeAsync(); } catch (Exception e) when (e is IOException or ObjectDisposedException) { }
         }
     }
 
@@ -183,13 +208,16 @@ internal sealed class DshRouter
         }
         if (sessionId is null || method is AcpMethods.Agent.SessionNew or AcpMethods.Agent.SessionList)
         {
-            if (id is not null)
+            if (method == AcpMethods.Agent.Initialize && id is not null) initializeParams = message["params"]?.DeepClone();
+            var keep = method is AcpMethods.Agent.SessionNew or AcpMethods.Agent.SessionList ? message["params"]?.DeepClone() : null;
+            try
             {
-                if (method == AcpMethods.Agent.Initialize) initializeParams = message["params"]?.DeepClone();
-                var keep = method is AcpMethods.Agent.SessionNew or AcpMethods.Agent.SessionList ? message["params"]?.DeepClone() : null;
-                lock (gate) pending[Key(id)] = new Pending(main, method, null, keep, null);
+                await SendToAsync(main, message, id, new Pending(main, method, null, keep, null));
             }
-            await ToLaneAsync(main, message);
+            catch (Exception e) when (id is not null && e is not OperationCanceledException)
+            {
+                await TryToServiceAsync(Error(id, e is JsonRpcException j ? j.Code : JsonRpcException.InternalError, e.Message));
+            }
             return;
         }
         // A session's messages wait for the work on its earlier ones (a switch, a process starting).
@@ -218,43 +246,98 @@ internal sealed class DshRouter
         {
             // A process that stopped under the message counts too: the service must not wait for an answer.
             options.Log?.Invoke($"dsh {sessionId}: {method} failed in the adapter: {e.Message}");
-            if (id is not null)
-                try { await ToServiceAsync(Error(id, e is JsonRpcException j ? j.Code : JsonRpcException.InternalError, e.Message)); }
-                catch (Exception gone) when (gone is IOException or ObjectDisposedException) { }
+            if (id is not null) await TryToServiceAsync(Error(id, e is JsonRpcException j ? j.Code : JsonRpcException.InternalError, e.Message));
         }
     }
 
     async Task SessionMessageAsync(JsonObject message, JsonNode? id, string method, string sessionId)
     {
+        DshLane? open;
+        DshMode? gone;
+        lock (gate)
+        {
+            open = live.GetValueOrDefault(sessionId)?.Lane;
+            gone = open is null && lost.TryGetValue(sessionId, out var m) ? m : null;
+        }
         if (method is AcpMethods.Agent.SessionResume or AcpMethods.Agent.SessionLoad)
         {
+            if (open is not null)
+            {
+                // Open already: the process that has it answers, as DSH does to a second resume.
+                await SendToAsync(open, message, id, new Pending(open, method, sessionId, message["params"]?.DeepClone(), null));
+                return;
+            }
             // A session DSH pinned runs as pinned in any process; it goes to the one of its pin.
             var pin = pins.Read(sessionId);
             var mode = (pin is null ? null : DshModes.Of(pin)) ?? modes.Get(sessionId);
-            await SendAsync(mode, message, id is null ? null : lane => new Pending(lane, method, sessionId, message["params"]?.DeepClone(), pin));
+            var lane = await ReserveAsync(mode, l =>
+            {
+                lost.Remove(sessionId);
+                if (id is not null) pending[Key(id)] = new Pending(l, method, sessionId, message["params"]?.DeepClone(), pin);
+            });
+            await SendToAsync(lane, message, id, null);
             return;
+        }
+        if (open is null && gone is not null)
+        {
+            if (id is null) return; // a cancel for a turn that ended with its process
+            if (method == AcpMethods.Agent.SessionClose)
+            {
+                lock (gate) lost.Remove(sessionId);
+                await ToServiceAsync(Result(id, []));
+                return;
+            }
+            throw new JsonRpcException(JsonRpcException.InternalError,
+                $"The {gone.Name.ToLowerInvariant()} DeepSeek Harness process stopped, and this session with it; open the session again.");
         }
         DshLane target;
         lock (gate)
-            target = live.TryGetValue(sessionId, out var open) ? open.Lane
-                : lanes.TryGetValue(modes.Get(sessionId), out var started) && started.IsCompletedSuccessfully && !started.Result.Stopping ? started.Result
-                : main;
-        lock (gate)
-        {
-            if (id is not null) pending[Key(id)] = new Pending(target, method, sessionId, null, null);
-            if (id is not null && method == AcpMethods.Agent.SessionPrompt) prompting[sessionId] = prompting.GetValueOrDefault(sessionId) + 1;
-        }
-        await ToLaneAsync(target, message);
+            target = open
+                ?? (lanes.TryGetValue(modes.Get(sessionId), out var started) && started.IsCompletedSuccessfully && !started.Result.Stopping
+                    ? started.Result : main);
+        var keep = method == SessionFork ? message["params"]?.DeepClone() : null;
+        await SendToAsync(target, message, id, new Pending(target, method, sessionId, keep, null));
     }
 
-    /// <summary>Sends a request or notification to the process of <paramref name="mode"/>, starting it if needed.</summary>
-    async Task SendAsync(DshMode mode, JsonObject message, Func<DshLane, Pending>? track)
+    /// <summary>
+    /// Writes a service message to a process, with the request noted as pending (and a prompt as a
+    /// running turn) unless <paramref name="track"/> is null. A write that fails takes both back.
+    /// </summary>
+    async Task SendToAsync(DshLane lane, JsonObject message, JsonNode? id, Pending? track)
     {
-        var lane = await ReserveAsync(mode, l =>
+        var key = id is null ? null : Key(id);
+        var turn = track?.Method == AcpMethods.Agent.SessionPrompt && track.Value.SessionId is not null ? track.Value.SessionId : null;
+        lock (gate)
         {
-            if (track is not null && message["id"] is { } id) pending[Key(id)] = track(l);
-        });
-        await ToLaneAsync(lane, message);
+            if (lane.Ended)
+            {
+                // A request noted before the process ended was answered by its end already.
+                if (key is not null && track is null && !pending.Remove(key)) return;
+                throw new JsonRpcException(JsonRpcException.InternalError, $"The {lane.Mode.Name.ToLowerInvariant()} DeepSeek Harness process stopped.");
+            }
+            if (key is not null && track is { } p) pending[key] = p;
+            if (key is not null && turn is not null) prompting[turn] = prompting.GetValueOrDefault(turn) + 1;
+        }
+        try
+        {
+            await ToLaneAsync(lane, message);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            lock (gate)
+            {
+                if (key is not null && !pending.Remove(key)) return; // answered by the process's end
+                if (key is not null && turn is not null) EndTurn(turn);
+            }
+            throw;
+        }
+    }
+
+    /// <summary>A prompt of the session ended. Called under the lock.</summary>
+    void EndTurn(string sessionId)
+    {
+        if (prompting.GetValueOrDefault(sessionId) is > 1 and var n) prompting[sessionId] = n - 1;
+        else prompting.Remove(sessionId);
     }
 
     /// <summary>
@@ -268,6 +351,7 @@ internal sealed class DshRouter
             Task<DshLane> starting;
             lock (gate)
             {
+                if (shuttingDown) throw new JsonRpcException(JsonRpcException.InternalError, "DeepSeek Harness is stopping.");
                 if (!lanes.TryGetValue(mode, out starting!) || starting.IsFaulted || starting.IsCanceled
                     || (starting.IsCompletedSuccessfully && starting.Result.Stopping))
                     lanes[mode] = starting = Task.Run(() => StartLaneAsync(mode));
@@ -286,25 +370,57 @@ internal sealed class DshRouter
     {
         options.Log?.Invoke($"dsh: starting the {mode.Name.ToLowerInvariant()} process");
         var lane = await startLane(mode);
-        _ = Task.Run(() => FromLaneAsync(lane));
-        var init = await RequestAsync(lane, AcpMethods.Agent.Initialize, initializeParams?.DeepClone() ?? new JsonObject { ["protocolVersion"] = 1 });
-        if (init["error"] is JsonObject error)
+        bool late;
+        lock (gate)
+        {
+            late = shuttingDown;
+            if (!late) all.Add(lane);
+        }
+        if (late)
         {
             await lane.StopAsync();
-            throw new JsonRpcException(JsonRpcException.InternalError, $"DeepSeek Harness ({mode.Name}) did not start: {Str(error["message"])}");
+            throw new JsonRpcException(JsonRpcException.InternalError, "DeepSeek Harness is stopping.");
         }
-        return lane;
+        _ = Task.Run(() => FromLaneAsync(lane));
+        var asking = RequestAsync(lane, AcpMethods.Agent.Initialize, initializeParams?.DeepClone() ?? new JsonObject { ["protocolVersion"] = 1 });
+        string? failure = null;
+        if (await Task.WhenAny(asking, Task.Delay(options.StartTimeout)) != asking)
+            failure = $"no answer to initialize within {options.StartTimeout.TotalSeconds:0} s";
+        else if ((await asking)["error"] is JsonObject error)
+            failure = Str(error["message"]) ?? "initialize failed";
+        if (failure is null) return lane;
+        lock (gate) lane.Stopping = true;
+        await lane.StopAsync();
+        throw new JsonRpcException(JsonRpcException.InternalError, $"DeepSeek Harness ({mode.Name.ToLowerInvariant()}) did not start: {failure}");
     }
 
-    /// <summary>The router's own request to a process, answered to the router alone.</summary>
+    /// <summary>
+    /// The router's own request to a process, answered to the router alone. A process that is gone,
+    /// or cannot be written to, answers with an error.
+    /// </summary>
     async Task<JsonObject> RequestAsync(DshLane lane, string method, JsonNode? @params)
     {
         var id = OwnPrefix + Interlocked.Increment(ref next);
         var answer = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
-        lock (gate) own[id] = (lane, answer);
-        await ToLaneAsync(lane, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["method"] = method, ["params"] = @params });
+        lock (gate)
+        {
+            if (lane.Ended) return Gone(id, lane);
+            own[id] = (lane, answer);
+        }
+        try
+        {
+            await ToLaneAsync(lane, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["method"] = method, ["params"] = @params });
+        }
+        catch (Exception e) when (e is IOException or ObjectDisposedException)
+        {
+            lock (gate) own.Remove(id);
+            return Gone(id, lane);
+        }
         return await answer.Task;
     }
+
+    static JsonObject Gone(string id, DshLane lane) =>
+        Error(id, JsonRpcException.InternalError, $"The {lane.Mode.Name.ToLowerInvariant()} DeepSeek Harness process stopped.");
 
     /// <summary>The service's answer to one of DSH's requests goes back to its process, with DSH's ID.</summary>
     async Task AnswerToLaneAsync(JsonObject message, JsonNode id)
@@ -317,7 +433,8 @@ internal sealed class DshRouter
             routerIds.Remove((request.Lane, Key(request.Id)));
         }
         message["id"] = request.Id.DeepClone();
-        await ToLaneAsync(request.Lane, message);
+        try { await ToLaneAsync(request.Lane, message); }
+        catch (Exception e) when (e is IOException or ObjectDisposedException) { } // the process is gone, and its question with it
     }
 
     // ---------------------------------------------------------------- switching
@@ -325,6 +442,8 @@ internal sealed class DshRouter
     /// <summary>
     /// <c>session/set_config_option</c> for <c>mode</c>: the session is closed in its process and resumed in
     /// the other one (DSH's resume brings back its model and effort). A session DSH pinned cannot switch.
+    /// Read-only is saved before the switch: a session must never stay full access on disk while the
+    /// client shows it read-only. Full access is saved after; a failure there only loses the choice.
     /// </summary>
     async Task SwitchAsync(JsonObject message, JsonNode id, string sessionId)
     {
@@ -355,51 +474,110 @@ internal sealed class DshRouter
             throw new JsonRpcException(JsonRpcException.InvalidParams, "A turn of this session is running; switch the mode once it has ended.");
 
         var from = open.Lane;
-        await ReserveAsync(target, _ => { }); // started first: a process that cannot start leaves the session where it is
-        var closed = await RequestAsync(from, AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = sessionId });
-        if (closed["error"] is JsonObject closeError)
-            options.Log?.Invoke($"dsh {sessionId}: close in the {from.Mode.Id} process failed ({Str(closeError["message"])}); DSH lets the session go anyway");
-        lock (gate) if (live.GetValueOrDefault(sessionId) == open) live.Remove(sessionId);
-        var resume = new JsonObject { ["sessionId"] = sessionId, ["cwd"] = open.Cwd, ["mcpServers"] = open.McpServers?.DeepClone() ?? new JsonArray() };
-        var resumed = await ResumeInAsync(target, resume);
-        if (resumed.Answer["error"] is JsonObject error)
+        var held = new List<DshLane>();
+        void Hold(DshLane lane) // under the lock
         {
-            // Back where it was, so the session stays usable; the client hears why the switch failed.
-            var back = await ResumeInAsync(from.Mode, resume.DeepClone().AsObject());
-            if (back.Answer["result"] is JsonObject backResult) Open(sessionId, back.Lane, open.Cwd, open.McpServers, null, backResult);
-            else options.Log?.Invoke($"dsh {sessionId}: could not resume it in the {from.Mode.Id} process either: {Str(back.Answer["error"]?["message"])}");
-            StopIfIdle(resumed.Lane);
-            await ToServiceAsync(Error(id, JsonRpcException.InternalError,
-                $"DeepSeek Harness could not open this session in {target.Name.ToLowerInvariant()} mode: {Str(error["message"]) ?? "no reason given"}"));
-            return;
+            lane.Holds++;
+            held.Add(lane);
         }
-        var opened = Open(sessionId, resumed.Lane, open.Cwd, open.McpServers, null, resumed.Answer["result"] as JsonObject);
+        var closed = false;
+        var lowering = target == DshModes.ReadOnly;
         try
         {
-            modes.Set(sessionId, target);
+            lock (gate) Hold(from);
+            await ReserveAsync(target, Hold); // started first: a process that cannot start leaves the session where it is
+            if (lowering)
+                try
+                {
+                    modes.Set(sessionId, target);
+                }
+                catch (IOException e)
+                {
+                    throw new JsonRpcException(JsonRpcException.InternalError,
+                        $"Gorynych could not save this session as read-only ({e.Message}), so it stays in full access.");
+                }
+
+            var answer = await RequestAsync(from, AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = sessionId });
+            if (answer["error"] is JsonObject closeError)
+                options.Log?.Invoke($"dsh {sessionId}: close in the {from.Mode.Id} process failed ({Str(closeError["message"])}); DSH lets the session go anyway");
+            lock (gate) if (live.GetValueOrDefault(sessionId) == open) live.Remove(sessionId);
+            closed = true;
+
+            var resume = new JsonObject { ["sessionId"] = sessionId, ["cwd"] = open.Cwd, ["mcpServers"] = open.McpServers?.DeepClone() ?? new JsonArray() };
+            var (resumed, opened, why) = await ResumeInAsync(target, resume, open, Hold);
+            if (opened is null)
+            {
+                // Back where it was, so the session stays usable; the client hears why the switch failed.
+                var (_, back, whyNot) = await ResumeInAsync(from.Mode, resume.DeepClone().AsObject(), open, Hold);
+                if (back is not null)
+                {
+                    closed = false;
+                    if (lowering) TrySave(sessionId, from.Mode);
+                }
+                else options.Log?.Invoke($"dsh {sessionId}: could not resume it in the {from.Mode.Id} process either: {whyNot}");
+                await ToServiceAsync(Error(id, JsonRpcException.InternalError,
+                    $"DeepSeek Harness could not open this session in {target.Name.ToLowerInvariant()} mode: {why}"));
+                return;
+            }
+            closed = false;
+            if (!lowering && !TrySave(sessionId, target))
+                options.Log?.Invoke($"dsh {sessionId}: full access was not saved; the session opens read-only next time");
+            options.Log?.Invoke($"dsh {sessionId}: now {target.Id}");
+            await ToServiceAsync(Result(id, Options(opened, target)));
+        }
+        catch when (closed)
+        {
+            // Closed in its process and open nowhere: back where it was before the error is answered.
+            var resume = new JsonObject { ["sessionId"] = sessionId, ["cwd"] = open.Cwd, ["mcpServers"] = open.McpServers?.DeepClone() ?? new JsonArray() };
+            try
+            {
+                var (_, back, whyNot) = await ResumeInAsync(from.Mode, resume, open, Hold);
+                if (back is null) options.Log?.Invoke($"dsh {sessionId}: could not resume it in the {from.Mode.Id} process: {whyNot}");
+                else if (lowering) TrySave(sessionId, from.Mode);
+            }
+            catch (Exception e)
+            {
+                options.Log?.Invoke($"dsh {sessionId}: could not resume it in the {from.Mode.Id} process: {e.Message}");
+            }
+            throw;
+        }
+        finally
+        {
+            lock (gate) foreach (var lane in held) lane.Holds--;
+            foreach (var lane in held.Distinct()) StopIfIdle(lane);
+        }
+    }
+
+    /// <summary>
+    /// A <c>session/resume</c> of the router's own in the process of <paramref name="mode"/>, held for the
+    /// switch. On success the session is open there (registered with its answer); otherwise the reason.
+    /// </summary>
+    async Task<(JsonObject? Answer, Live? Opened, string Why)> ResumeInAsync(DshMode mode, JsonObject resume, Live was, Action<DshLane> hold)
+    {
+        var lane = await ReserveAsync(mode, hold);
+        var answer = await RequestAsync(lane, AcpMethods.Agent.SessionResume, resume);
+        if (answer["result"] is not JsonObject result) return (answer, null, Str(answer["error"]?["message"]) ?? "no reason given");
+        var opened = Opened(lane, was.Cwd, was.McpServers, null, result);
+        lock (gate) live[Str(resume["sessionId"])!] = opened;
+        return (answer, opened, "");
+    }
+
+    bool TrySave(string sessionId, DshMode mode)
+    {
+        try
+        {
+            modes.Set(sessionId, mode);
+            return true;
         }
         catch (IOException e)
         {
-            options.Log?.Invoke($"dsh {sessionId}: {e.Message}; the session opens read-only next time");
+            options.Log?.Invoke($"dsh {sessionId}: {e.Message}");
+            return false;
         }
-        options.Log?.Invoke($"dsh {sessionId}: now {target.Id}");
-        StopIfIdle(from);
-        await ToServiceAsync(Result(id, Options(opened, target)));
     }
 
-    /// <summary>A <c>session/resume</c> of the router's own in the process of <paramref name="mode"/>; the answer carries the lane.</summary>
-    async Task<(JsonObject Answer, DshLane Lane)> ResumeInAsync(DshMode mode, JsonObject resume)
-    {
-        var lane = await ReserveAsync(mode, _ => { });
-        return (await RequestAsync(lane, AcpMethods.Agent.SessionResume, resume), lane);
-    }
-
-    Live Open(string sessionId, DshLane lane, string cwd, JsonNode? mcpServers, DshPin? pin, JsonObject? result)
-    {
-        var opened = new Live(lane, cwd, mcpServers?.DeepClone(), pin) { ConfigOptions = OwnOptions(result) };
-        lock (gate) live[sessionId] = opened;
-        return opened;
-    }
+    static Live Opened(DshLane lane, string cwd, JsonNode? mcpServers, DshPin? pin, JsonObject? result) =>
+        new(lane, cwd, mcpServers?.DeepClone(), pin) { ConfigOptions = OwnOptions(result) };
 
     /// <summary>DSH's options from a result, without a mode option.</summary>
     static JsonArray? OwnOptions(JsonObject? holder) =>
@@ -422,7 +600,7 @@ internal sealed class DshRouter
         if (lane == main) return;
         lock (gate)
         {
-            if (lane.Stopping
+            if (lane.Stopping || lane.Holds > 0
                 || live.Values.Any(s => s.Lane == lane)
                 || pending.Values.Any(p => p.Lane == lane)
                 || own.Values.Any(o => o.Lane == lane)
@@ -504,8 +682,9 @@ internal sealed class DshRouter
         {
             Live? open;
             lock (gate) open = live.GetValueOrDefault(sessionId);
+            if (open is not null && open.Lane != lane) return; // from a process that no longer has the session
             if (open is not null) open.ConfigOptions = OwnOptions(update);
-            DshModes.AddTo(update, open?.Lane.Mode ?? lane.Mode, open?.Pin);
+            DshModes.AddTo(update, lane.Mode, open?.Pin);
         }
         await ToServiceAsync(message);
     }
@@ -513,7 +692,10 @@ internal sealed class DshRouter
     async Task AnswerFromLaneAsync(DshLane lane, JsonObject message, JsonNode id)
     {
         var key = Key(id);
+        var result = message["result"] as JsonObject;
         Pending request;
+        Live? open;
+        string? forked = null;
         lock (gate)
         {
             if (Str(id) is { } ownId && ownId.StartsWith(OwnPrefix, StringComparison.Ordinal))
@@ -522,49 +704,65 @@ internal sealed class DshRouter
                 return;
             }
             if (!pending.Remove(key, out request)) request = default;
+            var sessionId = request.SessionId;
+            // A session that opens is registered together with its request's end, so no stop of an idle process comes in between.
+            switch (request.Method)
+            {
+                case AcpMethods.Agent.SessionNew when result is not null && Str(result["sessionId"]) is { } created:
+                    live[created] = Opened(lane, Str(request.Params?["cwd"]) ?? "", request.Params?["mcpServers"], null, result);
+                    break;
+                case AcpMethods.Agent.SessionResume or AcpMethods.Agent.SessionLoad when result is not null && sessionId is not null:
+                    if (!live.ContainsKey(sessionId))
+                        live[sessionId] = Opened(lane, Str(request.Params?["cwd"]) ?? "", request.Params?["mcpServers"], request.Pin, result);
+                    break;
+                case SessionFork when result is not null && Str(result["sessionId"]) is { } fork && sessionId is not null:
+                    var parent = live.GetValueOrDefault(sessionId);
+                    live[fork] = Opened(lane, Str(request.Params?["cwd"]) ?? parent?.Cwd ?? "", request.Params?["mcpServers"] ?? parent?.McpServers, null, result);
+                    forked = fork;
+                    break;
+                case AcpMethods.Agent.SessionPrompt when sessionId is not null:
+                    EndTurn(sessionId);
+                    break;
+            }
+            open = sessionId is null ? null : live.GetValueOrDefault(sessionId);
         }
-        var result = message["result"] as JsonObject;
-        var sessionId = request.SessionId;
         switch (request.Method)
         {
-            case AcpMethods.Agent.SessionNew when result is not null && Str(result["sessionId"]) is { } created:
-                Open(created, lane, Str(request.Params?["cwd"]) ?? "", request.Params?["mcpServers"], null, result);
-                DshModes.AddTo(result, lane.Mode, null);
-                break;
-            case AcpMethods.Agent.SessionResume or AcpMethods.Agent.SessionLoad when result is not null && sessionId is not null:
-                Open(sessionId, lane, Str(request.Params?["cwd"]) ?? "", request.Params?["mcpServers"], request.Pin, result);
+            case AcpMethods.Agent.SessionNew or AcpMethods.Agent.SessionResume or AcpMethods.Agent.SessionLoad when result is not null:
                 DshModes.AddTo(result, lane.Mode, request.Pin);
                 break;
-            case AcpMethods.Agent.SessionSetConfigOption when result is not null && sessionId is not null:
-                Live? open;
-                lock (gate) open = live.GetValueOrDefault(sessionId);
-                if (open is not null) open.ConfigOptions = OwnOptions(result);
-                DshModes.AddTo(result, open?.Lane.Mode ?? lane.Mode, open?.Pin);
+            case SessionFork when result is not null && forked is not null:
+                // A fork runs in the process of its parent, so it has its parent's mode.
+                if (lane.Mode != DshModes.ReadOnly && !TrySave(forked, lane.Mode))
+                    options.Log?.Invoke($"dsh {forked}: full access was not saved; the fork opens read-only next time");
+                DshModes.AddTo(result, lane.Mode, null);
                 break;
-            case AcpMethods.Agent.SessionList when (result?["sessions"]) is JsonArray sessions && (request.Params?["cursor"]) is null:
+            case AcpMethods.Agent.SessionSetConfigOption when result is not null:
+                if (open is not null && open.Lane == lane) open.ConfigOptions = OwnOptions(result);
+                DshModes.AddTo(result, lane.Mode, open?.Lane == lane ? open.Pin : null);
+                break;
+            case AcpMethods.Agent.SessionList when (result?["sessions"]) is JsonArray sessions
+                && (request.Params?["cursor"]) is null && (result?["nextCursor"]) is null:
                 MergeOthers(sessions, Str(request.Params?["cwd"]));
                 break;
-            case AcpMethods.Agent.SessionPrompt when sessionId is not null:
-                lock (gate)
-                    if (prompting.GetValueOrDefault(sessionId) is > 1 and var n) prompting[sessionId] = n - 1;
-                    else prompting.Remove(sessionId);
-                break;
         }
-        if (sessionId is not null
+        if (request.SessionId is { } ended
             && (request.Method == AcpMethods.Agent.SessionClose
                 || (Str(message["error"]?["message"]) ?? "").Contains("unknown session", StringComparison.OrdinalIgnoreCase)))
         {
             // DSH lets go of a session even when its close fails.
             lock (gate)
-                if (live.TryGetValue(sessionId, out var open) && open.Lane == lane) live.Remove(sessionId);
+                if (live.TryGetValue(ended, out var gone) && gone.Lane == lane) live.Remove(ended);
             StopIfIdle(lane);
         }
         await ToServiceAsync(message);
     }
 
     /// <summary>
-    /// The read-only process lists every session DSH keeps but those open in itself, which its proxy
-    /// adds; the sessions open in the other process are added here, once, on the first page.
+    /// DSH lists every session it keeps but those open in its own process: the read-only process's
+    /// proxy adds its own, and the full-access process's open sessions are on the read-only list
+    /// already, on whichever page. Only a list that fits one page is complete enough to add those
+    /// it still leaves out without listing one twice.
     /// </summary>
     void MergeOthers(JsonArray sessions, string? cwd)
     {
@@ -590,6 +788,8 @@ internal sealed class DshRouter
         lock (gate)
         {
             lane.Stopping = true;
+            lane.Ended = true;
+            all.Remove(lane);
             if (lanes.TryGetValue(lane.Mode, out var t) && t.IsCompletedSuccessfully && t.Result == lane) lanes.Remove(lane.Mode);
             foreach (var (key, p) in pending.Where(kv => kv.Value.Lane == lane).ToList())
             {
@@ -605,37 +805,28 @@ internal sealed class DshRouter
             foreach (var (ownId, o) in own.Where(kv => kv.Value.Lane == lane).ToList())
             {
                 own.Remove(ownId);
-                o.Answer.TrySetResult(Error(ownId, JsonRpcException.InternalError, "DeepSeek Harness stopped."));
+                o.Answer.TrySetResult(Gone(ownId, lane));
             }
             foreach (var sessionId in live.Where(kv => kv.Value.Lane == lane).Select(kv => kv.Key).ToList())
             {
                 live.Remove(sessionId);
                 prompting.Remove(sessionId);
+                if (lane != main) lost[sessionId] = lane.Mode;
             }
         }
-        try
-        {
-            foreach (var requestId in withdrawn)
-                await ToServiceAsync(new JsonObject
-                {
-                    ["jsonrpc"] = "2.0",
-                    ["method"] = AcpMethods.Protocol.CancelRequest,
-                    ["params"] = new JsonObject { ["requestId"] = requestId },
-                });
-            foreach (var requestId in failed)
-                await ToServiceAsync(Error(requestId, JsonRpcException.InternalError, $"DeepSeek Harness ({lane.Mode.Name.ToLowerInvariant()}) stopped."));
-        }
-        catch (Exception e) when (e is IOException or ObjectDisposedException)
-        {
-        }
+        foreach (var requestId in withdrawn)
+            await TryToServiceAsync(new JsonObject
+            {
+                ["jsonrpc"] = "2.0",
+                ["method"] = AcpMethods.Protocol.CancelRequest,
+                ["params"] = new JsonObject { ["requestId"] = requestId },
+            });
+        foreach (var requestId in failed)
+            await TryToServiceAsync(Error(requestId, JsonRpcException.InternalError, $"The {lane.Mode.Name.ToLowerInvariant()} DeepSeek Harness process stopped."));
         if (lane != main) return;
         try
         {
             await StopAsync();
-        }
-        catch (Exception e)
-        {
-            options.Log?.Invoke($"dsh: stopping the processes failed: {e.Message}");
         }
         finally
         {
@@ -664,6 +855,12 @@ internal sealed class DshRouter
     }
 
     Task ToServiceAsync(JsonObject message) => ToServiceAsync(message.ToJsonString(Wire));
+
+    async Task TryToServiceAsync(JsonObject message)
+    {
+        try { await ToServiceAsync(message); }
+        catch (Exception e) when (e is IOException or ObjectDisposedException) { }
+    }
 
     async Task ToServiceAsync(string line)
     {

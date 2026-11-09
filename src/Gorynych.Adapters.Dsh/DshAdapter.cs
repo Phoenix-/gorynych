@@ -41,6 +41,9 @@ public sealed class DshAdapterOptions
     /// </summary>
     public string? DshHome { get; init; }
 
+    /// <summary>How long the full-access process may take to answer <c>initialize</c> before it is stopped (it takes about 4 s).</summary>
+    public TimeSpan StartTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
     public Action<string>? Log { get; init; }
 }
 
