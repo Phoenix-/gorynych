@@ -319,7 +319,7 @@ internal sealed partial class ClaudeSession : IClaudeSession
         {
             var meta = new JsonObject { [Gorynych.Acp.Hosting.GorynychProtocol.MetaAgentTurn] = "ended" };
             // Its end carries the transcript's mark: the service's journal holds the turn now.
-            if (agent.MarkMeta(this)?[Gorynych.Acp.Hosting.GorynychProtocol.MetaHistoryMark] is { } history)
+            if ((await agent.MarkMetaAsync(this))?[Gorynych.Acp.Hosting.GorynychProtocol.MetaHistoryMark] is { } history)
                 meta[Gorynych.Acp.Hosting.GorynychProtocol.MetaHistoryMark] = history.DeepClone();
             await agent.EmitAsync(Id, new SessionInfoUpdate
             {

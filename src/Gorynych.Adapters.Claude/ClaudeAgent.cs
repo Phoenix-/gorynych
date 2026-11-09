@@ -213,10 +213,12 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 var session = Session(p.SessionId, p.Cwd);
                 if (p.McpServers is { } servers) session.McpServers = servers;
                 session.SystemPrompt = systemPrompt; // it applies per request: none now means none
-                var resumed = AcpJson.ToNode(new ResumeSessionResponse { ConfigOptions = ConfigOptionsOf(session) })!.AsObject();
-                if (p.Meta?[GorynychProtocol.MetaReplayFrom] is JsonObject from && await ReplayAsync(session, from) is { } replayed)
-                    resumed["_meta"] = new JsonObject { [GorynychProtocol.MetaReplay] = replayed };
-                return resumed;
+                var replayed = p.Meta?[GorynychProtocol.MetaReplayFrom] is JsonObject from ? await ReplayAsync(session, from) : null;
+                return AcpJson.ToNode(new ResumeSessionResponse
+                {
+                    ConfigOptions = ConfigOptionsOf(session),
+                    Meta = replayed is null ? null : new JsonObject { [GorynychProtocol.MetaReplay] = replayed },
+                });
             }
             case AcpMethods.Agent.SessionPrompt:
             {
@@ -228,7 +230,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 var stop = await session.PromptAsync(p.Prompt,
                     () => cancelledAt.TryGetValue(session.Id, out var at) && at > sequence, ct);
                 state.Update(session.Id, session.Cwd, r => r.UpdatedAt = DateTimeOffset.UtcNow);
-                return AcpJson.ToNode(new PromptResponse { StopReason = stop, Meta = MarkMeta(session) });
+                return AcpJson.ToNode(new PromptResponse { StopReason = stop, Meta = await MarkMetaAsync(session) });
             }
             case AcpMethods.Agent.SessionSetConfigOption:
             {
@@ -271,10 +273,31 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     /// <summary>
     /// <c>_meta</c> with the transcript's mark (<c>gorynych/historyMark</c>) at the end of a turn: the
-    /// service's journal now holds the conversation up to there. Null when there is no transcript.
+    /// service's journal now holds the conversation up to there. Claude may still be writing the
+    /// turn's last entries when its result comes, so the mark is taken once two reads 50 ms apart
+    /// agree (at most half a second). Null when there is no transcript; it never fails the turn.
     /// </summary>
-    public JsonObject? MarkMeta(IClaudeSession session) =>
-        TranscriptHistory.Mark(TranscriptOf(session)) is { } mark ? new JsonObject { [GorynychProtocol.MetaHistoryMark] = mark } : null;
+    public async Task<JsonObject?> MarkMetaAsync(IClaudeSession session)
+    {
+        try
+        {
+            var path = TranscriptOf(session);
+            var mark = TranscriptHistory.Mark(path);
+            for (var i = 0; i < 10 && mark is not null; i++)
+            {
+                await Task.Delay(50);
+                var again = TranscriptHistory.Mark(path);
+                if (again == mark) break;
+                mark = again;
+            }
+            return mark is null ? null : new JsonObject { [GorynychProtocol.MetaHistoryMark] = mark };
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            Log($"claude {session.Id}: the transcript's mark could not be taken: {e.Message}");
+            return null;
+        }
+    }
 
     /// <summary>
     /// Replays the session's conversation after the service's mark from Claude's transcript
@@ -285,13 +308,13 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     {
         var mark = (string?)from["type"] == GorynychProtocol.ReplayAfterMark ? (string?)from["mark"] : null;
         var path = TranscriptOf(session);
-        if (TranscriptHistory.Read(path, mark) is not { } replay)
+        var replay = await TranscriptHistory.ReadAsync(path, mark, update => rpc.SendUpdateAsync(session.Id, update), m => Log($"claude {session.Id}: {m}"));
+        if (replay is null)
         {
-            Log($"claude {session.Id}: no transcript at {path}; the service's journal is not caught up");
+            Log($"claude {session.Id}: no readable transcript at {path}; the service's journal is not caught up");
             return null;
         }
-        foreach (var update in replay.Updates) await rpc.SendUpdateAsync(session.Id, update);
-        Log($"claude {session.Id}: {replay.Updates.Count} updates replayed {(replay.FromMark ? "after the mark" : "from the start")} ({replay.BytesRead} bytes read)");
+        Log($"claude {session.Id}: {replay.Sent} updates replayed {(replay.FromMark ? "after the mark" : "from the start")} ({replay.BytesRead} bytes read)");
         return new JsonObject { ["from"] = replay.FromMark ? "mark" : "start", ["mark"] = replay.Mark };
     }
 

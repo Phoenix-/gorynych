@@ -14,6 +14,16 @@ public sealed class ClaudeTranscriptHistoryTests
 {
     static string NewTranscript() => Path.Combine(TestDirs.New(), "session.jsonl");
 
+    sealed record Got(bool FromMark, string? Mark, long BytesRead, List<SessionUpdate> Updates);
+
+    /// <summary>The replay with the updates it sent, or null when the transcript could not be read.</summary>
+    static Got? Read(string path, string? mark, long maxBytes = TranscriptHistory.MaxBytes)
+    {
+        var updates = new List<SessionUpdate>();
+        var replay = TranscriptHistory.ReadAsync(path, mark, u => { updates.Add(u); return Task.CompletedTask; }, maxBytes: maxBytes).GetAwaiter().GetResult();
+        return replay is null ? null : new Got(replay.FromMark, replay.Mark, replay.BytesRead, updates);
+    }
+
     static void Add(string path, params JsonObject[] entries) =>
         File.AppendAllText(path, string.Concat(entries.Select(e => e.ToJsonString() + "\n")));
 
@@ -80,7 +90,7 @@ public sealed class ClaudeTranscriptHistoryTests
             Assistant("a4", "u3", "msg_3", Text("There is one file.")),
             new JsonObject { ["type"] = "ai-title", ["aiTitle"] = "Files" }); // not part of the conversation
 
-        var replay = TranscriptHistory.Read(path, mark)!;
+        var replay = Read(path, mark)!;
 
         Assert.IsTrue(replay.FromMark);
         CollectionAssert.AreEqual(new[]
@@ -99,7 +109,7 @@ public sealed class ClaudeTranscriptHistoryTests
         Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")));
         var mark = TranscriptHistory.Mark(path)!;
 
-        var replay = TranscriptHistory.Read(path, mark)!;
+        var replay = Read(path, mark)!;
 
         Assert.AreEqual((true, mark, 0), (replay.FromMark, replay.Mark, replay.Updates.Count));
     }
@@ -112,7 +122,7 @@ public sealed class ClaudeTranscriptHistoryTests
         var mark = TranscriptHistory.Mark(path)!;
         Add(path, User("u3", "a1", "Instead"), Assistant("a3", "u3", "msg_3", Text("Another answer"))); // rewound to a1 in Claude Code
 
-        var replay = TranscriptHistory.Read(path, mark)!;
+        var replay = Read(path, mark)!;
 
         Assert.IsFalse(replay.FromMark);
         CollectionAssert.AreEqual(new[] { "user u1: First", "agent msg_1: Done", "user u3: Instead", "agent msg_3: Another answer" }, Seen(replay.Updates));
@@ -131,7 +141,7 @@ public sealed class ClaudeTranscriptHistoryTests
             User("u2", "s1", "Go on"),
             Assistant("a2", "u2", "msg_2", Text("Going on")));
 
-        var replay = TranscriptHistory.Read(path, mark)!;
+        var replay = Read(path, mark)!;
 
         Assert.IsTrue(replay.FromMark);
         CollectionAssert.AreEqual(new[] { "user u2: Go on", "agent msg_2: Going on" }, Seen(replay.Updates));
@@ -154,7 +164,7 @@ public sealed class ClaudeTranscriptHistoryTests
             Assistant("a2", "i1", "msg_2", Text("Answer")),
             sidechain); // after the conversation's last entry: not its end
 
-        var replay = TranscriptHistory.Read(path, mark)!;
+        var replay = Read(path, mark)!;
 
         CollectionAssert.AreEqual(new[] { "user u2: Real question", "agent msg_2: Answer" }, Seen(replay.Updates));
         StringAssert.StartsWith(replay.Mark, "a2@");
@@ -167,12 +177,12 @@ public sealed class ClaudeTranscriptHistoryTests
         Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")));
         File.AppendAllText(path, "{\"type\":\"user\",\"uuid\":\"u2\",\"parentUuid\":\"a1\",\"mess"); // being written
 
-        var replay = TranscriptHistory.Read(path, null)!;
+        var replay = Read(path, null)!;
 
         Assert.IsFalse(replay.FromMark);
         CollectionAssert.AreEqual(new[] { "user u1: First", "agent msg_1: Done" }, Seen(replay.Updates));
         StringAssert.StartsWith(replay.Mark, "a1@");
-        Assert.IsNull(TranscriptHistory.Read(Path.Combine(TestDirs.New(), "missing.jsonl"), null), "no transcript: not known");
+        Assert.IsNull(Read(Path.Combine(TestDirs.New(), "missing.jsonl"), null), "no transcript: not known");
         Assert.IsNull(TranscriptHistory.Mark(Path.Combine(TestDirs.New(), "missing.jsonl")));
     }
 
@@ -182,9 +192,65 @@ public sealed class ClaudeTranscriptHistoryTests
         var path = NewTranscript();
         Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")), User("u2", "a1", "Next"), Assistant("a2", "u2", "msg_2", Text("Ok")));
 
-        var replay = TranscriptHistory.Read(path, "a1@3")!; // a1, though its line is not at 3
+        var replay = Read(path, "a1@3")!; // a1, though its line is not at 3
 
         Assert.IsTrue(replay.FromMark);
         CollectionAssert.AreEqual(new[] { "user u2: Next", "agent msg_2: Ok" }, Seen(replay.Updates));
+    }
+
+    [TestMethod]
+    public void OnlyRemindersClaudeWroteIntoAMessage_AreLeftOut()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")));
+        var mark = TranscriptHistory.Mark(path)!;
+        var blocks = User("u3", "u2", "");
+        blocks["message"]!["content"] = new JsonArray(
+            new JsonObject { ["type"] = "text", ["text"] = "<system-reminder>\nThe todo list is empty.\n</system-reminder>" },
+            new JsonObject { ["type"] = "text", ["text"] = "Why does <system-reminder> show up in the log?" });
+        Add(path, User("u2", "a1", "<system-reminder>Files changed.</system-reminder>\nGo on"), blocks);
+
+        var replay = Read(path, mark)!;
+
+        CollectionAssert.AreEqual(new[] { "user u2: Go on", "user u3: Why does <system-reminder> show up in the log?" }, Seen(replay.Updates));
+    }
+
+    [TestMethod]
+    public void EntriesOfAnUnexpectedShape_AreLeftOut_AndTheRestReplayed()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")));
+        var mark = TranscriptHistory.Mark(path)!;
+        File.AppendAllText(path,
+            "{\"type\":\"user\",\"uuid\":5,\"parentUuid\":\"a1\"}\n" + // a uuid that is no string
+            "{\"type\":\"user\",\"uuid\":\"u2\",\"parentUuid\":\"a1\",\"isSidechain\":\"no\",\"message\":{\"content\":7}}\n" +
+            "[1,2,3]\n" +
+            "{\"type\":\"assistant\",\"uuid\":\"a2\",\"parentUuid\":\"u2\",\"message\":{\"id\":\"msg_2\",\"content\":\"not blocks\"}}\n");
+        Add(path, User("u3", "a2", "Still here"), Assistant("a3", "u3", "msg_3", Text("Yes")));
+
+        var replay = Read(path, mark)!;
+
+        CollectionAssert.AreEqual(new[] { "user u3: Still here", "agent msg_3: Yes" }, Seen(replay.Updates));
+    }
+
+    [TestMethod]
+    public void ATranscriptLargerThanACatchUpReads_IsNotRead()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, new string('x', 10_000)), Assistant("a1", "u1", "msg_1", Text("Done")));
+
+        Assert.IsNull(Read(path, null, maxBytes: 4096), "fails open: the service keeps its journal");
+    }
+
+    [TestMethod]
+    public void TheMark_IsFoundBackwardsPastLongLines()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text(new string('y', 300_000)))); // a line over several blocks
+        StringAssert.StartsWith(TranscriptHistory.Mark(path), "a1@");
+        Add(path, new JsonObject { ["type"] = "ai-title", ["aiTitle"] = new string('t', 200_000) });                      // not part of the conversation
+        var mark = TranscriptHistory.Mark(path)!;
+        StringAssert.StartsWith(mark, "a1@");
+        Assert.AreEqual(0, Read(path, mark)!.Updates.Count, "the mark's line is where it says");
     }
 }

@@ -764,12 +764,12 @@ internal sealed class HeadlessSession : IClaudeSession
         }
     }
 
-    Task MarkOwnTurnAsync(string mark)
+    async Task MarkOwnTurnAsync(string mark)
     {
         var meta = new JsonObject { [GorynychProtocol.MetaAgentTurn] = mark };
         // Its end carries the transcript's mark: the service's journal holds the turn now.
-        if (mark == "ended" && agent.MarkMeta(this)?[GorynychProtocol.MetaHistoryMark] is { } history) meta[GorynychProtocol.MetaHistoryMark] = history.DeepClone();
-        return EmitAsync(new SessionInfoUpdate { UpdatedAt = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture), Meta = meta });
+        if (mark == "ended" && (await agent.MarkMetaAsync(this))?[GorynychProtocol.MetaHistoryMark] is { } history) meta[GorynychProtocol.MetaHistoryMark] = history.DeepClone();
+        await EmitAsync(new SessionInfoUpdate { UpdatedAt = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture), Meta = meta });
     }
 
     /// <summary>Sends an update to the client; a client that is gone never breaks the turn bookkeeping.</summary>
