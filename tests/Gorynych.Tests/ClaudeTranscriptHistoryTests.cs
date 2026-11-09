@@ -187,6 +187,65 @@ public sealed class ClaudeTranscriptHistoryTests
     }
 
     [TestMethod]
+    public void TheMark_LeavesOutALastLineWithoutItsNewline_AsTheReplayDoes()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")));
+        var mark = TranscriptHistory.Mark(path)!;
+        File.AppendAllText(path, User("u2", "a1", "Next").ToJsonString()); // whole, but its newline not written yet
+
+        Assert.AreEqual(mark, TranscriptHistory.Mark(path));
+        var replay = Read(path, mark)!;
+        Assert.AreEqual((true, mark, 0), (replay.FromMark, replay.Mark, replay.Updates.Count));
+        File.AppendAllText(path, "\n");
+        StringAssert.StartsWith(TranscriptHistory.Mark(path), "u2@");
+        CollectionAssert.AreEqual(new[] { "user u2: Next" }, Seen(Read(path, mark)!.Updates));
+
+        var single = NewTranscript();
+        File.WriteAllText(single, User("u1", null, "First").ToJsonString());
+        Assert.IsNull(TranscriptHistory.Mark(single), "its only line is still being written");
+    }
+
+    [TestMethod]
+    public void AMarkWhoseLineMoved_FallsBackToTheWholeFile_WithTheWholeLimitForThatRead()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")), User("u2", "a1", "Next"), Assistant("a2", "u2", "msg_2", Text("Ok")));
+        var size = new FileInfo(path).Length;
+
+        var replay = Read(path, "a1@3", maxBytes: size)!; // read from 3, then all of it: more than the limit together
+
+        CollectionAssert.AreEqual(new[] { "user u2: Next", "agent msg_2: Ok" }, Seen(replay.Updates));
+        Assert.AreEqual(2 * size - 3, replay.BytesRead, "both reads are counted");
+    }
+
+    [TestMethod]
+    public async Task TheMarkAtATurnsEnd_WaitsForTheEntriesClaudeIsStillWriting()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")));
+        var waits = 0;
+
+        var mark = await TranscriptHistory.SettledMarkAsync(path, () =>
+        {
+            if (++waits == 1) Add(path, Assistant("a2", "a1", "msg_1", Text("And the rest"))); // written after the result came
+            return Task.CompletedTask;
+        });
+
+        StringAssert.StartsWith(mark, "a2@");
+        Assert.AreEqual(2, waits, "taken once two reads agree");
+
+        var growing = 0;
+        var last = await TranscriptHistory.SettledMarkAsync(path, () =>
+        {
+            Add(path, Assistant($"g{++growing}", growing == 1 ? "a2" : $"g{growing - 1}", "msg_1", Text("more")));
+            return Task.CompletedTask;
+        });
+        Assert.AreEqual((10, "g10@"), (growing, last?[..(last.IndexOf('@') + 1)]), "a transcript that keeps growing: the last mark after ten reads");
+        Assert.IsNull(await TranscriptHistory.SettledMarkAsync(Path.Combine(TestDirs.New(), "missing.jsonl"), () => throw new AssertFailedException("no wait without a mark")));
+    }
+
+    [TestMethod]
     public void AMarkWhoseLineMoved_IsFoundInTheFile()
     {
         var path = NewTranscript();

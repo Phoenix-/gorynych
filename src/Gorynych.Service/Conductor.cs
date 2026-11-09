@@ -547,9 +547,11 @@ public sealed class Conductor : IAsyncDisposable
             switch (plan.Kind)
             {
                 case HistoryCatchUp.Kind.Append:
-                    await feed.AppendHistoryAsync(plan.Updates);
+                    await feed.AppendHistoryAsync(plan.Updates, plan.Trimmed);
                     SetMark(feed, mark);
                     ServiceLog.Info($"{host.Name} {feed.SessionId}: {plan.Updates.Count} updates of its own history added to the journal ({plan.Why})");
+                    if (plan.Trimmed)
+                        ServiceLog.Warn($"{host.Name} {feed.SessionId}: its own history gained more than the journal keeps; only the last {plan.Updates.Count} updates were added, the journal is marked trimmed");
                     break;
                 case HistoryCatchUp.Kind.Replace:
                     await feed.ReplaceHistoryAsync(plan.Updates, options.Time.GetUtcNow(), mark, plan.Trimmed);

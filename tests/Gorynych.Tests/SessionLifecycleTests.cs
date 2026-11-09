@@ -905,7 +905,7 @@ sealed class LifecycleAgent
     /// <summary>The <c>gorynych/replayFrom</c> of every resume that had one.</summary>
     public List<(string SessionId, JsonNode ReplayFrom)> Replays { get; } = [];
 
-    void Record(string sessionId, string turn, string user, string? userId, string? answer)
+    void Record(string sessionId, string turn, string user, string? userId, string? answer, int answerChunks = 1)
     {
         var updates = new List<JsonObject>
         {
@@ -915,10 +915,11 @@ sealed class LifecycleAgent
         // Kimi replays a user message with a system reminder of its own after the text.
         if (LoadsWithoutIds) updates.Add(new JsonObject { ["sessionUpdate"] = "user_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = "<system-reminder> Plan mode is the exception. </system-reminder>" } });
         if (answer is not null)
-        {
-            updates.Add(new JsonObject { ["sessionUpdate"] = "agent_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = answer } });
-            if (KeepsHistory) updates[^1]["messageId"] = turn + "-answer";
-        }
+            for (var i = 0; i < answerChunks; i++) // the answer, then its further chunks of one message: " 1", " 2", …
+            {
+                updates.Add(new JsonObject { ["sessionUpdate"] = "agent_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = i == 0 ? answer : $" {i}" } });
+                if (KeepsHistory) updates[^1]["messageId"] = turn + "-answer";
+            }
         lock (history)
         {
             if (!history.TryGetValue(sessionId, out var turns)) history[sessionId] = turns = [];
@@ -926,11 +927,14 @@ sealed class LifecycleAgent
         }
     }
 
-    /// <summary>A turn made outside Gorynych (Codex Desktop, the CLI): in the history only. Returns its ID.</summary>
-    public string AddNativeTurn(string sessionId, string user, string answer)
+    /// <summary>
+    /// A turn made outside Gorynych (Codex Desktop, the CLI): in the history only, its answer in
+    /// <paramref name="answerChunks"/> chunks. Returns its ID.
+    /// </summary>
+    public string AddNativeTurn(string sessionId, string user, string answer, int answerChunks = 1)
     {
         var turn = $"n{Interlocked.Increment(ref nativeTurns)}";
-        Record(sessionId, turn, user, null, answer);
+        Record(sessionId, turn, user, null, answer, answerChunks);
         return turn;
     }
 

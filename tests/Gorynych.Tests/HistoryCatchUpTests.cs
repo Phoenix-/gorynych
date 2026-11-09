@@ -240,8 +240,27 @@ public sealed class HistoryCatchUpTests
         CollectionAssert.AreEqual(new[] { "user: First", "agent: ok", "user: Outside", "agent: Done outside", "user: Next", "agent: ok" },
             Texts(conductor.Feed(id).Journal.ReadAll()));
         CollectionAssert.AreEqual(new[] { "user: First", "agent: ok", "user: Outside", "agent: Done outside" }, Texts(other.Snapshot()).Take(4).ToArray());
-        Assert.AreEqual(codex.Prompts.Count, 2);
+        Assert.AreEqual(2, codex.Prompts.Count);
         Assert.AreEqual("t3", conductor.Feed(id).Journal.NativeMark, "the prompt's turn, after the native one");
+    }
+
+    [TestMethod]
+    public async Task MoreMadeOutsideThanTheJournalKeeps_AddsItsEnd_AndMarksTheJournalTrimmed()
+    {
+        var codex = new LifecycleAgent("codex", canDelete: true) { KeepsHistory = true };
+        await using var conductor = new Conductor(new ConductorOptions
+        {
+            DataDirectory = TestDirs.New(), ServiceId = "t", PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"],
+            UnloadAfter = TimeSpan.Zero, JournalMaxEntries = 16, // its least: the replay keeps the last 16 updates
+        }, [codex.Adapter]);
+        var id = await LeftSessionAsync(conductor, "codex", "First");
+        codex.AddNativeTurn(id, "Outside", "Done", answerChunks: 20); // 21 updates; their one message compacts to one entry
+
+        var (texts, _) = await SeenAsync(conductor, id);
+
+        Assert.AreEqual("user: First", texts[0]);
+        Assert.IsFalse(texts.Contains("user: Outside"), "dropped with the replay's start");
+        Assert.IsTrue(conductor.Feed(id).Journal.Trimmed, "the journal misses a part of the history: " + string.Join(" | ", texts));
     }
 
     [TestMethod]
@@ -429,6 +448,83 @@ public sealed class HistoryCatchUpTests
         JsonObject[] replay = [User("a", "u1"), Agent("x", "m1"), User("b", "u9"), Agent("other", "m9")];
 
         Assert.AreEqual(HistoryCatchUp.Kind.Replace, HistoryCatchUp.Make(journal, replay, HistoryCatchUp.Replayed.All, "Claude Code").Kind);
+    }
+
+    [TestMethod]
+    public void AKimiTurnWithAToolCall_ReplayedUnderAnotherToolCallId_IsTheSameTurn()
+    {
+        // Probed with Kimi Code 2.5.2: no message IDs in the replay, and the tool call's ID is another.
+        JsonNode[] journal =
+        [
+            User("Read note.txt", "j1"),
+            new JsonObject { ["sessionUpdate"] = "tool_call", ["toolCallId"] = "0:Read_0_bb3e5e8a", ["status"] = "completed", ["title"] = "Read" },
+            Agent("kiwi", "j2"),
+        ];
+        JsonObject[] replay =
+        [
+            User("Read note.txt"),
+            new() { ["sessionUpdate"] = "tool_call", ["toolCallId"] = "1:Read_0_bb3e5e8a", ["status"] = "completed", ["title"] = "Read" },
+            Agent("kiwi"),
+        ];
+
+        Assert.AreEqual(HistoryCatchUp.Kind.Nothing, HistoryCatchUp.Make(journal, replay, HistoryCatchUp.Replayed.All, "Kimi Code").Kind);
+        var outside = HistoryCatchUp.Make(journal, [.. replay, User("Then"), Agent("ok")], HistoryCatchUp.Replayed.All, "Kimi Code");
+        CollectionAssert.AreEqual(new[] { "user: Then", "agent: ok" }, Planned(outside), "a turn made outside after it is added");
+    }
+
+    [TestMethod]
+    public void AfterAStopInATurn_ThePromptTheJournalHasUnanswered_IsNotAddedAgain()
+    {
+        // The service stopped while Claude ran the prompt: the mark is from before it, and the
+        // transcript has the prompt under its own uuid.
+        JsonNode[] journal = [User("a", "j1"), Agent("x", "m1"), User("b", "j3")];
+
+        var plan = HistoryCatchUp.Make(journal, [User("b", "uuid-b"), Agent("y", "m2"), User("c", "uuid-c"), Agent("z", "m3")], HistoryCatchUp.Replayed.AfterMark, "Claude Code");
+
+        CollectionAssert.AreEqual(new[] { "agent: y", "user: c", "agent: z" }, Planned(plan));
+        var answered = HistoryCatchUp.Make([User("a", "j1"), Agent("x", "m1"), User("b", "j3"), Agent("y", "m2")],
+            [User("b", "uuid-b2"), Agent("again", "m4")], HistoryCatchUp.Replayed.AfterMark, "Claude Code");
+        CollectionAssert.AreEqual(new[] { "user: b", "agent: again" }, Planned(answered), "an answered prompt sent again outside is a turn of its own");
+        var notFirst = HistoryCatchUp.Make(journal, [Agent("y", "m2"), User("b", "uuid-b")], HistoryCatchUp.Replayed.AfterMark, "Claude Code");
+        CollectionAssert.AreEqual(new[] { "agent: y", "user: b" }, Planned(notFirst), "only the replay's first message is the prompt again");
+    }
+
+    [TestMethod]
+    public void OnlyAnAppendThatMissesAPartOfTheHistory_IsTrimmed()
+    {
+        JsonNode[] journal = [User("a", "u1"), Agent("x", "m1")];
+
+        Assert.IsTrue(HistoryCatchUp.Make(journal, [User("c", "u3"), Agent("z", "m3")], HistoryCatchUp.Replayed.AfterMark, "Codex", dropped: true).Trimmed,
+            "after the mark: what was dropped came right after it");
+        Assert.IsTrue(HistoryCatchUp.Make([], [User("c", "u3"), Agent("z", "m3")], HistoryCatchUp.Replayed.All, "Codex", dropped: true).Trimmed,
+            "a first import of the history's end");
+        var aligned = HistoryCatchUp.Make(journal, [User("a", "u1"), Agent("x", "m1"), User("c", "u3"), Agent("z", "m3")], HistoryCatchUp.Replayed.All, "Codex", dropped: true);
+        Assert.AreEqual((HistoryCatchUp.Kind.Append, false), (aligned.Kind, aligned.Trimmed), "aligned: what was dropped came before what the journal has");
+        Assert.IsFalse(HistoryCatchUp.Make(journal, [User("a", "u1"), Agent("x", "m1")], HistoryCatchUp.Replayed.AfterMark, "Codex", dropped: true).Trimmed,
+            "nothing to add");
+    }
+
+    [TestMethod]
+    public void AToolCallTheJournalOnlyStarted_AlignedByItsId_GetsTheUpdateThatEndsIt()
+    {
+        JsonNode[] journal =
+        [
+            User("a", "u1"),
+            new JsonObject { ["sessionUpdate"] = "tool_call", ["toolCallId"] = "t1", ["status"] = "in_progress", ["title"] = "ls" }, // the service stopped here
+        ];
+        JsonObject[] replay =
+        [
+            User("a", "u1"),
+            new() { ["sessionUpdate"] = "tool_call", ["toolCallId"] = "t1", ["status"] = "in_progress", ["title"] = "ls" },
+            new() { ["sessionUpdate"] = "tool_call_update", ["toolCallId"] = "t1", ["status"] = "completed" },
+            Agent("listed", "m1"),
+        ];
+
+        var plan = HistoryCatchUp.Make(journal, replay, HistoryCatchUp.Replayed.All, "Codex");
+
+        Assert.AreEqual("aligned by ID", plan.Why);
+        CollectionAssert.AreEqual(new[] { "tool_call_update t1 completed", "agent_message_chunk  " },
+            plan.Updates.Select(u => $"{(string?)u["sessionUpdate"]} {(string?)u["toolCallId"]} {(string?)u["status"]}").ToArray());
     }
 
     [TestMethod]

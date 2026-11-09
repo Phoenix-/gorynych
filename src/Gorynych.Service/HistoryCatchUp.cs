@@ -28,8 +28,9 @@ internal static class HistoryCatchUp
     public enum Kind { Nothing, Append, Replace }
 
     /// <summary>
-    /// The updates to append, or the journal's new entries; whether they are only the end of the
-    /// history (the replay was longer than the journal keeps); and why, for the log.
+    /// The updates to append, or the journal's new entries; whether the journal then misses a part
+    /// of the history (the replay was longer than the journal keeps, and what it dropped was not in
+    /// the journal yet); and why, for the log.
     /// </summary>
     public sealed record Plan(Kind Kind, List<JsonObject> Updates, bool Trimmed, string Why);
 
@@ -50,30 +51,51 @@ internal static class HistoryCatchUp
         // leading system reminder, as Kimi adds one to each) was not typed and is cut off.
         var history = replay.Where(u => SessionJournal.IsTurnKind((string?)u["sessionUpdate"])).Select(WithoutReminder).OfType<JsonObject>().ToList();
         var known = KnownKeys(journal);
-        if (replayed == Replayed.AfterMark)
-            return Appending(history.Where(u => !known.Contains(KnownKey(u))), native: true, dropped, "after the mark");
         var parts = journal.OfType<JsonObject>().Where(e => SessionJournal.IsTurnKind((string?)e["sessionUpdate"]) && !IsNotice(e)).ToList();
-        if (parts.Count == 0) return Appending(history, native: false, dropped, "imported"); // the first import is just that
+        // What the replay dropped came right after the mark, so the journal misses it.
+        if (replayed == Replayed.AfterMark)
+            return Appending(WithoutPromptAgain(parts, history.Where(u => !known.Contains(KnownKey(u))).ToList()), native: true, trimmed: dropped, "after the mark");
+        if (parts.Count == 0) return Appending(history, native: false, trimmed: dropped, "imported"); // the first import is just that
         // A replay without a single turn says nothing about the journal's turns (an empty or
         // unreadable history, turns without items): the journal stays.
         if (history.Count == 0) return new Plan(Kind.Nothing, [], false, "the agent replayed no turn; the journal is kept");
-        // The journal's last part of a turn from the agent, by its ID: the history goes on after it.
+        // Aligned with the journal (below), the history goes on from a part the journal has: what
+        // the replay dropped came before it, so the journal has that already.
+        // First by the ID of the journal's last part of a turn from the agent, from that part's
+        // first update. A tool call's later ones (the one that ends it) are then left to what the
+        // journal knows: it may have only started the call.
         if (parts.LastOrDefault(p => IsAgentPart(p) && AnchorId(p) is not null) is { } last)
         {
-            var at = history.FindLastIndex(u => AnchorId(u) == AnchorId(last));
-            if (at >= 0) return Appending(history.Skip(at + 1).Where(u => !known.Contains(KnownKey(u))), native: true, dropped, "aligned by ID");
+            var at = history.FindIndex(u => AnchorId(u) == AnchorId(last));
+            if (at >= 0) return Appending(history.Skip(at + 1).Where(u => !known.Contains(KnownKey(u))), native: true, trimmed: false, "aligned by ID");
         }
         // Else by the user messages' text: an agent that gives no IDs (Kimi), or a last part of the
         // journal's that has an ID of the service's (a text Claude gave none).
         var (next, why) = AfterUserTexts(parts, history);
-        if (next is { } from) return Appending(history.Skip(from).Where(u => !known.Contains(KnownKey(u))), native: true, dropped, why);
+        if (next is { } from) return Appending(history.Skip(from).Where(u => !known.Contains(KnownKey(u))), native: true, trimmed: false, why);
         return Rewritten(journal, history, agent, dropped, why);
     }
 
-    static Plan Appending(IEnumerable<JsonObject> updates, bool native, bool dropped, string why)
+    static Plan Appending(IEnumerable<JsonObject> updates, bool native, bool trimmed, string why)
     {
         var copies = updates.Select(u => native ? Native(u) : (JsonObject)u.DeepClone()).ToList();
-        return new Plan(copies.Count == 0 ? Kind.Nothing : Kind.Append, copies, dropped, why);
+        return copies.Count == 0 ? new Plan(Kind.Nothing, [], false, why) : new Plan(Kind.Append, copies, trimmed, why);
+    }
+
+    /// <summary>
+    /// The updates without the first one's user message when it is the journal's last prompt
+    /// again, still unanswered there (compared as <see cref="AfterUserTexts"/> does): the service
+    /// stopped in that turn, so the mark is from before it, and the agent's history has the prompt
+    /// under an ID of its own. An answered prompt is never taken: the same text may have been sent
+    /// again outside.
+    /// </summary>
+    static List<JsonObject> WithoutPromptAgain(List<JsonObject> journal, List<JsonObject> updates)
+    {
+        var prompt = Messages(journal).LastOrDefault(m => m.Kind == "user_message_chunk");
+        if (prompt is null || prompt.Text.Length == 0 || journal.Skip(prompt.End).Any(IsAgentPart)) return updates;
+        var first = Messages(updates).FirstOrDefault();
+        if (first is null || first.Start != 0 || first.Kind != "user_message_chunk" || first.Text != prompt.Text) return updates;
+        return updates.Skip(first.End).ToList();
     }
 
     /// <summary>
@@ -161,7 +183,11 @@ internal static class HistoryCatchUp
         // The journal's last user message got no answer in it yet (the service stopped in the turn): its answer is new.
         if (answer.Count == 0) return (theirs[u].End, why);
         var turnEnd = u + 1 < theirs.Count ? theirs[u + 1].Start : history.Count;
-        // An agent that gives IDs answered that turn with other messages: it was taken again, not the same turn.
+        // An agent that gives its messages IDs answered that turn with other messages and tool
+        // calls: it was taken again, not the same turn. One that gives none (Kimi) replays its tool
+        // calls under other IDs than it gave them live (probed with Kimi Code 2.5.2: "0:Read_0_…"
+        // live, "1:Read_0_…" replayed), so they say nothing.
+        if (!history.Any(h => SessionJournal.IsChunkKind((string?)h["sessionUpdate"]) && h["messageId"] is not null)) return (turnEnd, why);
         var mineIds = answer.Select(AnchorId).OfType<string>().ToHashSet(StringComparer.Ordinal);
         var theirIds = history.Skip(theirs[u].End).Take(turnEnd - theirs[u].End).Where(IsAgentPart).Select(AnchorId).OfType<string>().ToList();
         if (theirIds.Count > 0 && !theirIds.Any(mineIds.Contains)) return (null, "the journal's last turn was answered differently in the history");

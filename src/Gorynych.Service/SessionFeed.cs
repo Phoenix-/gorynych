@@ -525,8 +525,10 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <summary>
     /// Appends what the agent's own history gained (<see cref="HistoryCatchUp"/>) with one write,
     /// then sends it to the attached clients, as <see cref="PublishAsync"/> does one update.
+    /// <paramref name="trimmed"/>: it is only the end of what the history gained, and the journal
+    /// is marked so.
     /// </summary>
-    public async Task AppendHistoryAsync(List<JsonObject> updates)
+    public async Task AppendHistoryAsync(List<JsonObject> updates, bool trimmed = false)
     {
         await gate.WaitAsync();
         try
@@ -538,6 +540,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
                 RememberToolTitle(update);
             }
             Journal.AppendMany(updates);
+            if (trimmed) Journal.MarkTrimmed();
             foreach (var client in Clients())
                 foreach (var update in updates)
                     if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update.DeepClone()))) break;

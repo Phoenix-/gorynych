@@ -273,23 +273,15 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     /// <summary>
     /// <c>_meta</c> with the transcript's mark (<c>gorynych/historyMark</c>) at the end of a turn: the
-    /// service's journal now holds the conversation up to there. Claude may still be writing the
-    /// turn's last entries when its result comes, so the mark is taken once two reads 50 ms apart
-    /// agree (at most half a second). Null when there is no transcript; it never fails the turn.
+    /// service's journal now holds the conversation up to there. Taken once the transcript settles
+    /// (<see cref="TranscriptHistory.SettledMarkAsync"/>). Null when there is no transcript; it never
+    /// fails the turn.
     /// </summary>
     public async Task<JsonObject?> MarkMetaAsync(IClaudeSession session)
     {
         try
         {
-            var path = TranscriptOf(session);
-            var mark = TranscriptHistory.Mark(path);
-            for (var i = 0; i < 10 && mark is not null; i++)
-            {
-                await Task.Delay(50);
-                var again = TranscriptHistory.Mark(path);
-                if (again == mark) break;
-                mark = again;
-            }
+            var mark = await TranscriptHistory.SettledMarkAsync(TranscriptOf(session));
             return mark is null ? null : new JsonObject { [GorynychProtocol.MetaHistoryMark] = mark };
         }
         catch (Exception e) when (e is not OperationCanceledException)

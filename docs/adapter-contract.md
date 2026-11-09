@@ -155,7 +155,9 @@ it is; after an adapter restart, or a `session/close`, it is not.
   - fail open: an adapter that cannot read the history (any error but a cancellation) answers
     the resume without `gorynych/replay`, and the service keeps its journal as it is. Taking a
     mark MUST NOT fail a prompt;
-  - name only a point the history will keep: a completed turn, not one still running.
+  - name only a point the history will keep: a completed turn, not one still running; and not
+    replay a turn still running (in another app) either: the service keeps a message it has by
+    its ID, so a message replayed before it is whole would stay cut.
 
   The service then appends what is new. A replay from the start it first aligns with the
   journal, and imports it again behind a notice only when the journal's end is not in it. An

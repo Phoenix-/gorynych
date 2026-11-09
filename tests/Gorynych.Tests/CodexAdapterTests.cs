@@ -516,6 +516,27 @@ public sealed class CodexAdapterTests
     }
 
     [TestMethod]
+    public async Task ATurnStillRunning_IsNotReplayed_SoTheNextCatchUpGetsItWhole()
+    {
+        var fake = new FakeAppServer();
+        fake.Existing("t1", Cwd);
+        var done = fake.AddTurn("t1", "Ask", "Answer");
+        var running = fake.AddTurn("t1", "Still going", "Half an ans");
+        fake.Threads["t1"].Running.Add(running); // in Codex Desktop, say
+
+        var (replay, updates) = await ResumeDirectAsync(fake, "t1", After(done));
+
+        Assert.AreEqual(0, updates.Count, "its messages are not whole yet: " + string.Join(" | ", Texts(updates)));
+        Assert.AreEqual(("mark", done), ((string?)replay?["from"], (string?)replay?["mark"]), "the mark stays where it was");
+        Assert.IsFalse(fake.All("thread/items/list").Any(l => (string?)l["turnId"] == running), "its items are not read");
+
+        fake.Threads["t1"].Running.Remove(running);
+        var (after, whole) = await ResumeDirectAsync(fake, "t1", After(done));
+        CollectionAssert.AreEqual(new[] { "user: Still going", "agent: Half an ans" }, Texts(whole));
+        Assert.AreEqual(running, (string?)after?["mark"]);
+    }
+
+    [TestMethod]
     public async Task AResumeAfterAMarkCodexNoLongerHas_ReplaysEveryTurn()
     {
         var fake = new FakeAppServer();

@@ -216,4 +216,78 @@ public sealed class NativeCatchUpLiveTests
             continueNatively: id => RunNativeAsync(folder, "kimi", "-S", id, "-p", Outside),
             cleanUp: (zed, id) => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = id }));
     }
+
+    /// <summary>
+    /// A Kimi turn with a tool call, opened again, is not taken for a rewritten history. Kimi's
+    /// replay gives its messages no IDs, so only the tool calls' IDs could tell the turns apart;
+    /// the check prints what the replay gives them next to what the turn gave them live.
+    /// </summary>
+    [TestMethod]
+    [Timeout(900_000, CooperativeCancellation = true)]
+    public async Task Kimi_ATurnWithAToolCall_IsNotTakenForARewriteWhenOpenedAgain()
+    {
+        RequireLive("kimi");
+        var dir = TestDirs.New();
+        var folder = Directory.CreateDirectory(Path.Combine(dir, "work")).FullName;
+        File.WriteAllText(Path.Combine(folder, "note.txt"), "kiwi\n");
+        static string[] ToolIds(IEnumerable<JsonNode> updates) => updates.OfType<JsonObject>()
+            .Where(u => (string?)u["sessionUpdate"] == "tool_call").Select(u => (string?)u["toolCallId"] ?? "(none)").ToArray();
+        string id;
+        string[] live;
+        await using (var conductor = Conductor(dir, new KimiAdapter(new KimiAdapterOptions())))
+        {
+            await using (var zed = await TestClient.ConnectAsync(conductor, "live", agent: "kimi"))
+            {
+                id = (await zed.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+                    new NewSessionRequest { Cwd = folder, McpServers = [] })).SessionId;
+                await zed.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                    new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = "Read the file note.txt in the current folder with your file reading tool, then reply with exactly the word it holds and nothing else." }] });
+                await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+            }
+            await conductor.CleanupsIdleAsync();
+            live = ToolIds(conductor.Feed(id).Journal.ReadAll());
+        }
+        Console.WriteLine($"kimi {id}: tool calls live: {string.Join(", ", live)}");
+        Assert.AreNotEqual(0, live.Length, "the turn called a tool");
+
+        // What Kimi itself replays of the session, apart from the service.
+        var agent = await new KimiAdapter(new KimiAdapterOptions()).StartAsync(CancellationToken.None);
+        var replayed = new List<JsonObject>();
+        await using (agent)
+        await using (var acp = new JsonRpcConnection(agent.Input, agent.Output, "direct-client")
+        {
+            NotificationHandler = (method, p) =>
+            {
+                if (method == AcpMethods.Client.SessionUpdate) lock (replayed) replayed.Add((JsonObject)p!["update"]!.DeepClone());
+                return Task.CompletedTask;
+            },
+        })
+        {
+            acp.Start();
+            await acp.SendRequestAsync(AcpMethods.Agent.Initialize, new JsonObject { ["protocolVersion"] = 1, ["clientCapabilities"] = new JsonObject() });
+            await acp.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject { ["sessionId"] = id, ["cwd"] = folder, ["mcpServers"] = new JsonArray() });
+        }
+        string[] again;
+        lock (replayed) again = ToolIds(replayed);
+        Console.WriteLine($"kimi {id}: tool calls replayed: {string.Join(", ", again)}");
+        lock (replayed)
+            Console.WriteLine($"kimi {id}: replayed message IDs: {string.Join(", ", replayed.Where(u => ((string?)u["sessionUpdate"])?.EndsWith("_chunk", StringComparison.Ordinal) == true).Select(u => (string?)u["messageId"] ?? "(none)").Distinct())}");
+
+        await using (var conductor = Conductor(dir, new KimiAdapter(new KimiAdapterOptions())))
+        {
+            var seen = await SeenAsync(conductor, "kimi", id, folder);
+            var rewritten = seen.Any(u => (string?)u["_meta"]?[GorynychProtocol.MetaNotice] == HistoryCatchUp.HistoryRewritten);
+            Console.WriteLine($"kimi {id}: taken for a rewrite: {rewritten}; tool calls in the journal now: {string.Join(", ", ToolIds(conductor.Feed(id).Journal.ReadAll()))}");
+            Assert.IsFalse(rewritten, "the same turn, opened again, is not a rewritten history");
+            StringAssert.Contains(AgentText(seen, _ => true).ToLowerInvariant(), "kiwi");
+            static string[] Parts(Conductor c, string id) => c.Feed(id).Journal.ReadAll().OfType<JsonObject>()
+                .Where(u => SessionJournal.IsTurnKind((string?)u["sessionUpdate"]))
+                .Select(u => $"{(string?)u["sessionUpdate"]} {(string?)u["messageId"] ?? (string?)u["toolCallId"]} {(string?)u["status"]}").ToArray();
+            var before = Parts(conductor, id);
+            await SeenAsync(conductor, "kimi", id, folder);
+            CollectionAssert.AreEqual(before, Parts(conductor, id), "a second open adds no part of a turn");
+            await using var zed = await TestClient.ConnectAsync(conductor, "cleanup", agent: "kimi");
+            await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = id });
+        }
+    }
 }

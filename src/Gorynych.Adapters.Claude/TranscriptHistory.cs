@@ -25,7 +25,10 @@ internal static class TranscriptHistory
     /// <summary>Whether the updates sent follow the mark (else they are the whole conversation), the new mark, and how much was read.</summary>
     public sealed record Replay(bool FromMark, string? Mark, long BytesRead, int Sent);
 
-    /// <summary>The most a catch-up reads of a transcript before it gives up (fails open).</summary>
+    /// <summary>
+    /// The most a catch-up reads of a transcript in one pass (from the mark on, or the whole file)
+    /// before it gives up (fails open).
+    /// </summary>
     public const long MaxBytes = 512L * 1024 * 1024;
 
     /// <summary>A longer line is left out (its entry is not taken).</summary>
@@ -43,7 +46,11 @@ internal static class TranscriptHistory
         public bool InChain => Uuid is not null && !Sidechain && (Type is "user" or "assistant" or "system");
     }
 
-    /// <summary>The transcript's mark now: the last entry of its conversation; null when it has none, is not there or cannot be read.</summary>
+    /// <summary>
+    /// The transcript's mark now: the last entry of its conversation; null when it has none, is not
+    /// there or cannot be read. A last line without its newline is still being written and is left
+    /// out, as a replay leaves it out.
+    /// </summary>
     public static string? Mark(string path)
     {
         try
@@ -54,6 +61,7 @@ internal static class TranscriptHistory
             var piecesLength = 0L;
             var pos = file.Length;
             long read = 0;
+            var ended = false; // past the file's last newline: the lines from here on are whole
             while (pos > 0)
             {
                 var size = (int)Math.Min(Block, pos);
@@ -66,19 +74,20 @@ internal static class TranscriptHistory
                 for (var i = size - 1; i >= 0; i--)
                 {
                     if (block[i] != '\n') continue;
-                    if (Project(Joined(block, i + 1, lineEnd, pieces, piecesLength), pos + i + 1) is { InChain: true } entry) return MarkOf(entry);
+                    if (ended && Project(Joined(block, i + 1, lineEnd, pieces, piecesLength), pos + i + 1) is { InChain: true } entry) return MarkOf(entry);
+                    ended = true;
                     pieces.Clear();
                     piecesLength = 0;
                     lineEnd = i;
                 }
-                if (lineEnd > 0)
+                if (ended && lineEnd > 0)
                 {
                     pieces.Insert(0, block[..lineEnd]);
                     piecesLength += lineEnd;
                 }
                 if (piecesLength > MaxLine) { pieces.Clear(); piecesLength = 0; } // a line too long to take
             }
-            return Project(Joined([], 0, 0, pieces, piecesLength), 0) is { InChain: true } first ? MarkOf(first) : null;
+            return ended && Project(Joined([], 0, 0, pieces, piecesLength), 0) is { InChain: true } first ? MarkOf(first) : null;
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
@@ -140,6 +149,25 @@ internal static class TranscriptHistory
         }
     }
 
+    /// <summary>
+    /// The transcript's mark at a turn's end. Claude may still be writing the turn's last entries
+    /// when its result comes, so it is taken once two reads, <paramref name="wait"/> apart (50 ms),
+    /// agree; at most ten reads after the first.
+    /// </summary>
+    public static async Task<string?> SettledMarkAsync(string path, Func<Task>? wait = null)
+    {
+        wait ??= () => Task.Delay(50);
+        var mark = Mark(path);
+        for (var i = 0; i < 10 && mark is not null; i++)
+        {
+            await wait();
+            var again = Mark(path);
+            if (again == mark) break;
+            mark = again;
+        }
+        return mark;
+    }
+
     static FileStream Open(string path) => new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
 
     static string MarkOf(Entry entry) => $"{entry.Uuid}@{entry.Start}";
@@ -180,10 +208,15 @@ internal static class TranscriptHistory
         return chain;
     }
 
-    /// <summary>The entries of the lines from <paramref name="offset"/> on (at most <paramref name="limit"/>), each projected, never kept whole.</summary>
+    /// <summary>
+    /// The entries of the lines from <paramref name="offset"/> on (at most <paramref name="limit"/>),
+    /// each projected, never kept whole. Adds what it reads to <paramref name="read"/>; gives up past
+    /// <paramref name="maxBytes"/> read in this pass.
+    /// </summary>
     static List<Entry> Entries(FileStream file, long offset, ref long read, long maxBytes, int limit = int.MaxValue)
     {
         var entries = new List<Entry>();
+        var most = read + maxBytes;
         file.Position = offset;
         var buffer = new byte[Block];
         var line = new MemoryStream();
@@ -193,7 +226,7 @@ internal static class TranscriptHistory
         int got;
         while ((got = file.Read(buffer, 0, buffer.Length)) > 0)
         {
-            if ((read += got) > maxBytes) throw new TooLarge();
+            if ((read += got) > most) throw new TooLarge();
             var from = 0;
             for (var i = 0; i < got; i++)
             {

@@ -37,12 +37,21 @@ public sealed class SessionJournal
     }
 
     /// <summary>
-    /// True once compaction has dropped the journal's oldest entries. Kept in a marker file next to
-    /// the journal, so it survives a restart without an entry that clients would be replayed.
+    /// True once compaction has dropped the journal's oldest entries, or a catch-up could not keep
+    /// all that the agent's own history gained (<see cref="MarkTrimmed"/>). Kept in a marker file
+    /// next to the journal, so it survives a restart without an entry that clients would be replayed.
     /// </summary>
     public bool Trimmed
     {
         get { lock (gate) return File.Exists(TrimmedPath); }
+    }
+
+    /// <summary>Marks the journal <see cref="Trimmed"/>: it misses a part of the session's history.</summary>
+    public void MarkTrimmed()
+    {
+        lock (gate)
+            try { File.WriteAllText(TrimmedPath, ""); }
+            catch (IOException) { }
     }
 
     string TrimmedPath => path + ".trimmed";

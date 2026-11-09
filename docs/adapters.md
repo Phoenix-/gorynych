@@ -66,6 +66,11 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   drops them, and the session is imported again. `/clear` in the Kimi CLI starts a new session.
   Verified live on 10 November 2026: a turn taken with `kimi -S <id> -p` showed once, marked
   `native`, and a second open added nothing.
+  - The replay gives a tool call another ID than it had live: `1:Read_0_…` for a live
+    `0:Read_0_…` (probed with 2.5.2 on 10 November 2026). So a Kimi turn's tool calls never say
+    whether it is the journal's turn; before that was known, reopening any session with a tool
+    call imported it again as rewritten. Verified live since: such a session opened twice is
+    kept as it is.
 - Verified live on 7 November 2026 after logging in: first prompt, a Write approval, the
   title, replay through the service journal, and `ask_agent` to a Claude session. Before
   the login every turn failed with `-32000 Authentication required: 403`, which the service
@@ -346,7 +351,9 @@ written):
   `from: "start"`, and the log says so. A mark whose line moved is looked for in the whole file.
   - Lines are read as a stream, and only their `uuid`, parents, `type` and sidechain flag are
     taken. An entry's body is parsed only when it is sent.
-  - Past 512 MB read the catch-up gives up and fails open; a line over 64 MB is left out.
+  - Past 512 MB read in one pass (from the mark, or the whole file) the catch-up gives up and
+    fails open; a line over 64 MB is left out. A last line without its newline is still being
+    written: neither the mark nor a replay takes it.
   - A missing or unreadable transcript, or any error, answers without `gorynych/replay`; an
     entry of an unexpected shape is left out.
 - **The mark at a turn's end** is taken once two reads 50 ms apart agree (at most half a
@@ -677,8 +684,11 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     maps items, with Codex's own IDs (a prompt of the service's under its
     `clientUserMessageId`). Nothing before the mark is read, and a replay is never held whole. A
     mark Codex no longer has (a rollback) or none replays every turn.
-  - The new mark is the newest completed turn, never one still running. A thread without turns
-    has none. Any failure to list them answers without `gorynych/replay`.
+  - The new mark is the newest completed turn, never one still running. A turn still running
+    (in another Codex app) is not replayed either: its messages are not whole yet, and the
+    journal, which takes a message it has by its ID, would keep them cut. The next catch-up
+    gets it whole. A thread without turns has none. Any failure to list them answers without
+    `gorynych/replay`.
   - Verified live on 10 November 2026: a turn taken with `codex exec resume <id>` showed once,
     marked `native`, and a second open added nothing.
 - **Letting go of a thread.** Codex 0.167 keeps a thread it has nobody subscribed to loaded,

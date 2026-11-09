@@ -612,10 +612,13 @@ sealed class CodexAgent : IAsyncDisposable
                 }, CodexJsonContext.Default.ThreadTurnsListParams), ct), CodexJsonContext.Default.ThreadTurnsListResponse);
                 foreach (var turn in turns.Data)
                 {
-                    // A turn still running is no point to resume from: the next catch-up sees it whole.
-                    if (turn.Status != TurnStatus.InProgress) newest ??= turn.Id;
+                    // A turn still running (in another Codex app) is neither a point to resume from
+                    // nor replayed: its messages are not whole yet, and the journal would keep them
+                    // cut, as it takes a message it has by its ID. The next catch-up sees it whole.
+                    var running = turn.Status == TurnStatus.InProgress;
+                    if (!running) newest ??= turn.Id;
                     if (turn.Id == mark) { found = true; break; }
-                    newer.Add(turn.Id);
+                    if (!running) newer.Add(turn.Id);
                 }
                 cursor = turns.NextCursor;
                 if (cursor is null) break;

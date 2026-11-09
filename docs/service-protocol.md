@@ -884,7 +884,8 @@ GUI can use it too.
     compacts) uses `#<journal index>`.
   - A cursor the session does not have fails with `-32602`.
 - `total`: how many messages the journal holds. `inProgress`: a turn is running. `trimmed`:
-  the journal has lost its oldest entries ([Journal](#journal)).
+  the journal misses a part of the session's history: it has lost its oldest entries
+  ([Journal](#journal)), or a catch-up could not keep all that the agent's history gained.
 - **Source.** The service journal only; reading never runs a turn.
   - Reading a Claude session never starts Claude. The Claude adapter lists only sessions it
     created through the service, and the service journals them from their first prompt.
@@ -986,8 +987,10 @@ The contract is in [adapter-contract.md §4](adapter-contract.md#4-opening-a-ses
   [session-resume-replay](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/v2/session-resume-replay.mdx);
   in ACP v1, whose `session/resume` replays nothing, it lives in `_meta`. Only the parts of
   turns are taken aside meanwhile; a title, the commands or usage go through as usual. The
-  service keeps at most as many replayed updates as the journal holds (the oldest are dropped,
-  and the journal is then marked trimmed).
+  service keeps at most as many replayed updates as the journal holds, dropping the oldest.
+  When the journal then misses what was dropped (it came right after the mark, or it is a
+  first import), the journal is marked trimmed and the log says so; when the replay is aligned
+  with the journal (below), what was dropped came before what the journal has.
 - **An agent without marks** that loads (Kimi) is opened with `session/load`, and its whole
   replay is aligned with the journal like a replay from the start, below.
 - **A journal without turns** takes the replay as it comes: that is an import, and its updates
@@ -997,9 +1000,16 @@ The contract is in [adapter-contract.md §4](adapter-contract.md#4-opening-a-ses
   chunk without one gets one, as live). What the journal already has is skipped: a message by
   its `messageId`, a tool call by its `toolCallId` and status (so the update that ends a call
   the journal only started is not). A mark lost in a crash thus repeats nothing.
+  - A journal that ends with a prompt still unanswered there (the service stopped in its turn,
+    so the mark is from before it) does not get that prompt a second time: a replay whose first
+    message is a user message of the same text (compared as below) starts after it, with the
+    answer. An answered prompt is never taken so, as the same text may have been sent again
+    outside.
 - **From the start** (no mark, a mark the agent no longer has, or an agent without marks), the
   service first looks for where the journal ends in the history:
-  - by the ID of the journal's last part of a turn from the agent;
+  - by the ID of the journal's last part of a turn from the agent, from that part's first update
+    in the history (a tool call's later updates, such as the one that ends it, then pass by what
+    the journal has);
   - else by the user messages' text, compared without white space (an empty text, a prompt of
     only an image, is never compared): the journal's as the start of the history's, else its
     last three in a row, else two, else the last alone (a compaction may keep only the end),
@@ -1011,8 +1021,10 @@ The contract is in [adapter-contract.md §4](adapter-contract.md#4-opening-a-ses
   message (Kimi adds one to each) was not typed: it is cut off; one inside the text stays.
 - **A rewritten history.** When the journal's end is not found (a Codex rollback, a Claude
   rewind, a Kimi undo), is found more than once (a repeated `continue`: a turn could be skipped),
-  or the agent answered the journal's last turn with other messages, the session is imported
-  again. The journal becomes a notice entry, a `user_message_chunk` with
+  or an agent that gives its messages IDs answered the journal's last turn with other messages
+  and tool calls, the session is imported again. (Kimi gives its replayed messages no IDs and
+  its replayed tool calls other IDs than it gave them live, so its tool calls are not
+  compared.) The journal becomes a notice entry, a `user_message_chunk` with
   `_meta["gorynych/origin"]: "notice"` and `"gorynych/notice": "historyRewritten"`, whose text
   starts `[Gorynych: <agent>'s own history of this session no longer holds what this session
   showed before …]`, followed by the agent's history as it is now. Messages that are still there
@@ -1240,8 +1252,9 @@ version does not know are kept and replayed unchanged, with the `messageId`s cli
 live. Past the limit (default 5000 entries) the journal merges consecutive text chunks of one
 message (the same `messageId`; chunks without one, from journals written before the service
 named every message, are never merged) and then drops the oldest entries down to three
-quarters of the limit. Once it has dropped any, a marker file next to it
-(`<journal>.trimmed`) says so, for `_gorynych/read`'s `trimmed`. A line torn by a crash is dropped
+quarters of the limit. Once it has dropped any, or a catch-up could not keep all that the
+agent's own history gained ([History made outside Gorynych](#history-made-outside-gorynych)), a
+marker file next to it (`<journal>.trimmed`) says so, for `_gorynych/read`'s `trimmed`. A line torn by a crash is dropped
 when the journal is read back.
 
 ## Overlay
