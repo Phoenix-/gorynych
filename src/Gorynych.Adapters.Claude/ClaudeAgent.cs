@@ -26,7 +26,8 @@ public sealed class ClaudeAdapterOptions
     /// <summary>
     /// Passed as <c>--permission-mode</c> unless the person picks a mode. <c>default</c> makes Claude
     /// ask, which becomes an ACP approval; a global <c>defaultMode: auto</c> would otherwise decide
-    /// by itself.
+    /// by itself. Never Full access (<c>bypassPermissions</c>): that is only the person's own pick, and
+    /// is taken as <c>default</c> here.
     /// </summary>
     public string PermissionMode { get; init; } = "default";
 
@@ -69,6 +70,12 @@ public sealed class ClaudeAdapterOptions
     /// <summary>Keeps the raw terminal output of each TUI launch in the session folder, for diagnosis.</summary>
     public bool KeepTerminalLog { get; init; } = true;
 
+    /// <summary>
+    /// Headless: with no kept model catalog, fetch one at start from a Claude launched only for its
+    /// <c>initialize</c> (no prompt, no session saved), so the selectors show before any session runs.
+    /// </summary>
+    public bool FetchCatalog { get; init; } = true;
+
     public Action<string>? Log { get; init; }
 }
 
@@ -85,6 +92,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     readonly ConcurrentDictionary<string, long> cancelledAt = new(StringComparer.Ordinal);
     readonly ChannelConsentStore consent;
     readonly ClaudeTrust trust;
+    readonly ClaudeCatalogStore catalogStore;
     readonly ConcurrentDictionary<string, Lazy<Task>> trustQuestions = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock consentGate = new();
     string? consentAsking; // the session whose development-channels question is open
@@ -97,6 +105,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         state = new ClaudeStateStore(Path.Combine(options.DataDirectory, "sessions.json"), options.Log);
         consent = new ChannelConsentStore(Path.Combine(options.DataDirectory, "channels.json"), options.Log);
         trust = new ClaudeTrust(Path.Combine(options.DataDirectory, "trusted.json"), options.ClaudeStatePath, options.Log);
+        catalogStore = new ClaudeCatalogStore(Path.Combine(options.DataDirectory, "catalog.json"), options.Log);
+        Catalog = catalogStore.Load();
         Channel = options.ChannelServerCommand is { Count: > 0 } command ? new ChannelHost(command) : null;
         rpc.RequestHandler = HandleAsync;
         rpc.NotificationHandler = OnNotificationAsync;
@@ -107,7 +117,10 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     bool Headless => options.Transport == ClaudeTransport.Headless;
 
-    /// <summary>Claude's model catalog, from the first headless launch's <c>initialize</c>; empty until then.</summary>
+    /// <summary>
+    /// Claude's model catalog: kept from an earlier run (<c>catalog.json</c>), fetched at start, or from
+    /// the latest headless launch's <c>initialize</c>; empty until one of them brings it.
+    /// </summary>
     public IReadOnlyList<ClaudeModel> Catalog { get; private set; } = [];
 
     public async Task StartAsync()
@@ -116,6 +129,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         if (Channel is not null) Channel.BaseUrl = hooks.BaseUrl;
         Log($"claude adapter ({(Headless ? "headless" : "TUI")}): loopback server at {hooks.BaseUrl}");
         rpc.Start();
+        // In the background: neither the service's start nor session/new waits for it.
+        if (Headless && Catalog.Count == 0 && options.FetchCatalog) _ = Task.Run(FetchCatalogAsync);
     }
 
     public string HookUrl(string sessionId, string token) => $"{hooks!.BaseUrl}/hook/{sessionId}/{token}";
@@ -361,11 +376,72 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     // ---------------------------------------------------------------- headless: catalog and trust
 
-    /// <summary>A headless launch brought Claude's model catalog: keep it and show the session its options.</summary>
-    public async Task OnCatalogAsync(HeadlessSession session, List<ClaudeModel> catalog)
+    /// <summary>
+    /// A headless <c>initialize</c> answered (a session's launch, or the fetch at start). A catalog that is
+    /// new or changed is kept and shown to every headless session at once, so open threads get their
+    /// selectors without being reopened; otherwise only the launching session hears its options.
+    /// </summary>
+    public async Task OnInitializeAsync(HeadlessSession? session, JsonObject initialize)
     {
-        if (catalog.Count > 0) Catalog = catalog;
-        await OnSettingsReportedAsync(session);
+        var changed = false;
+        if (initialize["models"] is JsonArray models && ClaudeOptions.Catalog(initialize) is { Count: > 0 } catalog && catalogStore.Save(models))
+        {
+            Catalog = catalog;
+            changed = true;
+        }
+        if (changed)
+            foreach (var open in sessions.Values.OfType<HeadlessSession>().Concat(session is null ? [] : [session]).Distinct())
+                await OnSettingsReportedAsync(open);
+        else if (session is not null)
+            await OnSettingsReportedAsync(session);
+    }
+
+    /// <summary>
+    /// Fetches the catalog without a session: Claude launched as every headless session is (the same
+    /// flags, the same cleaned environment, the same plan check), in the adapter's own folder, with
+    /// no prompt and nothing saved (<c>--no-session-persistence</c>), asked only <c>initialize</c>.
+    /// </summary>
+    async Task FetchCatalogAsync()
+    {
+        try
+        {
+            var exe = options.Executable ?? ExecutableLocator.Find("claude");
+            if (exe is null)
+            {
+                Log("claude: not on PATH, so no model catalog yet");
+                return;
+            }
+            var folder = Path.Combine(options.DataDirectory, "catalog");
+            Directory.CreateDirectory(folder);
+            var settingsPath = Path.Combine(folder, "settings.json");
+            File.WriteAllText(settingsPath, StreamJson.Settings().ToJsonString(AcpJson.TextOptions));
+            var id = Guid.NewGuid().ToString();
+            var args = new List<string>(StreamJson.BaseArgs) { "--settings", settingsPath, "--no-session-persistence", "--session-id", id };
+            args.AddRange(ClaudeOptions.LaunchArgs(new ClaudeSettings(), options.PermissionMode, options.Model));
+            Log($"claude: fetching the model catalog in {folder} (session {id}, not kept)");
+            await using var claude = ClaudeProcess.Start(exe, args, folder, ClaudeEnvironment.Clean(headless: true), Path.Combine(folder, "stderr.log"),
+                _ => Task.CompletedTask, Log);
+            claude.BeginReading();
+            try
+            {
+                var init = await claude.ControlAsync(new JsonObject { ["subtype"] = "initialize" }, TimeSpan.FromSeconds(options.StartupTimeoutSeconds));
+                if (StreamJson.PlanProblem(init) is { } problem)
+                {
+                    Log($"claude: no model catalog fetched: {problem}");
+                    return;
+                }
+                await OnInitializeAsync(null, init);
+                Log($"claude: fetched the model catalog ({Catalog.Count} models) from Claude Code {(string?)init["claude_code_version"]}");
+            }
+            finally
+            {
+                await claude.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
+            }
+        }
+        catch (Exception e)
+        {
+            Log($"claude: could not fetch the model catalog: {e.Message}");
+        }
     }
 
     /// <summary>Claude reported its model or mode: the session's options may have changed.</summary>

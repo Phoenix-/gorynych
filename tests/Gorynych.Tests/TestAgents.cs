@@ -101,6 +101,9 @@ sealed class TestClient : IAsyncDisposable
 {
     readonly Task serving;
     public List<JsonObject> Updates { get; } = [];
+
+    /// <summary>The same updates with the session each one is for, in order.</summary>
+    public List<(string? SessionId, JsonObject Update)> SessionUpdates { get; } = [];
     public List<RequestPermissionRequest> Approvals { get; } = [];
 
     /// <summary>The <c>_gorynych/sessions_changed</c> notifications received, in order.</summary>
@@ -146,7 +149,11 @@ sealed class TestClient : IAsyncDisposable
         client.Rpc.NotificationHandler = (method, p) =>
         {
             if (method == AcpMethods.Client.SessionUpdate && p?["update"] is JsonObject u)
-                lock (client.Updates) client.Updates.Add(u);
+                lock (client.Updates)
+                {
+                    client.Updates.Add(u);
+                    client.SessionUpdates.Add(((string?)p["sessionId"], u));
+                }
             else if (method == GorynychProtocol.MethodSessionsChanged && p is JsonObject change)
                 lock (client.Changes) client.Changes.Add(change);
             return Task.CompletedTask;

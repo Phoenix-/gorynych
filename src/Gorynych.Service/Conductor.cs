@@ -1160,8 +1160,15 @@ public sealed class Conductor : IAsyncDisposable
         }
     }
 
-    /// <summary>Whether the session's agent runs MCP tools without asking the person (<c>gorynych/unaskedMcpTools</c>).</summary>
-    bool AsksNothing(string sessionId) => store.Get(sessionId) is { } session && HostOf(session).UnaskedMcpTools;
+    /// <summary>
+    /// Whether the session runs MCP tools without asking the person (<c>gorynych/unaskedMcpTools</c>):
+    /// every session of its agent (DSH), or this one in its present mode, whose current config value
+    /// carries the flag (Claude in Full access).
+    /// </summary>
+    bool AsksNothing(string sessionId) =>
+        store.Get(sessionId) is { } session
+        && (HostOf(session).UnaskedMcpTools
+            || (feeds.TryGetValue(sessionId, out var feed) && feed.CurrentValueFlag(GorynychProtocol.CapUnaskedMcpTools)));
 
     /// <summary>
     /// For a session whose agent runs MCP tools without asking (<c>gorynych/unaskedMcpTools</c>, DSH):

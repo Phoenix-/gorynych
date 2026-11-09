@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
+using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
 
 namespace Gorynych.Adapters.Claude;
@@ -44,6 +45,13 @@ public static class ClaudeOptions
 {
     public const string DefaultEffort = "default";
 
+    /// <summary>
+    /// Claude's <c>bypassPermissions</c>, offered as "Full access": only ever the person's own pick for
+    /// one session, never a default. Claude cannot enter it in a process started without it, so the
+    /// adapter starts Claude again for it (docs/adapters.md, "Full access").
+    /// </summary>
+    public const string FullAccess = "bypassPermissions";
+
     /// <summary>The permission modes offered, in order; <c>auto</c> only for a model that supports it.</summary>
     public static readonly (string Id, string Name, string Description)[] Modes =
     [
@@ -51,7 +59,11 @@ public static class ClaudeOptions
         ("acceptEdits", "Accept edits", "File edits go ahead; commands still ask"),
         ("plan", "Plan", "Claude plans and changes nothing"),
         ("auto", "Auto", "A classifier approves most actions instead of you"),
+        (FullAccess, "Full access", "Claude asks nothing at all: it runs any command and changes any file, outside this folder too"),
     ];
+
+    /// <summary>The mode a launch takes when the person picked none: never Full access, whatever the adapter was given.</summary>
+    public static string DefaultMode(string configured) => configured == FullAccess ? "default" : configured;
 
     /// <summary>Reads the <c>models</c> of an <c>initialize</c> answer.</summary>
     public static List<ClaudeModel> Catalog(JsonObject? initialize) =>
@@ -81,7 +93,12 @@ public static class ClaudeOptions
         var model = Current(s, catalog);
         var mode = CurrentMode(s);
         var modes = Modes.Where(m => m.Id != "auto" || model?.SupportsAutoMode == true || mode == "auto")
-            .Select(m => new SessionConfigSelectOption { Value = m.Id, Name = m.Name, Description = m.Description }).ToList();
+            .Select(m => new SessionConfigSelectOption
+            {
+                Value = m.Id, Name = m.Name, Description = m.Description,
+                // Claude asks for no tool in it, so the service asks before the gorynych tools act (C3).
+                Meta = m.Id == FullAccess ? new JsonObject { [GorynychProtocol.CapUnaskedMcpTools] = true } : null,
+            }).ToList();
         if (modes.All(m => m.Value != mode)) modes.Add(new SessionConfigSelectOption { Value = mode, Name = mode, Description = "Set in your Claude settings" });
         options.Add(Select("mode", "Permissions", SessionConfigOptionCategory.Mode, mode, modes));
         if (catalog.Count == 0) return options;
@@ -143,7 +160,7 @@ public static class ClaudeOptions
     public static IEnumerable<string> LaunchArgs(ClaudeSettings s, string defaultMode, string? defaultModel)
     {
         yield return "--permission-mode";
-        yield return s.Mode ?? defaultMode;
+        yield return s.Mode ?? DefaultMode(defaultMode);
         if ((s.Model ?? defaultModel) is { Length: > 0 } model)
         {
             yield return "--model";

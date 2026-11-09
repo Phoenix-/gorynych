@@ -191,16 +191,52 @@ idle. No development channel, consent question or notice is involved.
 
 ACP config options, like Codex's:
 
-- `mode`: `default` ("Ask"), `acceptEdits`, `plan`, and `auto` when the current model supports
-  it; a mode set in the person's own settings shows as itself.
+- `mode`: `default` ("Ask"), `acceptEdits`, `plan`, `auto` when the current model supports
+  it, and `bypassPermissions` ("Full access", [below](#full-access-mode)); a mode set in the
+  person's own settings shows as itself.
 - `model`: the catalog of `initialize` (`value`, `displayName`, `description`).
 - `reasoning_effort`: `default` (Claude's own) and the model's `supportedEffortLevels`.
-- The catalog comes from the first launch and is kept for the adapter's life; before it,
-  `session/new` returns only `mode`.
+- **The catalog** is the `models` of a headless `initialize`. Every launch that brings one that
+  is new or changed keeps it in `claude/catalog.json` and sends `config_option_update` to every
+  headless session, so open threads get the selectors without being reopened.
+  - At start the adapter loads the kept catalog, so `session/new` and `session/resume` show all
+    three selectors before any launch. A file that cannot be read counts as none.
+  - With none kept, the adapter fetches one once, in the background (neither the service's start
+    nor `session/new` waits): Claude launched as every headless session is (the same flags and
+    per-launch settings, the same cleaned environment, the same plan check), in `claude/catalog`,
+    with `--no-session-persistence` and no prompt, asked only `initialize`, then closed. It
+    spends no tokens and leaves no session behind. Off the plan it keeps nothing and logs why.
+    Until a catalog arrives, `session/new` returns only `mode`.
 - A change applies to a running Claude at once (`set_permission_mode`, `set_model`,
   `apply_flag_settings {effortLevel}`), is kept in the session's record in `claude/sessions.json`,
   and is passed to later launches (`--permission-mode`, `--model`, `--effort`). Nothing the
-  person did not change is sent.
+  person did not change is sent. Full access is the exception below.
+
+#### Full access mode
+
+Claude's `bypassPermissions`, as the `mode` value "Full access": Claude asks nothing at all,
+for any command and any file, outside the folder too. Only the person picks it, per session; the
+adapter's own default is never Full access (a configured `bypassPermissions` is taken as
+`default`).
+
+- **Entering.** Claude cannot enter `bypassPermissions` in a process started without it; only
+  `--allow-dangerously-skip-permissions` would allow that, and the adapter never gives it. So
+  choosing Full access stops an idle Claude, and the next prompt starts it again with
+  `--permission-mode bypassPermissions` (a resume: nothing is lost). During a turn the choice
+  is refused until the turn ends.
+- **Leaving** is `set_permission_mode` on the running Claude, which holds from its next tool
+  call; a Claude that refuses it is stopped.
+- `claude -p` asks no one to accept bypass mode, and the adapter writes nothing for it. A Claude
+  that starts in another mode (its settings may turn bypass off with
+  `permissions.disableBypassPermissionsMode`) fails the prompt with that reason instead of
+  running in another mode.
+- **The gorynych tools.** In Full access Claude calls no `can_use_tool`, so the value carries
+  `_meta["gorynych/unaskedMcpTools"]: true`. While it is the session's mode, the service asks the
+  person before `ask_agent`, `archive_session` and `restore_session`
+  ([adapter-contract.md](adapter-contract.md#62-the-gorynych-mcp-server)). The per-launch deny rule
+  that hides `gorynych-outside` still holds: Claude enforces deny rules in every mode.
+- The mode is kept in the session's record like the other choices, so a resumed session starts
+  in Full access until the person leaves it.
 
 #### Titles
 

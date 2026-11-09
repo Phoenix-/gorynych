@@ -12,7 +12,7 @@ namespace Gorynych.Tests;
 /// stdin, the native title and the loud failures, against Gorynych.FakeClaude in its <c>-p</c> mode.
 /// </summary>
 [TestClass]
-public sealed class ClaudeHeadlessTests
+public sealed partial class ClaudeHeadlessTests
 {
     static string FakeClaude()
     {
@@ -24,9 +24,12 @@ public sealed class ClaudeHeadlessTests
 
     static readonly string FakeRoot = Path.Combine(Path.GetTempPath(), "gorynych-fake-claude");
 
-    static ClaudeAdapterOptions Options(string dir, List<string>? log = null, bool liveNotes = false, Func<Task>? beforeInterrupt = null) => new()
+    static ClaudeAdapterOptions Options(string dir, List<string>? log = null, bool liveNotes = false, Func<Task>? beforeInterrupt = null,
+        bool fetchCatalog = true, string permissionMode = "default") => new()
     {
         BeforeInterrupt = beforeInterrupt,
+        FetchCatalog = fetchCatalog,
+        PermissionMode = permissionMode,
         DataDirectory = Path.Combine(dir, "claude"),
         Executable = FakeClaude(),
         ProjectsDirectory = Path.Combine(FakeRoot, "projects"),

@@ -234,7 +234,7 @@ internal sealed partial class ClaudeSession : IClaudeSession
         var settingsPath = Path.Combine(Folder, "settings.json");
         File.WriteAllText(settingsPath, ClaudeHooks.Settings(agent.HookUrl(Id, Token)).ToJsonString(AcpJson.TextOptions));
 
-        var args = new List<string> { "--settings", settingsPath, "--permission-mode", options.PermissionMode };
+        var args = new List<string> { "--settings", settingsPath, "--permission-mode", ClaudeOptions.DefaultMode(options.PermissionMode) };
         if (options.Model is { Length: > 0 } model) args.AddRange(["--model", model]);
         var mcpPath = Path.Combine(Folder, "mcp.json");
         var channel = withChannel ? agent.Channel : null;

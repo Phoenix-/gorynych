@@ -136,7 +136,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/setTitle` | an adapter's `agentCapabilities._meta` | `true`: the adapter takes `_gorynych/set_title {sessionId, title}` → `{}`, and the service writes a `spawn_session` name natively ([Child sessions](#child-sessions)) |
 | `gorynych/unloadAfter` | an adapter's `agentCapabilities._meta` | seconds: its sessions' idle time when shorter than `--unload-after` ([Unloading idle sessions](#unloading-idle-sessions)); read as at most a day |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
-| `gorynych/unaskedMcpTools` | an adapter's `agentCapabilities._meta` | `true`: its agent runs MCP tools without asking the person (DSH), so the service asks before `ask_agent`, `archive_session` and `restore_session` act for its sessions ([Opinions between agents](#opinions-between-agents)) |
+| `gorynych/unaskedMcpTools` | an adapter's `agentCapabilities._meta`, or the `_meta` of a config option's value | `true`: its agent runs MCP tools without asking the person (DSH), or this session does while that value is current (Claude's Full access), so the service asks before `ask_agent`, `archive_session` and `restore_session` act for its sessions ([Opinions between agents](#opinions-between-agents)) |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes in on its input (headless) or through its channel (TUI), and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards, and to the agent adds `_meta` with `gorynych/sender`, `gorynych/fromSessionId` and `gorynych/outside` as the journal keeps them on a request in a turn, for the user message the agent reports for it. An agent that answers method not found, or `-32600` because it is not running, is asked in a turn instead ([adapter-contract.md](adapter-contract.md#64-the-live-note-path)) |
@@ -333,6 +333,13 @@ sentence for the agent (`The user declined to ask session_id <id>, so it was not
 An archive or restore that would change nothing is not asked. The asked session is resolved
 first, so a session that only its agent lists yet (one made in that agent's own app) is asked
 about like any other.
+
+The same holds for one session in a mode that asks nothing: Claude in Full access
+(`bypassPermissions`) calls no `can_use_tool`. Its adapter marks that mode's value with
+`_meta["gorynych/unaskedMcpTools"]: true`, and while the session's current value of an option
+(as the service keeps it from the agent's answers and `config_option_update`) carries the flag,
+the service asks for that session as for DSH's. Back in another mode, Claude asks again itself,
+and the service does not.
 
 Verified live on 7 November 2026: Claude called `list_agents` and, after approval,
 `ask_agent`; Kimi got the marked turn, answered with `reply`, and Claude used the answer.

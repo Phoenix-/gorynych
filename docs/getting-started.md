@@ -134,8 +134,11 @@ Approvals, questions and the agent's answers come into the thread as with any AC
 
 **Claude** runs headless by default: the unmodified `claude -p` under your own plan login, which
 Anthropic's terms allow today ([adapters.md](adapters.md#claude-code)). Its thread has three
-selectors: **mode** (`Ask`, `Accept edits`, `Plan`, and `Auto` where the model has it), **model**
-and **reasoning effort**. A change applies at once and stays with the session. The first time
+selectors: **mode** (`Ask`, `Accept edits`, `Plan`, `Auto` where the model has it, and `Full
+access`), **model** and **reasoning effort**. A change applies at once and stays with the session.
+**Claude's `Full access` asks you nothing:** any command, any file, outside the folder too; you
+choose it per thread, between turns, and Gorynych still asks you before Claude asks another
+session, archives or restores one. The first time
 Claude works in a folder you have not trusted in Claude Code, Gorynych asks in the thread
 whether to trust it.
 

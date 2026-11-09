@@ -342,16 +342,57 @@ internal sealed class HeadlessSession : IClaudeSession
         // Changed on a copy, and kept only once a running Claude took it.
         var next = Settings.Clone();
         var request = ClaudeOptions.Change(next, agent.Catalog, configId, value);
+        var wasFull = ClaudeOptions.CurrentMode(Settings) == ClaudeOptions.FullAccess;
+        var isFull = ClaudeOptions.CurrentMode(next) == ClaudeOptions.FullAccess;
+        if (isFull && !wasFull)
+        {
+            await EnterFullAccessAsync(next, ct);
+            return ClaudeOptions.ConfigOptions(Settings, agent.Catalog);
+        }
         if (process is { Exited.IsCompleted: false } claude)
         {
             try { await claude.ControlAsync(request, TimeSpan.FromSeconds(15), ct); }
             catch (Exception e) when (e is ClaudeControlException or IOException or TimeoutException)
             {
-                throw new JsonRpcException(JsonRpcException.InternalError, $"Claude did not take the change: {e.Message}");
+                if (!(wasFull && !isFull)) throw new JsonRpcException(JsonRpcException.InternalError, $"Claude did not take the change: {e.Message}");
+                // Leaving Full access must hold before Claude's next tool call: a Claude that kept it is stopped.
+                Abandon(claude, $"it did not leave full access ({e.Message})");
             }
         }
         Settings.CopyChoicesFrom(next);
         return ClaudeOptions.ConfigOptions(Settings, agent.Catalog);
+    }
+
+    /// <summary>
+    /// Full access: Claude cannot enter <c>bypassPermissions</c> in a process started without it (only
+    /// <c>--allow-dangerously-skip-permissions</c> would let it, and that flag is never given), so a
+    /// running Claude is stopped between turns and the next prompt starts it in full access.
+    /// </summary>
+    async Task EnterFullAccessAsync(ClaudeSettings next, CancellationToken ct)
+    {
+        static JsonRpcException Running() => new(JsonRpcException.InvalidRequest,
+            "A turn of this session is running; choose Full access once it has ended.");
+        if (!await promptGate.WaitAsync(0, ct)) throw Running();
+        try
+        {
+            await launchGate.WaitAsync(ct);
+            try
+            {
+                ClaudeProcess? running;
+                lock (stateGate)
+                {
+                    if (Busy) throw Running();
+                    running = process is { Exited.IsCompleted: false } p ? p : null;
+                }
+                Settings.CopyChoicesFrom(next);
+                if (running is null) return;
+                OnExited(running, -1, "stopped to start again in full access with the next prompt");
+                await running.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
+                await running.DisposeAsync();
+            }
+            finally { launchGate.Release(); }
+        }
+        finally { promptGate.Release(); }
     }
 
     /// <summary>Writes Claude's own title (<c>custom-title</c>) through <c>rename_session</c>; waits for the next launch when Claude is not running.</summary>
@@ -402,9 +443,14 @@ internal sealed class HeadlessSession : IClaudeSession
                 // Never run on without the person's plan login (docs/adapters.md, "Failing loudly").
                 if (StreamJson.PlanProblem(init) is { } problem)
                     throw new JsonRpcException(JsonRpcException.InternalError, problem);
+                // Full access is the person's pick: a Claude that did not take it does not run in another mode instead.
+                if (Settings.Mode == ClaudeOptions.FullAccess && (string?)init["current_permission_mode"] is { } started && started != ClaudeOptions.FullAccess)
+                    throw new JsonRpcException(JsonRpcException.InternalError,
+                        $"Claude Code started in {started} instead of full access (bypassPermissions); your Claude settings may turn it off " +
+                        "(permissions.disableBypassPermissionsMode). Choose another mode, or allow it in Claude itself.");
                 Settings.ReportedMode = (string?)init["current_permission_mode"] ?? Settings.ReportedMode;
                 agent.Log($"claude {Id}: Claude Code {(string?)init["claude_code_version"]}, {(string?)init["account"]?["subscriptionType"]}");
-                await agent.OnCatalogAsync(this, ClaudeOptions.Catalog(init));
+                await agent.OnInitializeAsync(this, init);
                 string? title;
                 lock (stateGate) { title = pendingTitle; pendingTitle = null; }
                 if (title is not null) await RenameAsync(claude, title, ct);

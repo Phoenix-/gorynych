@@ -12,7 +12,10 @@
 // --mcp-config gives the gorynych server, as the peers server would. Files in the folder change
 // the account: `signed-out` (no login, as `--bare` gives), `no-account`, `api-key` (initialize
 // shows ANTHROPIC_API_KEY), `api-key-init` (only system/init shows it), `auth-token` (a token but
-// no plan) and `bedrock` (another provider); `deaf` stops reading stdin after initialize.
+// no plan) and `bedrock` (another provider); `deaf` stops reading stdin after initialize;
+// `no-bypass` starts in `default` whatever --permission-mode says, as a Claude whose settings turn
+// bypassPermissions off. As Claude 2.1.302: bypassPermissions asks for no tool, and a running
+// process enters it only when it started in it or with --allow-dangerously-skip-permissions.
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -26,6 +29,7 @@ static partial class FakeHeadless
     static readonly Channel<JsonObject> Inbox = Channel.CreateUnbounded<JsonObject>();
     static TaskCompletionSource interrupted = new(TaskCreationOptions.RunContinuationsAsynchronously);
     static string mode = "default";
+    static bool canBypass;
     static string model = "claude-fake-1";
     static int messages;
     static int tools;
@@ -47,6 +51,8 @@ static partial class FakeHeadless
         File.WriteAllText(Path.Combine(root, sessionId + ".args.json"), new JsonArray(args.Select(a => (JsonNode)a).ToArray()).ToJsonString());
         var controls = Path.Combine(root, sessionId + ".controls.jsonl");
         mode = Arg("--permission-mode") ?? "default";
+        if (mode == "bypassPermissions" && File.Exists(Path.Combine(cwd, "no-bypass"))) mode = "default";
+        canBypass = mode == "bypassPermissions" || args.Contains("--allow-dangerously-skip-permissions") || args.Contains("--dangerously-skip-permissions");
         model = Arg("--model") ?? model;
         var replyUrl = ReplyUrl(Arg("--mcp-config"));
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
@@ -122,6 +128,19 @@ static partial class FakeHeadless
                 await RespondAsync(id, []);
                 break;
             case "set_permission_mode":
+                if ((string?)request["mode"] == "bypassPermissions" && !canBypass)
+                {
+                    await WriteAsync(new JsonObject
+                    {
+                        ["type"] = "control_response",
+                        ["response"] = new JsonObject
+                        {
+                            ["subtype"] = "error", ["request_id"] = id,
+                            ["error"] = "Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions",
+                        },
+                    });
+                    break;
+                }
                 mode = (string?)request["mode"] ?? mode;
                 await RespondAsync(id, new JsonObject { ["mode"] = mode });
                 break;
@@ -275,6 +294,8 @@ static partial class FakeHeadless
 
     static async Task<JsonObject> AskAsync(string tool, JsonObject input, string toolUseId)
     {
+        // bypassPermissions: no question for any tool.
+        if (mode == "bypassPermissions" && tool != "AskUserQuestion") return new JsonObject { ["behavior"] = "allow", ["updatedInput"] = input.DeepClone() };
         var id = $"ask-{++asks}";
         var waiting = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
         Pending[id] = waiting;
