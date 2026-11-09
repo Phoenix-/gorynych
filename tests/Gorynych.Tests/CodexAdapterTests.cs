@@ -365,7 +365,7 @@ public sealed class CodexAdapterTests
 
         var open = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-open")));
         Assert.AreEqual("This Codex thread is open in another Codex app (Codex Desktop, the CLI or VS Code); close it there, then try again.", open.Message);
-        Assert.AreEqual("another Codex app", (string?)open.ErrorData?[GorynychProtocol.MetaOpenElsewhere], "when the holder could not be told beforehand");
+        Assert.IsNull(open.ErrorData, "no data: Zed would show it as raw JSON");
         var archived = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-archived")));
         Assert.AreEqual("This Codex thread is archived in Codex. Unarchive it there (codex unarchive t-archived), then try again.", archived.Message);
     }
@@ -397,7 +397,7 @@ public sealed class CodexAdapterTests
 
         var desk = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-desk")));
         Assert.AreEqual("This Codex thread is open in Codex Desktop; close it there, then try again.", desk.Message);
-        Assert.AreEqual("Codex Desktop", (string?)desk.ErrorData?[GorynychProtocol.MetaOpenElsewhere]);
+        Assert.IsNull(desk.ErrorData, "the message names the holder; no data, which Zed would show as raw JSON");
         var term = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, Resume("t-term")));
         Assert.AreEqual("This Codex thread is open in a terminal codex (pid 4242); close it there, then try again.", term.Message);
         Assert.AreEqual(0, fake.All("thread/resume").Length, "app-server was not asked: it would refuse, and Codex Desktop is left alone");

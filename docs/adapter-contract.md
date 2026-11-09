@@ -148,8 +148,8 @@ it is; after an adapter restart, or a `session/close`, it is not.
 - An agent may let one process at a time hold a session (Codex: one writer per thread). An
   adapter that can tell which other app holds one SHOULD mark it in `session/list` with
   `_meta["gorynych/openElsewhere"]` (a string naming the holder), SHOULD refuse its load or
-  resume at once, before asking the agent, with that string in the error's `data` under the same
-  key and a message that says to close it there, and MAY advertise `gorynych/openElsewhere` and
+  resume at once, before asking the agent, with a message that names the holder and says to close
+  it there (and no `data`: a client may show it raw), and MAY advertise `gorynych/openElsewhere` and
   answer `_gorynych/open_elsewhere {sessionIds}` ([service-protocol.md](service-protocol.md#sessions-open-in-another-app)).
   A guess on the agent's insides MUST fail open: when it cannot tell, it marks nothing and lets
   the agent answer. When another app takes such a session or lets it go, the adapter SHOULD tell

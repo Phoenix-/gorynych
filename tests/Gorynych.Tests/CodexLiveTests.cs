@@ -73,7 +73,7 @@ public sealed class CodexLiveTests
             new JsonObject { ["sessionId"] = desktop.SessionId, ["cwd"] = desktop.Cwd, ["mcpServers"] = new JsonArray() }));
         Console.WriteLine($"resume {desktop.SessionId}: {refused.Message} ({(DateTime.UtcNow - started).TotalMilliseconds:0} ms)");
         Assert.AreEqual($"This Codex thread is open in {holder}; close it there, then try again.", refused.Message);
-        Assert.AreEqual(holder, (string?)refused.ErrorData?[GorynychProtocol.MetaOpenElsewhere]);
+        Assert.IsNull(refused.ErrorData, "the message names the holder; no data");
     }
 
     [TestMethod]

@@ -722,8 +722,7 @@ sealed class LifecycleAgent
                     else if (Answer is { } answer) await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = answer } });
                     return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn });
                 case AcpMethods.Agent.SessionResume when HolderOf(sessionId!) is { } holder:
-                    throw new JsonRpcException(JsonRpcException.InvalidRequest, $"This thread is open in {holder}; close it there, then try again.",
-                        new JsonObject { [GorynychProtocol.MetaOpenElsewhere] = holder });
+                    throw new JsonRpcException(JsonRpcException.InvalidRequest, $"This thread is open in {holder}; close it there, then try again.");
                 case GorynychProtocol.MethodOpenElsewhere when TellsOpenElsewhere && OpenElsewhereFails:
                     throw new InvalidOperationException("the adapter broke");
                 case GorynychProtocol.MethodOpenElsewhere when TellsOpenElsewhere:

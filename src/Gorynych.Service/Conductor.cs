@@ -2063,6 +2063,9 @@ public sealed class Conductor : IAsyncDisposable
             }
             catch (Exception e) when (asker.IsAgent && e is not OperationCanceledException)
             {
+                // Held by another app (its agent says so: _gorynych/open_elsewhere): only closing it there helps.
+                if ((await OpenElsewhereAsync([record], ct)).GetValueOrDefault(record.SessionId) is { } holder)
+                    throw OpenElsewhereError(record, holder, asker, e);
                 throw CouldNotStart(record, e, asker);
             }
             // Its mode now, as its agent reports it once it is loaded: for a session that was not, the
@@ -2151,14 +2154,14 @@ public sealed class Conductor : IAsyncDisposable
     static string AskedState(string sessionId) => $"Asked session_id {sessionId}; waiting for its answer.";
 
     /// <summary>For an agent that asks: the asked session could not be started (or failed at once after it was).</summary>
+    /// <summary>For an agent that asks: the asked session is open in another app, which holds it.</summary>
+    static JsonRpcException OpenElsewhereError(SessionRecord record, string holder, Asker asker, Exception e) =>
+        new(e is JsonRpcException rpc ? rpc.Code : JsonRpcException.InvalidRequest,
+            $"{Who(record)} is open in {holder}, which holds it, so it cannot be asked until it is closed there. " +
+            $"Ask another session from {(asker.Outside is not null ? "list_sessions" : "list_agents")}, or ask the user to close it in {holder}.");
+
     static JsonRpcException CouldNotStart(SessionRecord record, Exception e, Asker asker)
     {
-        // Another app holds it (gorynych/openElsewhere in the error's data): only closing it there helps.
-        if (e is JsonRpcException { ErrorData: JsonObject data } held && (string?)data[GorynychProtocol.MetaOpenElsewhere] is { Length: > 0 } holder)
-            return new JsonRpcException(held.Code,
-                $"{Who(record)} is open in {holder}, which holds it, so it cannot be asked until it is closed there. " +
-                $"Ask another session from {(asker.Outside is not null ? "list_sessions" : "list_agents")}, or ask the user to close it in {holder}.",
-                data.DeepClone());
         var reason = e.Message.TrimEnd();
         if (!reason.EndsWith('.')) reason += ".";
         return new JsonRpcException(e is JsonRpcException rpc ? rpc.Code : JsonRpcException.InternalError,

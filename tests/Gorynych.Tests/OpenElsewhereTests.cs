@@ -69,7 +69,7 @@ public sealed class OpenElsewhereTests
         }));
         Assert.AreEqual($"session_id {held} (codex, \"Fix the flaky test\") is open in Codex Desktop, which holds it, so it cannot be asked " +
             "until it is closed there. Ask another session from list_agents, or ask the user to close it in Codex Desktop.", asked.Message);
-        Assert.AreEqual("Codex Desktop", (string?)asked.ErrorData?[GorynychProtocol.MetaOpenElsewhere]);
+        Assert.IsNull(asked.ErrorData, "the holder came from _gorynych/open_elsewhere; the text names it");
         lock (codex.Prompts) Assert.AreEqual(1, codex.Prompts.Count(p => p.SessionId == held), "asked nothing");
     }
 

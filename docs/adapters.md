@@ -573,9 +573,9 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     ignored too; none was seen: npm's shim starts the native `codex.exe`, which holds the lock.)
     `CODEX_HOME` comes from the service's environment, else `~/.codex`.
   - **What it does with it.** `session/load` and `session/resume` of a held thread fail at once
-    with `This Codex thread is open in <holder>; close it there, then try again.` and
-    `data: {"gorynych/openElsewhere": "<holder>"}`, before `thread/resume` (so the other app is
-    left alone). `session/list` marks each held thread with
+    with `This Codex thread is open in <holder>; close it there, then try again.`, before
+    `thread/resume` (so the other app is left alone). The error has no `data`: Zed appends it
+    to the message as raw JSON, and the message names the holder already. `session/list` marks each held thread with
     `_meta["gorynych/openElsewhere"]`, the folder read once per page, and the adapter answers
     `_gorynych/open_elsewhere` for the service's session lists
     ([service-protocol.md](service-protocol.md#sessions-open-in-another-app)).
@@ -598,8 +598,7 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     status other than success, a holder that is not Codex or cannot be read) means "not known":
     nothing is marked and the open goes on to app-server. Outside Windows nothing is known. App-server's own refusal, `thread <id> already
     has an active writer`, stays the fallback: `This Codex thread is open in another Codex app
-    (Codex Desktop, the CLI or VS Code); close it there, then try again.`, with
-    `gorynych/openElsewhere: "another Codex app"`.
+    (Codex Desktop, the CLI or VS Code); close it there, then try again.`
   - **Checked live** on 9 November 2026 with Codex 0.167 (CLI) and Codex Desktop 26.1029: of 18
     threads listed, three held by Codex Desktop and two by codex in terminals were marked as
     such, and resuming one of Codex Desktop's failed at once with its name.

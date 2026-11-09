@@ -533,12 +533,12 @@ sealed class CodexAgent : IAsyncDisposable
     }
 
     /// <summary>
-    /// A thread another Codex app holds: refused with that app's name, also in the error's data, so
-    /// the service can tell an asking agent what to do (<c>gorynych/openElsewhere</c>).
+    /// A thread another Codex app holds: refused with that app's name in the message, and no
+    /// <c>data</c> (Zed shows it as raw JSON); clients have the holder from the list's <c>_meta</c>, the
+    /// service from <c>_gorynych/open_elsewhere</c>.
     /// </summary>
     static JsonRpcException OpenElsewhere(string holder) =>
-        new(JsonRpcException.InvalidRequest, $"This Codex thread is open in {holder}; close it there, then try again.",
-            new JsonObject { [GorynychProtocol.MetaOpenElsewhere] = holder });
+        new(JsonRpcException.InvalidRequest, $"This Codex thread is open in {holder}; close it there, then try again.");
 
     /// <summary>App-server's refusals to load a thread, in words a person and an asking agent can act on.</summary>
     static JsonRpcException Explain(JsonRpcException e, string id)
@@ -546,8 +546,7 @@ sealed class CodexAgent : IAsyncDisposable
         // The lock was taken after the check, or the holder could not be told (outside Windows).
         if (e.Message.Contains("active writer", StringComparison.Ordinal))
             return new JsonRpcException(e.Code,
-                "This Codex thread is open in another Codex app (Codex Desktop, the CLI or VS Code); close it there, then try again.",
-                new JsonObject { [GorynychProtocol.MetaOpenElsewhere] = "another Codex app" });
+                "This Codex thread is open in another Codex app (Codex Desktop, the CLI or VS Code); close it there, then try again.");
         if (e.Message.Contains("is archived", StringComparison.Ordinal))
             return new JsonRpcException(e.Code, $"This Codex thread is archived in Codex. Unarchive it there (codex unarchive {id}), then try again.");
         if (e.Message.Contains("no rollout found", StringComparison.Ordinal) || e.Message.Contains("not found", StringComparison.OrdinalIgnoreCase))

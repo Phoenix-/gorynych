@@ -177,8 +177,7 @@ public static class GorynychProtocol
     /// <summary>
     /// A string naming another app that has the session open, so its agent cannot load it here until
     /// it is closed there ("Codex Desktop", "a terminal codex (pid 4242)"): in <c>SessionInfo._meta</c>
-    /// of <c>session/list</c> (absent: free, or not known), and in the <c>data</c> of the error that
-    /// refuses to load or resume it (docs/service-protocol.md, "Sessions open in another app").
+    /// of <c>session/list</c> (absent: free, or not known) (docs/service-protocol.md, "Sessions open in another app").
     /// </summary>
     public const string MetaOpenElsewhere = "gorynych/openElsewhere";
 
