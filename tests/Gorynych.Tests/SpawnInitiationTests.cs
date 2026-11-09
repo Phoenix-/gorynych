@@ -183,6 +183,9 @@ public sealed class SpawnInitiationTests
             await PromptAsync(zed, child, "One more thing"); // its end is reported into this turn
             await Until(() => { lock (claude.Notes) return claude.Notes.Count == 2; }, "the report in the turn");
             spawned = await SpawnAsync(zed, claude.Tokens[parent], "user_asked");
+            // The session it starts reports its first turn too: into this turn, not after it, where
+            // the report would rightly mark the idle parent again.
+            await Until(() => { lock (claude.Notes) return claude.Notes.Count == 3; }, "the started session's report in the turn");
         };
         var before = SpawnCards(zed).Length;
 
