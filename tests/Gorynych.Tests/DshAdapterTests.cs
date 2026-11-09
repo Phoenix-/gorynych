@@ -83,8 +83,9 @@ sealed class FakeDsh(FakeDshStore? shared = null)
         Rpc.RequestHandler = HandleAsync;
         Rpc.NotificationHandler = (method, p) => { lock (Calls) Calls.Add((method, p?.DeepClone())); return Task.CompletedTask; };
         Rpc.Start();
-        // A process that ends lets go of its sessions.
-        _ = Rpc.Completion.ContinueWith(_ =>
+        // A process that ends lets go of its sessions, after its output ended; by the time it has
+        // exited, they are free.
+        var exited = Rpc.Completion.ContinueWith(_ =>
         {
             lock (store)
             {
@@ -93,7 +94,11 @@ sealed class FakeDsh(FakeDshStore? shared = null)
             }
         }, TaskScheduler.Default);
         var (ci, co) = link.ClientEnd;
-        return Task.FromResult(new AgentInstance(ci, co, Rpc.Completion, () => Rpc.DisposeAsync()));
+        return Task.FromResult(new AgentInstance(ci, co, exited, async () =>
+        {
+            await Rpc.DisposeAsync();
+            await exited;
+        }));
     }
 
     async Task<JsonNode?> HandleAsync(JsonRpcRequest req, CancellationToken ct)

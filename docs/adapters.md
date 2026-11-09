@@ -815,8 +815,11 @@ are the model and the effort, and its `/permission` command has no ACP surface. 
 - **A process that ends.** When the full-access process ends, its sessions are gone, the
   service's requests to it fail and its questions are withdrawn. A request to such a session
   says that the full-access process stopped, until the session is opened again, which starts the
-  process again. The read-only process ending ends the adapter, and stopping the adapter stops
-  both, also one still starting.
+  process again. A process's output can end before the process lets go of its sessions, so the
+  router stops it (killing it if it lingers) and starts the next process of its mode only once it
+  has; otherwise that process's resume would find the session owned by an active write handle and
+  be refused as open in another DSH app. The read-only process ending ends the adapter, and
+  stopping the adapter stops both, also one still starting.
 
 ### Read only: a read-only shell, approved file writes
 

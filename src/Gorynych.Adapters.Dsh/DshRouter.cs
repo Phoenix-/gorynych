@@ -96,6 +96,11 @@ internal sealed class DshRouter
     readonly Dictionary<string, Live> live = [];
     /// <summary>Sessions that were open in a process that ended, with its mode, until they are opened again.</summary>
     readonly Dictionary<string, DshMode> lost = [];
+    /// <summary>
+    /// Per mode, the last process whose output ended. Its output can end before it lets go of its
+    /// sessions, so the next process of the mode starts only once it has stopped.
+    /// </summary>
+    readonly Dictionary<DshMode, DshLane> ended = [];
     readonly Dictionary<string, int> prompting = [];
     /// <summary>Per session, the work on its last message: the next one waits for it, so a session's messages keep their order.</summary>
     readonly Dictionary<string, Task> busy = [];
@@ -368,6 +373,21 @@ internal sealed class DshRouter
 
     async Task<DshLane> StartLaneAsync(DshMode mode)
     {
+        DshLane? before;
+        lock (gate) ended.Remove(mode, out before);
+        if (before is not null)
+        {
+            // Otherwise a resume in the new process could find a session the old one still holds
+            // owned by an active write handle, and be refused as open in another DSH app.
+            try
+            {
+                await before.StopAsync();
+            }
+            catch (Exception e) when (e is not OutOfMemoryException)
+            {
+                options.Log?.Invoke($"dsh: the {mode.Name.ToLowerInvariant()} process that ended did not stop cleanly: {e.Message}");
+            }
+        }
         options.Log?.Invoke($"dsh: starting the {mode.Name.ToLowerInvariant()} process");
         var lane = await startLane(mode);
         bool late;
@@ -813,7 +833,10 @@ internal sealed class DshRouter
                 prompting.Remove(sessionId);
                 if (lane != main) lost[sessionId] = lane.Mode;
             }
+            if (lane != main) ended[lane.Mode] = lane;
         }
+        // Its output ended; the process may not have yet (StartLaneAsync waits for this stop).
+        if (lane != main) _ = Task.Run(lane.StopAsync);
         foreach (var requestId in withdrawn)
             await TryToServiceAsync(new JsonObject
             {
