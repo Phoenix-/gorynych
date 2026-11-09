@@ -56,6 +56,10 @@ static partial class FakeHeadless
         var folder = new string(Path.GetFullPath(cwd).TrimEnd('\\', '/').Select(c => char.IsAsciiLetterOrDigit(c) ? c : '-').ToArray());
         var transcript = Path.Combine(root, "projects", folder, sessionId + ".jsonl");
         Directory.CreateDirectory(Path.GetDirectoryName(transcript)!);
+        transcriptPath = transcript;
+        lastUuid = File.Exists(transcript)
+            ? File.ReadAllLines(transcript).Select(l => { try { return (string?)JsonNode.Parse(l)?["uuid"]; } catch (System.Text.Json.JsonException) { return null; } }).LastOrDefault(u => u is not null)
+            : null;
         File.WriteAllText(Path.Combine(root, sessionId + ".args.json"), new JsonArray(args.Select(a => (JsonNode)a).ToArray()).ToJsonString());
         var controls = Path.Combine(root, sessionId + ".controls.jsonl");
         mode = Arg("--permission-mode") ?? "default";
@@ -398,15 +402,34 @@ static partial class FakeHeadless
         ["response"] = new JsonObject { ["subtype"] = "success", ["request_id"] = id, ["response"] = response },
     });
 
+    static string? transcriptPath;
+    static string? lastUuid;
+
     static async Task WriteAsync(JsonObject m)
     {
         await WriteGate.WaitAsync();
         try
         {
+            Transcribe(m);
             await Console.Out.WriteAsync(m.ToJsonString() + "\n");
             await Console.Out.FlushAsync();
         }
         finally { WriteGate.Release(); }
+    }
+
+    /// <summary>Keeps a user or assistant message in the transcript, as Claude does: chained by parentUuid, before it is streamed.</summary>
+    static void Transcribe(JsonObject m)
+    {
+        if (transcriptPath is null || (string?)m["type"] is not ("user" or "assistant") || (string?)m["parent_tool_use_id"] is { Length: > 0 }) return;
+        var uuid = (string?)m["uuid"] ?? Guid.NewGuid().ToString();
+        var entry = new JsonObject
+        {
+            ["type"] = (string?)m["type"], ["uuid"] = uuid, ["parentUuid"] = lastUuid, ["isSidechain"] = false,
+            ["sessionId"] = (string?)m["session_id"], ["message"] = m["message"]?.DeepClone(),
+        };
+        if (m["tool_use_result"] is { } result) entry["toolUseResult"] = result.DeepClone();
+        File.AppendAllText(transcriptPath, entry.ToJsonString() + "\n");
+        lastUuid = uuid;
     }
 
     static string Text(JsonObject user) => user["message"]?["content"] switch
