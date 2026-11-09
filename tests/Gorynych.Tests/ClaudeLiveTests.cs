@@ -105,13 +105,13 @@ public sealed partial class ClaudeLiveTests
     }
 
     /// <summary>
-    /// Full access on <c>haiku</c>: a shell write runs with no question, <c>ask_agent</c> is still asked
-    /// by the service (declined here, so the other session gets nothing), and back in Ask a write asks
-    /// again. Three short turns in a temporary folder.
+    /// Full access on <c>haiku</c>: a shell write runs with no question, <c>ask_agent</c> is still asked,
+    /// by the adapter from Claude's PreToolUse hook (declined here, so the other session gets nothing),
+    /// and back in Ask a write asks again. Three short turns in a temporary folder.
     /// </summary>
     [TestMethod]
     [Timeout(600_000, CooperativeCancellation = true)]
-    public async Task Claude_FullAccess_WritesWithoutAsking_ButTheServiceStillAsksBeforeAskAgent()
+    public async Task Claude_FullAccess_WritesWithoutAsking_ButAskAgentIsStillAsked()
     {
         RequireLive();
         var dir = TestDirs.New();
@@ -137,10 +137,10 @@ public sealed partial class ClaudeLiveTests
         try
         {
             await using var client = await TestClient.ConnectAsync(conductor);
-            // The folder-trust question and Claude's own approvals are allowed; the service's question before ask_agent is declined.
+            // The folder-trust question and Claude's own approvals are allowed; the question before ask_agent is declined.
             client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome
             {
-                OptionId = r.ToolCall.Title?.StartsWith("Ask ", StringComparison.Ordinal) == true ? "decline" : r.Options[0].OptionId,
+                OptionId = r.ToolCall.Title?.StartsWith("ask_agent", StringComparison.Ordinal) == true ? ClaudeHooks.DenyOptionId : r.Options[0].OptionId,
             });
             var target = (await NewAsync(client, folder, "echo")).SessionId;
             await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
@@ -164,10 +164,12 @@ public sealed partial class ClaudeLiveTests
             var trust = client.Approvals.Count(a => a.ToolCall.ToolCallId == "trust-folder");
             Assert.AreEqual(trust, client.Approvals.Count, "nothing asked in full access but the folder's trust");
 
-            // 2. ask_agent: the service asks the person, who declines; the other session gets nothing.
+            // 2. ask_agent: the adapter asks the person from Claude's hook; the person declines, so the other session gets nothing.
             await PromptAsync($"Call the tool mcp__gorynych__ask_agent once with session_id \"{target}\" and question \"ping\". Then reply in one sentence with what it returned.");
-            var asked = client.Approvals.SingleOrDefault(a => a.ToolCall.Title?.StartsWith("Ask ", StringComparison.Ordinal) == true);
-            Assert.IsNotNull(asked, "the service asked before ask_agent");
+            var asked = client.Approvals.SingleOrDefault(a => a.ToolCall.Title?.StartsWith("ask_agent", StringComparison.Ordinal) == true);
+            Assert.IsNotNull(asked, "asked before ask_agent: " + string.Join(" | ", log));
+            lock (log) Assert.IsTrue(log.Any(l => l.Contains("asking the person before mcp__gorynych__ask_agent (bypassPermissions)", StringComparison.Ordinal)),
+                "asked from the hook, in bypass");
             Assert.AreEqual(id, asked.SessionId);
             lock (echo.Prompts) Assert.AreEqual(1, echo.Prompts.Count, "the declined question reached no one");
 

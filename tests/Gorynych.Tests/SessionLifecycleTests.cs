@@ -699,11 +699,7 @@ sealed class LifecycleAgent
                         lock (Tokens) Tokens[id] = (string)peerArgs[peerArgs.Count - 1]!;
                     if (BeforeNew is { } beforeNew) await beforeNew(id);
                     await agent.Update(id, new AvailableCommandsUpdate { AvailableCommands = [] });
-                    if (ModeOption) return new JsonObject { ["sessionId"] = id, ["configOptions"] = ModeOptions(id) };
                     return AcpJson.ToNode(new NewSessionResponse { SessionId = id });
-                case AcpMethods.Agent.SessionSetConfigOption when ModeOption:
-                    lock (modes) modes[sessionId!] = (string)req.Params!["value"]!;
-                    return new JsonObject { ["configOptions"] = ModeOptions(sessionId!) };
                 case AcpMethods.Agent.SessionList:
                     lock (sessions)
                         return AcpJson.ToNode(new ListSessionsResponse
@@ -724,7 +720,7 @@ sealed class LifecycleAgent
                 case AcpMethods.Agent.SessionResume:
                     lock (SystemPrompts) SystemPrompts.Add((req.Method, sessionId!, req.Params?["systemPrompt"]?.DeepClone()));
                     if (BeforeResume is { } beforeResume) await beforeResume(sessionId!);
-                    return ModeOption ? new JsonObject { ["configOptions"] = ModeOptions(sessionId!) } : new JsonObject();
+                    return new JsonObject();
                 case AcpMethods.Agent.SessionClose:
                     return new JsonObject();
                 case GorynychProtocol.MethodOpinion when HasChannel:
@@ -768,25 +764,6 @@ sealed class LifecycleAgent
 
     /// <summary>Advertises <c>gorynych/unaskedMcpTools</c>, as the DSH adapter does; set before the first use.</summary>
     public bool UnaskedMcpTools { get; set; }
-
-    /// <summary>
-    /// Offers a <c>mode</c> option of <c>ask</c> and <c>full</c>, whose <c>full</c> carries
-    /// <c>gorynych/unaskedMcpTools</c>, as Claude's Full access does; set before the first use.
-    /// </summary>
-    public bool ModeOption { get; set; }
-
-    readonly Dictionary<string, string> modes = [];
-
-    JsonArray ModeOptions(string sessionId)
-    {
-        string current;
-        lock (modes) current = modes.GetValueOrDefault(sessionId, "ask");
-        return new JsonArray(JsonNode.Parse("""
-            {"id":"mode","name":"Permissions","category":"mode","type":"select","currentValue":"CURRENT","options":[
-              {"value":"ask","name":"Ask"},
-              {"value":"full","name":"Full access","_meta":{"FLAG":true}}]}
-            """.Replace("CURRENT", current).Replace("FLAG", GorynychProtocol.CapUnaskedMcpTools)));
-    }
 
     /// <summary>The <c>systemPrompt</c> param of every <c>session/new</c> and <c>session/resume</c>, in order.</summary>
     public List<(string Method, string SessionId, JsonNode? SystemPrompt)> SystemPrompts { get; } = [];

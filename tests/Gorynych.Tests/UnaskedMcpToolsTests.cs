@@ -102,36 +102,6 @@ public sealed class UnaskedMcpToolsTests
     }
 
     [TestMethod]
-    public async Task AskAgent_FromASessionInAModeThatAsksNothing_AsksThePerson_AndNoLongerOnceItLeavesIt()
-    {
-        var claude = new LifecycleAgent("claude", canDelete: false) { ModeOption = true };
-        var kimi = new LifecycleAgent("kimi", canDelete: true) { Answer = "fine" };
-        await using var conductor = Conductor(claude.Adapter, kimi.Adapter);
-        await using var client = await TestClient.ConnectAsync(conductor);
-        var asker = await NewPromptedAsync(client, "claude", "hi");
-        var asked = await NewPromptedAsync(client, "kimi", "hello");
-        client.Approve = r => Choose(r.Options[0].OptionId)(r); // ask, archive
-        Task<JsonNode?> Mode(string value) => client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
-            new JsonObject { ["sessionId"] = asker, ["configId"] = "mode", ["value"] = value });
-
-        await AskAsync(client, claude.Tokens[asker], asked);
-        Assert.AreEqual(0, client.Approvals.Count, "in a mode that asks, the agent asks for its tools itself");
-
-        await Mode("full");
-        await AskAsync(client, claude.Tokens[asker], asked);
-        Assert.AreEqual(1, client.Approvals.Count, "in a mode whose value carries the flag, the service asks");
-        Assert.AreEqual(asker, client.Approvals[0].SessionId);
-        StringAssert.StartsWith(client.Approvals[0].ToolCall.Title, "Ask session_id " + asked);
-        Assert.IsFalse(await IsArchivedAsync(client, asked));
-        await ArchiveAsync(client, claude.Tokens[asker], asked, archived: true);
-        Assert.AreEqual(2, client.Approvals.Count, "an archive asks too");
-
-        await Mode("ask");
-        await AskAsync(client, claude.Tokens[asker], asked);
-        Assert.AreEqual(2, client.Approvals.Count, "back in a mode that asks, the service asks nothing");
-    }
-
-    [TestMethod]
     public async Task AskAgent_ToASessionOnlyItsAgentListsYet_AsksThePersonToo()
     {
         var dsh = new LifecycleAgent("dsh", canDelete: false) { UnaskedMcpTools = true };

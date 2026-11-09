@@ -93,6 +93,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     readonly ChannelConsentStore consent;
     readonly ClaudeTrust trust;
     readonly ClaudeCatalogStore catalogStore;
+    readonly CancellationTokenSource lifetime = new();
+    Task? fetching;
     readonly ConcurrentDictionary<string, Lazy<Task>> trustQuestions = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock consentGate = new();
     string? consentAsking; // the session whose development-channels question is open
@@ -130,7 +132,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         Log($"claude adapter ({(Headless ? "headless" : "TUI")}): loopback server at {hooks.BaseUrl}");
         rpc.Start();
         // In the background: neither the service's start nor session/new waits for it.
-        if (Headless && Catalog.Count == 0 && options.FetchCatalog) _ = Task.Run(FetchCatalogAsync);
+        if (Headless && Catalog.Count == 0 && options.FetchCatalog) fetching = Task.Run(() => FetchCatalogAsync(lifetime.Token));
     }
 
     public string HookUrl(string sessionId, string token) => $"{hooks!.BaseUrl}/hook/{sessionId}/{token}";
@@ -389,19 +391,25 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             Catalog = catalog;
             changed = true;
         }
-        if (changed)
-            foreach (var open in sessions.Values.OfType<HeadlessSession>().Concat(session is null ? [] : [session]).Distinct())
-                await OnSettingsReportedAsync(open);
-        else if (session is not null)
-            await OnSettingsReportedAsync(session);
+        if (session is not null) await OnSettingsReportedAsync(session);
+        if (!changed) return;
+        // The other sessions hear it apart from the launch, which neither waits for them nor fails with them.
+        var others = sessions.Values.OfType<HeadlessSession>().Where(s => s != session).ToList();
+        _ = Task.Run(async () =>
+        {
+            foreach (var open in others) await OnSettingsReportedAsync(open);
+        });
     }
 
     /// <summary>
     /// Fetches the catalog without a session: Claude launched as every headless session is (the same
     /// flags, the same cleaned environment, the same plan check), in the adapter's own folder, with
-    /// no prompt and nothing saved (<c>--no-session-persistence</c>), asked only <c>initialize</c>.
+    /// no prompt and nothing saved (<c>--no-session-persistence</c>), asked only <c>initialize</c>. It
+    /// loads none of the person's settings files (<c>--setting-sources local</c>, and the folder has
+    /// none) and no MCP server (<c>--strict-mcp-config</c> with an empty <c>--mcp-config</c>), so none of
+    /// their hooks or servers runs for it. Stopping the adapter stops it.
     /// </summary>
-    async Task FetchCatalogAsync()
+    async Task FetchCatalogAsync(CancellationToken ct)
     {
         try
         {
@@ -416,7 +424,13 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             var settingsPath = Path.Combine(folder, "settings.json");
             File.WriteAllText(settingsPath, StreamJson.Settings().ToJsonString(AcpJson.TextOptions));
             var id = Guid.NewGuid().ToString();
-            var args = new List<string>(StreamJson.BaseArgs) { "--settings", settingsPath, "--no-session-persistence", "--session-id", id };
+            var mcpPath = Path.Combine(folder, "mcp.json");
+            File.WriteAllText(mcpPath, """{"mcpServers":{}}""");
+            var args = new List<string>(StreamJson.BaseArgs)
+            {
+                "--settings", settingsPath, "--setting-sources", "local", "--strict-mcp-config", "--mcp-config", mcpPath,
+                "--no-session-persistence", "--session-id", id,
+            };
             args.AddRange(ClaudeOptions.LaunchArgs(new ClaudeSettings(), options.PermissionMode, options.Model));
             Log($"claude: fetching the model catalog in {folder} (session {id}, not kept)");
             await using var claude = ClaudeProcess.Start(exe, args, folder, ClaudeEnvironment.Clean(headless: true), Path.Combine(folder, "stderr.log"),
@@ -424,12 +438,13 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             claude.BeginReading();
             try
             {
-                var init = await claude.ControlAsync(new JsonObject { ["subtype"] = "initialize" }, TimeSpan.FromSeconds(options.StartupTimeoutSeconds));
+                var init = await claude.ControlAsync(new JsonObject { ["subtype"] = "initialize" }, TimeSpan.FromSeconds(options.StartupTimeoutSeconds), ct);
                 if (StreamJson.PlanProblem(init) is { } problem)
                 {
                     Log($"claude: no model catalog fetched: {problem}");
                     return;
                 }
+                ct.ThrowIfCancellationRequested();
                 await OnInitializeAsync(null, init);
                 Log($"claude: fetched the model catalog ({Catalog.Count} models) from Claude Code {(string?)init["claude_code_version"]}");
             }
@@ -437,6 +452,10 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             {
                 await claude.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            Log("claude: the model catalog fetch stopped with the adapter");
         }
         catch (Exception e)
         {
@@ -447,8 +466,12 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     /// <summary>Claude reported its model or mode: the session's options may have changed.</summary>
     public async Task OnSettingsReportedAsync(HeadlessSession session)
     {
+        // News, not a step of anything: a session that is gone or not announced yet fails nothing else.
         try { await EmitAsync(session.Id, new ConfigOptionUpdate { ConfigOptions = ClaudeOptions.ConfigOptions(session.Settings, Catalog) }); }
-        catch (IOException) { }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            Log($"claude {session.Id}: its options were not sent: {e.Message}");
+        }
     }
 
     /// <summary>
@@ -619,6 +642,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        lifetime.Cancel();
+        if (fetching is not null) await fetching; // it never throws
         foreach (var s in sessions.Values)
             try { await s.DisposeAsync(); } catch (Exception e) { Log($"claude {s.Id}: stop failed: {e.Message}"); }
         sessions.Clear();

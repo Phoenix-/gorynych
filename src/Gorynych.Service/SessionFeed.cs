@@ -199,30 +199,6 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             if (state[key] is JsonObject part) part[field] = value.DeepClone();
     }
 
-    /// <summary>
-    /// Whether the current value of one of the session's config options carries <paramref name="flag"/>
-    /// as <c>true</c> in its <c>_meta</c>: a flag of the session in its present mode, such as
-    /// <c>gorynych/unaskedMcpTools</c> on Claude's Full access. Grouped options count too.
-    /// </summary>
-    public bool CurrentValueFlag(string flag)
-    {
-        lock (stateGate)
-        {
-            if (state["configOptions"] is not JsonArray options) return false;
-            foreach (var option in options.OfType<JsonObject>())
-            {
-                if (option["currentValue"] is not JsonValue cv || !cv.TryGetValue<string>(out var current)) continue;
-                var values = (option["options"] as JsonArray)?.OfType<JsonObject>()
-                    .SelectMany(v => v["options"] is JsonArray group ? group.OfType<JsonObject>() : [v]) ?? [];
-                foreach (var value in values)
-                    if (value["value"] is JsonValue vv && vv.TryGetValue<string>(out var id) && id == current
-                        && value["_meta"]?[flag] is JsonValue f && f.TryGetValue<bool>(out var on) && on)
-                        return true;
-            }
-            return false;
-        }
-    }
-
     /// <summary>A copy of the session state as the agent last reported it; empty if it reported none.</summary>
     public JsonObject State()
     {

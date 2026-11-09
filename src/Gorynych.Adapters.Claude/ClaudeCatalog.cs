@@ -13,7 +13,8 @@ namespace Gorynych.Adapters.Claude;
 internal sealed class ClaudeCatalogStore(string path, Action<string>? log)
 {
     readonly Lock gate = new();
-    string? saved;
+    string? current; // the catalog in use, as the file's text
+    string? written; // what the file holds
 
     /// <summary>The kept catalog, or an empty one when there is none or it cannot be read.</summary>
     public List<ClaudeModel> Load()
@@ -21,40 +22,47 @@ internal sealed class ClaudeCatalogStore(string path, Action<string>? log)
         try
         {
             if (!File.Exists(path)) return [];
-            var text = File.ReadAllText(path);
-            if (JsonNode.Parse(text) is not JsonObject file || file["models"] is not JsonArray models)
+            if (JsonNode.Parse(File.ReadAllText(path)) is not JsonObject file || file["models"] is not JsonArray models)
                 throw new JsonException("no models list");
             var catalog = ClaudeOptions.Catalog(file);
-            lock (gate) saved = Key(models);
+            var text = Text(models);
+            lock (gate) current = written = text;
             return catalog;
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+        catch (Exception e) when (e is not OutOfMemoryException)
         {
+            // Whatever the file holds, it never stops the adapter: a catalog comes with the next launch.
             log?.Invoke($"claude: {path} unreadable, no model catalog until Claude gives one: {e.Message}");
             return [];
         }
     }
 
-    /// <summary>Keeps <paramref name="models"/> unless they are what is kept already. False when nothing changed.</summary>
+    /// <summary>
+    /// Keeps <paramref name="models"/>. True when they differ from the catalog in use. The file is
+    /// written when it does not hold them yet; one that could not be written is tried again next time.
+    /// </summary>
     public bool Save(JsonArray models)
     {
-        var key = Key(models);
+        var text = Text(models);
+        bool changed;
         lock (gate)
         {
-            if (key == saved) return false;
-            saved = key;
+            changed = text != current;
+            current = text;
+            if (text == written) return changed;
         }
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            AtomicFile.WriteAllText(path, new JsonObject { ["models"] = models.DeepClone() }.ToJsonString(AcpJson.TextOptions));
+            AtomicFile.WriteAllText(path, text);
+            lock (gate) written = text;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
             log?.Invoke($"claude: the model catalog was not saved to {path}: {e.Message}");
         }
-        return true;
+        return changed;
     }
 
-    static string Key(JsonArray models) => models.ToJsonString(AcpJson.TextOptions);
+    static string Text(JsonArray models) => new JsonObject { ["models"] = models.DeepClone() }.ToJsonString(AcpJson.TextOptions);
 }

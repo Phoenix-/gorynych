@@ -32,6 +32,8 @@ internal sealed class HeadlessSession : IClaudeSession
     readonly Lock stateGate = new();
     readonly CancellationTokenSource lifetime = new();
     ClaudeProcess? process;
+    /// <summary>The <c>--permission-mode</c> of the latest launch.</summary>
+    string launchMode = "default";
     TranscriptWatcher? transcript;
     bool resume;
     bool disposed;
@@ -337,64 +339,72 @@ internal sealed class HeadlessSession : IClaudeSession
 
     // ---------------------------------------------------------------- options and title
 
+    /// <summary>
+    /// Applies an option. Changes take the launch gate, one at a time and never during a launch, and
+    /// each works on a copy taken inside it, kept only once a running Claude took it.
+    /// </summary>
     public async Task<List<SessionConfigOption>> SetOptionAsync(string configId, string value, CancellationToken ct)
     {
-        // Changed on a copy, and kept only once a running Claude took it.
-        var next = Settings.Clone();
-        var request = ClaudeOptions.Change(next, agent.Catalog, configId, value);
-        var wasFull = ClaudeOptions.CurrentMode(Settings) == ClaudeOptions.FullAccess;
-        var isFull = ClaudeOptions.CurrentMode(next) == ClaudeOptions.FullAccess;
-        if (isFull && !wasFull)
+        // Full access needs a Claude started in it, so it waits for no turn: it is refused during one.
+        var holdsPrompts = false;
+        if (configId == "mode" && value == ClaudeOptions.FullAccess && ClaudeOptions.CurrentMode(Settings) != ClaudeOptions.FullAccess)
         {
-            await EnterFullAccessAsync(next, ct);
-            return ClaudeOptions.ConfigOptions(Settings, agent.Catalog);
+            if (!await promptGate.WaitAsync(0, ct)) throw TurnRunning();
+            holdsPrompts = true;
         }
-        if (process is { Exited.IsCompleted: false } claude)
-        {
-            try { await claude.ControlAsync(request, TimeSpan.FromSeconds(15), ct); }
-            catch (Exception e) when (e is ClaudeControlException or IOException or TimeoutException)
-            {
-                if (!(wasFull && !isFull)) throw new JsonRpcException(JsonRpcException.InternalError, $"Claude did not take the change: {e.Message}");
-                // Leaving Full access must hold before Claude's next tool call: a Claude that kept it is stopped.
-                Abandon(claude, $"it did not leave full access ({e.Message})");
-            }
-        }
-        Settings.CopyChoicesFrom(next);
-        return ClaudeOptions.ConfigOptions(Settings, agent.Catalog);
-    }
-
-    /// <summary>
-    /// Full access: Claude cannot enter <c>bypassPermissions</c> in a process started without it (only
-    /// <c>--allow-dangerously-skip-permissions</c> would let it, and that flag is never given), so a
-    /// running Claude is stopped between turns and the next prompt starts it in full access.
-    /// </summary>
-    async Task EnterFullAccessAsync(ClaudeSettings next, CancellationToken ct)
-    {
-        static JsonRpcException Running() => new(JsonRpcException.InvalidRequest,
-            "A turn of this session is running; choose Full access once it has ended.");
-        if (!await promptGate.WaitAsync(0, ct)) throw Running();
         try
         {
             await launchGate.WaitAsync(ct);
             try
             {
+                var next = Settings.Clone();
+                var request = ClaudeOptions.Change(next, agent.Catalog, configId, value);
+                var wasFull = ClaudeOptions.CurrentMode(Settings) == ClaudeOptions.FullAccess;
+                var isFull = ClaudeOptions.CurrentMode(next) == ClaudeOptions.FullAccess;
                 ClaudeProcess? running;
+                bool busy;
                 lock (stateGate)
                 {
-                    if (Busy) throw Running();
                     running = process is { Exited.IsCompleted: false } p ? p : null;
+                    busy = Busy;
+                }
+                if (isFull && !wasFull)
+                {
+                    // Claude cannot enter bypassPermissions in a process started without it (only
+                    // --allow-dangerously-skip-permissions would let it, never given): the next prompt starts it so.
+                    if (running is not null)
+                    {
+                        if (busy) throw TurnRunning();
+                        await RetireAsync(running, "stopped to start again in full access with the next prompt");
+                    }
+                }
+                else if (running is not null)
+                {
+                    try { await running.ControlAsync(request, TimeSpan.FromSeconds(15), ct); }
+                    catch (Exception e) when (e is ClaudeControlException or IOException or TimeoutException)
+                    {
+                        if (!(wasFull && !isFull)) throw new JsonRpcException(JsonRpcException.InternalError, $"Claude did not take the change: {e.Message}");
+                        // Leaving Full access must hold before Claude's next tool call: a Claude that kept it is stopped.
+                        Abandon(running, $"it did not leave full access ({e.Message})");
+                    }
                 }
                 Settings.CopyChoicesFrom(next);
-                if (running is null) return;
-                OnExited(running, -1, "stopped to start again in full access with the next prompt");
-                await running.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
-                await running.DisposeAsync();
+                return ClaudeOptions.ConfigOptions(Settings, agent.Catalog);
             }
             finally { launchGate.Release(); }
         }
-        finally { promptGate.Release(); }
+        finally { if (holdsPrompts) promptGate.Release(); }
     }
 
+    static JsonRpcException TurnRunning() => new(JsonRpcException.InvalidRequest, "A turn of this session is running; choose Full access once it has ended.");
+
+    /// <summary>Lets a process go now and stops it: the session is reset at once, so the next prompt starts a new one.</summary>
+    async Task RetireAsync(ClaudeProcess claude, string why)
+    {
+        OnExited(claude, -1, why);
+        await claude.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
+        await claude.DisposeAsync();
+    }
     /// <summary>Writes Claude's own title (<c>custom-title</c>) through <c>rename_session</c>; waits for the next launch when Claude is not running.</summary>
     public async Task SetTitleAsync(string title, CancellationToken ct)
     {
@@ -434,7 +444,7 @@ internal sealed class HeadlessSession : IClaudeSession
             try
             {
                 JsonObject init;
-                try { init = await claude.ControlAsync(new JsonObject { ["subtype"] = "initialize" }, TimeSpan.FromSeconds(options.StartupTimeoutSeconds), ct); }
+                try { init = await claude.ControlAsync(StreamJson.Initialize(), TimeSpan.FromSeconds(options.StartupTimeoutSeconds), ct); }
                 catch (Exception e) when (e is ClaudeControlException or TimeoutException or IOException)
                 {
                     throw new JsonRpcException(JsonRpcException.InternalError,
@@ -443,8 +453,14 @@ internal sealed class HeadlessSession : IClaudeSession
                 // Never run on without the person's plan login (docs/adapters.md, "Failing loudly").
                 if (StreamJson.PlanProblem(init) is { } problem)
                     throw new JsonRpcException(JsonRpcException.InternalError, problem);
-                // Full access is the person's pick: a Claude that did not take it does not run in another mode instead.
-                if (Settings.Mode == ClaudeOptions.FullAccess && (string?)init["current_permission_mode"] is { } started && started != ClaudeOptions.FullAccess)
+                // Claude runs only in the mode it was started with: Full access exactly when the person
+                // picked it (option changes wait for the launch, so the pick cannot change meanwhile).
+                var started = (string?)init["current_permission_mode"];
+                if (started == ClaudeOptions.FullAccess && launchMode != ClaudeOptions.FullAccess)
+                    throw new JsonRpcException(JsonRpcException.InternalError,
+                        $"Claude Code started in full access (bypassPermissions), which this session did not choose (it asked for {launchMode}); " +
+                        "your Claude settings may set it. Gorynych does not run it so.");
+                if (launchMode == ClaudeOptions.FullAccess && started is not null && started != ClaudeOptions.FullAccess)
                     throw new JsonRpcException(JsonRpcException.InternalError,
                         $"Claude Code started in {started} instead of full access (bypassPermissions); your Claude settings may turn it off " +
                         "(permissions.disableBypassPermissionsMode). Choose another mode, or allow it in Claude itself.");
@@ -478,6 +494,7 @@ internal sealed class HeadlessSession : IClaudeSession
 
         var args = new List<string>(StreamJson.BaseArgs) { "--settings", settingsPath };
         args.AddRange(ClaudeOptions.LaunchArgs(Settings, options.PermissionMode, options.Model));
+        launchMode = args[args.IndexOf("--permission-mode") + 1];
         var mcpPath = Path.Combine(Folder, "mcp.json");
         var channel = agent.Channel;
         if (channel is not null)
@@ -776,6 +793,9 @@ internal sealed class HeadlessSession : IClaudeSession
                 case "can_use_tool":
                     await PermissionAsync(claude, requestId, request);
                     break;
+                case "hook_callback" when (string?)request["callback_id"] == StreamJson.AskHookId:
+                    await AskHookAsync(claude, requestId, request);
+                    break;
                 case "elicitation":
                     // MCP servers' forms are not passed on yet; Claude takes a decline as "no".
                     agent.Log($"claude {Id}: declined an elicitation from {(string?)request["mcp_server_name"]}");
@@ -822,16 +842,9 @@ internal sealed class HeadlessSession : IClaudeSession
                 }
             }
             else
-            {
-                var hookLike = new JsonObject { ["tool_name"] = tool, ["tool_input"] = input.DeepClone() };
-                var decision = await agent.RequestPermissionAsync(ClaudeHooks.Permission(Id, toolCallId, hookLike), cts.Token);
-                if (ClaudeHooks.IsAllowed(decision.Outcome)) answer = StreamJson.Allow(input);
-                else
-                {
-                    await EmitAsync(ClaudeHooks.ToolCallStatusUpdate(toolCallId, ToolCallStatus.Failed, "Denied in Gorynych."));
-                    answer = StreamJson.Deny("The user denied this tool call in Gorynych.");
-                }
-            }
+                answer = await AskPersonAsync(tool, input, toolCallId, cts.Token)
+                    ? StreamJson.Allow(input)
+                    : StreamJson.Deny("The user denied this tool call in Gorynych.");
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -843,6 +856,63 @@ internal sealed class HeadlessSession : IClaudeSession
             // Claude must always get an answer, or its turn waits for ever.
             agent.Log($"claude {Id}: approval failed: {e.Message}");
             answer = StreamJson.Deny("Gorynych could not reach the user for approval.");
+        }
+        finally
+        {
+            asks.TryRemove(requestId, out _);
+            cts.Dispose();
+        }
+        await claude.RespondAsync(requestId, answer);
+    }
+
+    /// <summary>The person's yes or no to a tool call, as an ACP approval; a no marks the call failed.</summary>
+    async Task<bool> AskPersonAsync(string tool, JsonObject input, string toolCallId, CancellationToken ct)
+    {
+        var hookLike = new JsonObject { ["tool_name"] = tool, ["tool_input"] = input.DeepClone() };
+        var decision = await agent.RequestPermissionAsync(ClaudeHooks.Permission(Id, toolCallId, hookLike), ct);
+        if (ClaudeHooks.IsAllowed(decision.Outcome)) return true;
+        await EmitAsync(ClaudeHooks.ToolCallStatusUpdate(toolCallId, ToolCallStatus.Failed, "Denied in Gorynych."));
+        return false;
+    }
+
+    /// <summary>
+    /// The PreToolUse hook on <c>ask_agent</c>, <c>archive_session</c> and <c>restore_session</c>, which
+    /// Claude calls in every mode with the mode it runs in now (<c>permission_mode</c>). Where Claude
+    /// asks for tools itself it decides nothing, and <c>can_use_tool</c> asks. In any other mode
+    /// (Full access, auto, or one Claude did not name) nobody would be asked, so the person is asked here.
+    /// </summary>
+    async Task AskHookAsync(ClaudeProcess claude, string requestId, JsonObject request)
+    {
+        var input = request["input"] as JsonObject ?? [];
+        var mode = (string?)input["permission_mode"];
+        if (StreamJson.AsksForTools(mode))
+        {
+            await claude.RespondAsync(requestId, StreamJson.NoHookDecision());
+            return;
+        }
+        var tool = (string?)input["tool_name"] ?? "";
+        var toolInput = input["tool_input"] as JsonObject ?? [];
+        var toolCallId = (string?)request["tool_use_id"] ?? (string?)input["tool_use_id"] ?? $"permission-{Interlocked.Increment(ref permissionCount)}";
+        agent.Log($"claude {Id}: asking the person before {tool} ({mode ?? "mode not given"})");
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        asks[requestId] = cts;
+        JsonObject answer;
+        try
+        {
+            answer = await AskPersonAsync(tool, toolInput, toolCallId, cts.Token)
+                ? StreamJson.HookDecision(true, "The user allowed it in Gorynych.")
+                : StreamJson.HookDecision(false, "The user denied this tool call in Gorynych.");
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            agent.Log($"claude {Id}: the question before {tool} was withdrawn");
+            return;
+        }
+        catch (Exception e)
+        {
+            // Claude must always get an answer; without the person's yes the call does not run.
+            agent.Log($"claude {Id}: could not ask before {tool}: {e.Message}");
+            answer = StreamJson.HookDecision(false, "Gorynych could not reach the user to ask.");
         }
         finally
         {
@@ -876,11 +946,7 @@ internal sealed class HeadlessSession : IClaudeSession
             if (transcript is not null) await transcript.DisposeAsync();
             ClaudeProcess? running;
             lock (stateGate) running = process;
-            if (running is not null)
-            {
-                await running.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
-                await running.DisposeAsync();
-            }
+            if (running is not null) await RetireAsync(running, "the session was closed");
         }
         finally
         {

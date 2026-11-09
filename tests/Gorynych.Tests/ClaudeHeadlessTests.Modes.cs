@@ -101,7 +101,39 @@ public sealed partial class ClaudeHeadlessTests
             .Single(a => a.Contains("--no-session-persistence") && a[a.IndexOf("--settings") + 1].StartsWith(Path.Combine(dir, "claude", "catalog"), StringComparison.OrdinalIgnoreCase));
         CollectionAssert.IsSubsetOf(new[] { "-p", "--permission-prompt-tool=stdio", "--settings" }, fetch, "launched as every session is");
         Assert.AreEqual("default", fetch[fetch.IndexOf("--permission-mode") + 1]);
+        Assert.AreEqual("local", fetch[fetch.IndexOf("--setting-sources") + 1], "none of the person's settings files, so none of their hooks");
+        CollectionAssert.Contains(fetch, "--strict-mcp-config", "no MCP server of theirs");
+        Assert.AreEqual("""{"mcpServers":{}}""", File.ReadAllText(fetch[fetch.IndexOf("--mcp-config") + 1]));
         lock (log) Assert.IsTrue(log.Any(l => l.Contains("fetched the model catalog", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ACatalogFileOfTheWrongShape_GivesNoCatalog_AndNoCrash()
+    {
+        var dir = TestDirs.New();
+        KeepCatalog(dir, """{"models":[{"value":"a","displayName":7,"supportsAutoMode":"yes","supportedEffortLevels":{"x":1}}]}""");
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+
+        CollectionAssert.AreEqual(new[] { "mode" }, Ids((await NewRawAsync(client, dir)).ConfigOptions));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ACatalogThatCouldNotBeSaved_IsSavedWithTheNextLaunch()
+    {
+        var dir = TestDirs.New();
+        var stuck = Directory.CreateDirectory(CatalogFile(dir) + ".tmp"); // the file cannot be replaced
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        await PromptAsync(client, await NewAsync(client, dir), "hello");
+        Assert.IsFalse(File.Exists(CatalogFile(dir)));
+
+        stuck.Delete();
+        await PromptAsync(client, await NewAsync(client, dir), "hello");
+
+        StringAssert.Contains(File.ReadAllText(CatalogFile(dir)), "claude-fake-2", "the same catalog, written now");
     }
 
     [TestMethod]
@@ -164,7 +196,6 @@ public sealed partial class ClaudeHeadlessTests
         Assert.AreEqual(ClaudeOptions.FullAccess, (string?)option["currentValue"]);
         var entry = option["options"]!.AsArray().Single(o => (string?)o!["value"] == ClaudeOptions.FullAccess)!;
         Assert.AreEqual("Full access", (string?)entry["name"]);
-        Assert.IsTrue((bool)entry["_meta"]![GorynychProtocol.CapUnaskedMcpTools]!, "the service asks before the gorynych tools act");
         Assert.IsFalse(Controls(id).Any(c => (string?)c["subtype"] == "set_permission_mode"), "not switched inside the running Claude");
         StringAssert.Contains(File.ReadAllText(Path.Combine(dir, "claude", "sessions.json")), ClaudeOptions.FullAccess, "kept in the session's record");
 
@@ -183,6 +214,176 @@ public sealed partial class ClaudeHeadlessTests
         Assert.AreEqual(2, Controls(id).Count(c => (string?)c["subtype"] == "initialize"), "no new Claude for it");
         await PromptAsync(client, id, "write");
         Assert.AreEqual(asked + 1, client.Approvals.Count, "the next write asks again");
+    }
+
+    static int HookAsks(List<string> log)
+    {
+        lock (log) return log.Count(l => l.Contains("asking the person before mcp__gorynych__", StringComparison.Ordinal));
+    }
+
+    static string[] AskedTools(TestClient client, int from) =>
+        client.Approvals.Skip(from).Select(a => (string)AcpJson.ToNode(a.ToolCall)!["rawInput"]?.ToJsonString()! + " " + a.ToolCall.Title).ToArray();
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task TheGorynychTools_AreAskedInFullAccess_ThroughTheHook_AndOnceInAsk()
+    {
+        var dir = TestDirs.New();
+        var log = new List<string>();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        await SetModeAsync(client, id, ClaudeOptions.FullAccess);
+        await PromptAsync(client, id, "hello");
+        var before = client.Approvals.Count;
+
+        var full = await PromptAsync(client, id, "gorynych tools");
+
+        Assert.AreEqual(StopReason.EndTurn, full.StopReason);
+        Assert.AreEqual(before + 3, client.Approvals.Count, "ask_agent, archive_session and restore_session each asked: " + string.Join(" | ", AskedTools(client, before)));
+        Assert.AreEqual(3, HookAsks(log), "asked by the adapter, from Claude's hook");
+        StringAssert.Contains(client.Text(), "ask_agent:allow archive_session:allow restore_session:allow");
+
+        await SetModeAsync(client, id, "default");
+        var inAsk = client.Approvals.Count;
+        await PromptAsync(client, id, "gorynych tools");
+        Assert.AreEqual(inAsk + 3, client.Approvals.Count, "in Ask, Claude's own can_use_tool asks, once each");
+        Assert.AreEqual(3, HookAsks(log), "the hook left it to Claude");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task TheGorynychTools_AreAskedInFullAccess_WhileTheCatalogChanges()
+    {
+        var dir = TestDirs.New();
+        var other = TestDirs.New();
+        File.WriteAllText(Path.Combine(other, "models-small"), "");
+        var log = new List<string>();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        await PromptAsync(client, id, "hello");
+        var entering = SetModeAsync(client, id, ClaudeOptions.FullAccess);
+        var elsewhere = await NewAsync(client, other);
+        await Task.WhenAll(entering, PromptAsync(client, elsewhere, "hello")); // its launch changes the catalog and tells every session
+        var before = client.Approvals.Count;
+
+        await PromptAsync(client, id, "gorynych tools");
+
+        Assert.AreEqual(before + 3, client.Approvals.Count, "asked whatever the client last heard of the mode");
+        Assert.AreEqual(3, HookAsks(log));
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task APersistedFullAccess_AfterARestart_StartsInIt_AndStillAsksBeforeTheGorynychTools()
+    {
+        var dir = TestDirs.New();
+        string id;
+        await using (var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false))))
+        {
+            await using var client = await TestClient.ConnectAsync(conductor);
+            id = await NewAsync(client, dir);
+            await PromptAsync(client, id, "hello");
+            await SetModeAsync(client, id, ClaudeOptions.FullAccess);
+        }
+        var log = new List<string>();
+        await using (var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false))))
+        {
+            await using var client = await TestClient.ConnectAsync(conductor);
+
+            await PromptAsync(client, id, "gorynych tools");
+
+            var args = LaunchArgs(id);
+            Assert.AreEqual(ClaudeOptions.FullAccess, args[args.IndexOf("--permission-mode") + 1], "resumed in full access");
+            Assert.AreEqual(3, client.Approvals.Count, "each tool asked: " + string.Join(" | ", AskedTools(client, 0)));
+            Assert.AreEqual(3, HookAsks(log));
+        }
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHookCallThatDoesNotSayTheMode_AsksThePerson()
+    {
+        var dir = TestDirs.New();
+        File.WriteAllText(Path.Combine(dir, "no-mode"), "");
+        var log = new List<string>();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        await PromptAsync(client, id, "hello");
+        var before = client.Approvals.Count;
+
+        await PromptAsync(client, id, "gorynych tools");
+
+        Assert.AreEqual(3, HookAsks(log), "an unknown mode counts as one that asks nobody");
+        Assert.AreEqual(before + 3, client.Approvals.Count, "the hook's yes settles it, so nothing is asked twice");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task LeavingFullAccess_WhenClaudeRefuses_StopsIt_AndTheNextTurnAsks()
+    {
+        var dir = TestDirs.New();
+        var log = new List<string>();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        await SetModeAsync(client, id, ClaudeOptions.FullAccess);
+        await PromptAsync(client, id, "hello");
+        File.WriteAllText(Path.Combine(dir, "no-leave"), "");
+
+        var back = await SetModeAsync(client, id, "default");
+
+        Assert.AreEqual("default", (string?)ModeOptionOf(back.ConfigOptions)["currentValue"]);
+        lock (log) Assert.IsTrue(log.Any(l => l.Contains("did not leave full access", StringComparison.Ordinal)), string.Join(" | ", log));
+        File.Delete(Path.Combine(dir, "no-leave"));
+        var before = client.Approvals.Count;
+        await PromptAsync(client, id, "write");
+        var args = LaunchArgs(id);
+        Assert.AreEqual("default", args[args.IndexOf("--permission-mode") + 1], "a new Claude, in Ask");
+        Assert.AreEqual(before + 1, client.Approvals.Count, "the write asks");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AClaudeThatStartsInFullAccessUnasked_IsStopped()
+    {
+        var dir = TestDirs.New();
+        File.WriteAllText(Path.Combine(dir, "force-bypass"), "");
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+
+        var refused = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, id, "write"));
+
+        StringAssert.Contains(refused.Message, "did not choose");
+        Assert.IsFalse(File.Exists(Path.Combine(dir, "fake.txt")), "nothing ran");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AChosenModelTheCatalogDropped_StaysTheSessionsModel()
+    {
+        var dir = TestDirs.New();
+        var other = TestDirs.New();
+        File.WriteAllText(Path.Combine(other, "models-small"), "");
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        await PromptAsync(client, id, "hello");
+        await client.Rpc.RequestAsync<SetSessionConfigOptionRequest, SetSessionConfigOptionResponse>(AcpMethods.Agent.SessionSetConfigOption,
+            new SetSessionConfigOptionRequestValueId { SessionId = id, ConfigId = "model", Value = "fast" });
+        var shown = OptionUpdates(client, id).Length;
+
+        var elsewhere = await NewAsync(client, other);
+        await PromptAsync(client, elsewhere, "hello"); // its catalog has no "fast"
+
+        await Until(() => OptionUpdates(client, id).Length > shown);
+        var model = OptionUpdates(client, id).Last()["configOptions"]!.AsArray().Single(o => (string?)o!["id"] == "model")!;
+        Assert.AreEqual("fast", (string?)model["currentValue"], "still the model the session runs on");
+        CollectionAssert.AreEquivalent(new[] { "default", "fast" }, model["options"]!.AsArray().Select(o => (string)o!["value"]!).ToArray());
+        Assert.IsFalse(File.ReadAllText(CatalogFile(dir)).Contains("claude-fake-2", StringComparison.Ordinal), "the catalog kept is the smaller one");
     }
 
     [TestMethod]

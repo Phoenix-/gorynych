@@ -26,6 +26,42 @@ public static class StreamJson
 
     // ---------------------------------------------------------------- adapter → Claude
 
+    /// <summary>The callback ID of the PreToolUse hook on the gorynych tools that act for the person.</summary>
+    public const string AskHookId = "gorynych-ask";
+
+    /// <summary>The tools whose hook calls the adapter: the gorynych tools that need the person's yes (docs/adapters.md, "Full access mode").</summary>
+    public const string AskedToolsMatcher = "^mcp__gorynych__(ask_agent|archive_session|restore_session)$";
+
+    /// <summary>
+    /// A session launch's <c>initialize</c>: Claude calls the adapter back (<c>hook_callback</c>) before
+    /// each of <see cref="AskedToolsMatcher"/>, in every permission mode.
+    /// </summary>
+    public static JsonObject Initialize() => new()
+    {
+        ["subtype"] = "initialize",
+        ["hooks"] = new JsonObject
+        {
+            ["PreToolUse"] = new JsonArray(new JsonObject { ["matcher"] = AskedToolsMatcher, ["hookCallbackIds"] = new JsonArray(AskHookId) }),
+        },
+    };
+
+    /// <summary>The permission modes in which Claude asks for the gorynych tools itself, through <c>can_use_tool</c>.</summary>
+    public static bool AsksForTools(string? mode) => mode is "default" or "manual" or "acceptEdits" or "plan";
+
+    /// <summary>A PreToolUse hook answer: no decision, so Claude's own permission check goes on.</summary>
+    public static JsonObject NoHookDecision() => [];
+
+    /// <summary>A PreToolUse hook answer that lets the call run, or blocks it with what the model is told.</summary>
+    public static JsonObject HookDecision(bool allow, string reason) => new()
+    {
+        ["hookSpecificOutput"] = new JsonObject
+        {
+            ["hookEventName"] = "PreToolUse",
+            ["permissionDecision"] = allow ? "allow" : "deny",
+            ["permissionDecisionReason"] = reason,
+        },
+    };
+
     /// <summary>A user message for Claude's stdin, stamped with <paramref name="uuid"/> so its replay can be told apart.</summary>
     public static JsonObject UserMessage(string uuid, JsonNode content) => new()
     {

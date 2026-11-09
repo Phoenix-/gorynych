@@ -14,8 +14,12 @@
 // shows ANTHROPIC_API_KEY), `api-key-init` (only system/init shows it), `auth-token` (a token but
 // no plan) and `bedrock` (another provider); `deaf` stops reading stdin after initialize;
 // `no-bypass` starts in `default` whatever --permission-mode says, as a Claude whose settings turn
-// bypassPermissions off. As Claude 2.1.302: bypassPermissions asks for no tool, and a running
-// process enters it only when it started in it or with --allow-dangerously-skip-permissions.
+// bypassPermissions off; `force-bypass` starts in it whatever was asked; `no-leave` refuses to leave
+// it; `models-small` offers only the default model. As Claude 2.1.302: bypassPermissions asks for
+// no tool, a running process enters it only when it started in it or with
+// --allow-dangerously-skip-permissions, and a PreToolUse hook registered in initialize is called
+// back (hook_callback) before a matching tool in every mode, with the mode (`no-mode` leaves it out).
+// Prompt `gorynych tools` calls ask_agent, archive_session and restore_session.
 using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -30,6 +34,8 @@ static partial class FakeHeadless
     static TaskCompletionSource interrupted = new(TaskCreationOptions.RunContinuationsAsynchronously);
     static string mode = "default";
     static bool canBypass;
+    static string cwdNow = "";
+    static readonly List<(Regex Matcher, string Id)> PreToolUse = [];
     static string model = "claude-fake-1";
     static int messages;
     static int tools;
@@ -52,6 +58,8 @@ static partial class FakeHeadless
         var controls = Path.Combine(root, sessionId + ".controls.jsonl");
         mode = Arg("--permission-mode") ?? "default";
         if (mode == "bypassPermissions" && File.Exists(Path.Combine(cwd, "no-bypass"))) mode = "default";
+        if (File.Exists(Path.Combine(cwd, "force-bypass"))) mode = "bypassPermissions";
+        cwdNow = cwd;
         canBypass = mode == "bypassPermissions" || args.Contains("--allow-dangerously-skip-permissions") || args.Contains("--dangerously-skip-permissions");
         model = Arg("--model") ?? model;
         var replyUrl = ReplyUrl(Arg("--mcp-config"));
@@ -110,11 +118,16 @@ static partial class FakeHeadless
                 if (File.Exists(Path.Combine(cwd, "bedrock")))
                     account = new JsonObject { ["subscriptionType"] = "Claude Max", ["apiProvider"] = "bedrock" };
                 if (File.Exists(Path.Combine(cwd, "no-account"))) account = null;
+                foreach (var hook in (request["hooks"]?["PreToolUse"] as JsonArray ?? []).OfType<JsonObject>())
+                    foreach (var callback in (hook["hookCallbackIds"] as JsonArray ?? []).Select(c => (string?)c).OfType<string>())
+                        PreToolUse.Add((new Regex((string?)hook["matcher"] ?? ".*"), callback));
                 await RespondAsync(id, new JsonObject
                 {
                     ["commands"] = new JsonArray(),
                     ["agents"] = new JsonArray(),
-                    ["models"] = JsonNode.Parse("""
+                    ["models"] = File.Exists(Path.Combine(cwd, "models-small"))
+                        ? JsonNode.Parse("""[{"value":"default","resolvedModel":"claude-fake-1","displayName":"Default (recommended)","supportedEffortLevels":["low","high"]}]""")
+                        : JsonNode.Parse("""
                         [{"value":"default","resolvedModel":"claude-fake-1","displayName":"Default (recommended)","supportedEffortLevels":["low","high"],"supportsAutoMode":true},
                          {"value":"fast","resolvedModel":"claude-fake-2","displayName":"Fast","supportedEffortLevels":["low"]}]
                         """),
@@ -128,7 +141,8 @@ static partial class FakeHeadless
                 await RespondAsync(id, []);
                 break;
             case "set_permission_mode":
-                if ((string?)request["mode"] == "bypassPermissions" && !canBypass)
+                if ((mode == "bypassPermissions" && (string?)request["mode"] != "bypassPermissions" && File.Exists(Path.Combine(cwd, "no-leave")))
+                    || ((string?)request["mode"] == "bypassPermissions" && !canBypass))
                 {
                     await WriteAsync(new JsonObject
                     {
@@ -205,6 +219,23 @@ static partial class FakeHeadless
             var allowed = (string?)decision["behavior"] == "allow" && chosen is not null;
             await ToolResultAsync(sessionId, toolUse, allowed ? $"answered {chosen}" : "no answer", !allowed, null);
             answer = allowed ? "you chose " + chosen : "no answer";
+        }
+        else if (prompt.Contains("gorynych tools", StringComparison.OrdinalIgnoreCase))
+        {
+            var verdicts = new List<string>();
+            foreach (var (tool, input) in new[]
+            {
+                ("mcp__gorynych__ask_agent", new JsonObject { ["session_id"] = "other", ["question"] = "tabs?" }),
+                ("mcp__gorynych__archive_session", new JsonObject { ["session_id"] = "other" }),
+                ("mcp__gorynych__restore_session", new JsonObject { ["session_id"] = "other" }),
+            })
+            {
+                var toolUse = await ToolUseAsync(sessionId, tool, input);
+                var decision = await AskAsync(tool, input, toolUse);
+                verdicts.Add($"{tool.Split("__")[2]}:{(string?)decision["behavior"]}");
+                await ToolResultAsync(sessionId, toolUse, "ok", false, null);
+            }
+            answer = string.Join(" ", verdicts);
         }
         else if (prompt.Contains("peers", StringComparison.OrdinalIgnoreCase))
         {
@@ -294,6 +325,26 @@ static partial class FakeHeadless
 
     static async Task<JsonObject> AskAsync(string tool, JsonObject input, string toolUseId)
     {
+        // Hooks first, in every mode: an allow or a deny of theirs settles it.
+        foreach (var (matcher, callback) in PreToolUse.Where(h => h.Matcher.IsMatch(tool)).ToList())
+        {
+            var hookInput = new JsonObject
+            {
+                ["hook_event_name"] = "PreToolUse", ["tool_name"] = tool, ["tool_input"] = input.DeepClone(), ["tool_use_id"] = toolUseId,
+            };
+            if (!File.Exists(Path.Combine(cwdNow, "no-mode"))) hookInput["permission_mode"] = mode;
+            var hookId = $"hook-{++asks}";
+            var hookAnswer = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Pending[hookId] = hookAnswer;
+            await WriteAsync(new JsonObject
+            {
+                ["type"] = "control_request", ["request_id"] = hookId,
+                ["request"] = new JsonObject { ["subtype"] = "hook_callback", ["callback_id"] = callback, ["input"] = hookInput, ["tool_use_id"] = toolUseId },
+            });
+            var decision = (string?)(await hookAnswer.Task)["response"]?["hookSpecificOutput"]?["permissionDecision"];
+            if (decision == "allow") return new JsonObject { ["behavior"] = "allow", ["updatedInput"] = input.DeepClone() };
+            if (decision == "deny") return new JsonObject { ["behavior"] = "deny", ["message"] = "denied by a hook" };
+        }
         // bypassPermissions: no question for any tool.
         if (mode == "bypassPermissions" && tool != "AskUserQuestion") return new JsonObject { ["behavior"] = "allow", ["updatedInput"] = input.DeepClone() };
         var id = $"ask-{++asks}";
