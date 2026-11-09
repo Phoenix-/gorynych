@@ -75,6 +75,11 @@ public sealed class SpawnInitiationTests
         Assert.Fail($"timed out waiting for {what}");
     }
 
+    /// <summary>Why a user_asked spawn is asked in a turn that another session's text came into.</summary>
+    const string OtherText = "another session's text (a question or a report) came into this turn, or the turn did not start with a prompt from the user";
+
+    static JsonObject AgentTurnMark(string mark) => new() { [GorynychProtocol.MetaAgentTurn] = mark };
+
     static readonly Func<RequestPermissionRequest, Task<RequestPermissionOutcome>> Start =
         _ => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = "start" });
 
@@ -120,8 +125,7 @@ public sealed class SpawnInitiationTests
         Assert.AreEqual(asked ? 1 : 0, SpawnCards(zed).Length);
         Assert.AreEqual(initiation == "user_asked" && asked, spawned["note"] is not null, "a note only when user_asked was asked all the same");
         if (spawned["note"] is { } note)
-            Assert.AreEqual("The user was asked although you passed initiation user_asked, as a question from another session came into this turn and is not answered yet.",
-                (string?)note);
+            Assert.AreEqual($"The user was asked although you passed initiation user_asked, as {OtherText}.", (string?)note);
         await conductor.BackgroundTurnsIdleAsync();
         StringAssert.Contains(kimi.FirstBlocks(child)[1], asked ? "with spawn_session, approved by the user]" : "with spawn_session, at the user's request]");
         if (!asked)
@@ -130,7 +134,7 @@ public sealed class SpawnInitiationTests
     }
 
     [TestMethod]
-    public async Task AQuestionAnsweredEarlierInTheTurn_DoesNotHoldBackAUserAskedSpawn()
+    public async Task AQuestionAnsweredEarlierInTheTurn_StillHoldsBackAUserAskedSpawn()
     {
         var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
         var kimi = new LifecycleAgent("kimi", canDelete: true);
@@ -152,10 +156,79 @@ public sealed class SpawnInitiationTests
         await PromptAsync(zed, parent, "Start a Kimi session that fixes the flaky test");
 
         Assert.AreEqual(1, claude.Opinions.Count, "the question came through the channel");
-        Assert.AreEqual(0, SpawnCards(zed).Length, "answered, so nothing is open");
-        Assert.IsNull(spawned!["note"]);
+        Assert.AreEqual(1, SpawnCards(zed).Length, "its text stays in the turn, answered or not");
+        Assert.AreEqual($"The user was asked although you passed initiation user_asked, as {OtherText}.", (string?)spawned!["note"]);
     }
 
+    [TestMethod]
+    public async Task AChildsReportInTheUsersTurn_HoldsBackAUserAskedSpawn_AndTheNextTurnIsClearAgain()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        zed.Approve = Start;
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        var child = (string)(await SpawnAsync(zed, claude.Tokens[parent], "proposal"))!["sessionId"]!;
+        await conductor.BackgroundTurnsIdleAsync();
+        await Until(() => { lock (claude.Notes) return claude.Notes.Count == 1; }, "the first turn's report, as a note");
+        await PromptAsync(zed, parent, "Thanks"); // a turn of the user's ends: nothing of the report is left
+        Assert.IsFalse(conductor.Feed(parent).HasOtherSessionText);
+        JsonNode? spawned = null;
+        var armed = true;
+        claude.BeforePrompt = async id =>
+        {
+            if (id != parent || !armed) return;
+            armed = false;
+            await PromptAsync(zed, child, "One more thing"); // its end is reported into this turn
+            await Until(() => { lock (claude.Notes) return claude.Notes.Count == 2; }, "the report in the turn");
+            spawned = await SpawnAsync(zed, claude.Tokens[parent], "user_asked");
+        };
+        var before = SpawnCards(zed).Length;
+
+        await PromptAsync(zed, parent, "Start a Kimi session that writes the docs");
+
+        Assert.AreEqual(before + 1, SpawnCards(zed).Length, "a report holds another agent's text");
+        Assert.AreEqual($"The user was asked although you passed initiation user_asked, as {OtherText}.", (string?)spawned!["note"]);
+        Assert.IsFalse(conductor.Feed(parent).HasOtherSessionText, "cleared when the turn ended");
+    }
+
+    [TestMethod]
+    public async Task AUsersPromptJoiningATurnOfTheAgentsOwn_HoldsBackAUserAskedSpawn_UntilTheSessionIsIdle()
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        zed.Approve = Start;
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        var spawned = new List<JsonNode?>();
+        var armed = 0;
+        claude.BeforePrompt = async id =>
+        {
+            if (id != parent || armed == 0) return;
+            armed--;
+            spawned.Add(await SpawnAsync(zed, claude.Tokens[parent], "user_asked"));
+        };
+        // Claude begins a turn of its own (a channel message started it); it holds no turn gate.
+        await claude.Adapter.Current!.Update(parent, new SessionInfoUpdate { Meta = AgentTurnMark("started") });
+        await Until(() => conductor.Feed(parent).HasOtherSessionText, "the turn of its own");
+
+        armed = 1;
+        await PromptAsync(zed, parent, "Start a Kimi session that fixes the flaky test"); // joins that turn
+
+        Assert.AreEqual(1, SpawnCards(zed).Length, "the user joined a turn they did not start");
+        Assert.AreEqual($"The user was asked although you passed initiation user_asked, as {OtherText}.", (string?)spawned[0]!["note"]);
+        Assert.IsTrue(conductor.Feed(parent).HasOtherSessionText, "the user's prompt ended, Claude's turn goes on");
+
+        await claude.Adapter.Current!.Update(parent, new SessionInfoUpdate { Meta = AgentTurnMark("ended") });
+        await Until(() => !conductor.Feed(parent).HasOtherSessionText, "idle again");
+        armed = 1;
+        await PromptAsync(zed, parent, "Start one more");
+
+        Assert.AreEqual(1, SpawnCards(zed).Length, "a turn the user started, with nothing else in it");
+        Assert.IsNull(spawned[1]!["note"]);
+    }
     // ---------------------------------------------------------------- in any other turn
 
     [TestMethod]

@@ -33,7 +33,12 @@ internal static class DshModes
 
     public static DshMode? ById(string? id) => All.FirstOrDefault(m => m.Id == id);
 
-    /// <summary>The mode a pin amounts to, or null for a pin no mode matches (such as <c>workspace-write</c>).</summary>
+    /// <summary>
+    /// The mode a pin amounts to, or null for a pin no mode matches (such as <c>workspace-write</c>,
+    /// even one that never asks: it is still confined). No sandbox is full access whatever the
+    /// approval: nothing escalates, so nothing asks, as in Gorynych's own full-access process (approval
+    /// <c>ask</c>). Only full access is marked <c>gorynych/fullAccess</c> (<see cref="Option"/>).
+    /// </summary>
     public static DshMode? Of(DshPin pin) => pin.Sandbox switch
     {
         "read-only" when pin.Approval is null or "ask" => ReadOnly,

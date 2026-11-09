@@ -746,10 +746,12 @@ are the model and the effort, and its `/permission` command has no ACP surface. 
   - Sessions DSH did pin (made in `dsh web`, or by Gorynych before this mode existed, or opened
     once in `dsh web`, which pins its own default into them) keep their pin. The router reads it
     from DSH's projection cache (`storages/session_projcache/sessions/<id>.json` in DSH's home,
-    read only, format 7 only) and shows it: a `read-only` pin as Read only, a
-    `danger-full-access` pin as Full access (that session goes to the full-access process), any
-    other pin as "Set in DeepSeek Harness" with its sandbox. Such a session cannot switch; the
-    answer says to change it in `dsh web` with `/permission`.
+    read only, format 7 only) and shows it: a `read-only` pin that asks as Read only, a
+    `danger-full-access` pin, whatever its approval, as Full access (that session goes to the
+    full-access process, and the value is marked `gorynych/fullAccess`: with no sandbox nothing
+    escalates, so nothing asks), any other pin as "Set in DeepSeek Harness" with its sandbox,
+    unmarked (a `workspace-write` pin that never asks is still confined). Such a session cannot
+    switch; the answer says to change it in `dsh web` with `/permission`.
 - **Kept by Gorynych.** DSH keeps no mode for an unpinned session, so the adapter keeps the
   full-access ones in `<data>/dsh/modes.json`; a resume goes to the process of the session's
   mode, also after a restart.

@@ -349,16 +349,26 @@ asking any session, and any session asking one that is not in full access, is no
 Which sessions are in full access the service reads from the agents' own state, as it last got
 it (`session/new`, `load`, `resume`, `set_config_option`, `config_option_update`,
 `current_mode_update`): the current value of the mode option (category `mode`), or the current
-`SessionMode`, carries `_meta["gorynych/fullAccess"]: true`. The Claude adapter marks
-`bypassPermissions`; the DSH adapter `full-access`; the Codex adapter `full-access`, and its own
-thread settings when they have approval `never` and sandbox `dangerFullAccess`. An agent that
-reports no mode counts as not in full access. The asked session's mode is read when it is
-asked: one that is not loaded is loaded first, as the question would load it anyway, so it is
-the mode it is loaded in (DSH's modes file, a Claude session's kept choice), and after a
-decline it is unloaded again after its idle time. A question that then waits for the asked
-session's running turn is not checked again when it is sent (Claude refuses Full access during
-a turn; Codex takes a mode chosen meanwhile with its next turn, which may be that question's). An agent outside Gorynych has no mode here;
-its host approves its `ask_agent` ([Agents outside Gorynych](#agents-outside-gorynych)).
+`SessionMode`, carries `_meta["gorynych/fullAccess"]: true`. **The mark is the only signal:** a
+session whose current mode value has no mark, or whose agent reported no state at all, counts
+as not in full access, whatever its mode is called. The Claude adapter marks
+`bypassPermissions`; the DSH adapter `full-access`, which a session DSH pinned shows only when
+the pin has no sandbox (`danger-full-access`, whatever its approval, since nothing escalates
+then; a pin such as `workspace-write` that never asks is still confined and is not marked); the
+Codex adapter `full-access`, and its own thread settings when they have approval `never` and
+sandbox `dangerFullAccess`. Kimi marks nothing.
+
+The modes are read when the question is asked: an asked session that is not loaded is loaded
+first, as the question would load it anyway, so it counts in the mode it is loaded in (DSH's
+modes file, a Claude session's kept choice). A question that then waits for the asked
+session's running turn (an agent without a live-note path) is checked again once the turn is
+free: if either session's mode changed meanwhile so that it now goes into full access from
+outside it, and the person was not asked about it yet, they are asked then, with the turn let go
+while they decide. Claude's live-note path sends the question at once, so it is checked once.
+After a decline, an asked session the question loaded is closed in its agent at once (unless a
+client or another operation holds it by then), not after its idle time. An agent outside
+Gorynych has no mode here; its host approves its `ask_agent`
+([Agents outside Gorynych](#agents-outside-gorynych)).
 
 Verified live on 7 November 2026 (when `ask_agent` still asked): Claude called `list_agents`
 and, after approval, `ask_agent`; Kimi got the marked turn, answered with `reply`, and Claude
@@ -380,13 +390,18 @@ it; otherwise `proposal`, the default. The service then
 
 1. decides whether to ask the person. A `user_asked` spawn starts unasked when the calling
    session's turn began with a client's `session/prompt` (the user's own, from the GUI) and no
-   question from another session is open in it (one that reached the agent through its
-   live-note path, Claude's input or channel, which may join a running turn, and has no answer
-   yet). Every other spawn is asked: a `proposal`, and a `user_asked` one in a turn that
-   answers another session's question, a child's report, a service turn that woke the
-   session, a turn the agent began itself (its terminal, a background task), or a turn with
-   such a question open. The agent's word alone cannot skip the question, since another agent's
-   text may have put it there; a `user_asked` spawn that is asked all the same is not an error;
+   other session's text came into it. The service marks a session when such text reaches its
+   agent in the middle of its work (a question or a child's report through the live-note path,
+   Claude's input or channel, which may join a running turn; marked before it is sent, so the
+   agent cannot act on it first) and when a turn of the agent's own begins (its adapter marks
+   it, `gorynych/agentTurn`); a client's prompt that joins such a turn finds the mark set. The
+   mark stays, answered or not, until the session is idle again: no client's turn and none of
+   the agent's own running. Every other spawn is asked: a `proposal`, and a `user_asked` one in
+   a turn that answers another session's question, a child's report, a service turn that woke
+   the session, a turn the agent began itself (its terminal, a background task), or a turn
+   another session's text came into. The agent's word alone cannot skip the question, since
+   another agent's text may have put it there; a `user_asked` spawn that is asked all the same
+   is not an error;
 2. to ask, shows the spawn in the calling session as a `tool_call` (kind `other`, the prompt and
    the folder as content, and for a `user_asked` spawn `The agent says you asked for this;
    Gorynych asks you all the same, as <why>.`) and asks the person with
@@ -417,8 +432,8 @@ it; otherwise `proposal`, the default. The service then
    when nothing was started.
 
 `<why>` is one of `this turn answers another session's question`, `this turn did not start
-with a prompt from the user` and `a question from another session came into this turn and is
-not answered yet`.
+with a prompt from the user` and `another session's text (a question or a report) came into
+this turn, or the turn did not start with a prompt from the user`.
 
 What follows the task in the child's first prompt:
 

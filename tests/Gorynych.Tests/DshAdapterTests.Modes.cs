@@ -276,8 +276,11 @@ public sealed partial class DshAdapterTests
 
     [TestMethod]
     [DataRow("workspace-write", "ask", "dsh", false)]
+    [DataRow("workspace-write", "never", "dsh", false)]
     [DataRow("read-only", "ask", "read-only", false)]
+    [DataRow("read-only", "never", "dsh", false)]
     [DataRow("danger-full-access", "never", "full-access", true)]
+    [DataRow("danger-full-access", "ask", "full-access", true)]
     public async Task ASessionDshPinned_ShowsItsPin_GoesToItsProcess_AndCannotSwitch(string sandbox, string approval, string shown, bool inFullAccess)
     {
         var home = TestDirs.New();
@@ -297,6 +300,9 @@ public sealed partial class DshAdapterTests
 
         Assert.AreEqual(shown, ModeIn(resumed));
         Assert.AreEqual(inFullAccess, host.FullAccessLaunches == 1 && host.FullAccess.IsOpen("pinned"));
+        // Marked only for no sandbox, which is what Gorynych's own full-access runs (with approval ask, nothing
+        // escalates): workspace-write that never asks is still confined.
+        Assert.AreEqual(inFullAccess, Gorynych.Service.Conductor.IsFullAccess(resumed!.AsObject()));
         if (shown == "dsh")
             StringAssert.Contains((string?)resumed!["configOptions"]![0]!["options"]!.AsArray().Last()!["description"], sandbox);
         var other = shown == "full-access" ? "read-only" : "full-access";

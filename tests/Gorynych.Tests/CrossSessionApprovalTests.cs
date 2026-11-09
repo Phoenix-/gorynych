@@ -19,12 +19,14 @@ public sealed class CrossSessionApprovalTests
 {
     static readonly string Cwd = Path.GetTempPath();
 
-    static Conductor Conductor(params IAgentAdapter[] adapters) => new(new ConductorOptions
+    static Conductor Conductor(params IAgentAdapter[] adapters) => Conductor(TestDirs.New(), TimeSpan.Zero, adapters); // a session its client left is unloaded at once
+
+    static Conductor Conductor(string data, TimeSpan unloadAfter, params IAgentAdapter[] adapters) => new(new ConductorOptions
     {
-        DataDirectory = TestDirs.New(),
+        DataDirectory = data,
         ServiceId = "t",
         PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"],
-        UnloadAfter = TimeSpan.Zero, // a session its client left is unloaded at once
+        UnloadAfter = unloadAfter,
     }, adapters);
 
     static async Task<string> NewPromptedAsync(TestClient client, string agent, string text)
@@ -170,6 +172,85 @@ public sealed class CrossSessionApprovalTests
         await AskAsync(client, claude.Tokens[asker], target);
         Assert.AreEqual(1, client.Approvals.Count);
         Assert.AreEqual(2, PromptsOf(dsh, target));
+    }
+
+    [TestMethod]
+    [DataRow(false, DisplayName = "the asked session goes into full access while the question waits")]
+    [DataRow(true, DisplayName = "the asking session leaves full access while the question waits")]
+    public async Task AQuestionWaitingForTheAskedSessionsTurn_IsCheckedAgainBeforeItIsSent(bool askerLeaves)
+    {
+        var dsh = new LifecycleAgent("dsh", canDelete: false) { ReportsModes = true };
+        var kimi = new LifecycleAgent("kimi", canDelete: true) { ReportsModes = true };
+        await using var conductor = Conductor(dsh.Adapter, kimi.Adapter);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var asker = await NewPromptedAsync(client, "dsh", "hi");
+        var target = await NewPromptedAsync(client, "kimi", "hello");
+        if (askerLeaves)
+        {
+            // Both in full access when it asks: nothing to ask then.
+            await SetModeAsync(client, asker, "full");
+            await SetModeAsync(client, target, "full");
+        }
+        var running = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        kimi.BeforePrompt = async id =>
+        {
+            string text;
+            lock (kimi.Prompts) text = kimi.Prompts.Last(p => p.SessionId == id).Text;
+            if (id != target || text != "busy") return;
+            running.SetResult();
+            await hold.Task;
+        };
+        var busy = client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = target, Prompt = [new TextContent { Text = "busy" }] });
+        await running.Task;
+        client.Approve = Choose("decline");
+
+        var asking = AskAsync(client, dsh.Tokens[asker], target);
+        await Task.Delay(300);
+        Assert.IsFalse(asking.IsCompleted, "waits for the running turn");
+        Assert.AreEqual(0, client.Approvals.Count, "nothing to ask when it asked");
+        await SetModeAsync(client, askerLeaves ? asker : target, askerLeaves ? "ask" : "full");
+        hold.SetResult();
+        await busy;
+
+        var declined = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => asking);
+        StringAssert.Contains(declined.Message, "declined to let this session ask session_id " + target);
+        StringAssert.StartsWith(client.Approvals.Single().ToolCall.Title, "Ask session_id " + target);
+        Assert.AreEqual(2, PromptsOf(kimi, target), "its own turns only: the question was not sent");
+    }
+
+    [TestMethod]
+    public async Task ADeclinedQuestion_UnloadsTheSessionItLoaded_AtOnce()
+    {
+        var dsh = new LifecycleAgent("dsh", canDelete: false) { ReportsModes = true };
+        var kimi = new LifecycleAgent("kimi", canDelete: true) { ReportsModes = true };
+        var data = TestDirs.New();
+        string target;
+        await using (var before = Conductor(data, TimeSpan.FromHours(1), dsh.Adapter, kimi.Adapter))
+        {
+            await using var owner = await TestClient.ConnectAsync(before, "owner");
+            target = await NewPromptedAsync(owner, "kimi", "hello");
+        }
+        lock (kimi.Modes) kimi.Modes[target] = "full";
+        await using var conductor = Conductor(data, TimeSpan.FromHours(1), dsh.Adapter, kimi.Adapter); // after a restart: not loaded
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var asker = await NewPromptedAsync(client, "dsh", "hi");
+        Assert.IsFalse(conductor.Agents["kimi"].IsLive(target));
+        client.Approve = Choose("decline");
+
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => AskAsync(client, dsh.Tokens[asker], target));
+
+        Assert.IsFalse(conductor.Agents["kimi"].IsLive(target), "closed in its agent at once, not after its idle hour");
+        CollectionAssert.AreEqual(new[] { AcpMethods.Agent.SessionResume, AcpMethods.Agent.SessionClose }, kimi.CallsFor(target)[^2..]);
+        Assert.AreEqual(1, PromptsOf(kimi, target), "asked nothing");
+
+        // Loaded before the question (a client opened it and left): it stays for its idle time.
+        await using (var other = await TestClient.ConnectAsync(conductor, "other"))
+            await other.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, AcpJson.ToNode(new ResumeSessionRequest { SessionId = target, Cwd = Cwd }));
+        Assert.IsTrue(conductor.Agents["kimi"].IsLive(target));
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => AskAsync(client, dsh.Tokens[asker], target));
+        Assert.IsTrue(conductor.Agents["kimi"].IsLive(target), "the question did not load it, so it is not closed for it");
     }
 
     [TestMethod]

@@ -66,29 +66,31 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         set => clientTurn = value;
     }
 
-    int liveQuestions;
+    int otherText;
 
     /// <summary>
-    /// True while a question from another session that reached the agent through its live-note path
-    /// (Claude's input or channel, which may join a client's turn) waits for its answer: the turn
-    /// then holds another agent's text, so a spawn the agent says the user asked for is asked anyway.
+    /// True from the moment another session's text reaches the agent in the middle of its work (a
+    /// question or a child's report through its live-note path: Claude's input or channel, which
+    /// may join a client's turn), or a turn of the agent's own begins (which such text, or anything
+    /// but a client's prompt, starts), until the session is idle again (<see cref="TurnEnded"/>). A
+    /// client's prompt that joins such a turn finds it set too. So a spawn the agent says the user
+    /// asked for is asked all the same: the request may come from that text.
     /// </summary>
-    public bool HasOpenLiveQuestion => Volatile.Read(ref liveQuestions) > 0;
+    public bool HasOtherSessionText => Volatile.Read(ref otherText) != 0;
 
-    /// <summary>Counts a question sent through the live-note path until it is answered (or fails).</summary>
-    public IDisposable OpenLiveQuestion()
+    /// <summary>Marks <see cref="HasOtherSessionText"/>; returns whether it was marked already.</summary>
+    public bool MarkOtherSessionText() => Interlocked.Exchange(ref otherText, 1) != 0;
+
+    /// <summary>Takes back a mark whose text did not reach the agent after all (it has no live-note path), unless it was marked before.</summary>
+    public void UnmarkOtherSessionText(bool markedBefore)
     {
-        Interlocked.Increment(ref liveQuestions);
-        return new Closer(() => Interlocked.Decrement(ref liveQuestions));
+        if (!markedBefore) Interlocked.Exchange(ref otherText, 0);
     }
 
-    sealed class Closer(Action close) : IDisposable
+    /// <summary>A turn ended: clears <see cref="HasOtherSessionText"/> once neither a client's turn nor one of the agent's own runs.</summary>
+    public void TurnEnded()
     {
-        int closed;
-        public void Dispose()
-        {
-            if (Interlocked.Exchange(ref closed, 1) == 0) close();
-        }
+        if (!ClientTurn && Volatile.Read(ref agentTurn) == 0) Interlocked.Exchange(ref otherText, 0);
     }
 
     int agentTurn;

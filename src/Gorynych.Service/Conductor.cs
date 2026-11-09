@@ -81,13 +81,10 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>
     /// The gorynych tools whose approval the service answers yes for an agent that asks for MCP tools
     /// (Kimi): all of them (docs/service-protocol.md, "Approvals"). The service itself asks the person
-    /// where it must: before every spawn, and before a session not in full access asks one that is.
+    /// where it must: before a spawn the user did not ask for, and before a session not in full access
+    /// asks one that is.
     /// </summary>
-    static readonly HashSet<string> PreAllowedTools =
-    [
-        "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent",
-        "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", "mcp__gorynych__spawn_session",
-    ];
+    static readonly HashSet<string> PreAllowedTools = [.. GorynychProtocol.PeerTools];
 
     /// <summary>The title source of a name given to <c>spawn_session</c>: harness titles do not replace it.</summary>
     const string SpawnTitle = "spawn";
@@ -208,12 +205,15 @@ public sealed class Conductor : IAsyncDisposable
     void AgentTurn(SessionFeed feed, JsonObject update)
     {
         var mark = update["_meta"] is JsonObject meta && meta[GorynychProtocol.MetaAgentTurn] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+        // The user did not start it, so a client's prompt that joins it does not make it theirs (SpawnAsync).
+        if (mark == "started") feed.MarkOtherSessionText();
         if (mark == "started" && feed.BeginAgentTurn())
         {
             feed.EnterUse();
         }
         else if (mark == "ended" && feed.EndAgentTurn())
         {
+            feed.TurnEnded();
             feed.ExitUse();
             IdleFromNow(feed.SessionId);
         }
@@ -223,7 +223,11 @@ public sealed class Conductor : IAsyncDisposable
     internal void OnAgentStopped(AgentHost host)
     {
         foreach (var feed in feeds.Values)
-            if (store.Get(feed.SessionId)?.Agent == host.Name && feed.EndAgentTurn()) feed.ExitUse();
+            if (store.Get(feed.SessionId)?.Agent == host.Name && feed.EndAgentTurn())
+            {
+                feed.TurnEnded();
+                feed.ExitUse();
+            }
     }
 
     void Remember(AgentHost host, string sessionId, JsonObject update)
@@ -553,6 +557,7 @@ public sealed class Conductor : IAsyncDisposable
         finally
         {
             feed.ClientTurn = false;
+            feed.TurnEnded();
             feed.TurnGate.Release();
         }
     }
@@ -1120,13 +1125,14 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>
     /// Why a spawn the agent says the user asked for (<c>initiation: user_asked</c>) is asked all the
     /// same, or null when it need not be: the caller's turn must have started with a client's prompt,
-    /// the user's own, and no question from another session may be open in it. Otherwise the request
-    /// could come from another agent's text, whatever the agent believes.
+    /// the user's own, and no other session's text may have come into it
+    /// (<see cref="SessionFeed.HasOtherSessionText"/>). Otherwise the request could come from another
+    /// agent's text, whatever the agent believes.
     /// </summary>
     static string? WhyAskedAnyway(SessionFeed feed) =>
         feed.CurrentOpinion is not null ? "this turn answers another session's question"
         : !feed.ClientTurn ? "this turn did not start with a prompt from the user"
-        : feed.HasOpenLiveQuestion ? "a question from another session came into this turn and is not answered yet"
+        : feed.HasOtherSessionText ? "another session's text (a question or a report) came into this turn, or the turn did not start with a prompt from the user"
         : null;
 
     /// <summary>What the agent is told when its <c>user_asked</c> spawn was asked all the same.</summary>
@@ -1449,6 +1455,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         finally
         {
+            feed.TurnEnded();
             feed.TurnGate.Release();
         }
     }
@@ -1508,6 +1515,8 @@ public sealed class Conductor : IAsyncDisposable
             var sender = $"child_{child.Agent}";
             using var use = await UseAsync(parentId, cleanupStop.Token); // its end starts the parent's idle timer
             var (rpc, _) = await EnsureLiveAsync(use.Record, cleanupStop.Token);
+            // Marked before it is sent, so the agent cannot act on it first (SpawnAsync).
+            var markedBefore = use.Feed.MarkOtherSessionText();
             try
             {
                 await rpc.SendRequestAsync(GorynychProtocol.MethodNote, new JsonObject
@@ -1523,6 +1532,7 @@ public sealed class Conductor : IAsyncDisposable
             {
                 // No live-note path, or the session's agent is not running (Claude): a turn reaches it
                 // either way, and in the second case starts the agent just for it.
+                use.Feed.UnmarkOtherSessionText(markedBefore);
             }
             await ReportTurnAsync(use, rpc, sender, childId, text);
             ServiceLog.Info($"report: {childId} -> {parentId} (turn)");
@@ -1611,16 +1621,49 @@ public sealed class Conductor : IAsyncDisposable
                 StartIdle(sessionId, idle - quiet);
                 return;
             }
-            if (store.Get(sessionId) is not { } record || !agents.TryGetValue(record.Agent, out var host)) return;
-            if (!host.IsRunning || !host.IsLive(sessionId) || !host.CanClose) return;
-            var rpc = await host.GetAsync(cleanupStop.Token);
-            await CloseInAgentAsync(host, rpc, sessionId, cleanupStop.Token);
-            ServiceLog.Info($"{record.Agent} {sessionId}: unloaded from its agent, idle with no client for {IdleTimeOf(host)}");
+            await CloseUnheldAsync(sessionId, host => $"idle with no client for {IdleTimeOf(host)}");
         }
         finally
         {
             feed.LifeGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Closes, at once rather than after its idle time, a session the service loaded only to ask it
+    /// something the person then declined (a question into full access), unless something holds it
+    /// now: a client attached, or another operation.
+    /// </summary>
+    async Task UnloadNowAsync(SessionFeed feed)
+    {
+        try
+        {
+            await feed.LifeGate.WaitAsync(cleanupStop.Token);
+            try
+            {
+                if (feed.Retired || feed.Users > 0 || feed.Clients().Length > 0) return;
+                feed.StopIdle(); // a timer started when the question let go of it no longer counts
+                await CloseUnheldAsync(feed.SessionId, _ => "loaded only for a question the user declined");
+            }
+            finally
+            {
+                feed.LifeGate.Release();
+            }
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            ServiceLog.Warn($"{feed.SessionId}: not unloaded after the declined question: {e.Message}");
+        }
+    }
+
+    /// <summary>Closes a session nothing holds in its agent, if the agent can; under the session's life gate.</summary>
+    async Task CloseUnheldAsync(string sessionId, Func<AgentHost, string> why)
+    {
+        if (store.Get(sessionId) is not { } record || !agents.TryGetValue(record.Agent, out var host)) return;
+        if (!host.IsRunning || !host.IsLive(sessionId) || !host.CanClose) return;
+        var rpc = await host.GetAsync(cleanupStop.Token);
+        await CloseInAgentAsync(host, rpc, sessionId, cleanupStop.Token);
+        ServiceLog.Info($"{record.Agent} {sessionId}: unloaded from its agent, {why(host)}");
     }
 
     async Task ReportTurnAsync(SessionUse use, JsonRpcConnection rpc, string sender, string childId, string text)
@@ -1667,6 +1710,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         finally
         {
+            feed.TurnEnded();
             feed.TurnGate.Release();
         }
     }
@@ -1984,6 +2028,7 @@ public sealed class Conductor : IAsyncDisposable
     {
         var use = await UseAskedAsync(target, asker, ct);
         var turnHasUse = false; // an opinion turn releases the use when the turn ends, which may be after the answer
+        var unload = false; // the person declined a question into a session this call loaded only for it
         try
         {
             var record = use.Record;
@@ -2002,8 +2047,20 @@ public sealed class Conductor : IAsyncDisposable
             }
             // Its mode now, as its agent reports it once it is loaded: for a session that was not, the
             // mode it was loaded in. An agent outside Gorynych is approved by its own host.
+            var confirmed = false;
             if (asker.From is { } from && InFullAccess(target) && !InFullAccess(from))
-                await ConfirmAskIntoFullAccessAsync(from, record, text, ct);
+            {
+                try
+                {
+                    await ConfirmAskIntoFullAccessAsync(from, record, text, ct);
+                }
+                catch
+                {
+                    unload = woken;
+                    throw;
+                }
+                confirmed = true;
+            }
             ServiceLog.Info($"opinion: {asker.From ?? asker.Sender} asks {record.Agent} {target}");
             var forwarded = new JsonObject
             {
@@ -2016,14 +2073,16 @@ public sealed class Conductor : IAsyncDisposable
             // A live-note path answers at once when its agent cannot take the request, so it counts
             // as asked only after a moment.
             using var askedLater = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var markedBefore = false;
             if (onState is not null)
                 _ = Task.Delay(TimeSpan.FromMilliseconds(500), askedLater.Token)
                     .ContinueWith(t => { if (!t.IsCanceled) onState(AskedState(target)); }, TaskScheduler.Default);
             try
             {
                 // An agent with its own way in (Claude's channel) answers directly.
-                JsonNode? answer;
-                using (use.Feed.OpenLiveQuestion()) answer = await rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, forwarded, ct);
+                // Marked before it is sent, so the agent cannot act on it first (SpawnAsync).
+                markedBefore = use.Feed.MarkOtherSessionText();
+                var answer = await rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, forwarded, ct);
                 if (record.Draft)
                 {
                     // It answered, so it has history now.
@@ -2036,6 +2095,7 @@ public sealed class Conductor : IAsyncDisposable
             {
                 // No live-note path (Kimi), or the agent is not running (Claude refuses while its process
                 // is down): ask in a turn, which in the second case starts the agent just for it.
+                use.Feed.UnmarkOtherSessionText(markedBefore);
                 askedLater.Cancel();
                 if (e.Code == JsonRpcException.InvalidRequest)
                 {
@@ -2043,7 +2103,7 @@ public sealed class Conductor : IAsyncDisposable
                     onState?.Invoke(StartingState(target));
                 }
                 turnHasUse = true;
-                return await OpinionTurnAsync(use, rpc, asker, text, woken, onState, ct);
+                return await OpinionTurnAsync(use, rpc, asker, text, woken, confirmed, onState, ct);
             }
             finally
             {
@@ -2053,6 +2113,7 @@ public sealed class Conductor : IAsyncDisposable
         finally
         {
             if (!turnHasUse) use.Dispose(); // closes the session again if the service woke it for this
+            if (unload) await UnloadNowAsync(use.Feed);
         }
     }
 
@@ -2153,8 +2214,9 @@ public sealed class Conductor : IAsyncDisposable
     /// own text. Takes over <paramref name="use"/> and releases it when the turn ends.
     /// </summary>
     /// <param name="woken">The service loaded or started the session for its turns, so a failure here is a failure to start.</param>
+    /// <param name="confirmed">The person was already asked about this question going into full access.</param>
     async Task<JsonNode?> OpinionTurnAsync(SessionUse use, JsonRpcConnection rpc, Asker asker, string question,
-        bool woken, Action<string>? onState, CancellationToken ct)
+        bool woken, bool confirmed, Action<string>? onState, CancellationToken ct)
     {
         var record = use.Record;
         var feed = use.Feed;
@@ -2162,10 +2224,28 @@ public sealed class Conductor : IAsyncDisposable
         var pending = new PendingOpinion(record.SessionId);
         pendingOpinions[messageId] = pending;
         var turnStarted = false;
+        var unload = false; // declined: the session this call woke goes again at once
         try
         {
             if (feed.TurnGate.CurrentCount == 0) onState?.Invoke(WaitingState(record.SessionId));
             await feed.TurnGate.WaitAsync(ct);
+            // Either session's mode may have changed while the question waited for the turn: checked
+            // again, and asked, with the turn let go meanwhile, if it was not asked before.
+            if (!confirmed && asker.From is { } from && InFullAccess(record.SessionId) && !InFullAccess(from))
+            {
+                feed.TurnGate.Release();
+                try
+                {
+                    await ConfirmAskIntoFullAccessAsync(from, record, question, ct);
+                }
+                catch
+                {
+                    unload = woken;
+                    throw;
+                }
+                if (feed.TurnGate.CurrentCount == 0) onState?.Invoke(WaitingState(record.SessionId));
+                await feed.TurnGate.WaitAsync(ct);
+            }
             Task turnDone;
             try
             {
@@ -2206,6 +2286,7 @@ public sealed class Conductor : IAsyncDisposable
                 {
                     pending.TurnText = feed.EndOpinionTurn();
                     pending.TurnError = t.Exception?.InnerException;
+                    feed.TurnEnded();
                     feed.TurnGate.Release();
                     use.Dispose(); // the turn may end after the answer: the session's idle time starts only now
                 }, TaskScheduler.Default);
@@ -2232,6 +2313,7 @@ public sealed class Conductor : IAsyncDisposable
         {
             pendingOpinions.TryRemove(messageId, out _);
             if (!turnStarted) use.Dispose();
+            if (unload) await UnloadNowAsync(feed);
         }
     }
 

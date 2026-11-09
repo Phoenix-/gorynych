@@ -174,6 +174,20 @@ public static class GorynychProtocol
     /// </summary>
     public const string CapDraftsNotDurable = "gorynych/draftsNotDurable";
 
+    /// <summary><c>spawn_session</c> of the service's <c>gorynych</c> MCP server, as agents name it.</summary>
+    public const string SpawnTool = "mcp__gorynych__spawn_session";
+
+    /// <summary>
+    /// The tools of the service's <c>gorynych</c> MCP server, as agents name them. None needs the
+    /// agent's own approval: the service asks the person itself where it must (docs/service-protocol.md,
+    /// "Approvals"). The service answers an agent's approval of them (Kimi), and so does the Claude adapter.
+    /// </summary>
+    public static readonly IReadOnlyList<string> PeerTools =
+    [
+        "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent",
+        "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", SpawnTool,
+    ];
+
     /// <summary>
     /// <c>true</c> in the <c>_meta</c> of a mode's value (<c>SessionConfigSelectOption</c> of the
     /// option with category <c>mode</c>, or a <c>SessionMode</c>): in that mode the agent runs

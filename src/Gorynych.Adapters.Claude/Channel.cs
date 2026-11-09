@@ -27,18 +27,14 @@ internal sealed partial class ChannelHost(IReadOnlyList<string> serverCommand)
     /// Every launch allows them with a rule in its <c>--settings</c>, which Claude applies before
     /// auto mode's classifier; the person's deny rules still win, since Claude evaluates deny rules first.
     /// </summary>
-    public static readonly string[] AllowedTools =
-    [
-        ReplyToolName, "mcp__gorynych__list_agents", "mcp__gorynych__ask_agent",
-        "mcp__gorynych__archive_session", "mcp__gorynych__restore_session",
-    ];
+    public static readonly string[] AllowedTools = [.. Acp.Hosting.GorynychProtocol.PeerTools.Where(t => t != Acp.Hosting.GorynychProtocol.SpawnTool)];
 
     /// <summary>
     /// The gorynych tools whose approval the adapter answers yes without asking the person: the
     /// <see cref="AllowedTools"/> (plan mode asks for MCP tools whatever the allow rules say, and an
     /// ask rule asks too), and <c>spawn_session</c>, for which the service itself asks the person.
     /// </summary>
-    public static readonly HashSet<string> PreAllowedTools = [.. AllowedTools, "mcp__gorynych__spawn_session"];
+    public static readonly HashSet<string> PreAllowedTools = [.. Acp.Hosting.GorynychProtocol.PeerTools];
 
     /// <summary>
     /// The channel's part of the appended system prompt, which the adapter adds whenever it

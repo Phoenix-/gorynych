@@ -209,7 +209,7 @@ Every session gets a `gorynych` MCP server with these tools:
   without asking you; nothing in it is lost.
 - `spawn_session`: start a child session in another agent. When you ask for it yourself, in
   your own message, it starts right away; any other spawn (one the agent proposes, or one in a
-  turn that answers another session) you approve first. The child starts in its agent's default
+  turn that another session's question or report came into) you approve first. The child starts in its agent's default
   mode, never in full access, and by default the child reports each finished turn to its
   parent.
 
