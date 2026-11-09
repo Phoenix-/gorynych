@@ -152,13 +152,17 @@ it is; after an adapter restart, or a `session/close`, it is not.
     the mark itself excluded), or all of it (`{"type": "start"}`, or a mark no longer in the
     history's active line: a rollback, a rewind), as its live stream shows it and with the same
     IDs, and answer `_meta["gorynych/replay"]: {"from": "mark" | "start", "mark": "<new mark>"}`;
-  - fail open: an adapter that cannot read the history answers the resume without
-    `gorynych/replay`, and the service keeps its journal as it is.
+  - fail open: an adapter that cannot read the history (any error but a cancellation) answers
+    the resume without `gorynych/replay`, and the service keeps its journal as it is. Taking a
+    mark MUST NOT fail a prompt;
+  - name only a point the history will keep: a completed turn, not one still running.
 
-  The service then appends what is new, or imports the whole history again behind a notice when
-  it was rewritten. An agent without the cursor that has `session/load` is opened with it, and
-  the service aligns its whole replay with the journal by user text (Kimi); with neither, the
-  journal stays as it is. The service never asks for a session its adapter has loaded.
+  The service then appends what is new. A replay from the start it first aligns with the
+  journal, and imports it again behind a notice only when the journal's end is not in it. An
+  agent without the cursor that has `session/load` is opened with it, and the service aligns its
+  whole replay the same way (Kimi); with neither, the journal stays as it is. The service never
+  asks for a session its adapter has loaded, and counts the session as loaded only once the
+  catch-up is done.
 - Opening SHOULD be cheap and start no model call. It MAY start no process either (Claude
   only registers the session; its process starts with the next prompt).
 - Fallback without either: the session cannot be reopened after a restart, and using it fails
@@ -465,7 +469,7 @@ DSH speaks ACP, and its adapter is a thin proxy.
 | New ([§3](#3-new-sessions-the-list-and-discovery)) | UUID from the adapter; recorded at the first prompt | UUID from the adapter; recorded at the first prompt | `session_…`; a real session at once, listed untitled | `thread/start`; nothing on disk before the first turn | UUID from DSH; durable at once, never titled, so an unused draft gets a tombstone |
 | List | the adapter's own list of the sessions it started | the adapter's own list of the sessions it started | Kimi's list; leaves natively archived sessions out; ignores `cursor` | `thread/list` (`cursor`, `limit`, exact `cwd`); archived left out; title = the thread's `name` | the read-only process's `{sessionId, cwd}` with cursor and `cwd`; the sessions open in either process added back by the proxy and the router; no title or `updatedAt` |
 | Open not loaded ([§4](#4-opening-a-session-that-is-not-loaded)) | `session/resume` only registers; the process starts with the next prompt | `session/resume` only registers; the process starts with the next prompt | `session/load`, its replay aligned with the journal | `thread/resume`, `excludeTurns`, then the turns after the mark; refused at once, naming the holder, while another Codex app has the thread (one writer; Windows), else by app-server; fails when it is archived in Codex | `session/resume` in the process of the session's mode, about 0.2 s; fails while `dsh web` or another DSH process has the session (one writer); no `session/load` |
-| History caught up ([§4](#4-opening-a-session-that-is-not-loaded)) | `gorynych/replayFrom`; mark `<uuid>@<offset>`: the transcript's last conversation entry; read from the mark's line on, the conversation walked back by `parentUuid` (`logicalParentUuid` across a compaction); a rewind replays it all | as headless | no marks: the service aligns the whole `session/load` replay by user text, leaving out Kimi's own `<system-reminder>` parts; an undo or a compaction that drops the journal's last messages imports it again | `gorynych/replayFrom`; mark: the newest turn's ID; `thread/turns/list` newest first with items, to the marked turn; a rollback replays every turn | none yet: DSH's ACP replays nothing, so the journal stays as it is |
+| History caught up ([§4](#4-opening-a-session-that-is-not-loaded)) | `gorynych/replayFrom`; mark `<uuid>@<offset>`: the transcript's last conversation entry; read from the mark's line on, the conversation walked back by `parentUuid` (`logicalParentUuid` across a compaction); a rewind replays it all | as headless | no marks: the service aligns the whole `session/load` replay by user text, leaving out Kimi's own `<system-reminder>` parts; an undo or a compaction that drops the journal's last messages imports it again | `gorynych/replayFrom`; mark: the newest completed turn's ID; `thread/turns/list` newest first without items, to the marked turn, then the newer turns' items; a rollback replays every turn | none yet: DSH's ACP replays nothing, so the journal stays as it is |
 | Turns ([§5](#5-prompts-and-turns)) | a user message on stdin; the `result` ends the turn; `interrupt` for `session/cancel` | bracketed paste into the TUI; the `Stop` hook ends the turn | native | `turn/start`; `turn/interrupt` for `session/cancel` | native; subagents run inside the prompt |
 | Service turns and waking ([§6.1](#61-waking-a-session-and-closing-it-again)) | turns start the process; unloaded after the idle time | turns start the process; unloaded after the idle time | turns; resumed, then unloaded after the idle time | turns; resumed, then unloaded after its 2-minute idle time | turns; resumed, then unloaded after its 2-minute idle time |
 | `gorynych` MCP server ([§6.2](#62-the-gorynych-mcp-server)) | per-launch `--mcp-config` | per-launch `--mcp-config` | through ACP `mcpServers` | per-thread `config.mcp_servers` on `thread/start` and every `thread/resume` (kept only while loaded) | through ACP `mcpServers` on new and every resume |

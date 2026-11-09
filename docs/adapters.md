@@ -60,8 +60,8 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   whole, on `session/load`, without message IDs. So the service reopens a Kimi session with
   `session/load` (not `session/resume`) and aligns the replay with its journal by user text
   ([service-protocol.md](service-protocol.md#history-made-outside-gorynych)). Kimi 2.5.2 puts a
-  `<system-reminder>` part of its own after every replayed user message; the service leaves
-  those out. The replay is Kimi's context, so after a compaction it is a summary and a kept
+  `<system-reminder>` part of its own after every replayed user message; the service cuts such a
+  leading reminder off a part, and a part that is only one is left out. The replay is Kimi's context, so after a compaction it is a summary and a kept
   tail; the journal's last user messages are found in that tail. An undo (`context.undone`)
   drops them, and the session is imported again. `/clear` in the Kimi CLI starts a new session.
   Verified live on 10 November 2026: a turn taken with `kimi -S <id> -p` showed once, marked
@@ -340,10 +340,18 @@ written):
   compaction. It is not the file's order: a rewind or a checkpoint restore starts a new branch
   further down. Every prompt's result carries the mark, and so does the `ended` update of a
   turn of Claude's own.
-- **A catch-up** reads the mark's line and what follows it. If the chain from the last entry
-  reaches the mark, the entries after it are replayed. Otherwise another branch is the
-  conversation now: the whole chain is replayed, as `from: "start"`. A mark whose line moved is
-  looked for in the whole file. A missing transcript answers without `gorynych/replay`.
+- **A catch-up** reads the file once from the mark's line, which must be the first entry there.
+  If the chain from the last entry reaches the mark, the entries after it are replayed.
+  Otherwise another branch is the conversation now: the whole chain is replayed, as
+  `from: "start"`, and the log says so. A mark whose line moved is looked for in the whole file.
+  - Lines are read as a stream, and only their `uuid`, parents, `type` and sidechain flag are
+    taken. An entry's body is parsed only when it is sent.
+  - Past 512 MB read the catch-up gives up and fails open; a line over 64 MB is left out.
+  - A missing or unreadable transcript, or any error, answers without `gorynych/replay`; an
+    entry of an unexpected shape is left out.
+- **The mark at a turn's end** is taken once two reads 50 ms apart agree (at most half a
+  second): Claude may still be writing the turn's last entries when its result comes. It never
+  fails the prompt.
 - **Entries become updates** as the live stream maps them, through the same code (`StreamJson`):
   - user text by `uuid`;
   - assistant text and thinking by the API's `msg_…` ID;
@@ -352,7 +360,9 @@ written):
 
   Left out: subagents' entries, slash commands and their output (`<command-…>`,
   `<local-command-…>`), meta notes (`isMeta`), `[Request interrupted by user]`, a compaction's
-  summary, and a torn last line.
+  summary, a torn last line, and the `<system-reminder>` blocks Claude Code writes into user
+  messages (a block that is only a reminder; reminders a text starts with). A reminder inside
+  text the person wrote stays.
 - `/clear` continues in a new session ID, so this session's transcript does not change.
   `claude --resume <id>` keeps the ID (`--fork-session` would not).
 - Verified live on 10 November 2026: a turn taken with `claude -p --resume <id>` showed once,
@@ -660,11 +670,15 @@ over app-server's JSON-RPC. The design and the probes behind it are in
   [service-protocol.md](service-protocol.md#history-made-outside-gorynych)):
   - The adapter advertises `gorynych/replayFrom`. Its mark is the thread's newest turn ID:
     every prompt's result carries the ID of the turn it ran.
-  - A resume with a mark lists the thread's turns newest first (`thread/turns/list`,
-    `sortDirection: desc`, `itemsView: full`, 20 a page) until the marked turn. It replays the
-    newer ones oldest first, mapped as `session/load` maps items, with Codex's own IDs (a prompt
-    of the service's under its `clientUserMessageId`), so nothing before the mark is read. A
+  - A resume with a mark lists the thread's turns newest first without their items
+    (`thread/turns/list`, `sortDirection: desc`, `itemsView: notLoaded`, 50 a page) until the
+    marked turn. Then it reads the items of the newer turns alone, turn by turn
+    (`thread/items/list` with `turnId`), and sends them as they come, mapped as `session/load`
+    maps items, with Codex's own IDs (a prompt of the service's under its
+    `clientUserMessageId`). Nothing before the mark is read, and a replay is never held whole. A
     mark Codex no longer has (a rollback) or none replays every turn.
+  - The new mark is the newest completed turn, never one still running. A thread without turns
+    has none. Any failure to list them answers without `gorynych/replay`.
   - Verified live on 10 November 2026: a turn taken with `codex exec resume <id>` showed once,
     marked `native`, and a second open added nothing.
   - Codex's app-server keeps a thread's writer lock for a while after `thread/unsubscribe`

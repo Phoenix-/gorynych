@@ -123,8 +123,10 @@ public sealed class NativeCatchUpLiveTests
             StringAssert.Contains(AgentText(first, u => !Native(u)).ToLowerInvariant(), "pong", "Gorynych's own turn");
             StringAssert.Contains(AgentText(first, Native).ToLowerInvariant(), "ping", "the turn made outside, marked native");
             var again = await SeenAsync(conductor, agent, id, folder);
-            Assert.AreEqual(first.Count(Native), again.Count(Native), "a second open adds nothing");
-            Assert.AreEqual(first.Count(u => (string?)u["sessionUpdate"] == "agent_message_chunk"), again.Count(u => (string?)u["sessionUpdate"] == "agent_message_chunk"));
+            static string[] Messages(JsonObject[] updates) => updates
+                .Where(u => (string?)u["sessionUpdate"] is "user_message_chunk" or "agent_message_chunk")
+                .Select(u => $"{(string?)u["sessionUpdate"]} {(string?)u["messageId"]}").Distinct().ToArray();
+            CollectionAssert.AreEqual(Messages(first), Messages(again), "a second open adds nothing: the same messages, by ID");
             if (cleanUp is not null)
                 await using (var zed = await TestClient.ConnectAsync(conductor, "cleanup", agent: agent))
                     await cleanUp(zed, id);
@@ -148,6 +150,8 @@ public sealed class NativeCatchUpLiveTests
             cleanUp: (zed, id) => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = id }));
     }
 
+    // Claude's transcripts of these sessions stay in its projects folder: Gorynych never writes or
+    // deletes anything of an agent's own (~/.claude), and Claude has no delete.
     [TestMethod]
     [Timeout(900_000, CooperativeCancellation = true)]
     public async Task Claude_ATurnTakenWithClaudeResume_ShowsOnceWhenOpenedAgain()

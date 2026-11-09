@@ -967,14 +967,16 @@ A session can be continued outside Gorynych: in Codex Desktop or `codex resume`,
 `claude --resume`, in the Kimi CLI. Its agent's own history is the source of truth, so whenever
 the service opens a session that its agent does not have loaded (a client's `session/load` or
 `session/resume`, a prompt, an `ask_agent` that wakes it, a report), it first catches the
-session's journal up with that history, before anything runs in it. A turn the service starts
-next lands after the turns made outside, as it did in the agent. The contract is in
-[adapter-contract.md §4](adapter-contract.md#4-opening-a-session-that-is-not-loaded).
+session's journal up with that history, before anything runs in it. The session counts as
+loaded only once that is done: a prompt, a wake or another load that comes meanwhile waits for
+it. So a turn the service starts next lands after the turns made outside, as it did in the agent.
+The contract is in [adapter-contract.md §4](adapter-contract.md#4-opening-a-session-that-is-not-loaded).
 
 - **The mark.** An adapter that advertises `gorynych/replayFrom` names how far into its history
   the journal goes with an opaque mark, in `_meta["gorynych/historyMark"]` of every
   `session/prompt` result and of the update that ends a turn of the agent's own. The service
-  keeps the latest next to the journal (`<journal>.native`).
+  keeps the latest next to the journal (`<journal>.native`). A mark that cannot be written is
+  logged; it never fails a turn that is done.
 - **The catch-up.** The service opens such a session with `session/resume` and
   `_meta["gorynych/replayFrom"]`: `{"type": "gorynych/after", "mark": "<mark>"}`, or
   `{"type": "start"}` without a mark (a journal from before marks). The adapter replays its
@@ -982,29 +984,46 @@ next lands after the turns made outside, as it did in the agent. The contract is
   `_meta["gorynych/replay"]: {"from": "mark" | "start", "mark": "<new mark>"}`. The shape is
   `replayFrom` of ACP v2's draft
   [session-resume-replay](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/v2/session-resume-replay.mdx);
-  in ACP v1, whose `session/resume` replays nothing, it lives in `_meta`.
-- **An agent without marks** that loads (Kimi) is opened with `session/load`, and its replay,
-  the whole session, is aligned with the journal: by the journal's last three user messages in
-  a row, compared without white space, else two, else the last alone (a compaction may keep only
-  that). A user part that is the agent's own `<system-reminder>` is left out: nobody typed it.
-- **What is added.** What follows the mark, or what follows the journal's last messages in a
-  whole replay (a journal without a mark is aligned by the agent's message IDs first), is
-  appended to the journal and sent to the clients attached. Every such update has
-  `_meta["gorynych/origin"]: "native"` and the agent's own `messageId`; a chunk without one
-  gets one, as live. A message or tool call whose `messageId` or `toolCallId` the journal already
-  has is skipped, so a mark lost in a crash repeats nothing.
-- **A rewritten history.** When the mark is no longer in the agent's history (a Codex rollback,
-  a Claude rewind, a Kimi undo), or a whole replay does not hold the journal's last messages,
-  the session is imported again. The journal becomes a notice entry, a `user_message_chunk`
-  with `_meta["gorynych/origin"]: "notice"` and `"gorynych/notice": "historyRewritten"`, whose
-  text starts `[Gorynych: <agent>'s own history of this session no longer holds what this
-  session showed before …]`, followed by the agent's history as it is now. Messages that are
-  still there keep their `messageId`. The journal it replaces is kept next to it as
-  `<journal>.<UTC time>.before`, the last three, and deleted with the session. The notice is the
+  in ACP v1, whose `session/resume` replays nothing, it lives in `_meta`. Only the parts of
+  turns are taken aside meanwhile; a title, the commands or usage go through as usual. The
+  service keeps at most as many replayed updates as the journal holds (the oldest are dropped,
+  and the journal is then marked trimmed).
+- **An agent without marks** that loads (Kimi) is opened with `session/load`, and its whole
+  replay is aligned with the journal like a replay from the start, below.
+- **A journal without turns** takes the replay as it comes: that is an import, and its updates
+  are not marked.
+- **After the mark**, the replay is appended to the journal and sent to the clients attached,
+  every update with `_meta["gorynych/origin"]: "native"` and the agent's own `messageId` (a
+  chunk without one gets one, as live). What the journal already has is skipped: a message by
+  its `messageId`, a tool call by its `toolCallId` and status (so the update that ends a call
+  the journal only started is not). A mark lost in a crash thus repeats nothing.
+- **From the start** (no mark, a mark the agent no longer has, or an agent without marks), the
+  service first looks for where the journal ends in the history:
+  - by the ID of the journal's last part of a turn from the agent;
+  - else by the user messages' text, compared without white space (an empty text, a prompt of
+    only an image, is never compared): the journal's as the start of the history's, else its
+    last three in a row, else two, else the last alone (a compaction may keep only the end),
+    where they occur once.
+
+  What follows is appended, as after a mark; a journal that ends with a prompt the agent
+  answered after the service stopped gets that answer. A replay without a single turn changes
+  nothing (an empty or unreadable history). A system reminder an agent put first into a user
+  message (Kimi adds one to each) was not typed: it is cut off; one inside the text stays.
+- **A rewritten history.** When the journal's end is not found (a Codex rollback, a Claude
+  rewind, a Kimi undo), is found more than once (a repeated `continue`: a turn could be skipped),
+  or the agent answered the journal's last turn with other messages, the session is imported
+  again. The journal becomes a notice entry, a `user_message_chunk` with
+  `_meta["gorynych/origin"]: "notice"` and `"gorynych/notice": "historyRewritten"`, whose text
+  starts `[Gorynych: <agent>'s own history of this session no longer holds what this session
+  showed before …]`, followed by the agent's history as it is now. Messages that are still there
+  keep their `messageId`. The journal it replaces is kept next to it as
+  `<journal>.<UTC time>-<n>.before`, the last three, and deleted with the session; the new mark
+  is written first, so a crash in between does not import it twice. The notice is the
   service's own entry: clients get it, the agent never does. (An ACP `notice` update is live
   only and not replayed, so it cannot stand in a journal.)
 - **Failing open.** An adapter that cannot read its history answers without `gorynych/replay`,
-  and the journal stays as it is. A session its agent no longer has shows its journal, as before.
+  and the journal stays as it is; so does any error of the catch-up itself. A session its agent
+  no longer has shows its journal, as before.
 - **Not caught up.** A session its agent has loaded now: Codex and DSH let one writer hold a
   session, so nothing else wrote it meanwhile. And a session nobody opens: `_gorynych/read`, so
   `read_session` for agents outside Gorynych, and `list_agents` show the journal as it is. They
