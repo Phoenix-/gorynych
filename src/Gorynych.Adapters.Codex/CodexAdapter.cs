@@ -52,6 +52,9 @@ public sealed class CodexAdapterOptions
     /// <summary>How often the threads last seen held are looked at again, for a holder that left no event.</summary>
     internal TimeSpan LockRecheck { get; init; } = TimeSpan.FromSeconds(60);
 
+    /// <summary>How long closing a thread waits for app-server to unload it (<c>thread/closed</c>).</summary>
+    internal TimeSpan UnloadWait { get; init; } = TimeSpan.FromSeconds(10);
+
     public Action<string>? Log { get; init; }
 }
 
@@ -89,6 +92,14 @@ public sealed class CodexAdapter(CodexAdapterOptions options) : IAgentAdapter
         return new AgentInstance(clientIn, clientOut, agent.Exited, agent.DisposeAsync);
     }
 
+    /// <summary>
+    /// <c>codex app-server</c>, told per launch (never in <c>~/.codex</c>) to unload a thread as soon
+    /// as nobody subscribes to it: Codex's default <c>thread_unload_delay_secs</c> keeps it loaded, and
+    /// its writer lock held, for 60 s after <c>thread/unsubscribe</c>, so Codex Desktop or a terminal
+    /// could not take a thread Gorynych had let go of for that long (probed with Codex 0.167).
+    /// </summary>
+    internal static readonly string[] AppServerArguments = ["app-server", "-c", "thread_unload_delay_secs=0"];
+
     (AgentInstance AppServer, int Pid) StartAppServer()
     {
         var exe = options.Executable ?? FindCodex() ?? throw new InvalidOperationException("codex was not found on PATH");
@@ -101,7 +112,7 @@ public sealed class CodexAdapter(CodexAdapterOptions options) : IAgentAdapter
             CreateNoWindow = true,
             WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         };
-        psi.ArgumentList.Add("app-server");
+        foreach (var arg in AppServerArguments) psi.ArgumentList.Add(arg);
         var process = Process.Start(psi) ?? throw new InvalidOperationException("codex app-server did not start");
         options.Log?.Invoke($"codex: started {exe} app-server, pid {process.Id}");
         _ = Task.Run(async () =>

@@ -96,6 +96,9 @@ afterwards (see [Leftovers](#leftovers)).
      when idle: `-32600 thread <id> already has an active writer`.
    - It could resume the thread once the first sent `thread/unsubscribe`. That unloaded the
      thread at once (`thread/loaded/list` empty).
+   - Corrected on 10 November 2026: with Codex 0.167's default `thread_unload_delay_secs` (60 s), an
+     unsubscribed thread stays loaded, and its writer lock held, for a minute. The adapter now
+     starts app-server with `-c thread_unload_delay_secs=0` ([adapters.md](../docs/adapters.md#codex)).
    - A second process received none of the first one's notifications.
 9. **Archive.**
    - `thread/archive` (emits `thread/archived`), `thread/unarchive` (`thread/unarchived`) and

@@ -136,6 +136,45 @@ public sealed class NativeCatchUpLiveTests
 
     const string Outside = "Reply with exactly the word ping and nothing else.";
 
+    /// <summary>
+    /// A thread Gorynych lets go of is free for another Codex app at once, with the service still
+    /// running: its app-server unloads it without Codex's 60 s delay, and the close waits for that.
+    /// </summary>
+    [TestMethod]
+    [Timeout(900_000, CooperativeCancellation = true)]
+    public async Task Codex_AThreadGorynychLetGoOf_IsFreeForCodexExecResumeAtOnce()
+    {
+        RequireLive("codex");
+        var dir = TestDirs.New();
+        var folder = Directory.CreateDirectory(Path.Combine(dir, "work")).FullName;
+        await using var conductor = Conductor(dir, new CodexAdapter(new CodexAdapterOptions()));
+        string id;
+        await using (var zed = await TestClient.ConnectAsync(conductor, "live", agent: "codex"))
+        {
+            id = (await zed.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+                new NewSessionRequest { Cwd = folder, McpServers = [] })).SessionId;
+            await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
+                new JsonObject { ["sessionId"] = id, ["configId"] = "reasoning_effort", ["value"] = "low" });
+            await zed.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = "Reply with exactly the word pong and nothing else." }] });
+            await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+        }
+        for (var i = 0; i < 100 && conductor.Agents["codex"].IsLive(id); i++)
+        {
+            await conductor.CleanupsIdleAsync();
+            await Task.Delay(100);
+        }
+        Assert.IsFalse(conductor.Agents["codex"].IsLive(id), "let go in its agent");
+
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        var output = await RunOnceAsync(folder, "codex", ["exec", "resume", "-c", "model_reasoning_effort=\"low\"", "--skip-git-repo-check", id, Outside]);
+        Console.WriteLine($"codex exec resume took the thread at once and ran its turn in {started.ElapsedMilliseconds} ms");
+        StringAssert.Contains(output.ToLowerInvariant(), "ping");
+
+        await using (var cleanup = await TestClient.ConnectAsync(conductor, "cleanup", agent: "codex"))
+            await cleanup.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = id });
+    }
+
     [TestMethod]
     [Timeout(900_000, CooperativeCancellation = true)]
     public async Task Codex_ATurnTakenWithCodexExecResume_ShowsOnceWhenOpenedAgain()

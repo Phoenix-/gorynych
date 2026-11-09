@@ -582,7 +582,7 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 | `session/list` | `thread/list {cwd, cursor, limit 50, archived: false, sortKey: updated_at, useStateDbOnly: true}`; `title` is the thread's `name` (none until a name is set or generated: the service shows its provisional title), `updatedAt` from unix seconds |
 | `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}`; with `gorynych/replayFrom`, then the thread's turns after the mark (below) |
 | `session/load` | the same, then the history from `thread/items/list`, page by page, as the updates below. The service no longer uses it: a thread the journal has not seen is imported through the replay from the start |
-| `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), up to 5 s for the turn to end, then `thread/unsubscribe`, which unloads an idle thread at once. A turn that has not ended by then ends `cancelled`: Codex sends nothing more of an unsubscribed thread |
+| `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), up to 5 s for the turn to end, then `thread/unsubscribe`. App-server is started with `-c thread_unload_delay_secs=0`, so it unloads the thread at once, and the close returns once `thread/closed` came (at most 10 s): the thread's writer lock is then free for another Codex app. A turn that has not ended by then ends `cancelled`: Codex sends nothing more of an unsubscribed thread |
 | `session/delete` | stops a running turn as `session/close` does, then `thread/delete`; a thread Codex no longer has answers `-32002` |
 | `_gorynych/set_title` | `thread/name/set` (works before the first turn too) |
 
@@ -681,9 +681,21 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     has none. Any failure to list them answers without `gorynych/replay`.
   - Verified live on 10 November 2026: a turn taken with `codex exec resume <id>` showed once,
     marked `native`, and a second open added nothing.
-  - Codex's app-server keeps a thread's writer lock for a while after `thread/unsubscribe`
-    (over 30 s, seen live). So `codex exec resume` right after Gorynych let go of the thread
-    fails with "active writer"; the live check stops the service first.
+- **Letting go of a thread.** Codex 0.167 keeps a thread it has nobody subscribed to loaded,
+  and its writer lock held, for `thread_unload_delay_secs`, 60 s by default (probed on
+  10 November 2026; [probe](../research/probes/codex/writer_lock_probe.py)).
+  - Measured, with nothing else running: after `thread/unsubscribe` the thread stayed in
+    `thread/loaded/list` and its lock file stayed open in app-server's own process. After
+    61 s app-server sent `thread/status/changed` `notLoaded` and `thread/closed`, and only then
+    could a second app-server resume it. A name set before the turn changed nothing (it is no
+    naming job that holds it).
+  - So for a minute after Gorynych let go of a thread, Codex Desktop or `codex resume` were
+    refused with "active writer".
+  - App-server has no method to unload a thread at once. The adapter therefore starts it with
+    `-c thread_unload_delay_secs=0` (per launch; `~/.codex` is not touched) and waits for
+    `thread/closed` on a close.
+  - Measured with that: the thread was unloaded within 3 s, also one with an MCP server given
+    per thread, and `codex exec resume` took it at once with the service still running.
 
 ### Prompts and turns
 

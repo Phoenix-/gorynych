@@ -81,6 +81,11 @@ sealed class FakeAppServer
     /// <summary>When set, <c>turn/start</c> answers only once it completes.</summary>
     public TaskCompletionSource? HoldTurnStart { get; set; }
 
+    /// <summary>After <c>thread/unsubscribe</c>, tells <c>thread/status/changed</c> notLoaded and <c>thread/closed</c>, after <see cref="UnloadDelay"/>.</summary>
+    public bool TellsUnload { get; set; } = true;
+
+    public TimeSpan UnloadDelay { get; set; } = TimeSpan.Zero;
+
     /// <summary><c>thread/unsubscribe</c> fails, as when app-server is going away.</summary>
     public bool FailUnsubscribe { get; set; }
 
@@ -229,6 +234,14 @@ sealed class FakeAppServer
                     t.Loaded = false;
                     if (!t.Durable) Threads.TryRemove(id, out _); // a thread with no turn has no rollout to come back to
                 }
+                // As app-server with thread_unload_delay_secs=0: the unload is told once it is done.
+                if (TellsUnload)
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(UnloadDelay);
+                        await Notify("thread/status/changed", new JsonObject { ["threadId"] = id, ["status"] = new JsonObject { ["type"] = "notLoaded" } });
+                        await Notify("thread/closed", new JsonObject { ["threadId"] = id });
+                    });
                 return Done(new JsonObject { ["status"] = "unsubscribed" });
             }
             case "thread/delete":

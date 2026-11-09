@@ -319,6 +319,8 @@ sealed class CodexAgent : IAsyncDisposable
     CodexLockWatcher? lockWatcher;
     readonly ConcurrentDictionary<string, CodexThread> threads = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, CancellationTokenSource> asking = new(StringComparer.Ordinal);
+    /// <summary>Threads being closed, until app-server says it unloaded them (<c>thread/closed</c>).</summary>
+    readonly ConcurrentDictionary<string, TaskCompletionSource> unloading = new(StringComparer.Ordinal);
 
     /// <summary>Turns ended here before Codex said so (a close, delete or unload): their late <c>turn/completed</c> is dropped.</summary>
     readonly ConcurrentDictionary<string, byte> abandoned = new(StringComparer.Ordinal);
@@ -692,23 +694,33 @@ sealed class CodexAgent : IAsyncDisposable
     /// <summary>
     /// Closing stops the thread's turn (ACP), gives it a moment to end, then unloads the thread
     /// from app-server. A turn that has not ended by then ends as cancelled: after unsubscribing,
-    /// no <c>turn/completed</c> comes for it.
+    /// no <c>turn/completed</c> comes for it. It returns once app-server has unloaded the thread
+    /// (<c>thread/closed</c>, at once with the launch's <c>thread_unload_delay_secs=0</c>), so the
+    /// thread's writer lock is free for another Codex app; it waits for that at most
+    /// <see cref="CodexAdapterOptions.UnloadWait"/>.
     /// </summary>
     async Task CloseAsync(string id, CancellationToken ct)
     {
         if (!threads.TryGetValue(id, out var t) || !t.Loaded) return;
         await StopTurnAsync(t);
+        var closed = unloading.GetOrAdd(id, _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+        var unsubscribed = false;
         try
         {
             await app.SendRequestAsync(CodexMethods.Client.ThreadUnsubscribe, ToNode(new ThreadUnsubscribeParams { ThreadId = id },
                 CodexJsonContext.Default.ThreadUnsubscribeParams), ct);
+            unsubscribed = true;
         }
         finally
         {
             // Also when unsubscribing fails (app-server going away): the turn has had its time.
             t.Loaded = false;
             Abandon(t);
+            if (!unsubscribed) unloading.TryRemove(id, out _);
         }
+        if (await Task.WhenAny(closed.Task, Task.Delay(options.UnloadWait, ct)) != closed.Task)
+            Log($"codex: thread {id}: app-server has not unloaded it {options.UnloadWait.TotalSeconds:0} s after the unsubscribe; its writer lock may still be held");
+        unloading.TryRemove(id, out _);
     }
 
     async Task DeleteAsync(string id, CancellationToken ct)
@@ -1130,12 +1142,15 @@ sealed class CodexAgent : IAsyncDisposable
             {
                 // Codex unloaded the thread: a turn still running ends, as no turn/completed comes for it.
                 var n = From(p, ctx.ThreadStatusChangedNotification);
-                if (n.Status is NotLoadedThreadStatus && Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "status notLoaded");
+                if (n.Status is not NotLoadedThreadStatus) break;
+                if (unloading.TryGetValue(n.ThreadId, out var closing)) closing.TrySetResult();
+                if (Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "status notLoaded");
                 break;
             }
             case CodexMethods.Notification.ThreadClosed:
             {
                 var n = From(p, ctx.ThreadClosedNotification);
+                if (unloading.TryGetValue(n.ThreadId, out var closing)) closing.TrySetResult();
                 if (Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "thread/closed");
                 break;
             }

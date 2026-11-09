@@ -828,6 +828,55 @@ public sealed class CodexAdapterTests
     }
 
     [TestMethod]
+    public void AppServer_IsStartedToUnloadAThreadAsSoonAsNobodySubscribes()
+    {
+        // Codex's default keeps an unsubscribed thread, and its writer lock, for 60 s (probed with 0.167).
+        CollectionAssert.AreEqual(new[] { "app-server", "-c", "thread_unload_delay_secs=0" }, CodexAdapter.AppServerArguments);
+    }
+
+    [TestMethod]
+    public async Task Closing_WaitsUntilAppServerHasUnloadedTheThread()
+    {
+        var fake = new FakeAppServer { UnloadDelay = TimeSpan.FromMilliseconds(400) };
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+        await PromptDirectAsync(acp, id, "hello");
+
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        await acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+
+        Assert.IsTrue(started.ElapsedMilliseconds >= 350, $"closed after {started.ElapsedMilliseconds} ms: before app-server let go of the thread");
+    }
+
+    [TestMethod]
+    public async Task Closing_AThreadAppServerNeverSaysItUnloaded_GivesUpAfterAWhile()
+    {
+        var fake = new FakeAppServer { TellsUnload = false };
+        var log = new List<string>();
+        var agent = await new CodexAdapter(new CodexAdapterOptions
+        {
+            Launch = fake.StartAsync,
+            ClientVersion = "test",
+            TurnEndWait = TimeSpan.FromMilliseconds(200),
+            UnloadWait = TimeSpan.FromMilliseconds(300),
+            Log = m => { lock (log) log.Add(m); },
+            FindHolders = _ => new Dictionary<string, string>(),
+            LocksDirectory = Path.Combine(Path.GetTempPath(), "gorynych-no-codex-locks"),
+        }).StartAsync(CancellationToken.None);
+        await using var _ = agent;
+        await using var acp = new JsonRpcConnection(agent.Input, agent.Output, "direct-client") { NotificationHandler = (_, _) => Task.CompletedTask };
+        acp.Start();
+        var id = await NewDirectAsync(acp);
+        await PromptDirectAsync(acp, id, "hello");
+
+        await acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id }).WaitAsync(Wait);
+
+        Assert.IsTrue(Logged(log, "has not unloaded it"), string.Join(" | ", log));
+    }
+
+    [TestMethod]
     public async Task ALateUnloadNote_ForAThreadOpenedAgain_IsIgnored()
     {
         var fake = new FakeAppServer();
