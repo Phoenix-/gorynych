@@ -153,6 +153,8 @@ public sealed class PeersTests
 
         StringAssert.Contains(Description("ask_agent"), "Start a new question");
         StringAssert.Contains(Description("ask_agent"), "To answer a request you received (its header names a message_id), use reply instead.");
+        StringAssert.Contains(Description("ask_agent"),
+            "If that session runs in full access and this one does not, the user approves the question first; if they decline, the call fails and nothing is sent.");
         StringAssert.Contains((string?)tools["ask_agent"]["inputSchema"]!["properties"]!["session_id"]!["description"],
             "never an agent name, a title or a sender label");
         StringAssert.Contains(Description("reply"), "Use it only to answer; to start a question of your own, use ask_agent.");
@@ -173,7 +175,7 @@ public sealed class PeersTests
         StringAssert.Contains(Description("restore_session"), "To ask an archived session something, use ask_agent: it need not be restored first.");
         foreach (var tool in new[] { "archive_session", "restore_session" })
         {
-            StringAssert.Contains(Description(tool), "The user approves each call.");
+            Assert.IsFalse(Description(tool).Contains("approve", StringComparison.Ordinal), "reversible, so never asked");
             CollectionAssert.AreEqual(new[] { "session_id" }, tools[tool]["inputSchema"]!["required"]!.AsArray().Select(r => (string?)r).ToArray());
         }
     }

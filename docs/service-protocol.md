@@ -136,7 +136,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/setTitle` | an adapter's `agentCapabilities._meta` | `true`: the adapter takes `_gorynych/set_title {sessionId, title}` → `{}`, and the service writes a `spawn_session` name natively ([Child sessions](#child-sessions)) |
 | `gorynych/unloadAfter` | an adapter's `agentCapabilities._meta` | seconds: its sessions' idle time when shorter than `--unload-after` ([Unloading idle sessions](#unloading-idle-sessions)); read as at most a day |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
-| `gorynych/unaskedMcpTools` | an adapter's `agentCapabilities._meta` | `true`: its agent runs MCP tools without asking the person (DSH), so the service asks before `ask_agent`, `archive_session` and `restore_session` act for its sessions ([Opinions between agents](#opinions-between-agents)) |
+| `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes in on its input (headless) or through its channel (TUI), and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards, and to the agent adds `_meta` with `gorynych/sender`, `gorynych/fromSessionId` and `gorynych/outside` as the journal keeps them on a request in a turn, for the user message the agent reports for it. An agent that answers method not found, or `-32600` because it is not running, is asked in a turn instead ([adapter-contract.md](adapter-contract.md#64-the-live-note-path)) |
@@ -286,6 +286,7 @@ Errors from the peer tools say how to recover. The peers server returns them to 
 | --- | --- |
 | `ask_agent` with an unknown or deleted `session_id` (`-32002`) | `No session "<x>". Pass an exact session_id from list_agents.` and the first five sessions it can ask, one per line as `- session_id <id> (<agent>, "<title>")`, or `There is no other session to ask now.` |
 | `ask_agent` with its own ID (`-32602`) | `"<x>" is this session's own session_id; ask_agent asks another session.` and the same list |
+| `ask_agent` into full access, declined by the user (`-32600`) | `The user declined to let this session ask session_id <id>, so it was not asked: that session runs in full access and this one does not, so the user approves each such question. Go on without its opinion, or ask the user.` ([Approvals](#approvals)) |
 | `ask_agent` while answering a request as a turn (`-32600`) | `This session is answering opinion request mk7q2-3, so it cannot ask another session during this turn. Send your answer with the reply tool, passing message_id "mk7q2-3"; if another opinion would help, say so in the answer.` |
 | `ask_agent` to a session that could not be loaded or started, or whose turn failed right after the service started it (the error's own code) | `session_id <id> (<agent>, "<title>") could not be started to answer: <reason>. Ask another session from list_agents, or ask the user to open that session and check it.` A session that is merely not loaded or not running is started instead ([above](#opinions-between-agents)) |
 | `reply` with a `message_id` nothing waits for (the tool's own error) | `No open request with message_id "<x>" for this session; it may have been answered already or withdrawn. reply only answers a request you received, by the message_id in its header. To ask a session something, use ask_agent with its session_id.` |
@@ -314,28 +315,53 @@ takes for the session itself). `archive_session` and `restore_session` say what 
 A client calling `_gorynych/opinion` or `_gorynych/archive` without a peer token gets the
 plain `Unknown session <id>`, since it has no `list_agents`.
 
-Approvals are the same for every agent: `list_agents` (read only) and `reply` (an answer the
-user's own agent was asked for) run without asking — the Claude adapter allows them in its
-PermissionRequest hook, the service answers Kimi's `session/request_permission` for them —
-while `ask_agent` always asks the person, because it hands context to another agent and
-spends its turns. `spawn_session` is also allowed without the agent's own approval, because
-the service itself asks the person before every spawn (below), so it is asked once.
-`archive_session` and `restore_session` go through the agent's normal approval, with no
-card of the service's own: both can be undone.
+### Approvals
 
-An agent that runs MCP tools without asking anyone (DeepSeek Harness, whose adapter says so
-with `gorynych/unaskedMcpTools`) would let its sessions ask, archive and restore unseen. For
-its sessions the service asks the person itself, on the calling session, before
-`ask_agent` (`Ask session_id <id> (…) for an opinion`), `archive_session` and
-`restore_session` act. It shows a card and sends `session/request_permission` with allow
-once or decline, the same way it asks before every spawn. A decline fails the tool with a
-sentence for the agent (`The user declined to ask session_id <id>, so it was not asked. …`).
-An archive or restore that would change nothing is not asked. The asked session is resolved
-first, so a session that only its agent lists yet (one made in that agent's own app) is asked
-about like any other.
+Approvals are the same for every agent. No gorynych tool asks the person: `list_agents` (read
+only), `reply` (an answer the user's own agent was asked for), `ask_agent` (the asked agent
+only gives an opinion), and `archive_session` and `restore_session` (both can be undone).
+`spawn_session` does not ask either, because the service itself asks the person before every
+spawn (below), so it is asked once. How each agent runs them unasked:
 
-Verified live on 7 November 2026: Claude called `list_agents` and, after approval,
-`ask_agent`; Kimi got the marked turn, answered with `reply`, and Claude used the answer.
+- Claude: every launch allows them with a permission rule in its `--settings`
+  (`spawn_session` aside), which Claude applies before auto mode's classifier, and the adapter
+  answers yes when Claude asks for one all the same (plan mode asks for MCP tools whatever the
+  allow rules say, and so does an ask rule). The person's deny rules still win: Claude
+  evaluates deny rules first, and leaves a denied MCP tool out of its list
+  ([adapters.md](adapters.md#the-gorynych-tools)).
+- Codex runs the `gorynych` server's tools without asking (`default_tools_approval_mode: "approve"`).
+- Kimi asks with `session/request_permission`, which the service answers itself (allow once).
+- DeepSeek Harness runs MCP tools without asking anyone.
+
+The one exception is a question into full access. A session in full access runs anything
+without asking the person, so a question from a session that is not would lend the asking
+session its rights: the asked agent might act on the request (each is told only to answer,
+but nothing in full access stops it). So before a session that is not in full access asks one
+that is, the service asks the person, on the asking session, the same for every agent: a card
+`Ask session_id <id> (<agent>, "<title>") for an opinion` with the question and
+`That session runs in full access, so it could act on this request without asking you; this
+session does not.`, and `session/request_permission` with allow once or decline, as before
+every spawn. Without a client attached it waits for one. A decline fails the tool
+([above](#what-agents-are-told)) and the asked session gets nothing. A session in full access
+asking any session, and any session asking one that is not in full access, is not asked.
+
+Which sessions are in full access the service reads from the agents' own state, as it last got
+it (`session/new`, `load`, `resume`, `set_config_option`, `config_option_update`,
+`current_mode_update`): the current value of the mode option (category `mode`), or the current
+`SessionMode`, carries `_meta["gorynych/fullAccess"]: true`. The Claude adapter marks
+`bypassPermissions`; the DSH adapter `full-access`; the Codex adapter `full-access`, and its own
+thread settings when they have approval `never` and sandbox `dangerFullAccess`. An agent that
+reports no mode counts as not in full access. The asked session's mode is read when it is
+asked: one that is not loaded is loaded first, as the question would load it anyway, so it is
+the mode it is loaded in (DSH's modes file, a Claude session's kept choice), and after a
+decline it is unloaded again after its idle time. A question that then waits for the asked
+session's running turn is not checked again when it is sent (Claude refuses Full access during
+a turn; Codex takes a mode chosen meanwhile with its next turn, which may be that question's). An agent outside Gorynych has no mode here;
+its host approves its `ask_agent` ([Agents outside Gorynych](#agents-outside-gorynych)).
+
+Verified live on 7 November 2026 (when `ask_agent` still asked): Claude called `list_agents`
+and, after approval, `ask_agent`; Kimi got the marked turn, answered with `reply`, and Claude
+used the answer.
 Kimi asking Claude goes through Claude's channel the same way.
 
 ## Child sessions
@@ -711,10 +737,12 @@ progress, message}` through the request-scoped notifications above.
   Without progress, an answer slower than 30 minutes would be cut off. With it, only the
   28-hour limit applies.
 
-**Approvals.** Gorynych adds no card of its own: the host approves its MCP tools as it does
-for any server. The guide suggests allowing `list_sessions` and `read_session` in the host's
-own settings, since they only read, and leaving `ask_agent` to ask each time, as it does
-inside Gorynych. Gorynych itself never writes those settings.
+**Approvals.** Gorynych adds no card of its own, not even for a question into full access
+([Approvals](#approvals)): the host approves its MCP tools as it does for any server, and that
+is the only gate. The guide suggests allowing all three, `list_sessions`, `read_session` and
+`ask_agent`, in the host's own settings, as the gorynych tools run unasked inside Gorynych, and
+leaving `ask_agent` out for a person who wants to approve each question. Gorynych itself never
+writes those settings.
 
 ### What outside agents are told
 

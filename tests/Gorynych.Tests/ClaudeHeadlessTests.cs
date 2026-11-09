@@ -137,8 +137,7 @@ public sealed partial class ClaudeHeadlessTests
 
         await PromptAsync(client, sessionId, "peers please");
         StringAssert.Contains(client.Text(), "list_agents:allow ask_agent:allow");
-        Assert.IsFalse(client.Approvals.Any(a => a.ToolCall.Title?.Contains("list_agents", StringComparison.Ordinal) == true), "list_agents is pre-allowed");
-        Assert.IsTrue(client.Approvals.Any(a => a.ToolCall.Title?.Contains("ask_agent", StringComparison.Ordinal) == true), "ask_agent asks the person");
+        Assert.IsFalse(client.Approvals.Any(a => a.ToolCall.Title?.Contains("(gorynych)", StringComparison.Ordinal) == true), "the gorynych tools ask nothing");
 
         client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = ClaudeHooks.DenyOptionId });
         await PromptAsync(client, sessionId, "write it again");

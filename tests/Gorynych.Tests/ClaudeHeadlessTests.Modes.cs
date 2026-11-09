@@ -216,150 +216,63 @@ public sealed partial class ClaudeHeadlessTests
         Assert.AreEqual(asked + 1, client.Approvals.Count, "the next write asks again");
     }
 
-    static int HookAsks(List<string> log)
-    {
-        lock (log) return log.Count(l => l.Contains("asking the person before mcp__gorynych__", StringComparison.Ordinal));
-    }
-
-    static string[] AskedTools(TestClient client, int from) =>
-        client.Approvals.Skip(from).Select(a => (string)AcpJson.ToNode(a.ToolCall)!["rawInput"]?.ToJsonString()! + " " + a.ToolCall.Title).ToArray();
+    static string[] AskedTools(TestClient client, int from) => client.Approvals.Skip(from).Select(a => a.ToolCall.Title ?? "").ToArray();
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task TheGorynychTools_AreAskedInFullAccess_ThroughTheHook_AndOnceInAsk()
-    {
-        var dir = TestDirs.New();
-        var log = new List<string>();
-        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false)));
-        await using var client = await TestClient.ConnectAsync(conductor);
-        var id = await NewAsync(client, dir);
-        await SetModeAsync(client, id, ClaudeOptions.FullAccess);
-        await PromptAsync(client, id, "hello");
-        var before = client.Approvals.Count;
-
-        var full = await PromptAsync(client, id, "gorynych tools");
-
-        Assert.AreEqual(StopReason.EndTurn, full.StopReason);
-        Assert.AreEqual(before + 3, client.Approvals.Count, "ask_agent, archive_session and restore_session each asked: " + string.Join(" | ", AskedTools(client, before)));
-        Assert.AreEqual(3, HookAsks(log), "asked by the adapter, from Claude's hook");
-        var hook = Controls(id).First(c => (string?)c["subtype"] == "initialize")["hooks"]!["PreToolUse"]![0]!;
-        Assert.AreEqual(StreamJson.AskedToolsMatcher, (string?)hook["matcher"]);
-        Assert.AreEqual(86400, (int)hook["timeout"]!, "a day, in seconds, for the person to answer");
-        StringAssert.Contains(client.Text(), "ask_agent:allow archive_session:allow restore_session:allow");
-
-        await SetModeAsync(client, id, "default");
-        var inAsk = client.Approvals.Count;
-        await PromptAsync(client, id, "gorynych tools");
-        Assert.AreEqual(inAsk + 3, client.Approvals.Count, "in Ask, Claude's own can_use_tool asks, once each");
-        Assert.AreEqual(3, HookAsks(log), "the hook left it to Claude");
-    }
-
-    [TestMethod]
-    [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task TheGorynychTools_AreAskedOnce_EvenWhereAnAllowRuleWouldLetThemRun()
-    {
-        var dir = TestDirs.New();
-        Directory.CreateDirectory(Path.Combine(dir, ".claude"));
-        File.WriteAllText(Path.Combine(dir, ".claude", "settings.json"), """{"permissions":{"allow":["mcp__gorynych"]}}""");
-        var log = new List<string>();
-        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false)));
-        await using var client = await TestClient.ConnectAsync(conductor);
-        var id = await NewAsync(client, dir);
-        await PromptAsync(client, id, "hello");
-        var before = client.Approvals.Count;
-
-        await PromptAsync(client, id, "gorynych tools");
-
-        Assert.AreEqual(before + 3, client.Approvals.Count, "the project's allow rule lets none of them run unasked");
-        Assert.AreEqual(0, HookAsks(log), "asked once each, by Claude's can_use_tool after the hook's ask");
-    }
-
-    [TestMethod]
-    [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task InFullAccess_ThePersonsNo_ThroughTheHook_StopsTheTool()
+    [DataRow("default")]
+    [DataRow("acceptEdits")]
+    [DataRow("plan")]
+    [DataRow("auto")]
+    [DataRow(ClaudeOptions.FullAccess)]
+    public async Task TheGorynychTools_RunUnasked_InEveryMode(string mode)
     {
         var dir = TestDirs.New();
         await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false)));
         await using var client = await TestClient.ConnectAsync(conductor);
         var id = await NewAsync(client, dir);
-        await SetModeAsync(client, id, ClaudeOptions.FullAccess);
         await PromptAsync(client, id, "hello");
-        client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome
-        {
-            OptionId = r.ToolCall.Title?.StartsWith("ask_agent", StringComparison.Ordinal) == true ? ClaudeHooks.DenyOptionId : r.Options[0].OptionId,
-        });
+        await SetModeAsync(client, id, mode);
+        var before = client.Approvals.Count;
+
+        await PromptAsync(client, id, "gorynych tools");
+
+        StringAssert.Contains(client.Text(), "ask_agent:allow archive_session:allow restore_session:allow");
+        Assert.AreEqual(before, client.Approvals.Count, "nothing asked: " + string.Join(" | ", AskedTools(client, before)));
+        var args = LaunchArgs(id);
+        var permissions = JsonNode.Parse(File.ReadAllText(args[args.IndexOf("--settings") + 1]))!["permissions"]!;
+        CollectionAssert.AreEquivalent(
+            new[] { "mcp__gorynych__reply", "mcp__gorynych__list_agents", "mcp__gorynych__ask_agent", "mcp__gorynych__archive_session", "mcp__gorynych__restore_session" },
+            permissions["allow"]!.AsArray().Select(r => (string?)r).ToArray(), "allowed by the launch, so auto's classifier does not judge them; spawn_session is not");
+        CollectionAssert.AreEqual(new[] { "mcp__gorynych-outside" }, permissions["deny"]!.AsArray().Select(r => (string?)r).ToArray());
+        Assert.IsTrue(Controls(id).Where(c => (string?)c["subtype"] == "initialize").All(c => c["hooks"] is null), "no hooks");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    [DataRow("default")]
+    [DataRow(ClaudeOptions.FullAccess)]
+    public async Task ThePersonsDenyRule_StillStopsAGorynychTool(string mode)
+    {
+        var dir = TestDirs.New();
+        Directory.CreateDirectory(Path.Combine(dir, ".claude"));
+        File.WriteAllText(Path.Combine(dir, ".claude", "settings.json"), """{"permissions":{"deny":["mcp__gorynych__ask_agent"]}}""");
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        await PromptAsync(client, id, "hello");
+        await SetModeAsync(client, id, mode);
+        var before = client.Approvals.Count;
 
         await PromptAsync(client, id, "gorynych tools");
 
         StringAssert.Contains(client.Text(), "ask_agent:deny archive_session:allow restore_session:allow");
+        Assert.AreEqual(before, client.Approvals.Count);
     }
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task InFullAccess_AFailureWhileAsking_StopsTheTool()
-    {
-        var dir = TestDirs.New();
-        var log = new List<string>();
-        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false)));
-        await using var client = await TestClient.ConnectAsync(conductor);
-        var id = await NewAsync(client, dir);
-        await SetModeAsync(client, id, ClaudeOptions.FullAccess);
-        await PromptAsync(client, id, "hello");
-        client.Approve = _ => throw new InvalidOperationException("the client broke");
-
-        await PromptAsync(client, id, "gorynych tools");
-
-        StringAssert.Contains(client.Text(), "ask_agent:deny archive_session:deny restore_session:deny");
-    }
-
-    [TestMethod]
-    [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task InAuto_TheGorynychTools_AreAskedByTheAdapter()
-    {
-        var dir = TestDirs.New();
-        var log = new List<string>();
-        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false)));
-        await using var client = await TestClient.ConnectAsync(conductor);
-        var id = await NewAsync(client, dir);
-        await PromptAsync(client, id, "hello");
-        await SetModeAsync(client, id, "auto");
-        var before = client.Approvals.Count;
-
-        await PromptAsync(client, id, "write");
-        Assert.AreEqual(before, client.Approvals.Count, "auto's classifier lets an ordinary write run");
-        await PromptAsync(client, id, "gorynych tools");
-
-        Assert.AreEqual(before + 3, client.Approvals.Count, "but not Gorynych's tools");
-        Assert.AreEqual(3, HookAsks(log));
-        lock (log) Assert.IsTrue(log.Any(l => l.Contains("(auto)", StringComparison.Ordinal)));
-    }
-
-    [TestMethod]
-    [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task TheGorynychTools_AreAskedInFullAccess_WhileTheCatalogChanges()
-    {
-        var dir = TestDirs.New();
-        var other = TestDirs.New();
-        File.WriteAllText(Path.Combine(other, "models-small"), "");
-        var log = new List<string>();
-        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false)));
-        await using var client = await TestClient.ConnectAsync(conductor);
-        var id = await NewAsync(client, dir);
-        await PromptAsync(client, id, "hello");
-        var entering = SetModeAsync(client, id, ClaudeOptions.FullAccess);
-        var elsewhere = await NewAsync(client, other);
-        await Task.WhenAll(entering, PromptAsync(client, elsewhere, "hello")); // its launch changes the catalog and tells every session
-        var before = client.Approvals.Count;
-
-        await PromptAsync(client, id, "gorynych tools");
-
-        Assert.AreEqual(before + 3, client.Approvals.Count, "asked whatever the client last heard of the mode");
-        Assert.AreEqual(3, HookAsks(log));
-    }
-
-    [TestMethod]
-    [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task APersistedFullAccess_AfterARestart_StartsInIt_AndStillAsksBeforeTheGorynychTools()
+    public async Task APersistedFullAccess_AfterARestart_IsReportedMarked_AndStartsInIt()
     {
         var dir = TestDirs.New();
         string id;
@@ -370,39 +283,24 @@ public sealed partial class ClaudeHeadlessTests
             await PromptAsync(client, id, "hello");
             await SetModeAsync(client, id, ClaudeOptions.FullAccess);
         }
-        var log = new List<string>();
-        await using (var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false))))
+        await using (var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false))))
         {
             await using var client = await TestClient.ConnectAsync(conductor);
 
-            await PromptAsync(client, id, "gorynych tools");
+            var resumed = await client.Rpc.RequestAsync<ResumeSessionRequest, ResumeSessionResponse>(AcpMethods.Agent.SessionResume,
+                new ResumeSessionRequest { SessionId = id, Cwd = dir });
 
+            var option = ModeOptionOf(resumed.ConfigOptions!);
+            Assert.AreEqual(ClaudeOptions.FullAccess, (string?)option["currentValue"], "the mode it is loaded in, before Claude runs");
+            var marked = option["options"]!.AsArray().Where(o => o!["_meta"]?[GorynychProtocol.MetaFullAccess] is JsonValue v && v.GetValue<bool>())
+                .Select(o => (string?)o!["value"]).ToArray();
+            CollectionAssert.AreEqual(new[] { ClaudeOptions.FullAccess }, marked, "so the service knows to ask before a session outside it asks this one");
+            await PromptAsync(client, id, "gorynych tools");
             var args = LaunchArgs(id);
             Assert.AreEqual(ClaudeOptions.FullAccess, args[args.IndexOf("--permission-mode") + 1], "resumed in full access");
-            Assert.AreEqual(3, client.Approvals.Count, "each tool asked: " + string.Join(" | ", AskedTools(client, 0)));
-            Assert.AreEqual(3, HookAsks(log));
+            Assert.AreEqual(0, client.Approvals.Count, "nothing asked: " + string.Join(" | ", AskedTools(client, 0)));
         }
     }
-
-    [TestMethod]
-    [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task AHookCallThatDoesNotSayTheMode_AsksThePerson()
-    {
-        var dir = TestDirs.New();
-        File.WriteAllText(Path.Combine(dir, "no-mode"), "");
-        var log = new List<string>();
-        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, fetchCatalog: false)));
-        await using var client = await TestClient.ConnectAsync(conductor);
-        var id = await NewAsync(client, dir);
-        await PromptAsync(client, id, "hello");
-        var before = client.Approvals.Count;
-
-        await PromptAsync(client, id, "gorynych tools");
-
-        Assert.AreEqual(3, HookAsks(log), "an unknown mode counts as one that asks nobody");
-        Assert.AreEqual(before + 3, client.Approvals.Count, "the hook's yes settles it, so nothing is asked twice");
-    }
-
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
     public async Task LeavingFullAccess_WhenClaudeRefuses_StopsIt_AndTheNextTurnAsks()

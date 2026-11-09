@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
+using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
 
 namespace Gorynych.Adapters.Claude;
@@ -95,7 +96,12 @@ public static class ClaudeOptions
         var model = Current(s, catalog);
         var mode = CurrentMode(s);
         var modes = Modes.Where(m => m.Id != "auto" || model?.SupportsAutoMode == true || mode == "auto")
-            .Select(m => new SessionConfigSelectOption { Value = m.Id, Name = m.Name, Description = m.Description }).ToList();
+            .Select(m => new SessionConfigSelectOption
+            {
+                Value = m.Id, Name = m.Name, Description = m.Description,
+                // The service asks the person before a session not in full access asks this one.
+                Meta = m.Id == FullAccess ? new JsonObject { [GorynychProtocol.MetaFullAccess] = true } : null,
+            }).ToList();
         if (modes.All(m => m.Value != mode)) modes.Add(new SessionConfigSelectOption { Value = mode, Name = mode, Description = "Set in your Claude settings" });
         options.Add(Select("mode", "Permissions", SessionConfigOptionCategory.Mode, mode, modes));
         if (catalog.Count == 0) return options;

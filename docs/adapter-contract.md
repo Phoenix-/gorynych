@@ -229,16 +229,18 @@ prompt and a spawned session's first turn are not service turns.
 - Its tools: `list_agents`, `ask_agent`, `spawn_session`, `archive_session`,
   `restore_session` and `reply`. Their texts are in
   [service-protocol.md](service-protocol.md#opinions-between-agents).
-- `list_agents`, `reply` and `spawn_session` run without the agent's approval; the others ask
-  the person. An adapter whose approvals reach the service as `session/request_permission`
-  SHOULD title them `mcp__gorynych__<tool>`, as Kimi does, so the service can answer the
-  first three itself. An adapter that approves tools on its own MUST allow exactly those three
-  without asking (Claude's PermissionRequest hook). Fallback: the person is asked for all.
-- An adapter whose agent runs MCP tools without asking the person (DSH) MUST say so with
-  `agentCapabilities._meta["gorynych/unaskedMcpTools"]: true`. The service then asks the person
-  on the calling session before `ask_agent`, `archive_session` and `restore_session` act, the way
-  it asks before every spawn (allow once or decline; a decline fails the tool with a sentence
-  for the agent). An archive or restore that would change nothing is not asked. (DSH)
+- All six run without the agent's approval ([service-protocol.md](service-protocol.md#approvals)).
+  An adapter whose approvals reach the service as `session/request_permission` SHOULD title
+  them `mcp__gorynych__<tool>`, as Kimi does, so the service can answer them itself. An adapter
+  that approves tools on its own MUST allow them without asking (Claude: a per-launch allow
+  rule and its own approvals; Codex: the server's `default_tools_approval_mode`), and MUST
+  leave the person's own deny rules in force. Fallback: the person is asked for each.
+- The service asks the person itself where the person must decide: before every spawn, and
+  before a session that is not in full access asks one that is. For that an adapter whose agent
+  has a mode in which it runs anything without asking MUST mark that mode's value with
+  `_meta["gorynych/fullAccess"]: true` in its mode option (category `mode`) or `SessionMode`,
+  in every state it reports (Claude's `bypassPermissions`, DSH's and Codex's `full-access`).
+  Fallback: an unmarked mode counts as not full access, so a question into it is not asked.
 - Fallback without the server: the agent cannot ask, answer, spawn or archive; an opinion
   asked as a turn is answered with the turn's text.
 
@@ -426,7 +428,7 @@ DSH speaks ACP, and its adapter is a thin proxy.
 
 | Feature | Claude Code, headless (default: in-process adapter over `claude -p` with stream-json) | Claude Code, TUI (fallback, `--claude-transport tui`: the TUI in a pseudo console) | Kimi Code 2.5.2 (`kimi acp`, native ACP) | Codex 0.167 (in-process adapter over `codex app-server`) | DeepSeek Harness 0.2.2-rc.1 (`dsh --profile acp`, native ACP, in-process proxy; one process per permission mode) |
 | --- | --- | --- | --- | --- | --- |
-| Capabilities | list, resume, close, systemPrompt; `gorynych/setTitle`; image prompts | list, resume, close, systemPrompt | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable` | list, resume, close; `gorynych/unloadAfter` 120, `gorynych/unaskedMcpTools` |
+| Capabilities | list, resume, close, systemPrompt; `gorynych/setTitle`; image prompts | list, resume, close, systemPrompt | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable` | list, resume, close; `gorynych/unloadAfter` 120 |
 | New ([§3](#3-new-sessions-the-list-and-discovery)) | UUID from the adapter; recorded at the first prompt | UUID from the adapter; recorded at the first prompt | `session_…`; a real session at once, listed untitled | `thread/start`; nothing on disk before the first turn | UUID from DSH; durable at once, never titled, so an unused draft gets a tombstone |
 | List | the adapter's own list of the sessions it started | the adapter's own list of the sessions it started | Kimi's list; leaves natively archived sessions out; ignores `cursor` | `thread/list` (`cursor`, `limit`, exact `cwd`); archived left out; title = the thread's `name` | the read-only process's `{sessionId, cwd}` with cursor and `cwd`; the sessions open in either process added back by the proxy and the router; no title or `updatedAt` |
 | Open not loaded ([§4](#4-opening-a-session-that-is-not-loaded)) | `session/resume` only registers; the process starts with the next prompt | `session/resume` only registers; the process starts with the next prompt | `session/resume` | `thread/resume`, `excludeTurns`; `session/load` replays `thread/items/list`; fails while another Codex process has the thread (one writer) or when it is archived in Codex | `session/resume` in the process of the session's mode, about 0.2 s; fails while `dsh web` or another DSH process has the session (one writer); no `session/load` |
@@ -439,7 +441,7 @@ DSH speaks ACP, and its adapter is a thin proxy.
 | Message IDs ([§5](#5-prompts-and-turns)) | answers: the API's `msg_…`; live notes: the `uuid` the adapter wrote them with; texts Claude gives no ID: a new UUID | answers: `MessageDisplay`'s `message_id`; typed and channel messages: the hook's `prompt_id` (the transcript's `promptId`), a new UUID for a channel message within a turn; texts Claude gives no ID: a new UUID | none sent by 2.5.2: the service assigns them | item IDs (`msg_…`, `rs_…`, UUIDv7 user messages); the service's prompt ID kept as `clientUserMessageId` | DSH's on answers; thoughts as `<id>:thought` |
 | Live-note path ([§6.4](#64-the-live-note-path)) | user messages on stdin, `reply` routed by `--reply-url`; `-32600` while not running | the development channel; `-32600` while not running | none (`-32601`) | none (`-32601`); `turn/steer` could carry notes into a running turn later | none (`-32601`) |
 | Turns of its own marked ([§7](#7-closing-and-unloading)) | yes: from the first update of a turn the client did not start (a live note's, or one Claude began itself) to its `result` or the exit | yes: channel and terminal turns, from `UserPromptSubmit` to `Stop` or exit | none to mark: Kimi runs no turn of its own | none: one writer, so the adapter's process drives every turn | none marked: autonomous work after a cancel falls back to idle since the last update |
-| Approvals ([§8](#8-approvals-and-forms)) | `can_use_tool` control requests; Allow / Deny only; the three tools pre-allowed; in Full access nothing asks but a PreToolUse hook, through which the adapter asks before `ask_agent`, `archive_session`, `restore_session` | the PermissionRequest hook; Allow / Deny only; the three tools pre-allowed | Kimi's own `session/request_permission`; the service pre-allows | command, file change, permissions and MCP tool approvals; no option that writes `~/.codex`; the gorynych tools ask the person | sandbox escalations only: a shell escalation refused by the proxy, a file write asks the person; in full access nothing asks; MCP tools unasked, so the service asks before `ask_agent`, `archive_session`, `restore_session` |
+| Approvals ([§8](#8-approvals-and-forms)) | `can_use_tool` control requests; Allow / Deny only; the gorynych tools allowed by a per-launch rule and pre-allowed; in Full access nothing asks; `bypassPermissions` marked `gorynych/fullAccess` | the PermissionRequest hook; Allow / Deny only; the gorynych tools allowed by a per-launch rule and pre-allowed | Kimi's own `session/request_permission`; the service pre-allows the gorynych tools | command, file change, permissions and MCP tool approvals; no option that writes `~/.codex`; the gorynych tools run unasked (`default_tools_approval_mode: "approve"`); `full-access` marked | sandbox escalations only: a shell escalation refused by the proxy, a file write asks the person; in full access nothing asks; MCP tools unasked; `full-access` marked |
 | Forms | `AskUserQuestion` as `elicitation/create`, through `can_use_tool`; MCP elicitations declined | `AskUserQuestion` as `elicitation/create`; MCP elicitations shown only in the terminal | none seen | `item/tool/requestUserInput` and MCP form elicitations as `elicitation/create`; URL elicitations declined | none (no ask tool, no elicitation in the acp profile) |
 | Titles ([§9](#9-titles)) | `custom-title` from the transcript; `_gorynych/set_title` → `rename_session`, which writes `custom-title` | `ai-title` / `custom-title` from the transcript; no way to set one | the first prompt, cut at 200 characters; no way to set one | `thread/name/updated`; `_gorynych/set_title` → `thread/name/set` for spawn names | none over ACP: the provisional title |
 | Close ([§7](#7-closing-and-unloading)) | ends the process | ends the process | `session/close`, still listed | `turn/interrupt`, up to 5 s for the turn to end, then `thread/unsubscribe` (unloads an idle thread at once) | `session/close`: cancels a running prompt, drains DSH's subagents |

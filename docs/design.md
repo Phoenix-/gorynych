@@ -300,7 +300,10 @@ sequenceDiagram
   waits for the session's running turn, because ACP cannot inject into a turn.
 - A session that is answering a request cannot ask another meanwhile, so two agents cannot wait
   on each other.
-- `list_agents` and `reply` need no approval; `ask_agent` is approved by the person like any tool.
+- No gorynych tool needs the agent's own approval. The service asks the person itself before
+  every spawn, and before a session that is not in full access asks one that is, since the asked
+  agent runs anything unasked and so could lend the asker its rights
+  ([service-protocol.md](service-protocol.md#approvals)).
 
 ### Child sessions
 

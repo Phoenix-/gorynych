@@ -775,11 +775,15 @@ sealed class CodexAgent : IAsyncDisposable
         return AcpJson.ToNode(new SetSessionConfigOptionResponse { ConfigOptions = ConfigOptions(seen, models) });
     }
 
+    /// <summary>The service's own MCP server, with the gorynych tools.</summary>
+    const string PeersServerName = "gorynych";
+
     /// <summary>
     /// The thread's MCP servers as a Codex config override: the request's (the service's
-    /// <c>gorynych</c> server), plus the user's own <c>gorynych-outside</c> turned off for this
-    /// thread when the user's Codex config has it. Overriding a server the config does not have
-    /// fails the thread, so that one is checked first.
+    /// <c>gorynych</c> server, whose tools Codex runs without asking: docs/service-protocol.md,
+    /// "Approvals"), plus the user's own <c>gorynych-outside</c> turned off for this thread when the
+    /// user's Codex config has it. Overriding a server the config does not have fails the thread,
+    /// so that one is checked first.
     /// </summary>
     JsonObject? McpConfig(List<McpServer> servers)
     {
@@ -790,6 +794,8 @@ sealed class CodexAgent : IAsyncDisposable
                 case McpServerStdio s:
                     var stdio = new JsonObject { ["command"] = s.Command, ["args"] = new JsonArray(s.Args.Select(a => (JsonNode?)a).ToArray()) };
                     if (s.Env.Count > 0) stdio["env"] = new JsonObject(s.Env.Select(e => KeyValuePair.Create(e.Name, (JsonNode?)e.Value)));
+                    // The service asks the person itself where it must (a spawn, a session asking one in full access).
+                    if (s.Name == PeersServerName) stdio["default_tools_approval_mode"] = "approve";
                     mcp[s.Name] = stdio;
                     break;
                 case McpServerHttp h:

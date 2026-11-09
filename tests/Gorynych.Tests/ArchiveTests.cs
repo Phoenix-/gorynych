@@ -345,11 +345,16 @@ public sealed class ArchiveTests
     }
 
     [TestMethod]
-    public void ArchiveAndRestoreSession_AreNotPreAllowedInClaude()
+    public void ArchiveAndRestoreSession_ArePreAllowedInClaude()
     {
-        // The service side (Kimi's approvals) is checked in OpinionTurnTests; the Claude adapter allows only these in its hook.
-        CollectionAssert.AreEquivalent(new[] { "mcp__gorynych__reply", "mcp__gorynych__list_agents", "mcp__gorynych__spawn_session" },
-            ChannelHost.PreAllowedTools.ToArray());
+        // The service side (Kimi's approvals) is checked in OpinionTurnTests. Claude: every gorynych tool;
+        // all but spawn_session also by the launch's allow rule.
+        CollectionAssert.AreEquivalent(new[]
+        {
+            "mcp__gorynych__reply", "mcp__gorynych__list_agents", "mcp__gorynych__ask_agent",
+            "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", "mcp__gorynych__spawn_session",
+        }, ChannelHost.PreAllowedTools.ToArray());
+        CollectionAssert.AreEquivalent(ChannelHost.PreAllowedTools.Where(t => t != "mcp__gorynych__spawn_session").ToArray(), ChannelHost.AllowedTools);
     }
 
     // ---------------------------------------------------------------- reports

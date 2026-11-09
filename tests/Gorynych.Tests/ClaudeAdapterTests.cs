@@ -83,7 +83,7 @@ public sealed class ClaudeAdapterTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task PeerTools_ComeThroughTheLaunchFlags_AndOnlyAskAgentNeedsApproval()
+    public async Task PeerTools_ComeThroughTheLaunchFlags_AndNeedNoApproval()
     {
         if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
         var dir = TestDirs.New();
@@ -112,11 +112,13 @@ public sealed class ClaudeAdapterTests
 
         await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
             new PromptRequest { SessionId = sessionId, Prompt = [new TextContent { Text = "try the peers tools" }] });
-        Assert.AreEqual("list_agents:allow ask_agent:deny", client.Text(), "list_agents is pre-allowed, ask_agent asks the person");
-        Assert.AreEqual("ask_agent (gorynych)", client.Approvals.Single().ToolCall.Title);
+        Assert.AreEqual("list_agents:allow ask_agent:allow", client.Text(), "both pre-allowed, though the person would deny anything");
+        Assert.AreEqual(0, client.Approvals.Count);
 
         var args = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", sessionId + ".args.json")))!
             .AsArray().Select(a => (string)a!).ToList();
+        var allow = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(args[args.IndexOf("--settings") + 1]))!["permissions"]!["allow"]!.AsArray();
+        CollectionAssert.AreEquivalent(ChannelHost.AllowedTools, allow.Select(r => (string?)r).ToArray(), "allowed by the launch too, as headless");
         CollectionAssert.Contains(args, "server:gorynych");
         Assert.IsTrue(File.Exists(NoticeFile(sessionId)), "the adapter confirmed Claude's development-channels notice");
         Assert.AreEqual(ChannelHost.SystemPrompt + "\n\n" + Gorynych.Service.PeersServer.SystemPrompt, args[args.IndexOf("--append-system-prompt") + 1],

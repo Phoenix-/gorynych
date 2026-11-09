@@ -232,7 +232,6 @@ internal sealed class DshProxy
                 if (result["agentCapabilities"] is not JsonObject caps) result["agentCapabilities"] = caps = [];
                 if (caps["_meta"] is not JsonObject meta) caps["_meta"] = meta = [];
                 meta[GorynychProtocol.CapUnloadAfter] = (int)options.UnloadAfter.TotalSeconds;
-                meta[GorynychProtocol.CapUnaskedMcpTools] = true;
                 break;
             case AcpMethods.Agent.SessionNew when Str(result?["sessionId"]) is { } created:
                 lock (gate) live[created] = request.Cwd ?? "";

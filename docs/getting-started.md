@@ -137,10 +137,8 @@ Anthropic's terms allow today ([adapters.md](adapters.md#claude-code)). Its thre
 selectors: **mode** (`Ask`, `Accept edits`, `Plan`, `Auto` where the model has it, and `Full
 access`), **model** and **reasoning effort**. A change applies at once and stays with the session.
 **Claude's `Full access` asks you nothing:** any command, any file, outside the folder too; you
-choose it per thread, between turns. Gorynych's own cross-session tools always ask, whatever the
-mode or allow rules: before Claude asks another session, archives or restores one. The first time
-Claude works in a folder you have not trusted in Claude Code, Gorynych asks in the thread
-whether to trust it.
+choose it per thread, between turns. The first time Claude works in a folder you have not
+trusted in Claude Code, Gorynych asks in the thread whether to trust it.
 
 Should headless Claude stop working on your plan, start the service with
 `--claude-transport tui`: Gorynych then drives the interactive Claude Code instead, and your
@@ -187,8 +185,7 @@ reading secrets or sending them over the network.
 
 **`full-access` asks you nothing.** The agent runs any command and writes any file, anywhere
 on your disk, without a single question, as Codex's `full-access` does: builds, tests and
-installs work. It changes no folder's permissions. Gorynych still asks you before the agent
-asks another session, archives or restores one. Switch the mode between turns; a thread
+installs work. It changes no folder's permissions. Switch the mode between turns; a thread
 made in `dsh web`, or in Gorynych before full access existed, keeps the permissions DSH gave it
 and shows them instead.
 
@@ -204,9 +201,12 @@ More in [adapters.md](adapters.md#deepseek-harness).
 Every session gets a `gorynych` MCP server with these tools:
 
 - `list_agents`: see the other sessions.
-- `ask_agent`: ask one for its opinion. You approve each question like any other tool. DSH runs
-  these tools without asking, so for a DeepSeek session Gorynych asks you itself, before each
-  question, archive or restore.
+- `ask_agent`: ask one for its opinion, without asking you. The one exception is a session
+  that is not in full access asking one that is (Claude's, Codex's or DeepSeek's
+  `Full access`): that session could act on the question without asking you, so Gorynych asks
+  you first, in the asking session's thread.
+- `archive_session` and `restore_session`: hide a session from the lists or bring it back,
+  without asking you; nothing in it is lost.
 - `spawn_session`: start a child session in another agent. You approve each spawn, and by
   default the child reports each finished turn to its parent.
 

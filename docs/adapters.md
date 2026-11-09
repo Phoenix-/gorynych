@@ -23,6 +23,10 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   ([service-protocol.md](service-protocol.md#standard-methods)).
 - Approvals arrive as `session/request_permission` with Kimi's own options (approve once,
   approve for this session, reject); tool calls stream their arguments as `tool_call_update`.
+  The service answers those of the gorynych tools itself, approve once, as they ask nothing
+  ([service-protocol.md](service-protocol.md#approvals)). Kimi marks no mode
+  `gorynych/fullAccess` (it has no adapter of Gorynych's to do so), so a Kimi session never
+  counts as in full access.
 - `session/new` creates a real, empty native session. Kimi lists it with `title: null`
   until the first prompt titles it, and `session/close` keeps it listed. A `session/delete`
   of a session Kimi does not have answers `-32602 Invalid params: Unknown sessionId`, not
@@ -159,8 +163,8 @@ with its `result`, so the service holds the session meanwhile.
 - `AskUserQuestion` (present in `-p` only because the adapter declares a permission host)
   becomes the same `elicitation/create` form as in the TUI; an accepted form answers `allow`
   with `updatedInput.answers`.
-- `mcp__gorynych__reply`, `list_agents` and `spawn_session` are allowed without asking, as in
-  the TUI.
+- The gorynych tools ask nothing ([below](#the-gorynych-tools)): `can_use_tool` for one of them
+  is answered allow without asking the person, as in the TUI.
 - `control_cancel_request` withdraws the ACP request.
 - An MCP server's `elicitation` is declined for now; other control requests from Claude get an
   error.
@@ -243,34 +247,38 @@ adapter's own default is never Full access (a configured `bypassPermissions` is 
   turn it off with `permissions.disableBypassPermissionsMode`); either fails the prompt with the
   reason.
 - `claude -p` asks no one to accept bypass mode, and the adapter writes nothing for it.
-- **The gorynych tools.** Gorynych's own cross-session tools always ask, whatever the mode or allow
-  rules. Every launch's `initialize` registers a PreToolUse hook callback for
-  `mcp__gorynych__ask_agent`, `archive_session` and `restore_session` (timeout 86400 s, a day,
-  so a person may take their time). Claude calls it before each, in every mode, with the mode it
-  runs in at that moment (`permission_mode`).
-  - In `default`, `acceptEdits` and `plan` the hook answers `ask`. Claude evaluates hooks
-    before deny, ask and allow rules, and among hooks `ask` outranks `allow`, so an allow rule
-    of the person's or a project's settings (`.claude/settings.json` allowing `mcp__gorynych`)
-    or another hook's allow does not let the call run unasked: Claude asks through
-    `can_use_tool`, once.
-  - In Full access, `auto`, or a mode Claude does not name, the adapter asks the person itself
-    (the same approval card) and answers allow or deny. (In `auto` a hook's `ask` would usually
-    reach the prompt too, but Claude's classifier may deny some calls first.)
-  - A dismissed question, a failure while asking, or a callback Claude withdraws all end in no:
-    the call does not run. When a callback outlives its timeout, Claude withdraws it
-    (`control_cancel_request`) and does not run the call.
-  - So the question follows the mode the running Claude is really in, not what a client last
-    heard.
-  - Checked live in `claude -p` (2.1.302, default mode): the callback comes with
-    `permission_mode`, `tool_name`, `tool_input` and `tool_use_id`; the matcher's
-    `timeout` is in seconds (one of 3 was withdrawn after 3.0 s and the call blocked); and with a
-    project allow rule for `mcp__gorynych`, `ask_agent` was asked exactly once. That the
-    callback fires in bypass rests on Claude Code's documentation ("hooks still execute"); the
-    live check of Full access covers it.
-  - The per-launch deny rule that hides `gorynych-outside` still holds: Claude enforces deny
-    rules in every mode.
+- The value is marked `_meta["gorynych/fullAccess"]: true` in the `mode` option, so the service
+  asks the person before a session that is not in full access asks this one
+  ([service-protocol.md](service-protocol.md#approvals)); the gorynych tools themselves run
+  unasked here as in every mode ([below](#the-gorynych-tools)).
 - The mode is kept in the session's record like the other choices, so a resumed session starts
   in Full access until the person leaves it.
+
+#### The gorynych tools
+
+They run without asking the person, in every mode ([service-protocol.md](service-protocol.md#approvals)):
+
+- Every launch's `--settings` allows `mcp__gorynych__list_agents`, `reply`, `ask_agent`,
+  `archive_session` and `restore_session` (`permissions.allow`). Claude applies allow rules
+  before auto mode's classifier, so `auto` does not judge them either. `spawn_session` is not in
+  the rule: the service asks the person before every spawn.
+- Claude may still ask for one through `can_use_tool`, and the adapter answers allow without
+  asking the person: `plan` asks for MCP tools whatever the allow rules say, and so does an ask
+  rule of the person's or a project's settings. `can_use_tool` does not say why it asks, so the
+  two cannot be told apart.
+- The person's deny rules still win: Claude evaluates deny rules before the mode and allow
+  rules, and leaves a denied MCP tool out of its list, in Full access too. So does the rule that
+  hides `gorynych-outside`.
+- No hook is registered. A PreToolUse hook's allow would not override deny rules either
+  (Claude Code's permissions page: "PreToolUse hook decisions don't bypass permission rules"),
+  and nothing needs one.
+- Checked live in `claude -p` 2.1.302 (`haiku`, `sonnet` for auto) with a stdio MCP server named
+  `gorynych`: with the per-launch allow rule, `ask_agent` ran unasked in `default`,
+  `acceptEdits` and `auto`, while `plan` and a project ask rule still went to `can_use_tool`; a
+  project deny rule took the tool out of Claude's list, with the allow rule or with a hook's
+  allow alike. Without the rule, `default` asked through `can_use_tool`. Through the adapter
+  (live test, 9 November 2026, `haiku`): `ask_agent` ran with no question in Ask and in auto,
+  and not at all in a folder whose `.claude/settings.json` denies it.
 
 #### Titles
 
@@ -448,10 +456,9 @@ Claude about `list_agents`, `ask_agent` (by exact `session_id`; `reply` only ans
 `spawn_session` and reports ([service-protocol.md](service-protocol.md#what-agents-are-told)).
 `override`, any other mode, an empty `content` and blocks other than text fail the request
 with `-32602`, as ACP requires. Without a channel and without a `systemPrompt` there is no
-`--append-system-prompt`. The PermissionRequest hook allows `mcp__gorynych__reply`,
-`mcp__gorynych__list_agents` and `mcp__gorynych__spawn_session` without asking (the service
-asks the person before every spawn); `mcp__gorynych__ask_agent`, `archive_session` and
-`restore_session` become ACP approvals like any tool.
+`--append-system-prompt`. The gorynych tools ask nothing, as headless
+([above](#the-gorynych-tools)): the launch's `--settings` allows them, and the PermissionRequest
+hook allows any of them without asking (the service asks the person before every spawn).
 
 `_gorynych/note` (a child's report to its parent) becomes a channel message with
 `meta: {kind: "report"}` and no `message_id`; the peer instructions say it needs no reply. The
@@ -611,10 +618,11 @@ All approvals are `session/request_permission` on the item's tool call:
   `applyNetworkPolicyAmendment` add rules to `~/.codex/rules/default.rules`, and MCP's
   `persist: always` keeps an approval beyond the session. Codex offers them; the adapter does
   not (adapter-contract §8).
-- **The gorynych tools ask the person** like any other MCP tool: their approvals are titled
-  `<tool> (<server>)`, which the service does not answer itself. Codex can also allow a
-  server's tools without asking (`default_tools_approval_mode: "approve"`, verified per thread),
-  and whether to use it is left for a pass over the permissions of all harnesses.
+- **The gorynych tools ask nothing**: the `gorynych` server goes to Codex with
+  `default_tools_approval_mode: "approve"` (verified per thread), so Codex runs its tools without
+  an approval ([service-protocol.md](service-protocol.md#approvals)). The `full-access` mode is
+  marked `gorynych/fullAccess`, as are a thread's own settings with approval `never` and sandbox
+  `dangerFullAccess`, so the service asks the person before a session outside full access asks it.
 - **Only what was offered.** An `optionId` the adapter did not offer counts as the first "deny"
   option (`decline`, or deny for a permissions request), never as an approval.
 - **Withdrawn**, each request answers its own "nothing granted": `{decision: cancel}` for a
@@ -800,8 +808,8 @@ The full-access process runs DSH's `danger-full-access` sandbox with approval `a
   does. Builds, tests and installs work.
 - No ACL changes: without a sandbox DSH writes no ACE and no label.
 - The guard stays as it is: should DSH still ask, the same allowlist applies.
-- The service still asks the person before `ask_agent`, `archive_session` and
-  `restore_session` (`gorynych/unaskedMcpTools`).
+- The `full-access` value is marked `gorynych/fullAccess`, so the service asks the person before
+  a session that is not in full access asks this one ([service-protocol.md](service-protocol.md#approvals)).
 - The appended prompt says that the session has full access, that nobody reviews a command, and
   to keep to the task's folder and ask before reaching beyond it.
 
@@ -842,10 +850,9 @@ The full-access process runs DSH's `danger-full-access` sandbox with approval `a
     - MCP tools keep `mcp__<server>__<tool>`, which pre-allowing and `read_session` read;
   - **locations:** `file_path` resolved against the session's folder, or the shell's working folder;
   - **diffs:** `write` (new text) and `edit` (`old_string` → `new_string`).
-- **The gorynych tools.** DSH runs MCP tools without asking, so the adapter sets
-  `gorynych/unaskedMcpTools`. The service then asks the person before `ask_agent`,
-  `archive_session` and `restore_session`, as it asks before every spawn
-  ([adapter-contract.md](adapter-contract.md#62-the-gorynych-mcp-server)).
+- **The gorynych tools.** DSH runs MCP tools without asking, which is what the service wants
+  of every agent for them; it asks the person itself where it must, before a spawn and before a
+  question into full access ([service-protocol.md](service-protocol.md#approvals)).
 - **Withdrawn questions.** On a cancel DSH drops its own pending approval without
   `$/cancel_request`. The proxy withdraws it from the service when the call ends or the prompt
   does, and drops a late answer.

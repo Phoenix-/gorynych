@@ -155,8 +155,11 @@ Code (an entry in `~/.kimi-code/mcp.json`), and how to undo each, are in
   TUI command, `/mcp-config`, that edits that file. Neither has been tried with Kimi Code 2.5.2.
 - Keep the name `gorynych-outside`: the Claude adapter's deny rule matches it. Any other name
   still works, and the server still hides itself inside Gorynych.
-- Optional: allow `mcp__gorynych-outside__list_sessions` and
-  `mcp__gorynych-outside__read_session` in the agent's own permission settings.
+- Optional: allow `mcp__gorynych-outside__list_sessions`, `mcp__gorynych-outside__read_session`
+  and `mcp__gorynych-outside__ask_agent` in the agent's own permission settings, so they run
+  without asking, as the gorynych tools do inside Gorynych. Gorynych adds no approval of its own
+  for an agent outside it, so the host's approval is the only gate: leave `ask_agent` out to
+  approve each question yourself.
 - Timeouts (Claude Code): a question waits as long as the asked session needs, and Gorynych
   keeps the call alive with progress notifications. Leave `MCP_TOOL_TIMEOUT` (about 28 hours
   by default) and `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (30 minutes for stdio servers) as they

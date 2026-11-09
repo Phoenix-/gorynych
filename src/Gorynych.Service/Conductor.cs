@@ -79,10 +79,15 @@ public sealed class Conductor : IAsyncDisposable
     long spawnCount;
 
     /// <summary>
-    /// The gorynych tools an agent may call without asking: looking who is there, and answering.
-    /// <c>spawn_session</c> is here because the service itself asks the person before it spawns.
+    /// The gorynych tools whose approval the service answers yes for an agent that asks for MCP tools
+    /// (Kimi): all of them (docs/service-protocol.md, "Approvals"). The service itself asks the person
+    /// where it must: before every spawn, and before a session not in full access asks one that is.
     /// </summary>
-    static readonly HashSet<string> PreAllowedTools = ["mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__spawn_session"];
+    static readonly HashSet<string> PreAllowedTools =
+    [
+        "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent",
+        "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", "mcp__gorynych__spawn_session",
+    ];
 
     /// <summary>The title source of a name given to <c>spawn_session</c>: harness titles do not replace it.</summary>
     const string SpawnTitle = "spawn";
@@ -1160,26 +1165,46 @@ public sealed class Conductor : IAsyncDisposable
         }
     }
 
-    /// <summary>Whether the session's agent runs MCP tools without asking the person (<c>gorynych/unaskedMcpTools</c>).</summary>
-    bool AsksNothing(string sessionId) => store.Get(sessionId) is { } session && HostOf(session).UnaskedMcpTools;
+    /// <summary>
+    /// Whether the session runs in full access, as its agent last reported its state: the current
+    /// value of its mode option (category <c>mode</c>), or its current <c>SessionMode</c>, carries
+    /// <c>gorynych/fullAccess</c> in its <c>_meta</c>. A session whose agent reported no state does not.
+    /// </summary>
+    bool InFullAccess(string sessionId) => IsFullAccess(Feed(sessionId).State());
+
+    internal static bool IsFullAccess(JsonObject state)
+    {
+        static bool Marked(JsonNode? value) => value?["_meta"]?[GorynychProtocol.MetaFullAccess] is JsonValue v && v.TryGetValue<bool>(out var on) && on;
+        foreach (var option in (state["configOptions"] as JsonArray ?? []).OfType<JsonObject>())
+        {
+            if ((string?)option["category"] != "mode" || (string?)option["type"] != "select" || (string?)option["currentValue"] is not { } current) continue;
+            // Values are listed flat or in groups.
+            var values = (option["options"] as JsonArray ?? []).OfType<JsonObject>()
+                .SelectMany(o => o["options"] is JsonArray grouped ? grouped.OfType<JsonObject>() : [o]);
+            if (values.Any(v => (string?)v["value"] == current && Marked(v))) return true;
+        }
+        return state["modes"] is JsonObject modes && (string?)modes["currentModeId"] is { } mode
+            && (modes["availableModes"] as JsonArray ?? []).OfType<JsonObject>().Any(m => (string?)m["id"] == mode && Marked(m));
+    }
 
     /// <summary>
-    /// For a session whose agent runs MCP tools without asking (<c>gorynych/unaskedMcpTools</c>, DSH):
-    /// asks the person on that session before a gorynych tool acts for them (<c>ask_agent</c>,
-    /// <c>archive_session</c>, <c>restore_session</c>), as every spawn is asked. Returns when
-    /// allowed; throws with what the agent is told otherwise. Other agents ask for their tools themselves.
+    /// Before a session that is not in full access asks one that is (docs/service-protocol.md,
+    /// "Approvals"): the asked agent runs anything without asking the person, so it could act on the
+    /// request with rights the asking session does not have. Asks the person on the asking session,
+    /// as before a spawn. Returns when allowed; throws with what the agent is told otherwise.
     /// </summary>
-    async Task ConfirmForUnaskingAgentAsync(string callerId, string what, JsonObject input, string text, PermissionOption allow, string declineName,
-        string declined, CancellationToken ct)
+    async Task ConfirmAskIntoFullAccessAsync(string callerId, SessionRecord asked, string question, CancellationToken ct)
     {
-        if (!AsksNothing(callerId)) return;
         using var use = await UseAsync(callerId, ct);
         var callId = "gorynych-confirm-" + Interlocked.Increment(ref spawnCount);
+        var allow = new PermissionOption { OptionId = "ask", Name = "Ask", Kind = PermissionOptionKind.AllowOnce };
         RequestPermissionOutcome outcome;
         try
         {
-            outcome = await AskPersonAsync(use.Feed, use.Record, callId, what, input, text, allow,
-                new PermissionOption { OptionId = "decline", Name = declineName, Kind = PermissionOptionKind.RejectOnce }, ct);
+            outcome = await AskPersonAsync(use.Feed, use.Record, callId, $"Ask {Who(asked)} for an opinion",
+                new JsonObject { ["session_id"] = asked.SessionId, ["question"] = question },
+                $"{question}\n\nThat session runs in full access, so it could act on this request without asking you; this session does not.",
+                allow, new PermissionOption { OptionId = "decline", Name = "Don't ask", Kind = PermissionOptionKind.RejectOnce }, ct);
         }
         catch (Exception e) when (e is OperationCanceledException or JsonRpcException)
         {
@@ -1195,7 +1220,9 @@ public sealed class Conductor : IAsyncDisposable
         if (outcome is not SelectedPermissionOutcome selected || selected.OptionId != allow.OptionId)
         {
             await EndSpawnCardAsync(use.Feed, use.Record, callId, ToolCallStatus.Failed, "Not done: the user declined.");
-            throw new JsonRpcException(JsonRpcException.InvalidRequest, declined);
+            throw new JsonRpcException(JsonRpcException.InvalidRequest,
+                $"The user declined to let this session ask session_id {asked.SessionId}, so it was not asked: that session runs in " +
+                "full access and this one does not, so the user approves each such question. Go on without its opinion, or ask the user.");
         }
         await EndSpawnCardAsync(use.Feed, use.Record, callId, ToolCallStatus.Completed, "Allowed by the user.");
     }
@@ -1663,13 +1690,6 @@ public sealed class Conductor : IAsyncDisposable
         }
         using (use)
         {
-            if (from is not null && store.Get(target) is { Deleted: false } current && current.Archived != archived)
-                await ConfirmForUnaskingAgentAsync(from, $"{(archived ? "Archive" : "Restore")} {Who(current)}",
-                    new JsonObject { ["session_id"] = target },
-                    archived ? "Hides the session from the session lists; nothing in it is lost, and it can be restored." : "Brings the session back into the session lists.",
-                    new PermissionOption { OptionId = archived ? "archive" : "restore", Name = archived ? "Archive" : "Restore", Kind = PermissionOptionKind.AllowOnce },
-                    archived ? "Don't archive" : "Don't restore",
-                    $"The user declined to {(archived ? "archive" : "restore")} session_id {target}, so nothing changed.", ct);
             SessionRecord record;
             bool changed;
             await archiveGate.WaitAsync(ct);
@@ -1897,25 +1917,6 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.InvalidRequest,
                 $"This session is answering opinion request {answering}, so it cannot ask another session during this turn. " +
                 $"Send your answer with the reply tool, passing message_id \"{answering}\"; if another opinion would help, say so in the answer.");
-        if (from is not null && AsksNothing(from))
-        {
-            // Resolved first, as asking would resolve it: a session only an agent's own list has yet
-            // (made in its own app) is added now, so it is asked about like any other.
-            SessionRecord? askedRecord = null;
-            try
-            {
-                askedRecord = await FindAsync(target, ct);
-            }
-            catch (JsonRpcException e) when (e.Code == JsonRpcException.ResourceNotFound)
-            {
-                // No such session: nothing to ask the person; asking below fails with the usual hint.
-            }
-            if (askedRecord is not null)
-                await ConfirmForUnaskingAgentAsync(from, $"Ask {Who(askedRecord)} for an opinion",
-                    new JsonObject { ["session_id"] = target, ["question"] = text }, text,
-                    new PermissionOption { OptionId = "ask", Name = "Ask", Kind = PermissionOptionKind.AllowOnce }, "Don't ask",
-                    $"The user declined to ask session_id {target}, so it was not asked. Go on without its opinion, or ask the user.", ct);
-        }
         // The asked agent sees who asks by the asking session's real ID, which it can pass to ask_agent;
         // sender (peer_claude) is only a label for GUIs.
         var origin = from is not null && store.Get(from) is { } asking ? $"from {Who(asking)}" : $"from {sender ?? "a Gorynych client"}";
@@ -1959,6 +1960,10 @@ public sealed class Conductor : IAsyncDisposable
             {
                 throw CouldNotStart(record, e, asker);
             }
+            // Its mode now, as its agent reports it once it is loaded: for a session that was not, the
+            // mode it was loaded in. An agent outside Gorynych is approved by its own host.
+            if (asker.From is { } from && InFullAccess(target) && !InFullAccess(from))
+                await ConfirmAskIntoFullAccessAsync(from, record, text, ct);
             ServiceLog.Info($"opinion: {asker.From ?? asker.Sender} asks {record.Agent} {target}");
             var forwarded = new JsonObject
             {

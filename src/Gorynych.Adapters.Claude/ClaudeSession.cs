@@ -469,8 +469,8 @@ internal sealed partial class ClaudeSession : IClaudeSession
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(hookAborted, lifetime.Token);
         var ct = linked.Token;
         var tool = (string?)e["tool_name"] ?? "";
-        // Answering an opinion request and looking who is there need no approval; asking another
-        // agent (ask_agent) does, as it does for every agent (see docs/service-protocol.md).
+        // The gorynych tools need no approval (docs/service-protocol.md, "Approvals"): the launch's
+        // allow rule covers them, but plan mode, or an ask rule, still asks for them here.
         if (ChannelHost.PreAllowedTools.Contains(tool)) return ClaudeHooks.AllowReply();
         string toolCallId;
         lock (stateGate)

@@ -686,7 +686,6 @@ sealed class LifecycleAgent
                                 Delete = canDelete ? new SessionDeleteCapabilities() : null,
                                 SystemPrompt = TakesSystemPrompt ? new SessionSystemPromptCapabilities() : null,
                             },
-                            Meta = UnaskedMcpTools ? new JsonObject { [GorynychProtocol.CapUnaskedMcpTools] = true } : null,
                         },
                         AgentInfo = new Implementation { Name = name, Version = "1" },
                     });
@@ -699,7 +698,7 @@ sealed class LifecycleAgent
                         lock (Tokens) Tokens[id] = (string)peerArgs[peerArgs.Count - 1]!;
                     if (BeforeNew is { } beforeNew) await beforeNew(id);
                     await agent.Update(id, new AvailableCommandsUpdate { AvailableCommands = [] });
-                    return AcpJson.ToNode(new NewSessionResponse { SessionId = id });
+                    return WithModes(AcpJson.ToNode(new NewSessionResponse { SessionId = id })!.AsObject(), id);
                 case AcpMethods.Agent.SessionList:
                     lock (sessions)
                         return AcpJson.ToNode(new ListSessionsResponse
@@ -720,7 +719,10 @@ sealed class LifecycleAgent
                 case AcpMethods.Agent.SessionResume:
                     lock (SystemPrompts) SystemPrompts.Add((req.Method, sessionId!, req.Params?["systemPrompt"]?.DeepClone()));
                     if (BeforeResume is { } beforeResume) await beforeResume(sessionId!);
-                    return new JsonObject();
+                    return WithModes([], sessionId!);
+                case AcpMethods.Agent.SessionSetConfigOption when ReportsModes && Equals((string?)req.Params?["configId"], "mode"):
+                    lock (Modes) Modes[sessionId!] = (string)req.Params!["value"]!;
+                    return WithModes([], sessionId!);
                 case AcpMethods.Agent.SessionClose:
                     return new JsonObject();
                 case GorynychProtocol.MethodOpinion when HasChannel:
@@ -762,8 +764,32 @@ sealed class LifecycleAgent
     /// <summary>Advertises <c>sessionCapabilities.systemPrompt</c> (append), as the Claude adapter does; set before the first use.</summary>
     public bool TakesSystemPrompt { get; set; }
 
-    /// <summary>Advertises <c>gorynych/unaskedMcpTools</c>, as the DSH adapter does; set before the first use.</summary>
-    public bool UnaskedMcpTools { get; set; }
+    /// <summary>
+    /// Reports a <c>mode</c> config option on new, resume and set_config_option: <c>ask</c>, or
+    /// <c>full</c>, marked <c>gorynych/fullAccess</c> as the adapters mark their full access.
+    /// </summary>
+    public bool ReportsModes { get; set; }
+
+    /// <summary>Each session's mode (<c>ask</c> when absent), as its agent keeps it: a change here is what the next resume reports.</summary>
+    public Dictionary<string, string> Modes { get; } = [];
+
+    JsonObject WithModes(JsonObject response, string sessionId)
+    {
+        if (!ReportsModes) return response;
+        string current;
+        lock (Modes) current = Modes.GetValueOrDefault(sessionId, "ask");
+        response["configOptions"] = new JsonArray(AcpJson.ToNode<SessionConfigOption>(new SessionConfigSelect
+        {
+            Id = "mode",
+            Name = "Permissions",
+            Category = SessionConfigOptionCategory.Mode,
+            CurrentValue = current,
+            Options = new JsonArray(
+                AcpJson.ToNode(new SessionConfigSelectOption { Value = "ask", Name = "Ask" }),
+                AcpJson.ToNode(new SessionConfigSelectOption { Value = "full", Name = "Full access", Meta = new JsonObject { [GorynychProtocol.MetaFullAccess] = true } })),
+        }));
+        return response;
+    }
 
     /// <summary>The <c>systemPrompt</c> param of every <c>session/new</c> and <c>session/resume</c>, in order.</summary>
     public List<(string Method, string SessionId, JsonNode? SystemPrompt)> SystemPrompts { get; } = [];

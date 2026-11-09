@@ -278,7 +278,7 @@ public sealed partial class DshAdapterTests
         var caps = init!["agentCapabilities"]!;
         Assert.IsNotNull(caps["sessionCapabilities"]!["resume"]);
         Assert.AreEqual(120, (int)caps["_meta"]![GorynychProtocol.CapUnloadAfter]!);
-        Assert.IsTrue((bool)caps["_meta"]![GorynychProtocol.CapUnaskedMcpTools]!);
+        Assert.IsNull(caps["_meta"]!["gorynych/unaskedMcpTools"], "the service decides who asks, the same for every agent");
         Assert.AreEqual("dsh", adapter.Name);
     }
 

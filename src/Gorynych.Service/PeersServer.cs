@@ -92,8 +92,7 @@ public static class PeersServer
             instructions.Append("list_agents shows the user's other coding-agent sessions and ask_agent asks one for its opinion, by " +
                 "its exact session_id; they only give opinions, they do not act on your behalf. spawn_session starts a new child session " +
                 "of one of these agents with a task, after the user approves it; each turn the child finishes is reported back to you " +
-                "automatically. archive_session hides a session from the lists without deleting it, and restore_session brings it back; " +
-                "the user approves each.");
+                "automatically. archive_session hides a session from the lists without deleting it, and restore_session brings it back.");
         return new JsonObject
         {
             ["protocolVersion"] = req.Params?["protocolVersion"]?.DeepClone() ?? "2025-06-18",
@@ -344,6 +343,8 @@ public static class PeersServer
             ["name"] = "ask_agent",
             ["description"] = "Start a new question to another of the user's coding-agent sessions and wait for its answer. " +
                 "The other agent answers from its own session and context; it does not run tools for you. " +
+                "If that session runs in full access and this one does not, the user approves the question first; if they decline, " +
+                "the call fails and nothing is sent. " +
                 "To answer a request you received (its header names a message_id), use reply instead.",
             ["inputSchema"] = new JsonObject
             {
@@ -390,7 +391,7 @@ public static class PeersServer
             ["name"] = "archive_session",
             ["description"] = "Archive one of the user's coding-agent sessions, this one included: Gorynych hides it from list_agents and " +
                 "from the user's session list. Archiving is not deleting: the session keeps all its history, ask_agent still reaches it, " +
-                "and the user can still open and prompt it; restore_session brings it back. The user approves each call. " +
+                "and the user can still open and prompt it; restore_session brings it back. " +
                 "Use it when the user asks you to archive or tidy up sessions.",
             ["inputSchema"] = new JsonObject
             {
@@ -411,7 +412,7 @@ public static class PeersServer
             ["name"] = "restore_session",
             ["description"] = "Bring an archived session back into list_agents and the user's session list. It only changes where the " +
                 "session is shown and sends it nothing. To ask an archived session something, use ask_agent: it need not be restored " +
-                "first. list_agents with include_archived: true shows the archived sessions. The user approves each call.",
+                "first. list_agents with include_archived: true shows the archived sessions.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",

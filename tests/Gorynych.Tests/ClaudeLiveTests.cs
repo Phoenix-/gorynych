@@ -104,24 +104,13 @@ public sealed partial class ClaudeLiveTests
         }
     }
 
-    /// <summary>
-    /// In Ask (no full access), with a project allow rule that would let the gorynych tools run
-    /// unasked (<c>.claude/settings.json</c> of the folder): <c>ask_agent</c> is still asked once, by
-    /// Claude's <c>can_use_tool</c> after the adapter's hook answered <c>ask</c>. One short turn on <c>haiku</c>.
-    /// </summary>
-    [TestMethod]
-    [Timeout(300_000, CooperativeCancellation = true)]
-    public async Task Claude_AskAgent_IsAskedOnce_EvenWithAProjectAllowRule()
+    /// <summary>A service with the real Claude on <c>haiku</c> and a scripted <c>echo</c> agent that answers "pong", on its own pipe.</summary>
+    static (Conductor Conductor, LifecycleAgent Echo, List<string> Log, Func<CancellationToken, Task> Listen) LiveService(string dir)
     {
-        RequireLive();
-        var dir = TestDirs.New();
-        var folder = Path.Combine(dir, "work");
-        Directory.CreateDirectory(Path.Combine(folder, ".claude"));
-        File.WriteAllText(Path.Combine(folder, ".claude", "settings.json"), """{"permissions":{"allow":["mcp__gorynych","mcp__gorynych__ask_agent"]}}""");
         var pipe = "gorynych-live-" + Guid.NewGuid().ToString("N")[..8];
         var log = new List<string>();
         var echo = new LifecycleAgent("echo", canDelete: true) { Answer = "pong" };
-        await using var conductor = new Conductor(new ConductorOptions
+        var conductor = new Conductor(new ConductorOptions
         {
             DataDirectory = dir,
             ServiceId = "live",
@@ -133,32 +122,71 @@ public sealed partial class ClaudeLiveTests
             ClaudeStatePath = Path.Combine(dir, "no-claude-state.json"),
             Log = m => { lock (log) log.Add(m); },
         }), echo.Adapter]);
+        return (conductor, echo, log, ct => PipeListener.RunAsync(conductor, pipe, ct));
+    }
+
+    static int PromptsOf(LifecycleAgent agent)
+    {
+        lock (agent.Prompts) return agent.Prompts.Count;
+    }
+
+    /// <summary>The approvals other than the folder-trust question.</summary>
+    static string[] Asked(TestClient client) =>
+        client.Approvals.Where(a => a.ToolCall.ToolCallId != "trust-folder").Select(a => a.ToolCall.Title ?? "").ToArray();
+
+    static string AskPrompt(string target, string question) =>
+        $"Call the tool mcp__gorynych__ask_agent once with session_id \"{target}\" and question \"{question}\". Then reply in one sentence with what it returned.";
+
+    /// <summary>
+    /// Outside full access, <c>ask_agent</c> asking a session that is not in it runs unasked in Ask and
+    /// in auto (the launch's allow rule comes before the classifier), and a project deny rule still
+    /// stops it. Three short turns on <c>haiku</c>; every approval but the folder's trust is declined.
+    /// </summary>
+    [TestMethod]
+    [Timeout(600_000, CooperativeCancellation = true)]
+    public async Task Claude_AskAgent_RunsUnasked_InAskAndAuto_AndADenyRuleStillStopsIt()
+    {
+        RequireLive();
+        var dir = TestDirs.New();
+        var folder = Path.Combine(dir, "work");
+        var denied = Path.Combine(dir, "denied");
+        Directory.CreateDirectory(folder);
+        Directory.CreateDirectory(Path.Combine(denied, ".claude"));
+        File.WriteAllText(Path.Combine(denied, ".claude", "settings.json"), """{"permissions":{"deny":["mcp__gorynych__ask_agent"]}}""");
+        var (service, echo, log, listen) = LiveService(dir);
+        await using var conductor = service;
         using var stop = new CancellationTokenSource();
-        var listening = PipeListener.RunAsync(conductor, pipe, stop.Token);
+        var listening = listen(stop.Token);
         try
         {
             await using var client = await TestClient.ConnectAsync(conductor);
             client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome
             {
-                OptionId = r.ToolCall.Title?.StartsWith("ask_agent", StringComparison.Ordinal) == true ? ClaudeHooks.DenyOptionId : r.Options[0].OptionId,
+                OptionId = r.ToolCall.ToolCallId == "trust-folder" ? r.Options[0].OptionId : r.Options.First(o => o.Kind.Value.StartsWith("reject", StringComparison.Ordinal)).OptionId,
             });
             var target = (await NewAsync(client, folder, "echo")).SessionId;
             await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
                 new PromptRequest { SessionId = target, Prompt = [new TextContent { Text = "hello" }] });
-            var id = (await NewAsync(client, folder)).SessionId;
-
-            var r = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt, new PromptRequest
+            async Task<string> AskFromAsync(string cwd, string? mode, string question)
             {
-                SessionId = id,
-                Prompt = [new TextContent { Text = $"Call the tool mcp__gorynych__ask_agent once with session_id \"{target}\" and question \"ping\". Then reply in one sentence with what it returned." }],
-            });
+                var id = (await NewAsync(client, cwd)).SessionId;
+                if (mode is not null)
+                    await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption, new JsonObject { ["sessionId"] = id, ["configId"] = "mode", ["value"] = mode });
+                var r = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                    new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = AskPrompt(target, question) }] });
+                Console.WriteLine($"{mode ?? "default"} in {Path.GetFileName(cwd)}: {r.StopReason}; echo prompts {PromptsOf(echo)}; asked: {string.Join(" | ", Asked(client))}; session {id}");
+                return id;
+            }
 
-            var titles = client.Approvals.Select(a => a.ToolCall.Title).ToArray();
-            Console.WriteLine($"< {r.StopReason}; approvals: {string.Join(" | ", titles)}");
-            Assert.AreEqual(1, titles.Count(t => t?.StartsWith("ask_agent", StringComparison.Ordinal) == true), "asked once, despite the allow rule");
-            lock (log) Assert.IsFalse(log.Any(l => l.Contains("asking the person before", StringComparison.Ordinal)), "Claude asked, after the hook's ask");
-            lock (echo.Prompts) Assert.AreEqual(1, echo.Prompts.Count, "declined, so the other session got nothing");
-            Console.WriteLine($"claude session {id}");
+            await AskFromAsync(folder, null, "ping");
+            Assert.AreEqual(2, PromptsOf(echo), "asked, in Ask: " + string.Join(" | ", log));
+            await AskFromAsync(folder, "auto", "ping again");
+            Assert.AreEqual(3, PromptsOf(echo), "asked, in auto: " + string.Join(" | ", log));
+            Assert.AreEqual(0, Asked(client).Length, "nothing asked but the folder's trust");
+
+            await AskFromAsync(denied, null, "ping once more");
+            Assert.AreEqual(3, PromptsOf(echo), "the deny rule kept ask_agent from running");
+            Assert.AreEqual(0, Asked(client).Length);
         }
         finally
         {
@@ -168,42 +196,30 @@ public sealed partial class ClaudeLiveTests
     }
 
     /// <summary>
-    /// Full access on <c>haiku</c>: a shell write runs with no question, <c>ask_agent</c> is still asked,
-    /// by the adapter from Claude's PreToolUse hook (declined here, so the other session gets nothing),
-    /// and back in Ask a write asks again. Three short turns in a temporary folder.
+    /// Full access on <c>haiku</c>: a shell write and <c>ask_agent</c> to a session outside full access
+    /// run with no question; a session outside full access asking this one is approved by the person
+    /// first (declined here, so Claude gets nothing); back in Ask a write asks again. Three short turns
+    /// in a temporary folder.
     /// </summary>
     [TestMethod]
     [Timeout(600_000, CooperativeCancellation = true)]
-    public async Task Claude_FullAccess_WritesWithoutAsking_ButAskAgentIsStillAsked()
+    public async Task Claude_FullAccess_RunsUnasked_AndASessionOutsideItIsApprovedBeforeAskingIt()
     {
         RequireLive();
         var dir = TestDirs.New();
         var folder = Path.Combine(dir, "work");
         Directory.CreateDirectory(folder);
-        var pipe = "gorynych-live-" + Guid.NewGuid().ToString("N")[..8];
-        var log = new List<string>();
-        var echo = new LifecycleAgent("echo", canDelete: true) { Answer = "pong" };
-        await using var conductor = new Conductor(new ConductorOptions
-        {
-            DataDirectory = dir,
-            ServiceId = "live",
-            PeerServerCommand = [ServiceExe(), "peers", "--pipe", pipe],
-        }, [new ClaudeAdapter(new ClaudeAdapterOptions
-        {
-            DataDirectory = Path.Combine(dir, "claude"),
-            Model = "haiku",
-            ClaudeStatePath = Path.Combine(dir, "no-claude-state.json"),
-            Log = m => { lock (log) log.Add(m); },
-        }), echo.Adapter]);
+        var (service, echo, log, listen) = LiveService(dir);
+        await using var conductor = service;
         using var stop = new CancellationTokenSource();
-        var listening = PipeListener.RunAsync(conductor, pipe, stop.Token);
+        var listening = listen(stop.Token);
         try
         {
             await using var client = await TestClient.ConnectAsync(conductor);
-            // The folder-trust question and Claude's own approvals are allowed; the question before ask_agent is declined.
+            // The folder-trust question and Claude's own approvals are allowed; the question into full access is declined.
             client.Approve = r => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome
             {
-                OptionId = r.ToolCall.Title?.StartsWith("ask_agent", StringComparison.Ordinal) == true ? ClaudeHooks.DenyOptionId : r.Options[0].OptionId,
+                OptionId = r.ToolCall.Title?.StartsWith("Ask session_id", StringComparison.Ordinal) == true ? "decline" : r.Options[0].OptionId,
             });
             var target = (await NewAsync(client, folder, "echo")).SessionId;
             await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
@@ -224,19 +240,29 @@ public sealed partial class ClaudeLiveTests
             // 1. A shell write: no question but the folder's trust.
             await PromptAsync("Run this shell command with your Bash or PowerShell tool, exactly once: echo hi > shell.txt . Then reply DONE.");
             Assert.IsTrue(File.Exists(Path.Combine(folder, "shell.txt")), "the shell wrote: " + string.Join(" | ", log));
-            var trust = client.Approvals.Count(a => a.ToolCall.ToolCallId == "trust-folder");
-            Assert.AreEqual(trust, client.Approvals.Count, "nothing asked in full access but the folder's trust");
+            Assert.AreEqual(0, Asked(client).Length, "nothing asked in full access but the folder's trust");
 
-            // 2. ask_agent: the adapter asks the person from Claude's hook; the person declines, so the other session gets nothing.
-            await PromptAsync($"Call the tool mcp__gorynych__ask_agent once with session_id \"{target}\" and question \"ping\". Then reply in one sentence with what it returned.");
-            var asked = client.Approvals.SingleOrDefault(a => a.ToolCall.Title?.StartsWith("ask_agent", StringComparison.Ordinal) == true);
-            Assert.IsNotNull(asked, "asked before ask_agent: " + string.Join(" | ", log));
-            lock (log) Assert.IsTrue(log.Any(l => l.Contains("asking the person before mcp__gorynych__ask_agent (bypassPermissions)", StringComparison.Ordinal)),
-                "asked from the hook, in bypass");
-            Assert.AreEqual(id, asked.SessionId);
-            lock (echo.Prompts) Assert.AreEqual(1, echo.Prompts.Count, "the declined question reached no one");
+            // 2. ask_agent into a session outside full access: no question either.
+            await PromptAsync(AskPrompt(target, "ping"));
+            Assert.AreEqual(2, PromptsOf(echo), "asked: " + string.Join(" | ", log));
+            Assert.AreEqual(0, Asked(client).Length, "nothing asked");
 
-            // 3. Back to Ask: a write asks again.
+            // 3. The echo session, outside full access, asks this one: the person is asked first, on the echo session, and declines.
+            var declined = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => client.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject
+            {
+                ["sessionId"] = id,
+                ["text"] = "What did you just write?",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = echo.Tokens[target] },
+            }));
+            Console.WriteLine($"echo -> claude in full access: {declined.Message}");
+            var card = client.Approvals.Single(a => a.ToolCall.Title?.StartsWith("Ask session_id", StringComparison.Ordinal) == true);
+            Assert.AreEqual(target, card.SessionId, "asked on the asking session");
+            StringAssert.StartsWith(card.ToolCall.Title, $"Ask session_id {id}");
+            lock (client.Updates)
+                Assert.IsFalse(client.SessionUpdates.Any(u => u.SessionId == id && u.Update.ToJsonString().Contains("What did you just write?", StringComparison.Ordinal)),
+                    "declined, so Claude got nothing");
+
+            // 4. Back to Ask: a write asks again.
             await ModeAsync("default");
             var before = client.Approvals.Count;
             await PromptAsync("Create the file note.txt containing exactly hi with your Write tool. Then reply DONE.");
@@ -249,5 +275,4 @@ public sealed partial class ClaudeLiveTests
             stop.Cancel();
             await listening;
         }
-    }
-}
+    }}

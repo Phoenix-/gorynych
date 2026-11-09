@@ -122,6 +122,9 @@ public sealed partial class DshAdapterTests
         Assert.AreEqual("read-only", ModeIn(created));
         var values = created!["configOptions"]![0]!["options"]!.AsArray().Select(o => ((string)o!["value"]!, (string)o["name"]!)).ToArray();
         CollectionAssert.AreEqual(new[] { ("read-only", "Read only"), ("full-access", "Full access") }, values);
+        var marked = created["configOptions"]![0]!["options"]!.AsArray()
+            .Where(o => o!["_meta"]?[GorynychProtocol.MetaFullAccess] is JsonValue v && v.GetValue<bool>()).Select(o => (string?)o!["value"]).ToArray();
+        CollectionAssert.AreEqual(new[] { "full-access" }, marked, "the service asks before a session outside full access asks this one");
         Assert.AreEqual(0, host.FullAccessLaunches, "the full-access process starts only when needed");
     }
 

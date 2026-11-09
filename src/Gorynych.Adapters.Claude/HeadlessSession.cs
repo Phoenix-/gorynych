@@ -444,7 +444,7 @@ internal sealed class HeadlessSession : IClaudeSession
             try
             {
                 JsonObject init;
-                try { init = await claude.ControlAsync(StreamJson.Initialize(), TimeSpan.FromSeconds(options.StartupTimeoutSeconds), ct); }
+                try { init = await claude.ControlAsync(new JsonObject { ["subtype"] = "initialize" }, TimeSpan.FromSeconds(options.StartupTimeoutSeconds), ct); }
                 catch (Exception e) when (e is ClaudeControlException or TimeoutException or IOException)
                 {
                     throw new JsonRpcException(JsonRpcException.InternalError,
@@ -793,9 +793,6 @@ internal sealed class HeadlessSession : IClaudeSession
                 case "can_use_tool":
                     await PermissionAsync(claude, requestId, request);
                     break;
-                case "hook_callback" when (string?)request["callback_id"] == StreamJson.AskHookId:
-                    await AskHookAsync(claude, requestId, request);
-                    break;
                 case "elicitation":
                     // MCP servers' forms are not passed on yet; Claude takes a decline as "no".
                     agent.Log($"claude {Id}: declined an elicitation from {(string?)request["mcp_server_name"]}");
@@ -816,8 +813,8 @@ internal sealed class HeadlessSession : IClaudeSession
     {
         var tool = (string?)request["tool_name"] ?? "";
         var input = request["input"] as JsonObject ?? [];
-        // Answering an opinion request, looking who is there and asking to spawn (the service asks
-        // the person itself) need no approval; asking another agent does (docs/service-protocol.md).
+        // The gorynych tools need no approval (docs/service-protocol.md, "Approvals"): the launch's
+        // allow rule covers them, but plan mode, or an ask rule, still asks for them here.
         if (ChannelHost.PreAllowedTools.Contains(tool))
         {
             await claude.RespondAsync(requestId, StreamJson.Allow(input));
@@ -842,9 +839,16 @@ internal sealed class HeadlessSession : IClaudeSession
                 }
             }
             else
-                answer = await AskPersonAsync(tool, input, toolCallId, cts.Token)
-                    ? StreamJson.Allow(input)
-                    : StreamJson.Deny("The user denied this tool call in Gorynych.");
+            {
+                var hookLike = new JsonObject { ["tool_name"] = tool, ["tool_input"] = input.DeepClone() };
+                var decision = await agent.RequestPermissionAsync(ClaudeHooks.Permission(Id, toolCallId, hookLike), cts.Token);
+                if (ClaudeHooks.IsAllowed(decision.Outcome)) answer = StreamJson.Allow(input);
+                else
+                {
+                    await EmitAsync(ClaudeHooks.ToolCallStatusUpdate(toolCallId, ToolCallStatus.Failed, "Denied in Gorynych."));
+                    answer = StreamJson.Deny("The user denied this tool call in Gorynych.");
+                }
+            }
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -856,65 +860,6 @@ internal sealed class HeadlessSession : IClaudeSession
             // Claude must always get an answer, or its turn waits for ever.
             agent.Log($"claude {Id}: approval failed: {e.Message}");
             answer = StreamJson.Deny("Gorynych could not reach the user for approval.");
-        }
-        finally
-        {
-            asks.TryRemove(requestId, out _);
-            cts.Dispose();
-        }
-        await claude.RespondAsync(requestId, answer);
-    }
-
-    /// <summary>The person's yes or no to a tool call, as an ACP approval; a no marks the call failed.</summary>
-    async Task<bool> AskPersonAsync(string tool, JsonObject input, string toolCallId, CancellationToken ct)
-    {
-        var hookLike = new JsonObject { ["tool_name"] = tool, ["tool_input"] = input.DeepClone() };
-        var decision = await agent.RequestPermissionAsync(ClaudeHooks.Permission(Id, toolCallId, hookLike), ct);
-        if (ClaudeHooks.IsAllowed(decision.Outcome)) return true;
-        await EmitAsync(ClaudeHooks.ToolCallStatusUpdate(toolCallId, ToolCallStatus.Failed, "Denied in Gorynych."));
-        return false;
-    }
-
-    /// <summary>
-    /// The PreToolUse hook on <c>ask_agent</c>, <c>archive_session</c> and <c>restore_session</c>, which
-    /// Claude calls in every mode with the mode it runs in now (<c>permission_mode</c>). These three
-    /// always ask the person, whatever the mode or allow rules. Where Claude asks for tools itself
-    /// the hook answers <c>ask</c>, which outranks allow rules and other hooks' allow, and
-    /// <c>can_use_tool</c> asks once. In any other mode (Full access, auto, or one Claude did not name)
-    /// Claude would ask nobody, so the person is asked here.
-    /// </summary>
-    async Task AskHookAsync(ClaudeProcess claude, string requestId, JsonObject request)
-    {
-        var input = request["input"] as JsonObject ?? [];
-        var mode = (string?)input["permission_mode"];
-        if (StreamJson.AsksForTools(mode))
-        {
-            await claude.RespondAsync(requestId, StreamJson.HookAsk("Gorynych asks the user before this tool, whatever allow rules say."));
-            return;
-        }
-        var tool = (string?)input["tool_name"] ?? "";
-        var toolInput = input["tool_input"] as JsonObject ?? [];
-        var toolCallId = (string?)request["tool_use_id"] ?? (string?)input["tool_use_id"] ?? $"permission-{Interlocked.Increment(ref permissionCount)}";
-        agent.Log($"claude {Id}: asking the person before {tool} ({mode ?? "mode not given"})");
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-        asks[requestId] = cts;
-        JsonObject answer;
-        try
-        {
-            answer = await AskPersonAsync(tool, toolInput, toolCallId, cts.Token)
-                ? StreamJson.HookDecision(true, "The user allowed it in Gorynych.")
-                : StreamJson.HookDecision(false, "The user denied this tool call in Gorynych.");
-        }
-        catch (OperationCanceledException) when (cts.IsCancellationRequested)
-        {
-            agent.Log($"claude {Id}: the question before {tool} was withdrawn");
-            return;
-        }
-        catch (Exception e)
-        {
-            // Claude must always get an answer; without the person's yes the call does not run.
-            agent.Log($"claude {Id}: could not ask before {tool}: {e.Message}");
-            answer = StreamJson.HookDecision(false, "Gorynych could not reach the user to ask.");
         }
         finally
         {

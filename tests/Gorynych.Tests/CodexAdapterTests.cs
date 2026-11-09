@@ -113,6 +113,7 @@ public sealed class CodexAdapterTests
         var servers = start["config"]!["mcp_servers"]!.AsObject();
         Assert.AreEqual("svc.exe", (string?)servers["gorynych"]!["command"]);
         CollectionAssert.AreEqual(new[] { "peers", "--pipe", "p", "--token" }, servers["gorynych"]!["args"]!.AsArray().Take(4).Select(a => (string?)a).ToArray());
+        Assert.AreEqual("approve", (string?)servers["gorynych"]!["default_tools_approval_mode"], "Codex runs the gorynych tools without asking");
         Assert.AreEqual(false, (bool?)servers["gorynych-outside"]!["enabled"], "the user's outside server is off in Gorynych's threads");
         Assert.IsNull(servers["other-tool"], "the user's other servers are left as they are");
         Assert.AreEqual(PeersServer.SystemPrompt, (string?)start["developerInstructions"]);
@@ -307,6 +308,9 @@ public sealed class CodexAdapterTests
         var mode = set!["configOptions"]!.AsArray().First(o => (string?)o!["id"] == "mode")!;
         Assert.AreEqual("auto-review", (string?)mode["currentValue"]);
         CollectionAssert.AreEqual(new[] { "read-only", "auto", "auto-review", "full-access" }, mode["options"]!.AsArray().Select(o => (string?)o!["value"]).ToArray());
+        CollectionAssert.AreEqual(new[] { "full-access" }, mode["options"]!.AsArray()
+            .Where(o => o!["_meta"]?[GorynychProtocol.MetaFullAccess] is JsonValue v && v.GetValue<bool>()).Select(o => (string?)o!["value"]).ToArray(),
+            "the service asks before a session outside full access asks this one");
         await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption, new JsonObject { ["sessionId"] = id, ["configId"] = "reasoning_effort", ["value"] = "low" });
         await PromptAsync(zed, id, "hello");
         await PromptAsync(zed, id, "again");
@@ -475,6 +479,23 @@ public sealed class CodexAdapterTests
         ["approvalPolicy"] = approvalPolicy, ["approvalsReviewer"] = "user", ["model"] = "gpt-fake", ["modelProvider"] = "openai",
         ["reasoningEffort"] = "medium", ["sandbox"] = sandbox,
     };
+
+    [TestMethod]
+    public async Task ThreadSettingsThatAskNothing_WithNoSandbox_CountAsFullAccess_WhateverTheReviewer()
+    {
+        var fake = new FakeAppServer();
+        var settings = OwnSettings("never", new JsonObject { ["type"] = "dangerFullAccess" });
+        settings["approvalsReviewer"] = "auto_review";
+        fake.Existing("t-yolo", Cwd, settings: settings);
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+
+        var resumed = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = "t-yolo", ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
+
+        var mode = resumed!["configOptions"]!.AsArray().First(o => (string?)o!["id"] == "mode")!;
+        Assert.AreEqual("custom", (string?)mode["currentValue"]);
+        Assert.IsTrue(Gorynych.Service.Conductor.IsFullAccess(resumed.AsObject()), "the service asks before a session outside full access asks this one");
+    }
 
     [TestMethod]
     public async Task AModelOrEffortChange_OnAThreadWithItsOwnSettings_SendsOnlyThat()

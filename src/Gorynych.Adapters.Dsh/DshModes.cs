@@ -50,7 +50,12 @@ internal static class DshModes
         var current = pin is null ? mode.Id : Of(pin)?.Id ?? PinnedValue;
         var values = new JsonArray();
         foreach (var m in All)
-            values.Add(AcpJson.ToNode(new SessionConfigSelectOption { Value = m.Id, Name = m.Name, Description = m.Description }));
+            values.Add(AcpJson.ToNode(new SessionConfigSelectOption
+            {
+                Value = m.Id, Name = m.Name, Description = m.Description,
+                // The service asks the person before a session not in full access asks this one.
+                Meta = m == FullAccess ? new JsonObject { [GorynychProtocol.MetaFullAccess] = true } : null,
+            }));
         if (current == PinnedValue)
             values.Add(AcpJson.ToNode(new SessionConfigSelectOption
             {

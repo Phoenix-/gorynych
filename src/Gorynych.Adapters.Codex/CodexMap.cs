@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization.Metadata;
 using Gorynych.Acp;
+using Gorynych.Acp.Hosting;
 using Gorynych.Adapters.Codex.Protocol;
 
 namespace Gorynych.Adapters.Codex;
@@ -260,6 +261,10 @@ static class CodexMap
         new("full-access", "Full access", "Codex runs anything without asking, outside this folder too.", "never", "dangerFullAccess", "user"),
     ];
 
+    /// <summary><c>gorynych/fullAccess</c> for settings that run anything without asking: no approvals, no sandbox.</summary>
+    static JsonObject? FullAccessMeta(string policy, string sandbox) =>
+        policy == "never" && sandbox == "dangerFullAccess" ? new JsonObject { [GorynychProtocol.MetaFullAccess] = true } : null;
+
     public static string ModeOf(CodexSettings s) =>
         Modes.FirstOrDefault(m => m.Policy == s.Policy && m.Sandbox == s.SandboxType && m.Reviewer == s.Reviewer)?.Id ?? "custom";
 
@@ -276,12 +281,17 @@ static class CodexMap
     public static List<SessionConfigOption> ConfigOptions(CodexSettings s, IReadOnlyList<Model> models)
     {
         var mode = ModeOf(s);
-        var modes = Modes.Select(m => new SessionConfigSelectOption { Value = m.Id, Name = m.Name, Description = m.Description }).ToList();
+        // The service asks the person before a session not in full access asks one that is.
+        var modes = Modes.Select(m => new SessionConfigSelectOption
+        {
+            Value = m.Id, Name = m.Name, Description = m.Description, Meta = FullAccessMeta(m.Policy, m.Sandbox),
+        }).ToList();
         if (mode == "custom")
             modes.Add(new SessionConfigSelectOption
             {
                 Value = "custom", Name = "Your Codex settings",
                 Description = $"approval {s.Policy}, sandbox {s.SandboxType}, reviewer {s.Reviewer}",
+                Meta = FullAccessMeta(s.Policy, s.SandboxType),
             });
         var options = new List<SessionConfigOption>
         {

@@ -60,15 +60,21 @@ public static class ClaudeHooks
                 ["hooks"] = new JsonArray(new JsonObject { ["type"] = "http", ["url"] = url, ["timeout"] = timeout }),
             });
         }
-        return new JsonObject
-        {
-            ["hooks"] = hooks,
-            // The gorynych-outside server is for agents outside Gorynych; a session inside Gorynych
-            // that reads it from the user's configuration must not use it. The server hides itself
-            // by its ancestry too; this rule matches the name the guide registers it under.
-            ["permissions"] = new JsonObject { ["deny"] = new JsonArray(OutsideServerDeny) },
-        };
+        return new JsonObject { ["hooks"] = hooks, ["permissions"] = Permissions() };
     }
+
+    /// <summary>
+    /// The permission rules of every launch: the gorynych tools that need no approval
+    /// (<see cref="ChannelHost.AllowedTools"/>) are allowed; the gorynych-outside server is denied.
+    /// That server is for agents outside Gorynych; a session inside Gorynych that reads it from the
+    /// user's configuration must not use it. The server hides itself by its ancestry too; this rule
+    /// matches the name the guide registers it under.
+    /// </summary>
+    public static JsonObject Permissions() => new()
+    {
+        ["allow"] = new JsonArray(ChannelHost.AllowedTools.Select(t => (JsonNode)t).ToArray()),
+        ["deny"] = new JsonArray(OutsideServerDeny),
+    };
 
     public static string? Name(JsonObject e) => (string?)e["hook_event_name"];
 

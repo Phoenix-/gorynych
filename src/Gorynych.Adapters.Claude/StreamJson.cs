@@ -18,74 +18,13 @@ public static class StreamJson
         "--include-partial-messages", "--replay-user-messages", "--permission-prompt-tool=stdio",
     ];
 
-    /// <summary>The per-launch settings of a headless session: no hooks, only the rule that hides gorynych-outside.</summary>
-    public static JsonObject Settings() => new()
-    {
-        ["permissions"] = new JsonObject { ["deny"] = new JsonArray(ClaudeHooks.OutsideServerDeny) },
-    };
+    /// <summary>
+    /// The per-launch settings of a headless session: no hooks; the gorynych tools that need no
+    /// approval allowed, and the rule that hides gorynych-outside.
+    /// </summary>
+    public static JsonObject Settings() => new() { ["permissions"] = ClaudeHooks.Permissions() };
 
     // ---------------------------------------------------------------- adapter → Claude
-
-    /// <summary>The callback ID of the PreToolUse hook on the gorynych tools that act for the person.</summary>
-    public const string AskHookId = "gorynych-ask";
-
-    /// <summary>The tools whose hook calls the adapter: the gorynych tools that need the person's yes (docs/adapters.md, "Full access mode").</summary>
-    public const string AskedToolsMatcher = "^mcp__gorynych__(ask_agent|archive_session|restore_session)$";
-
-    /// <summary>
-    /// How long, in seconds, Claude waits for the hook's answer: the person may take their time, as
-    /// with any approval (a day, as the TUI transport's PermissionRequest hook waits).
-    /// </summary>
-    public const int AskHookTimeoutSeconds = 86400;
-
-    /// <summary>
-    /// A session launch's <c>initialize</c>: Claude calls the adapter back (<c>hook_callback</c>) before
-    /// each of <see cref="AskedToolsMatcher"/>, in every permission mode.
-    /// </summary>
-    public static JsonObject Initialize() => new()
-    {
-        ["subtype"] = "initialize",
-        ["hooks"] = new JsonObject
-        {
-            ["PreToolUse"] = new JsonArray(new JsonObject
-            {
-                ["matcher"] = AskedToolsMatcher,
-                ["hookCallbackIds"] = new JsonArray(AskHookId),
-                ["timeout"] = AskHookTimeoutSeconds,
-            }),
-        },
-    };
-
-    /// <summary>
-    /// The permission modes in which a hook's <c>ask</c> makes Claude ask through <c>can_use_tool</c>.
-    /// In any other (Full access, auto, one not named) the adapter asks the person itself.
-    /// </summary>
-    public static bool AsksForTools(string? mode) => mode is "default" or "manual" or "acceptEdits" or "plan";
-
-    /// <summary>
-    /// A PreToolUse hook answer that makes Claude ask, through <c>can_use_tool</c>, even where an allow
-    /// rule (the person's or a project's settings) or another hook would let the call run unasked.
-    /// </summary>
-    public static JsonObject HookAsk(string reason) => new()
-    {
-        ["hookSpecificOutput"] = new JsonObject
-        {
-            ["hookEventName"] = "PreToolUse",
-            ["permissionDecision"] = "ask",
-            ["permissionDecisionReason"] = reason,
-        },
-    };
-
-    /// <summary>A PreToolUse hook answer that lets the call run, or blocks it with what the model is told.</summary>
-    public static JsonObject HookDecision(bool allow, string reason) => new()
-    {
-        ["hookSpecificOutput"] = new JsonObject
-        {
-            ["hookEventName"] = "PreToolUse",
-            ["permissionDecision"] = allow ? "allow" : "deny",
-            ["permissionDecisionReason"] = reason,
-        },
-    };
 
     /// <summary>A user message for Claude's stdin, stamped with <paramref name="uuid"/> so its replay can be told apart.</summary>
     public static JsonObject UserMessage(string uuid, JsonNode content) => new()
