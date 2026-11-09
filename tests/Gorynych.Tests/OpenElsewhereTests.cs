@@ -74,6 +74,25 @@ public sealed class OpenElsewhereTests
     }
 
     [TestMethod]
+    public async Task AnAdapterThatFailsToTell_LeavesTheListAsItIs()
+    {
+        var codex = new LifecycleAgent("codex", canDelete: true) { TellsOpenElsewhere = true, OpenElsewhereFails = true };
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(TestDirs.New(), codex.Adapter, kimi.Adapter);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var held = await NewPromptedAsync(client, "codex", "Fix the flaky test");
+        lock (codex.OpenElsewhere) codex.OpenElsewhere[held] = "Codex Desktop";
+        var asker = await NewPromptedAsync(client, "kimi", "Coordinate");
+
+        var peers = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodPeers, new JsonObject { ["token"] = kimi.Tokens[asker] });
+
+        Assert.IsNull(Entry(peers, held)["open_elsewhere"], "a hint: not known, and the list is whole");
+        codex.Adapter.BreakWritesToAgent();
+        var outside = await conductor.PeerListAsync(null, includeArchived: false, CancellationToken.None);
+        Assert.IsNull(Entry(outside, held)["open_elsewhere"], "nor when the agent cannot be reached");
+    }
+
+    [TestMethod]
     public async Task AnAgentThatIsNotRunning_IsNotStartedForTheList()
     {
         var codex = new LifecycleAgent("codex", canDelete: true) { TellsOpenElsewhere = true };

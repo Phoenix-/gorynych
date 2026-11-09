@@ -561,12 +561,17 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     processes have the lock file open (`NtQueryInformationFile`,
     `FileProcessIdsUsingFileInformation`). It opens the file for its attributes only, with
     read, write and delete sharing: it takes no lock, which could make Codex itself fail to
-    open the thread, and creates or deletes nothing. Its own app-server and the service do not
-    count. The holder is named by its image and its parent: `Codex Desktop` (an image under
-    `%LOCALAPPDATA%\OpenAI\Codex\` or in the `OpenAI.Codex` package, or started by
-    `ChatGPT.exe`), `VS Code` (an image in a VS Code extensions folder, or started by
-    `Code.exe`), otherwise `a terminal codex (pid N)`. `CODEX_HOME` comes from the service's
-    environment, else `~/.codex`.
+    open the thread, and creates or deletes nothing. Its own app-server, the service, and any
+    process its app-server started (a wrapper's child) do not count. Only a Codex process that
+    can be read is a holder, named by its image and its parent: `Codex Desktop` (any image
+    under `%LOCALAPPDATA%\OpenAI\Codex\` or in the `OpenAI.Codex` package, or a `codex*.exe`
+    started by `ChatGPT.exe`), `VS Code` (a `codex*.exe` in a VS Code extensions folder or
+    started by `Code.exe`), otherwise a `codex*.exe` is `a terminal codex (pid N)`. Anything else
+    that has the file open (an antivirus, an indexer, a backup, Explorer's preview), and a
+    process that cannot be read (gone, its ID reused, elevated), is ignored: an early refusal is
+    final, so a false one would lock a free thread out. (A codex that runs as `node` would be
+    ignored too; none was seen: npm's shim starts the native `codex.exe`, which holds the lock.)
+    `CODEX_HOME` comes from the service's environment, else `~/.codex`.
   - **What it does with it.** `session/load` and `session/resume` of a held thread fail at once
     with `This Codex thread is open in <holder>; close it there, then try again.` and
     `data: {"gorynych/openElsewhere": "<holder>"}`, before `thread/resume` (so the other app is
@@ -575,8 +580,8 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     `_gorynych/open_elsewhere` for the service's session lists
     ([service-protocol.md](service-protocol.md#sessions-open-in-another-app)).
   - **A heuristic on Codex's insides.** Any failure (no folder, a file that does not open, a
-    status other than success) means "not known": nothing is marked and the open goes on to
-    app-server. Outside Windows nothing is known. App-server's own refusal, `thread <id> already
+    status other than success, a holder that is not Codex or cannot be read) means "not known":
+    nothing is marked and the open goes on to app-server. Outside Windows nothing is known. App-server's own refusal, `thread <id> already
     has an active writer`, stays the fallback: `This Codex thread is open in another Codex app
     (Codex Desktop, the CLI or VS Code); close it there, then try again.`, with
     `gorynych/openElsewhere: "another Codex app"`.

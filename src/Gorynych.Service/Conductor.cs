@@ -2441,26 +2441,25 @@ public sealed class Conductor : IAsyncDisposable
 
     /// <summary>
     /// Which of these sessions another app has open now, as their agents say: only agents that run
-    /// and take <c>_gorynych/open_elsewhere</c>; any failure is "not known". Briefly bounded, so a
-    /// slow agent does not hold up the list.
+    /// (none is started for a list) and take <c>_gorynych/open_elsewhere</c>. A hint, so any failure
+    /// of an agent is "not known" and the list goes on. Briefly bounded, so a slow agent does not hold it up.
     /// </summary>
     async Task<Dictionary<string, string>> OpenElsewhereAsync(IEnumerable<SessionRecord> records, CancellationToken ct)
     {
         var held = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var group in records.GroupBy(r => r.Agent))
         {
-            if (!agents.TryGetValue(group.Key, out var host) || !host.IsRunning || !host.TellsOpenElsewhere) continue;
+            if (!agents.TryGetValue(group.Key, out var host) || !host.TellsOpenElsewhere || host.Running is not { } rpc) continue;
             try
             {
                 using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 bounded.CancelAfter(TimeSpan.FromSeconds(5));
-                var rpc = await host.GetAsync(bounded.Token);
                 var answer = await rpc.SendRequestAsync(GorynychProtocol.MethodOpenElsewhere,
                     new JsonObject { ["sessionIds"] = new JsonArray(group.Select(r => (JsonNode)r.SessionId).ToArray()) }, bounded.Token);
                 foreach (var (id, holder) in answer?["sessions"] as JsonObject ?? [])
                     if (holder is JsonValue v && v.TryGetValue<string>(out var name) && name.Length > 0) held[id] = name;
             }
-            catch (Exception e) when (e is JsonRpcException or IOException or OperationCanceledException && !ct.IsCancellationRequested)
+            catch (Exception e) when (!(e is OperationCanceledException && ct.IsCancellationRequested))
             {
                 ServiceLog.Warn($"{host.Name}: could not tell which sessions are open elsewhere: {e.Message}");
             }

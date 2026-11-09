@@ -27,6 +27,9 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
 
     public bool IsRunning => connection is { IsClosed: false };
 
+    /// <summary>The agent's connection when it runs, or null: never starts it (unlike <see cref="GetAsync"/>).</summary>
+    public JsonRpcConnection? Running => connection is { IsClosed: false } running ? running : null;
+
     public static string Version =>
         typeof(AgentHost).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0";
 

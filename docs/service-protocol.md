@@ -972,7 +972,8 @@ app-server until it is closed there. An adapter that can tell who holds a sessio
   it there, then try again.`) and `data: {"gorynych/openElsewhere": "<holder>"}`.
 - The adapter advertises `gorynych/openElsewhere` and answers `_gorynych/open_elsewhere
   {sessionIds}` with the held ones. The service asks it, only while its agent runs (a list
-  starts no agent) and for at most five seconds, when it builds the list agents see: an entry
+  starts no agent) and for at most five seconds, when it builds the list agents see; an adapter
+  that fails to answer is "not known", and the list goes on without marks: an entry
   of `list_agents`, and of `list_sessions` for agents outside Gorynych, then has
   `open_elsewhere: "<holder> has it open; it cannot be asked until it is closed there"`.
 - `ask_agent` to such a session fails at once with what to do (the error table above), since the

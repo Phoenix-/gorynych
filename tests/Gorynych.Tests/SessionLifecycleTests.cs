@@ -720,6 +720,8 @@ sealed class LifecycleAgent
                 case AcpMethods.Agent.SessionResume when HolderOf(sessionId!) is { } holder:
                     throw new JsonRpcException(JsonRpcException.InvalidRequest, $"This thread is open in {holder}; close it there, then try again.",
                         new JsonObject { [GorynychProtocol.MetaOpenElsewhere] = holder });
+                case GorynychProtocol.MethodOpenElsewhere when TellsOpenElsewhere && OpenElsewhereFails:
+                    throw new InvalidOperationException("the adapter broke");
                 case GorynychProtocol.MethodOpenElsewhere when TellsOpenElsewhere:
                 {
                     var held = new JsonObject();
@@ -784,6 +786,9 @@ sealed class LifecycleAgent
 
     /// <summary>Advertises <c>gorynych/openElsewhere</c> and answers <c>_gorynych/open_elsewhere</c> from <see cref="OpenElsewhere"/>; set before the first use.</summary>
     public bool TellsOpenElsewhere { get; set; }
+
+    /// <summary>Fails every <c>_gorynych/open_elsewhere</c>, as a broken adapter would.</summary>
+    public bool OpenElsewhereFails { get; set; }
 
     /// <summary>Sessions another app has open, with who: their resume is refused as Codex's is.</summary>
     public Dictionary<string, string> OpenElsewhere { get; } = [];

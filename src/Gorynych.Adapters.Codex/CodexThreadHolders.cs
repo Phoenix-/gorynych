@@ -10,11 +10,13 @@ namespace Gorynych.Adapters.Codex;
 /// <c>rollout/src/writer_lock.rs</c>), and app-server has no API that says who holds it. On Windows
 /// the file system says which processes have the file open (<c>FileProcessIdsUsingFileInformation</c>);
 /// the file is opened for its attributes only, with full sharing, so no lock is taken and nothing is
-/// created or deleted. A heuristic on Codex's insides: any failure means "not known" and marks
-/// nothing, and outside Windows nothing is known.
+/// created or deleted. Only a Codex process counts as a holder, and only one that can be read:
+/// anything else that has the file open (an antivirus, an indexer, a backup, a preview) is ignored.
+/// A heuristic on Codex's insides: any failure means "not known" and marks nothing, and outside
+/// Windows nothing is known; app-server then decides.
 /// </summary>
 /// <param name="locksDirectory">Codex's <c>thread-writer-locks</c> folder; null knows nothing.</param>
-/// <param name="ownProcesses">Processes whose locks do not count: this adapter's own app-server.</param>
+/// <param name="ownProcesses">Processes whose locks do not count, nor their descendants': this adapter's own app-server.</param>
 internal sealed partial class CodexThreadHolders(string? locksDirectory, Func<IReadOnlyCollection<int>> ownProcesses)
 {
     /// <summary><c>$CODEX_HOME/thread-writer-locks</c>, or <c>~/.codex/thread-writer-locks</c>.</summary>
@@ -47,10 +49,18 @@ internal sealed partial class CodexThreadHolders(string? locksDirectory, Func<IR
                 var path = Path.Combine(locksDirectory, id + ".lock");
                 if (locks is not null ? !locks.Contains(id) : !File.Exists(path)) continue;
                 if (Windows.ProcessesUsing(path) is not { } pids) continue;
-                var other = pids.FirstOrDefault(p => p != Environment.ProcessId && !own.Contains(p));
-                if (other == 0) continue;
-                var (image, parentImage) = Windows.Describe(other);
-                held[id] = Classify(other, image, parentImage, localAppData);
+                foreach (var pid in pids)
+                {
+                    if (pid == Environment.ProcessId || own.Contains(pid)) continue;
+                    // A process that cannot be read (gone, its ID reused, elevated) is not taken for anything.
+                    if (Windows.Read(pid) is not { Image: { } image } process) continue;
+                    // A wrapper's child (a .cmd, a shim) holds the lock for the adapter's own app-server.
+                    if (Windows.DescendsFrom(pid, process, own)) continue;
+                    var parentImage = Windows.Parent(process)?.Image;
+                    if (Classify(pid, image, parentImage, localAppData) is not { } holder) continue;
+                    held[id] = holder;
+                    break;
+                }
             }
         }
         catch (Exception e) when (e is not OutOfMemoryException)
@@ -67,19 +77,25 @@ internal sealed partial class CodexThreadHolders(string? locksDirectory, Func<IR
     static bool IsThreadId(string id) => id.Length is > 0 and <= 64 && id.All(c => char.IsAsciiLetterOrDigit(c) || c == '-');
 
     /// <summary>
-    /// Who a holding process is: Codex Desktop (its image under <c>%LOCALAPPDATA%\OpenAI\Codex\</c> or
-    /// the OpenAI.Codex package, or started by ChatGPT.exe), VS Code (an extension's codex, or started by
-    /// Code.exe), otherwise a codex in a terminal, by its process ID.
+    /// Who a holding process is, or null when it is not Codex. Codex Desktop: any image under
+    /// <c>%LOCALAPPDATA%\OpenAI\Codex\</c> or in the OpenAI.Codex package, or a <c>codex*.exe</c>
+    /// started by ChatGPT.exe. VS Code: a <c>codex*.exe</c> in a VS Code extensions folder or started by
+    /// Code.exe. Otherwise a <c>codex*.exe</c> is a codex in a terminal, by its process ID; any other
+    /// image, or none (the process could not be read), is not a holder.
     /// </summary>
-    internal static string Classify(int pid, string? image, string? parentImage, string localAppData)
+    internal static string? Classify(int pid, string? image, string? parentImage, string localAppData)
     {
+        if (image is null) return null;
+        var name = Path.GetFileName(image);
+        var codex = name.StartsWith("codex", StringComparison.OrdinalIgnoreCase) && name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
         var parent = parentImage is null ? null : Path.GetFileName(parentImage);
-        if ((image is not null && (image.StartsWith(Path.Combine(localAppData, "OpenAI", "Codex") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-                || image.Contains(@"\WindowsApps\OpenAI.Codex", StringComparison.OrdinalIgnoreCase)))
-            || string.Equals(parent, "ChatGPT.exe", StringComparison.OrdinalIgnoreCase))
+        if (image.StartsWith(Path.Combine(localAppData, "OpenAI", "Codex") + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            || image.Contains(@"\WindowsApps\OpenAI.Codex", StringComparison.OrdinalIgnoreCase)
+            || (codex && string.Equals(parent, "ChatGPT.exe", StringComparison.OrdinalIgnoreCase)))
             return "Codex Desktop";
-        if ((image is not null && (image.Contains(@"\.vscode\extensions\", StringComparison.OrdinalIgnoreCase)
-                || image.Contains(@"\.vscode-insiders\extensions\", StringComparison.OrdinalIgnoreCase)))
+        if (!codex) return null;
+        if (image.Contains(@"\.vscode\extensions\", StringComparison.OrdinalIgnoreCase)
+            || image.Contains(@"\.vscode-insiders\extensions\", StringComparison.OrdinalIgnoreCase)
             || string.Equals(parent, "Code.exe", StringComparison.OrdinalIgnoreCase)
             || string.Equals(parent, "Code - Insiders.exe", StringComparison.OrdinalIgnoreCase))
             return "VS Code";
@@ -121,25 +137,45 @@ internal sealed partial class CodexThreadHolders(string? locksDirectory, Func<IR
             return null;
         }
 
-        /// <summary>A process's image path and its parent's, as far as they can be read.</summary>
-        public static (string? Image, string? ParentImage) Describe(int pid)
+        /// <summary>One process as far as it can be read: its image, its parent's ID, when it started.</summary>
+        public readonly record struct ProcessInfo(int Pid, string? Image, int ParentPid, long Created);
+
+        /// <summary>The process, or null when it cannot be opened (gone, elevated, another user's).</summary>
+        public static ProcessInfo? Read(int pid)
         {
             var process = OpenProcess(ProcessQueryLimitedInformation, false, (uint)pid);
-            if (process == 0) return (null, null);
+            if (process == 0) return null;
             try
             {
-                var image = ImagePath(process);
+                if (!GetProcessTimes(process, out var created, out _, out _, out _)) return null;
                 ProcessBasicInfo info;
-                if (NtQueryInformationProcess(process, ProcessBasicInformation, &info, (uint)sizeof(ProcessBasicInfo), out _) != 0) return (image, null);
-                var parent = OpenProcess(ProcessQueryLimitedInformation, false, (uint)info.InheritedFromUniqueProcessId);
-                if (parent == 0) return (image, null);
-                try { return (image, ImagePath(parent)); }
-                finally { CloseHandle(parent); }
+                var parentPid = NtQueryInformationProcess(process, ProcessBasicInformation, &info, (uint)sizeof(ProcessBasicInfo), out _) == 0
+                    ? (int)info.InheritedFromUniqueProcessId : 0;
+                return new ProcessInfo(pid, ImagePath(process), parentPid, created);
             }
             finally
             {
                 CloseHandle(process);
             }
+        }
+
+        /// <summary>The process's parent, unless it is gone or its ID now names a younger process.</summary>
+        public static ProcessInfo? Parent(ProcessInfo child) =>
+            child.ParentPid > 0 && Read(child.ParentPid) is { } parent && parent.Created <= child.Created ? parent : null;
+
+        /// <summary>Whether one of <paramref name="ancestors"/> is above the process, its parents' chain followed while it holds.</summary>
+        public static bool DescendsFrom(int pid, ProcessInfo process, IReadOnlyCollection<int> ancestors)
+        {
+            if (ancestors.Count == 0) return false;
+            var current = process;
+            for (var depth = 0; depth < 16; depth++)
+            {
+                if (Parent(current) is not { } parent) return false;
+                if (ancestors.Contains(parent.Pid)) return true;
+                if (parent.Pid == pid) return false;
+                current = parent;
+            }
+            return false;
         }
 
         static string? ImagePath(nint process)
@@ -182,6 +218,10 @@ internal sealed partial class CodexThreadHolders(string? locksDirectory, Func<IR
         [LibraryImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static partial bool QueryFullProcessImageNameW(nint process, uint flags, char* name, ref uint size);
+
+        [LibraryImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static partial bool GetProcessTimes(nint process, out long creation, out long exit, out long kernel, out long user);
 
         [LibraryImport("kernel32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
