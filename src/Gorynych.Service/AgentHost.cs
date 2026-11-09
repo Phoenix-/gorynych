@@ -121,6 +121,9 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// <summary>The adapter sets native titles (<c>_gorynych/set_title</c>).</summary>
     public bool CanSetTitle => Flag(GorynychProtocol.CapSetTitle);
 
+    /// <summary>The adapter tells which sessions another app has open (<c>_gorynych/open_elsewhere</c>).</summary>
+    public bool TellsOpenElsewhere => Flag(GorynychProtocol.CapOpenElsewhere);
+
     /// <summary>The agent keeps nothing durable before a session's first prompt.</summary>
     public bool DraftsNotDurable => Flag(GorynychProtocol.CapDraftsNotDurable);
 

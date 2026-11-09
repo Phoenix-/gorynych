@@ -43,6 +43,39 @@ public sealed class CodexLiveTests
         client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
             new JsonObject { ["sessionId"] = sessionId, ["configId"] = option, ["value"] = value });
 
+    /// <summary>
+    /// The threads another Codex app on this machine holds (Codex Desktop, a codex in a terminal) are
+    /// marked in the list and refused at once, by name, before app-server is asked; a free thread is
+    /// not marked. Read only: no thread is resumed, written or locked, and no turn runs. Inconclusive
+    /// when no other Codex app holds a thread now.
+    /// </summary>
+    [TestMethod]
+    [Timeout(300_000, CooperativeCancellation = true)]
+    public async Task Codex_ThreadsAnotherAppHolds_AreMarked_AndRefusedAtOnce()
+    {
+        RequireLive();
+        var dir = TestDirs.New();
+        var log = new List<string>();
+        await using var conductor = Conductor(dir, log);
+        await using var zed = await TestClient.ConnectAsync(conductor, "live", agent: "codex");
+
+        var listed = await zed.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
+
+        var held = listed.Sessions.Where(s => s.Meta?[GorynychProtocol.MetaOpenElsewhere] is not null).ToList();
+        Console.WriteLine($"{listed.Sessions.Count} threads listed, {held.Count} held by another Codex app:");
+        foreach (var s in held) Console.WriteLine($"  {s.SessionId} {(string?)s.Meta![GorynychProtocol.MetaOpenElsewhere]} in {s.Cwd}: {s.Title}");
+        if (held.Count == 0) Assert.Inconclusive("no other Codex app holds a thread now");
+
+        var desktop = held.FirstOrDefault(s => (string?)s.Meta![GorynychProtocol.MetaOpenElsewhere] == "Codex Desktop") ?? held[0];
+        var holder = (string)desktop.Meta![GorynychProtocol.MetaOpenElsewhere]!;
+        var started = DateTime.UtcNow;
+        var refused = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume,
+            new JsonObject { ["sessionId"] = desktop.SessionId, ["cwd"] = desktop.Cwd, ["mcpServers"] = new JsonArray() }));
+        Console.WriteLine($"resume {desktop.SessionId}: {refused.Message} ({(DateTime.UtcNow - started).TotalMilliseconds:0} ms)");
+        Assert.AreEqual($"This Codex thread is open in {holder}; close it there, then try again.", refused.Message);
+        Assert.AreEqual(holder, (string?)refused.ErrorData?[GorynychProtocol.MetaOpenElsewhere]);
+    }
+
     [TestMethod]
     [Timeout(600_000, CooperativeCancellation = true)]
     public async Task Codex_FirstPrompt_Approval_Reload_List_AndDelete()

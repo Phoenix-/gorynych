@@ -2133,6 +2133,12 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>For an agent that asks: the asked session could not be started (or failed at once after it was).</summary>
     static JsonRpcException CouldNotStart(SessionRecord record, Exception e, Asker asker)
     {
+        // Another app holds it (gorynych/openElsewhere in the error's data): only closing it there helps.
+        if (e is JsonRpcException { ErrorData: JsonObject data } held && (string?)data[GorynychProtocol.MetaOpenElsewhere] is { Length: > 0 } holder)
+            return new JsonRpcException(held.Code,
+                $"{Who(record)} is open in {holder}, which holds it, so it cannot be asked until it is closed there. " +
+                $"Ask another session from {(asker.Outside is not null ? "list_sessions" : "list_agents")}, or ask the user to close it in {holder}.",
+                data.DeepClone());
         var reason = e.Message.TrimEnd();
         if (!reason.EndsWith('.')) reason += ".";
         return new JsonRpcException(e is JsonRpcException rpc ? rpc.Code : JsonRpcException.InternalError,
@@ -2384,19 +2390,26 @@ public sealed class Conductor : IAsyncDisposable
     /// leaves it out and an agent does not know its own ID otherwise. Without <c>includeArchived</c>,
     /// <c>hiddenArchived</c> counts the archived sessions the list would otherwise show (never the caller).
     /// </summary>
-    internal JsonObject Peers(JsonRpcRequest request)
+    internal Task<JsonObject> PeersAsync(JsonRpcRequest request, CancellationToken ct)
     {
         var token = (string?)request.Params?["token"];
         var self = token is not null && peerTokens.TryGetValue(token, out var sid) ? sid : null;
         var includeArchived = request.Params?["includeArchived"] is JsonValue all && all.TryGetValue<bool>(out var include) && include;
-        return PeerList(self, includeArchived);
+        return PeerListAsync(self, includeArchived, ct);
     }
 
-    /// <summary>The list of <see cref="Peers"/>; for an agent outside Gorynych (no <paramref name="self"/>) every session with history.</summary>
-    internal JsonObject PeerList(string? self, bool includeArchived)
+    /// <summary>
+    /// The list of <see cref="PeersAsync"/>; for an agent outside Gorynych (no <paramref name="self"/>)
+    /// every session with history. A session another app has open, as its running agent says now
+    /// (<c>_gorynych/open_elsewhere</c>), has <c>open_elsewhere</c>: it cannot be asked until it is
+    /// closed there. An agent that is not running is not started for it, and its sessions show none.
+    /// </summary>
+    internal async Task<JsonObject> PeerListAsync(string? self, bool includeArchived, CancellationToken ct)
     {
         var sessions = new JsonArray();
-        foreach (var (r, live) in Askable(self, includeArchived))
+        var askable = Askable(self, includeArchived).ToList();
+        var elsewhere = await OpenElsewhereAsync(askable.Select(c => c.Record), ct);
+        foreach (var (r, live) in askable)
         {
             var entry = new JsonObject
             {
@@ -2409,6 +2422,7 @@ public sealed class Conductor : IAsyncDisposable
                 ["parent_session_id"] = r.ParentSessionId,
             };
             if (includeArchived) entry["archived"] = r.Archived;
+            if (elsewhere.TryGetValue(r.SessionId, out var holder)) entry["open_elsewhere"] = OpenElsewhereText(holder);
             sessions.Add((JsonNode)entry);
         }
         var result = new JsonObject { ["sessions"] = sessions };
@@ -2420,6 +2434,38 @@ public sealed class Conductor : IAsyncDisposable
         }
         if (!includeArchived) result["hiddenArchived"] = Askable(self, includeArchived: true).Count(c => c.Record.Archived);
         return result;
+    }
+
+    /// <summary>What a session list tells an agent about a session another app has open.</summary>
+    internal static string OpenElsewhereText(string holder) => $"{holder} has it open; it cannot be asked until it is closed there";
+
+    /// <summary>
+    /// Which of these sessions another app has open now, as their agents say: only agents that run
+    /// and take <c>_gorynych/open_elsewhere</c>; any failure is "not known". Briefly bounded, so a
+    /// slow agent does not hold up the list.
+    /// </summary>
+    async Task<Dictionary<string, string>> OpenElsewhereAsync(IEnumerable<SessionRecord> records, CancellationToken ct)
+    {
+        var held = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var group in records.GroupBy(r => r.Agent))
+        {
+            if (!agents.TryGetValue(group.Key, out var host) || !host.IsRunning || !host.TellsOpenElsewhere) continue;
+            try
+            {
+                using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                bounded.CancelAfter(TimeSpan.FromSeconds(5));
+                var rpc = await host.GetAsync(bounded.Token);
+                var answer = await rpc.SendRequestAsync(GorynychProtocol.MethodOpenElsewhere,
+                    new JsonObject { ["sessionIds"] = new JsonArray(group.Select(r => (JsonNode)r.SessionId).ToArray()) }, bounded.Token);
+                foreach (var (id, holder) in answer?["sessions"] as JsonObject ?? [])
+                    if (holder is JsonValue v && v.TryGetValue<string>(out var name) && name.Length > 0) held[id] = name;
+            }
+            catch (Exception e) when (e is JsonRpcException or IOException or OperationCanceledException && !ct.IsCancellationRequested)
+            {
+                ServiceLog.Warn($"{host.Name}: could not tell which sessions are open elsewhere: {e.Message}");
+            }
+        }
+        return held;
     }
 
     static string NewToken() => Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));

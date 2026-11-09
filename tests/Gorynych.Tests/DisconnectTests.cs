@@ -90,7 +90,7 @@ public sealed class DisconnectTests
 
     /// <summary>The session's status in the list agents see, inside Gorynych and outside.</summary>
     static string Status(Conductor conductor, string sessionId) =>
-        (string)conductor.PeerList(null, includeArchived: true)["sessions"]!.AsArray()
+        (string)conductor.PeerListAsync(null, includeArchived: true, CancellationToken.None).GetAwaiter().GetResult()["sessions"]!.AsArray()
             .Single(s => (string?)s!["session_id"] == sessionId)!["status"]!;
 
     /// <summary>Moves the clock and waits for the unloads it fired, which the timer starts before the move returns.</summary>

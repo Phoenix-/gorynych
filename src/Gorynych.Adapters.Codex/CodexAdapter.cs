@@ -37,6 +37,12 @@ public sealed class CodexAdapterOptions
     /// <summary>Gorynych's version, for <c>clientInfo</c>.</summary>
     public string ClientVersion { get; init; } = "0";
 
+    /// <summary>
+    /// Which of some threads another Codex app holds, and who: <see cref="CodexThreadHolders"/> on
+    /// Codex's own lock folder by default. For tests.
+    /// </summary>
+    internal Func<IEnumerable<string>, IReadOnlyDictionary<string, string>>? FindHolders { get; init; }
+
     public Action<string>? Log { get; init; }
 }
 
@@ -51,10 +57,16 @@ public sealed class CodexAdapter(CodexAdapterOptions options) : IAgentAdapter
 
     public async Task<AgentInstance> StartAsync(CancellationToken ct)
     {
-        var appServer = options.Launch is { } launch ? await launch(ct) : StartAppServer();
+        int? appServerPid = null;
+        AgentInstance appServer;
+        if (options.Launch is { } launch) appServer = await launch(ct);
+        else (appServer, appServerPid) = StartAppServer();
         var link = new DuplexLink();
         var (agentIn, agentOut) = link.AgentEnd;
-        var agent = new CodexAgent(options, new JsonRpcConnection(agentIn, agentOut, "codex-adapter"), appServer);
+        // The app-server's own locks are the threads Gorynych has open: they do not count.
+        var holders = options.FindHolders
+            ?? new CodexThreadHolders(CodexThreadHolders.DefaultDirectory(), () => appServerPid is { } pid ? [pid] : []).Find;
+        var agent = new CodexAgent(options, new JsonRpcConnection(agentIn, agentOut, "codex-adapter"), appServer, holders);
         try
         {
             await agent.StartAsync(ct);
@@ -68,7 +80,7 @@ public sealed class CodexAdapter(CodexAdapterOptions options) : IAgentAdapter
         return new AgentInstance(clientIn, clientOut, agent.Exited, agent.DisposeAsync);
     }
 
-    AgentInstance StartAppServer()
+    (AgentInstance AppServer, int Pid) StartAppServer()
     {
         var exe = options.Executable ?? FindCodex() ?? throw new InvalidOperationException("codex was not found on PATH");
         var psi = new ProcessStartInfo(exe)
@@ -90,13 +102,13 @@ public sealed class CodexAdapter(CodexAdapterOptions options) : IAgentAdapter
                 options.Log?.Invoke("codex: " + line);
         }, CancellationToken.None);
         var exited = process.WaitForExitAsync(CancellationToken.None);
-        return new AgentInstance(process.StandardOutput.BaseStream, process.StandardInput.BaseStream, exited, async () =>
+        return (new AgentInstance(process.StandardOutput.BaseStream, process.StandardInput.BaseStream, exited, async () =>
         {
             try { process.StandardInput.Close(); } catch (Exception e) when (e is IOException or ObjectDisposedException) { }
             if (await Task.WhenAny(exited, Task.Delay(3000)) != exited)
                 try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
             process.Dispose();
-        });
+        }), process.Id);
     }
 
     /// <summary>

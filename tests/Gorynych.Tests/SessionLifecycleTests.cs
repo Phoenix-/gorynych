@@ -686,6 +686,7 @@ sealed class LifecycleAgent
                                 Delete = canDelete ? new SessionDeleteCapabilities() : null,
                                 SystemPrompt = TakesSystemPrompt ? new SessionSystemPromptCapabilities() : null,
                             },
+                            Meta = TellsOpenElsewhere ? new JsonObject { [GorynychProtocol.CapOpenElsewhere] = true } : null,
                         },
                         AgentInfo = new Implementation { Name = name, Version = "1" },
                     });
@@ -716,6 +717,16 @@ sealed class LifecycleAgent
                         foreach (var u in updates) await agent.Update(sessionId!, u);
                     else if (Answer is { } answer) await agent.Update(sessionId!, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = answer } });
                     return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn });
+                case AcpMethods.Agent.SessionResume when HolderOf(sessionId!) is { } holder:
+                    throw new JsonRpcException(JsonRpcException.InvalidRequest, $"This thread is open in {holder}; close it there, then try again.",
+                        new JsonObject { [GorynychProtocol.MetaOpenElsewhere] = holder });
+                case GorynychProtocol.MethodOpenElsewhere when TellsOpenElsewhere:
+                {
+                    var held = new JsonObject();
+                    foreach (var asked in (req.Params?["sessionIds"] as JsonArray ?? []).Select(i => (string?)i).OfType<string>())
+                        if (HolderOf(asked) is { } h) held[asked] = h;
+                    return new JsonObject { ["sessions"] = held };
+                }
                 case AcpMethods.Agent.SessionResume:
                     lock (SystemPrompts) SystemPrompts.Add((req.Method, sessionId!, req.Params?["systemPrompt"]?.DeepClone()));
                     if (BeforeResume is { } beforeResume) await beforeResume(sessionId!);
@@ -770,6 +781,17 @@ sealed class LifecycleAgent
     /// <c>full</c>, marked <c>gorynych/fullAccess</c> as the adapters mark their full access.
     /// </summary>
     public bool ReportsModes { get; set; }
+
+    /// <summary>Advertises <c>gorynych/openElsewhere</c> and answers <c>_gorynych/open_elsewhere</c> from <see cref="OpenElsewhere"/>; set before the first use.</summary>
+    public bool TellsOpenElsewhere { get; set; }
+
+    /// <summary>Sessions another app has open, with who: their resume is refused as Codex's is.</summary>
+    public Dictionary<string, string> OpenElsewhere { get; } = [];
+
+    string? HolderOf(string sessionId)
+    {
+        lock (OpenElsewhere) return OpenElsewhere.GetValueOrDefault(sessionId);
+    }
 
     /// <summary>Each session's mode (<c>ask</c> when absent), as its agent keeps it: a change here is what the next resume reports.</summary>
     public Dictionary<string, string> Modes { get; } = [];

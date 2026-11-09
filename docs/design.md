@@ -261,7 +261,8 @@ Titles and archive live in the harness when it has them; otherwise in the servic
 - **Deleting** is native where the agent can (Kimi); a Claude session is only hidden, its
   transcript belongs to `~/.claude`.
 - **One thread, one writer.** Codex lets one process write a thread; a thread that Codex Desktop
-  or the CLI holds fails to open through Gorynych with a message that says so (**done**).
+  or the CLI holds is marked in the session list with the app that holds it, and fails to open
+  through Gorynych at once, naming that app (`gorynych/openElsewhere`, **done**).
 - **Renaming from the GUI** goes to the native side (Codex `thread/name/set`, Claude `/rename`
   typed through the PTY after `Stop`): **planned**.
 

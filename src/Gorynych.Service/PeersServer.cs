@@ -326,7 +326,8 @@ public static class PeersServer
             ["description"] = "List the user's other coding-agent sessions in Gorynych that you can ask with ask_agent. " +
                 "The result's first line names this session, which the list leaves out: \"You are session_id ...\", the ID for this " +
                 "session itself, for example for archive_session. Each entry has session_id, agent, title, cwd, status, updated_at and " +
-                "parent_session_id (set when another session started it with spawn_session). " +
+                "parent_session_id (set when another session started it with spawn_session), and open_elsewhere when another app, " +
+                "such as Codex Desktop, has the session open: it cannot be asked until it is closed there. " +
                 "Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's, Codex's and DeepSeek's are a bare UUID, Kimi's start with session_. " +
                 StatusLegend + " status has nothing to do with archived. " +
                 "Archived sessions are left out unless include_archived is true; when some are left out, the result's last line " +

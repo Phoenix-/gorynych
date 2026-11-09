@@ -551,10 +551,38 @@ over app-server's JSON-RPC. The design and the probes behind it are in
   them (checked live), so a thread keeps the text of the service that created it.
 - **One writer.** A thread has one writer process. While Gorynych's app-server has a thread
   loaded, Codex Desktop, the CLI or VS Code cannot continue it, and Gorynych cannot resume a
-  thread one of them has open. The adapter turns app-server's `thread <id> already has an
-  active writer` into `This Codex thread is open in another Codex app (Codex Desktop, the CLI
-  or VS Code); close it there, then try again.` Within its own process the adapter drives
-  every turn, so there are no turns of Codex's own to mark (`gorynych/agentTurn`).
+  thread one of them has open. Within its own process the adapter drives every turn, so there
+  are no turns of Codex's own to mark (`gorynych/agentTurn`).
+  - **The mechanism.** Codex takes an OS lock on `<CODEX_HOME>/thread-writer-locks/<thread
+    id>.lock` (an empty file; Rust `File::try_lock`, `LockFileEx` on Windows; codex-rs
+    `rollout/src/writer_lock.rs`). Nothing in it says who holds it, and app-server has no API
+    for it: its `ThreadStatus` is about its own process.
+  - **Who holds a thread, told beforehand (Windows).** The adapter asks the file system which
+    processes have the lock file open (`NtQueryInformationFile`,
+    `FileProcessIdsUsingFileInformation`). It opens the file for its attributes only, with
+    read, write and delete sharing: it takes no lock, which could make Codex itself fail to
+    open the thread, and creates or deletes nothing. Its own app-server and the service do not
+    count. The holder is named by its image and its parent: `Codex Desktop` (an image under
+    `%LOCALAPPDATA%\OpenAI\Codex\` or in the `OpenAI.Codex` package, or started by
+    `ChatGPT.exe`), `VS Code` (an image in a VS Code extensions folder, or started by
+    `Code.exe`), otherwise `a terminal codex (pid N)`. `CODEX_HOME` comes from the service's
+    environment, else `~/.codex`.
+  - **What it does with it.** `session/load` and `session/resume` of a held thread fail at once
+    with `This Codex thread is open in <holder>; close it there, then try again.` and
+    `data: {"gorynych/openElsewhere": "<holder>"}`, before `thread/resume` (so the other app is
+    left alone). `session/list` marks each held thread with
+    `_meta["gorynych/openElsewhere"]`, the folder read once per page, and the adapter answers
+    `_gorynych/open_elsewhere` for the service's session lists
+    ([service-protocol.md](service-protocol.md#sessions-open-in-another-app)).
+  - **A heuristic on Codex's insides.** Any failure (no folder, a file that does not open, a
+    status other than success) means "not known": nothing is marked and the open goes on to
+    app-server. Outside Windows nothing is known. App-server's own refusal, `thread <id> already
+    has an active writer`, stays the fallback: `This Codex thread is open in another Codex app
+    (Codex Desktop, the CLI or VS Code); close it there, then try again.`, with
+    `gorynych/openElsewhere: "another Codex app"`.
+  - **Checked live** on 9 November 2026 with Codex 0.167 (CLI) and Codex Desktop 26.1029: of 18
+    threads listed, three held by Codex Desktop and two by codex in terminals were marked as
+    such, and resuming one of Codex Desktop's failed at once with its name.
 - **Idle time: 2 minutes** (`gorynych/unloadAfter: 120`; the service takes the shorter of it and
   `--unload-after`). A loaded thread locks Codex's own apps out, so it should go back soon after
   a conversation moves on. Loading it again is cheap (probe of 8 November 2026): `thread/resume`

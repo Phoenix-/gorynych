@@ -174,6 +174,23 @@ public static class GorynychProtocol
     /// </summary>
     public const string CapDraftsNotDurable = "gorynych/draftsNotDurable";
 
+    /// <summary>
+    /// A string naming another app that has the session open, so its agent cannot load it here until
+    /// it is closed there ("Codex Desktop", "a terminal codex (pid 4242)"): in <c>SessionInfo._meta</c>
+    /// of <c>session/list</c> (absent: free, or not known), and in the <c>data</c> of the error that
+    /// refuses to load or resume it (docs/service-protocol.md, "Sessions open in another app").
+    /// </summary>
+    public const string MetaOpenElsewhere = "gorynych/openElsewhere";
+
+    /// <summary>
+    /// Which of some sessions another app has open now: <c>{sessionIds}</c> → <c>{sessions: {"&lt;id&gt;":
+    /// "&lt;holder&gt;"}}</c>, the held ones only. Sent to an adapter that advertises <see cref="CapOpenElsewhere"/>.
+    /// </summary>
+    public const string MethodOpenElsewhere = "_gorynych/open_elsewhere";
+
+    /// <summary>In <c>agentCapabilities._meta</c>: <c>true</c> when the adapter takes <see cref="MethodOpenElsewhere"/>.</summary>
+    public const string CapOpenElsewhere = "gorynych/openElsewhere";
+
     /// <summary><c>spawn_session</c> of the service's <c>gorynych</c> MCP server, as agents name it.</summary>
     public const string SpawnTool = "mcp__gorynych__spawn_session";
 

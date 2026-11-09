@@ -104,7 +104,8 @@ internal static class OutsideTools
             ["description"] = "List the user's coding-agent sessions in Gorynych, which runs Claude, Codex, Kimi and DeepSeek sessions on this machine. " +
                 "Pass a session_id to read_session to see what that session said, or to ask_agent to ask it something. Each entry has " +
                 "session_id, agent, title, cwd, status, updated_at and parent_session_id (set when another session started it with " +
-                "spawn_session). Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's, Codex's " +
+                "spawn_session), and open_elsewhere when another app, such as Codex Desktop, has the session open: it cannot be asked " +
+                "until it is closed there. Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's, Codex's " +
                 "and DeepSeek's are a bare UUID, Kimi's start with session_. status open means the agent has the session loaded now; a saved one is started when " +
                 "asked, so it answers more slowly, and is unloaded again once it has been idle with no client for some minutes; " +
                 "read_session reads it without starting it. Archived sessions are left out " +

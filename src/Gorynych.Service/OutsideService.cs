@@ -80,7 +80,7 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
         {
             var text = name switch
             {
-                "list_sessions" => ListSessions(args),
+                "list_sessions" => await ListSessionsAsync(args, ct),
                 "read_session" => await ReadSessionAsync(args, ct),
                 _ => await AskAsync(client, requestId, call!, args, host, ct),
             };
@@ -99,10 +99,10 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
     sealed class ToolInputException(string message) : Exception(message);
 
     /// <summary><c>list_sessions</c>: every session with history, rendered as <c>list_agents</c> renders its list, with no caller.</summary>
-    string ListSessions(JsonObject args)
+    async Task<string> ListSessionsAsync(JsonObject args, CancellationToken ct)
     {
         var includeArchived = args["include_archived"] is JsonValue v && v.TryGetValue<bool>(out var b) && b;
-        return PeersServer.ListAgentsText(conductor.PeerList(self: null, includeArchived), empty: NoSession);
+        return PeersServer.ListAgentsText(await conductor.PeerListAsync(self: null, includeArchived, ct), empty: NoSession);
     }
 
     async Task<string> ReadSessionAsync(JsonObject args, CancellationToken ct)

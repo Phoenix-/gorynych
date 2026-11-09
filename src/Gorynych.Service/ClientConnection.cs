@@ -93,7 +93,7 @@ internal sealed class ClientConnection
             case GorynychProtocol.MethodOpinion:
                 return await conductor.OpinionAsync(request, ct);
             case GorynychProtocol.MethodPeers:
-                return conductor.Peers(request);
+                return await conductor.PeersAsync(request, ct);
             case GorynychProtocol.MethodReply:
                 return conductor.Reply(request);
             case GorynychProtocol.MethodSpawn:

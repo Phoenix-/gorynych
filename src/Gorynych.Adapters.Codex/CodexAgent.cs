@@ -310,6 +310,9 @@ sealed class CodexAgent : IAsyncDisposable
     readonly JsonRpcConnection rpc;
     readonly AgentInstance appServer;
     readonly JsonRpcConnection app;
+
+    /// <summary>Which of some threads another Codex app holds, and who (<see cref="CodexThreadHolders"/>).</summary>
+    readonly Func<IEnumerable<string>, IReadOnlyDictionary<string, string>> holders;
     readonly ConcurrentDictionary<string, CodexThread> threads = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, CancellationTokenSource> asking = new(StringComparer.Ordinal);
 
@@ -321,11 +324,13 @@ sealed class CodexAgent : IAsyncDisposable
     string version = "";
     int disposed;
 
-    public CodexAgent(CodexAdapterOptions options, JsonRpcConnection rpc, AgentInstance appServer)
+    public CodexAgent(CodexAdapterOptions options, JsonRpcConnection rpc, AgentInstance appServer,
+        Func<IEnumerable<string>, IReadOnlyDictionary<string, string>> holders)
     {
         this.options = options;
         this.rpc = rpc;
         this.appServer = appServer;
+        this.holders = holders;
         app = new JsonRpcConnection(appServer.Input, appServer.Output, "codex-app-server")
         {
             RequestHandler = OnServerRequestAsync,
@@ -402,6 +407,7 @@ sealed class CodexAgent : IAsyncDisposable
                             [GorynychProtocol.CapSetTitle] = true,
                             [GorynychProtocol.CapDraftsNotDurable] = true,
                             [GorynychProtocol.CapUnloadAfter] = options.UnloadAfter.TotalSeconds,
+                            [GorynychProtocol.CapOpenElsewhere] = true,
                         },
                     },
                     AuthMethods = [],
@@ -433,6 +439,13 @@ sealed class CodexAgent : IAsyncDisposable
                 return await PromptAsync(request, ct);
             case AcpMethods.Agent.SessionSetConfigOption:
                 return SetConfigOption(request.ParamsAs<SetSessionConfigOptionRequest>());
+            case GorynychProtocol.MethodOpenElsewhere:
+            {
+                var ids = (request.Params?["sessionIds"] as JsonArray ?? []).Select(i => (string?)i).OfType<string>().ToList();
+                var sessions = new JsonObject();
+                foreach (var (id, holder) in holders(ids)) sessions[id] = holder;
+                return new JsonObject { ["sessions"] = sessions };
+            }
             case GorynychProtocol.MethodSetTitle:
             {
                 var title = (string?)request.Params?["title"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "title is required");
@@ -483,6 +496,8 @@ sealed class CodexAgent : IAsyncDisposable
     {
         var instructions = Instructions(systemPrompt);
         if (threads.TryGetValue(id, out var known) && known.Loaded) return known;
+        // App-server would refuse it anyway (one writer); said at once, naming the app that has it.
+        if (holders([id]).GetValueOrDefault(id) is { } holder) throw OpenElsewhere(holder);
         ThreadResumeResponse resumed;
         try
         {
@@ -504,12 +519,22 @@ sealed class CodexAgent : IAsyncDisposable
         return t;
     }
 
+    /// <summary>
+    /// A thread another Codex app holds: refused with that app's name, also in the error's data, so
+    /// the service can tell an asking agent what to do (<c>gorynych/openElsewhere</c>).
+    /// </summary>
+    static JsonRpcException OpenElsewhere(string holder) =>
+        new(JsonRpcException.InvalidRequest, $"This Codex thread is open in {holder}; close it there, then try again.",
+            new JsonObject { [GorynychProtocol.MetaOpenElsewhere] = holder });
+
     /// <summary>App-server's refusals to load a thread, in words a person and an asking agent can act on.</summary>
     static JsonRpcException Explain(JsonRpcException e, string id)
     {
+        // The lock was taken after the check, or the holder could not be told (outside Windows).
         if (e.Message.Contains("active writer", StringComparison.Ordinal))
             return new JsonRpcException(e.Code,
-                "This Codex thread is open in another Codex app (Codex Desktop, the CLI or VS Code); close it there, then try again.");
+                "This Codex thread is open in another Codex app (Codex Desktop, the CLI or VS Code); close it there, then try again.",
+                new JsonObject { [GorynychProtocol.MetaOpenElsewhere] = "another Codex app" });
         if (e.Message.Contains("is archived", StringComparison.Ordinal))
             return new JsonRpcException(e.Code, $"This Codex thread is archived in Codex. Unarchive it there (codex unarchive {id}), then try again.");
         if (e.Message.Contains("no rollout found", StringComparison.Ordinal) || e.Message.Contains("not found", StringComparison.OrdinalIgnoreCase))
@@ -556,6 +581,8 @@ sealed class CodexAgent : IAsyncDisposable
             SortKey = ThreadSortKey.UpdatedAt,
             UseStateDbOnly = true,
         }, CodexJsonContext.Default.ThreadListParams), ct), CodexJsonContext.Default.ThreadListResponse);
+        // Read once for the page: the threads another Codex app has open, which this app-server cannot load.
+        var held = holders(listed.Data.Select(th => th.Id));
         return AcpJson.ToNode(new ListSessionsResponse
         {
             Sessions = listed.Data.Select(th => new SessionInfo
@@ -564,6 +591,7 @@ sealed class CodexAgent : IAsyncDisposable
                 Cwd = th.Cwd,
                 Title = string.IsNullOrEmpty(th.Name) ? null : th.Name,
                 UpdatedAt = Iso(th.UpdatedAt),
+                Meta = held.TryGetValue(th.Id, out var holder) ? new JsonObject { [GorynychProtocol.MetaOpenElsewhere] = holder } : null,
             }).ToList(),
             NextCursor = listed.NextCursor,
         });

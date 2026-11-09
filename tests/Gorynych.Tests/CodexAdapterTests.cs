@@ -27,12 +27,14 @@ public sealed class CodexAdapterTests
         Time = (TimeProvider?)time ?? TimeProvider.System,
     }, [new CodexAdapter(codex ?? Options(fake)), .. more ?? []]);
 
-    static CodexAdapterOptions Options(FakeAppServer fake, List<string>? log = null) => new()
+    static CodexAdapterOptions Options(FakeAppServer fake, List<string>? log = null, Func<IEnumerable<string>, IReadOnlyDictionary<string, string>>? holders = null) => new()
     {
         Launch = fake.StartAsync,
         ClientVersion = "test",
         TurnEndWait = TimeSpan.FromMilliseconds(200),
         Log = log is null ? null : m => { lock (log) log.Add(m); },
+        // No other Codex app holds a fake thread; the user's own Codex folder is never read.
+        FindHolders = holders ?? (_ => new Dictionary<string, string>()),
     };
 
     /// <summary>The adapter alone, without the service: an ACP connection straight to it.</summary>
@@ -362,8 +364,49 @@ public sealed class CodexAdapterTests
 
         var open = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-open")));
         Assert.AreEqual("This Codex thread is open in another Codex app (Codex Desktop, the CLI or VS Code); close it there, then try again.", open.Message);
+        Assert.AreEqual("another Codex app", (string?)open.ErrorData?[GorynychProtocol.MetaOpenElsewhere], "when the holder could not be told beforehand");
         var archived = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-archived")));
         Assert.AreEqual("This Codex thread is archived in Codex. Unarchive it there (codex unarchive t-archived), then try again.", archived.Message);
+    }
+
+    [TestMethod]
+    public async Task AThreadAnotherCodexAppHolds_IsMarkedInTheList_AndRefusedAtOnce_WithoutAskingAppServer()
+    {
+        var fake = new FakeAppServer();
+        fake.Existing("t-desk", Cwd, name: "Open in Codex Desktop");
+        fake.Existing("t-term", Cwd, name: "Open in a terminal");
+        fake.Existing("t-free", Cwd, name: "Free");
+        var held = new Dictionary<string, string> { ["t-desk"] = "Codex Desktop", ["t-term"] = "a terminal codex (pid 4242)" };
+        var asked = new List<string[]>();
+        await using var conductor = Conductor(fake, codex: Options(fake, holders: ids =>
+        {
+            var list = ids.ToArray();
+            lock (asked) asked.Add(list);
+            return held.Where(kv => list.Contains(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value);
+        }));
+        await using var zed = await ZedAsync(conductor);
+        JsonObject Resume(string id) => new() { ["sessionId"] = id, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() };
+
+        var listed = await zed.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
+
+        string? Mark(string id) => (string?)listed.Sessions.Single(s => s.SessionId == id).Meta?[GorynychProtocol.MetaOpenElsewhere];
+        Assert.AreEqual(("Codex Desktop", "a terminal codex (pid 4242)", (string?)null), (Mark("t-desk"), Mark("t-term"), Mark("t-free")));
+        lock (asked) CollectionAssert.AreEquivalent(new[] { "t-desk", "t-term", "t-free" }, asked.SelectMany(a => a).ToArray(), "once per page, each thread once");
+        Assert.IsTrue(conductor.Agents["codex"].TellsOpenElsewhere);
+
+        var desk = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-desk")));
+        Assert.AreEqual("This Codex thread is open in Codex Desktop; close it there, then try again.", desk.Message);
+        Assert.AreEqual("Codex Desktop", (string?)desk.ErrorData?[GorynychProtocol.MetaOpenElsewhere]);
+        var term = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, Resume("t-term")));
+        Assert.AreEqual("This Codex thread is open in a terminal codex (pid 4242); close it there, then try again.", term.Message);
+        Assert.AreEqual(0, fake.All("thread/resume").Length, "app-server was not asked: it would refuse, and Codex Desktop is left alone");
+
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-free"));
+        Assert.AreEqual("t-free", (string?)fake.Last("thread/resume")["threadId"]);
+
+        var answer = await (await conductor.Agents["codex"].GetAsync(CancellationToken.None)).SendRequestAsync(GorynychProtocol.MethodOpenElsewhere,
+            new JsonObject { ["sessionIds"] = new JsonArray("t-desk", "t-free") });
+        Assert.AreEqual("{\"t-desk\":\"Codex Desktop\"}", answer!["sessions"]!.ToJsonString(), "the held ones only");
     }
 
     [TestMethod]
