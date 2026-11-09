@@ -129,4 +129,57 @@ public sealed class JsonRpcTests
             Assert.IsFalse(call.IsCompleted, $"{name} cancels only the request it names");
         }
     }
+
+    /// <summary>
+    /// Every write on a connection disposed before or while it writes fails as a closed connection
+    /// (an IOException), the failure callers take for "the peer is gone": the service then asks the
+    /// next client, so an approval is not lost to a client that left just as it was asked
+    /// (ConductorTests.PendingApproval_WaitsForTheNextClient). Not a cancellation, and not the
+    /// disposed object a write met when it came after DisposeAsync had disposed its token source.
+    /// </summary>
+    [TestMethod]
+    [Timeout(30_000, CooperativeCancellation = true)]
+    public async Task WritesOnADisposedConnection_FailAsAClosedConnection()
+    {
+        var link = new DuplexLink();
+        var (ci, _) = link.ClientEnd;
+        var output = new StuckStream();
+        var rpc = new JsonRpcConnection(ci, output, "client");
+        rpc.Start();
+        var stuck = rpc.SendNotificationAsync("stuck", null);
+        await output.Writing.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var request = rpc.SendRequestAsync("waiting", null);
+        var notification = rpc.SendNotificationAsync("waiting", null);
+
+        await rpc.DisposeAsync();
+
+        await Assert.ThrowsExactlyAsync<IOException>(() => stuck.WaitAsync(TimeSpan.FromSeconds(10)), "cut off while writing");
+        await Assert.ThrowsExactlyAsync<IOException>(() => request.WaitAsync(TimeSpan.FromSeconds(10)), "a request waiting to write");
+        await Assert.ThrowsExactlyAsync<IOException>(() => notification.WaitAsync(TimeSpan.FromSeconds(10)), "a notification waiting to write");
+        await Assert.ThrowsExactlyAsync<IOException>(() => rpc.SendNotificationAsync("after", null), "a notification after");
+        await Assert.ThrowsExactlyAsync<IOException>(() => rpc.SendRequestAsync("after", null), "a request after");
+    }
+
+    /// <summary>An output that takes nothing: a write waits until it is cancelled.</summary>
+    sealed class StuckStream : Stream
+    {
+        public TaskCompletionSource Writing { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            Writing.TrySetResult();
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
 }

@@ -47,6 +47,9 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     readonly ConcurrentDictionary<long, TaskCompletionSource<JsonNode?>> pending = new();
     readonly ConcurrentDictionary<string, CancellationTokenSource> incoming = new();
     readonly CancellationTokenSource lifetime = new();
+    // lifetime's token, taken once: a write may still run while DisposeAsync disposes lifetime,
+    // whose Token then throws.
+    readonly CancellationToken stopping;
     readonly TaskCompletionSource closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     long nextId;
     long received;
@@ -57,6 +60,7 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         this.input = input;
         this.output = output;
         Name = name;
+        stopping = lifetime.Token;
     }
 
     /// <summary>A label for logs.</summary>
@@ -130,19 +134,36 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         return WriteAsync(message);
     }
 
+    /// <summary>
+    /// Writes one message. On a connection that is closed, or closes meanwhile, it fails with an
+    /// <see cref="IOException"/>, never anything else: callers take that as "the peer is gone" (the
+    /// service then asks another client), so a write that races <see cref="DisposeAsync"/> must not
+    /// surface as a cancellation or a disposed object.
+    /// </summary>
     async Task WriteAsync(JsonObject message)
     {
         var text = message.ToJsonString(WireOptions);
         var bytes = Encoding.UTF8.GetBytes(text);
-        await writeGate.WaitAsync(lifetime.Token).ConfigureAwait(false);
+        try
+        {
+            await writeGate.WaitAsync(stopping).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw new IOException($"{Name}: connection closed");
+        }
         try
         {
             if (IsClosed) throw new IOException($"{Name}: connection closed");
-            await output.WriteAsync(bytes, lifetime.Token).ConfigureAwait(false);
-            await output.WriteAsync(NewLine, lifetime.Token).ConfigureAwait(false);
-            await output.FlushAsync(lifetime.Token).ConfigureAwait(false);
+            await output.WriteAsync(bytes, stopping).ConfigureAwait(false);
+            await output.WriteAsync(NewLine, stopping).ConfigureAwait(false);
+            await output.FlushAsync(stopping).ConfigureAwait(false);
         }
-        catch (Exception e) when (e is not IOException and not OperationCanceledException)
+        catch (OperationCanceledException)
+        {
+            throw new IOException($"{Name}: connection closed");
+        }
+        catch (Exception e) when (e is not IOException)
         {
             throw new IOException($"{Name}: write failed", e);
         }
@@ -158,9 +179,9 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         try
         {
             using var reader = new StreamReader(input, new UTF8Encoding(false), detectEncodingFromByteOrderMarks: false, bufferSize: 1 << 16, leaveOpen: true);
-            while (!lifetime.IsCancellationRequested)
+            while (!stopping.IsCancellationRequested)
             {
-                var line = await reader.ReadLineAsync(lifetime.Token).ConfigureAwait(false);
+                var line = await reader.ReadLineAsync(stopping).ConfigureAwait(false);
                 if (line is null) break;
                 if (line.Length == 0) continue;
                 Trace?.Invoke("<", line);
@@ -210,7 +231,7 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         var request = new JsonRpcRequest(id, method, @params) { Sequence = sequence };
         // Registered here, before the next message is read, so a cancel right behind the request finds it.
         var requestKey = id.ToJsonString();
-        var requestCts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+        var requestCts = CancellationTokenSource.CreateLinkedTokenSource(stopping);
         incoming[requestKey] = requestCts;
         _ = Task.Run(() => HandleRequestAsync(request, requestKey, requestCts));
     }
