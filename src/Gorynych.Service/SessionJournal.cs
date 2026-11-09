@@ -68,14 +68,21 @@ public sealed class SessionJournal
     /// <summary>An update that only a turn produces: a message, a thought, a tool call or a plan.</summary>
     public static bool IsTurnKind(string? kind) => kind is not null && TurnKinds.Contains(kind);
 
-    public void Append(JsonNode update)
+    /// <summary>How many entries the journal keeps at most; past it, it compacts.</summary>
+    public int MaxEntries => maxEntries;
+
+    public void Append(JsonNode update) => AppendMany([update]);
+
+    /// <summary>Appends several updates with one write (and at most one compaction).</summary>
+    public void AppendMany(IReadOnlyList<JsonNode> updates)
     {
-        var line = update.ToJsonString(LineOptions);
+        if (updates.Count == 0) return;
+        var added = updates.Select(u => u.ToJsonString(LineOptions)).ToList();
         lock (gate)
         {
             var all = Load();
-            all.Add(line);
-            turns |= IsTurn(update);
+            all.AddRange(added);
+            turns |= updates.Any(IsTurn);
             if (all.Count > maxEntries)
             {
                 Compact(all);
@@ -83,7 +90,7 @@ public sealed class SessionJournal
             }
             else
             {
-                File.AppendAllText(path, line + "\n", Encoding.UTF8);
+                File.AppendAllText(path, string.Concat(added.Select(l => l + "\n")), Encoding.UTF8);
             }
         }
     }
@@ -164,22 +171,39 @@ public sealed class SessionJournal
 
     /// <summary>
     /// Replaces the journal with <paramref name="entries"/> (the agent's history imported again),
-    /// keeping the one it replaces next to it as <c>&lt;journal&gt;.&lt;UTC time&gt;.before</c>, the
-    /// last <see cref="KeptHistoryCount"/> of them.
+    /// keeping the one it replaces next to it as <c>&lt;journal&gt;.&lt;UTC time&gt;-&lt;n&gt;.before</c>, the
+    /// last <see cref="KeptHistoryCount"/> of them. The new <paramref name="mark"/> is written first:
+    /// a crash before the journal is written then leaves the earlier journal and a mark past it,
+    /// which a later open finds nothing after, rather than a second import. <paramref name="trimmed"/>
+    /// says that the entries are only the end of the history.
     /// </summary>
-    public void Replace(IEnumerable<JsonNode> entries, DateTimeOffset now)
+    public void Replace(IEnumerable<JsonNode> entries, DateTimeOffset now, string? mark, bool trimmed)
     {
         lock (gate)
         {
             if (File.Exists(path))
             {
-                File.Copy(path, $"{path}.{now.UtcDateTime:yyyyMMdd'T'HHmmssfff'Z'}.before", overwrite: true);
+                // Numbered after any kept at the same instant, so they sort as they were made.
+                var stamp = $"{path}.{now.UtcDateTime:yyyyMMdd'T'HHmmssfff'Z'}";
+                var n = KeptHistories().Where(k => k.StartsWith(stamp + "-", StringComparison.Ordinal))
+                    .Select(k => int.TryParse(k.AsSpan(stamp.Length + 1, k.Length - stamp.Length - 1 - ".before".Length), out var i) ? i + 1 : 0)
+                    .DefaultIfEmpty(0).Max();
+                File.Copy(path, $"{stamp}-{n:D3}.before");
                 var kept = KeptHistories();
                 for (var i = 0; i < kept.Count - KeptHistoryCount; i++) File.Delete(kept[i]);
+            }
+            if (mark is not null)
+            {
+                Gorynych.Acp.Hosting.AtomicFile.WriteAllText(MarkPath, mark, Encoding.UTF8);
+                this.mark = mark;
+                markRead = true;
             }
             var all = entries.Select(e => e.ToJsonString(LineOptions)).ToList();
             turns = all.Select(TryParse).Any(IsTurn);
             File.Delete(TrimmedPath); // the whole history again, unless it is trimmed once more
+            if (trimmed)
+                try { File.WriteAllText(TrimmedPath, ""); }
+                catch (IOException) { }
             if (all.Count > maxEntries) Compact(all);
             Rewrite(all);
             lines = all;
@@ -231,19 +255,21 @@ public sealed class SessionJournal
     }
 
     static bool IsTextChunk(JsonObject o) =>
-        ChunkKinds.Contains((string?)o["sessionUpdate"] ?? "") && (string?)o["content"]?["type"] == "text" && o["_meta"] is null;
+        ChunkKinds.Contains((string?)o["sessionUpdate"] ?? "") && (string?)o["content"]?["type"] == "text";
 
     /// <summary>
     /// Merges <paramref name="next"/> into <paramref name="into"/> when both are text chunks of one
-    /// message: the same kind and the same <c>messageId</c>. Chunks without one are never merged,
-    /// since nothing says that two of them belong to one message (the service gives every chunk it
-    /// publishes an ID; only journals written before it did lack them).
+    /// message: the same kind, the same <c>messageId</c> and the same <c>_meta</c> (a message from the
+    /// agent's own history has <c>gorynych/origin: native</c> on every chunk). Chunks without an ID
+    /// are never merged, since nothing says that two of them belong to one message (the service
+    /// gives every chunk it publishes an ID; only journals written before it did lack them).
     /// </summary>
     static bool TryMerge(JsonObject into, JsonObject next)
     {
         if (!IsTextChunk(next)) return false;
         if ((string?)into["sessionUpdate"] != (string?)next["sessionUpdate"]) return false;
         if ((string?)into["messageId"] is not { } id || (string?)next["messageId"] != id) return false;
+        if (!JsonNode.DeepEquals(into["_meta"], next["_meta"])) return false;
         into["content"]!["text"] = (string?)into["content"]!["text"] + (string?)next["content"]!["text"];
         return true;
     }

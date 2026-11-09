@@ -18,65 +18,69 @@ internal static class HistoryCatchUp
         /// <summary>What follows the journal's mark.</summary>
         AfterMark,
 
-        /// <summary>Everything, because the journal's mark is no longer in the history: it was rewritten.</summary>
-        MarkLost,
-
-        /// <summary>Everything, with no mark to go by (a journal from before marks, or an agent without them, Kimi).</summary>
+        /// <summary>
+        /// All of it: there was no mark (a journal from before marks, an agent without them, Kimi),
+        /// or the mark is no longer in the history.
+        /// </summary>
         All,
     }
 
     public enum Kind { Nothing, Append, Replace }
 
-    /// <summary>The updates to append, or the journal's new entries.</summary>
-    public sealed record Plan(Kind Kind, List<JsonObject> Updates);
+    /// <summary>
+    /// The updates to append, or the journal's new entries; whether they are only the end of the
+    /// history (the replay was longer than the journal keeps); and why, for the log.
+    /// </summary>
+    public sealed record Plan(Kind Kind, List<JsonObject> Updates, bool Trimmed, string Why);
 
     public const string NativeOrigin = "native";
     public const string NoticeOrigin = "notice";
     public const string HistoryRewritten = "historyRewritten";
 
+    const string Reminder = "<system-reminder>";
+    const string ReminderEnd = "</system-reminder>";
+
     /// <param name="journal">The journal as it is.</param>
-    /// <param name="replay">The agent's updates in the order it sent them.</param>
+    /// <param name="replay">The agent's updates in the order it sent them (its last ones, when <paramref name="dropped"/>).</param>
+    /// <param name="dropped">Older updates of the replay were dropped, as the journal could not keep them.</param>
     /// <param name="agent">The agent's display name, for the notice of a rewrite.</param>
-    public static Plan Make(IReadOnlyList<JsonNode> journal, IReadOnlyList<JsonObject> replay, Replayed replayed, string agent)
+    public static Plan Make(IReadOnlyList<JsonNode> journal, IReadOnlyList<JsonObject> replay, Replayed replayed, string agent, bool dropped = false)
     {
-        // Only a turn's parts are history; a replayed mode or command list is state. Text the agent
-        // put into a user message itself (Kimi's system reminders) was not typed and is left out.
-        var history = replay.Where(u => SessionJournal.IsTurnKind((string?)u["sessionUpdate"]) && !IsInjected(u)).ToList();
-        var known = KnownIds(journal);
-        switch (replayed)
-        {
-            case Replayed.AfterMark:
-                return Appending(history.Where(u => !known.Contains(IdOf(u) ?? "")));
-            case Replayed.MarkLost:
-                return Rewritten(journal, history, agent);
-        }
+        // Only a turn's parts are history; text the agent put into a user message itself (a
+        // leading system reminder, as Kimi adds one to each) was not typed and is cut off.
+        var history = replay.Where(u => SessionJournal.IsTurnKind((string?)u["sessionUpdate"])).Select(WithoutReminder).OfType<JsonObject>().ToList();
+        var known = KnownKeys(journal);
+        if (replayed == Replayed.AfterMark)
+            return Appending(history.Where(u => !known.Contains(KnownKey(u))), native: true, dropped, "after the mark");
         var parts = journal.OfType<JsonObject>().Where(e => SessionJournal.IsTurnKind((string?)e["sessionUpdate"]) && !IsNotice(e)).ToList();
-        if (parts.Count == 0) return Appending(history);
-        // The journal's last part of a turn from the agent that the history has, by ID ...
-        for (var i = parts.Count - 1; i >= 0; i--)
+        if (parts.Count == 0) return Appending(history, native: false, dropped, "imported"); // the first import is just that
+        // A replay without a single turn says nothing about the journal's turns (an empty or
+        // unreadable history, turns without items): the journal stays.
+        if (history.Count == 0) return new Plan(Kind.Nothing, [], false, "the agent replayed no turn; the journal is kept");
+        // The journal's last part of a turn from the agent, by its ID: the history goes on after it.
+        if (parts.LastOrDefault(p => IsAgentPart(p) && AnchorId(p) is not null) is { } last)
         {
-            if (!IsAgentPart(parts[i]) || IdOf(parts[i]) is not { } id) continue;
-            var at = history.FindLastIndex(u => IdOf(u) == id);
-            if (at >= 0) return Appending(history.Skip(at + 1).Where(u => !known.Contains(IdOf(u) ?? "")));
+            var at = history.FindLastIndex(u => AnchorId(u) == AnchorId(last));
+            if (at >= 0) return Appending(history.Skip(at + 1).Where(u => !known.Contains(KnownKey(u))), native: true, dropped, "aligned by ID");
         }
-        // ... else its last user messages, by text: an agent that gives no IDs (Kimi), or prompts
-        // the agent keeps under IDs of its own (Claude).
-        if (AfterUserTexts(parts, history) is { } next)
-            return Appending(history.Skip(next).Where(u => !known.Contains(IdOf(u) ?? "")));
-        return Rewritten(journal, history, agent);
+        // Else by the user messages' text: an agent that gives no IDs (Kimi), or a last part of the
+        // journal's that has an ID of the service's (a text Claude gave none).
+        var (next, why) = AfterUserTexts(parts, history);
+        if (next is { } from) return Appending(history.Skip(from).Where(u => !known.Contains(KnownKey(u))), native: true, dropped, why);
+        return Rewritten(journal, history, agent, dropped, why);
     }
 
-    static Plan Appending(IEnumerable<JsonObject> updates)
+    static Plan Appending(IEnumerable<JsonObject> updates, bool native, bool dropped, string why)
     {
-        var tagged = updates.Select(Native).ToList();
-        return new Plan(tagged.Count == 0 ? Kind.Nothing : Kind.Append, tagged);
+        var copies = updates.Select(u => native ? Native(u) : (JsonObject)u.DeepClone()).ToList();
+        return new Plan(copies.Count == 0 ? Kind.Nothing : Kind.Append, copies, dropped, why);
     }
 
     /// <summary>
     /// The journal anew: a notice that says what happened, then the agent's history, whose messages
     /// keep the journal's IDs where they are the same messages.
     /// </summary>
-    static Plan Rewritten(IReadOnlyList<JsonNode> journal, List<JsonObject> history, string agent)
+    static Plan Rewritten(IReadOnlyList<JsonNode> journal, List<JsonObject> history, string agent, bool dropped, string why)
     {
         var entries = new List<JsonObject>
         {
@@ -97,7 +101,7 @@ internal static class HistoryCatchUp
         // The journal's user messages by text, for an agent that replays them without the journal's IDs.
         var userIds = new Dictionary<string, Queue<string>>(StringComparer.Ordinal);
         foreach (var m in Messages(journal.OfType<JsonObject>().Where(e => !IsNotice(e)).ToList()))
-            if (m.Kind == "user_message_chunk" && m.Id is { } id)
+            if (m.Kind == "user_message_chunk" && m.Id is { } id && m.Text.Length > 0)
             {
                 if (!userIds.TryGetValue(m.Text, out var ids)) userIds[m.Text] = ids = new();
                 ids.Enqueue(id);
@@ -112,28 +116,56 @@ internal static class HistoryCatchUp
             for (var i = m.Start; i < m.End; i++) copy[i]["messageId"] = id;
         }
         entries.AddRange(copy.Select(Native));
-        return new Plan(Kind.Replace, entries);
+        return new Plan(Kind.Replace, entries, dropped, why);
     }
 
     /// <summary>
-    /// Where the history goes on past the journal, found by the journal's last user messages in a
-    /// row (three, else two, else the last alone, as a compaction may have kept only that; the
-    /// latest occurrence): the start of the next user message, or the end.
+    /// Where the history goes on past the journal, found by the user messages' text (compared
+    /// without white space; an empty text, a prompt of only an image, is left out of both):
+    /// the journal's user messages as the start of the history's; else its last three in a row,
+    /// else two, else the last alone (a compaction may keep only the end), where they occur once.
+    /// Occurring more than once is not taken: a turn could be skipped. Returns where the new part
+    /// starts: the next user message, or right after the matched one when the journal has no
+    /// answer to it yet.
     /// </summary>
-    static int? AfterUserTexts(List<JsonObject> journal, List<JsonObject> history)
+    static (int? From, string Why) AfterUserTexts(List<JsonObject> journal, List<JsonObject> history)
     {
-        var mine = Messages(journal).Where(m => m.Kind == "user_message_chunk").Select(m => m.Text).ToList();
-        var theirs = Messages(history).Where(m => m.Kind == "user_message_chunk").ToList();
-        for (var k = Math.Min(3, mine.Count); k >= 1; k--)
-            for (var i = theirs.Count - k; i >= 0; i--)
+        var mine = Messages(journal).Where(m => m.Kind == "user_message_chunk" && m.Text.Length > 0).ToList();
+        var theirs = Messages(history).Where(m => m.Kind == "user_message_chunk" && m.Text.Length > 0).ToList();
+        if (mine.Count == 0) return (null, "no user message to align by");
+        int? matched = null;
+        var why = "";
+        if (theirs.Count >= mine.Count && mine.Select((m, i) => theirs[i].Text == m.Text).All(same => same))
+        {
+            matched = mine.Count - 1;
+            why = "the journal is the start of the history";
+        }
+        for (var k = Math.Min(3, mine.Count); matched is null && k >= 1; k--)
+        {
+            var at = new List<int>();
+            for (var i = 0; i + k <= theirs.Count; i++)
             {
                 var same = true;
-                for (var j = 0; j < k && same; j++) same = theirs[i + j].Text == mine[mine.Count - k + j];
-                if (!same) continue;
-                var last = i + k - 1;
-                return last + 1 < theirs.Count ? theirs[last + 1].Start : history.Count;
+                for (var j = 0; j < k && same; j++) same = theirs[i + j].Text == mine[mine.Count - k + j].Text;
+                if (same) at.Add(i + k - 1);
             }
-        return null;
+            if (at.Count > 1) return (null, $"the journal's last {k} user messages occur {at.Count} times in the history");
+            if (at.Count == 1)
+            {
+                matched = at[0];
+                why = $"aligned by the last {k} user messages";
+            }
+        }
+        if (matched is not { } u) return (null, "the journal's last user messages are not in the history");
+        var answer = journal.Skip(mine[^1].End).Where(IsAgentPart).ToList();
+        // The journal's last user message got no answer in it yet (the service stopped in the turn): its answer is new.
+        if (answer.Count == 0) return (theirs[u].End, why);
+        var turnEnd = u + 1 < theirs.Count ? theirs[u + 1].Start : history.Count;
+        // An agent that gives IDs answered that turn with other messages: it was taken again, not the same turn.
+        var mineIds = answer.Select(AnchorId).OfType<string>().ToHashSet(StringComparer.Ordinal);
+        var theirIds = history.Skip(theirs[u].End).Take(turnEnd - theirs[u].End).Where(IsAgentPart).Select(AnchorId).OfType<string>().ToList();
+        if (theirIds.Count > 0 && !theirIds.Any(mineIds.Contains)) return (null, "the journal's last turn was answered differently in the history");
+        return (turnEnd, why);
     }
 
     /// <summary>A message: consecutive chunks of one kind and one <c>messageId</c> (or none), as a client would read them.</summary>
@@ -151,7 +183,7 @@ internal static class HistoryCatchUp
             var start = i;
             while (i < updates.Count && (string?)updates[i]["sessionUpdate"] == kind && (string?)updates[i]["messageId"] == id)
             {
-                text.Append((string?)updates[i]["content"]?["text"]);
+                text.Append(updates[i]["content"]?["text"] is JsonValue t && t.TryGetValue<string>(out var s) ? s : "");
                 i++;
             }
             all.Add(new Message(start, i, kind!, id, Normalized(text.ToString())));
@@ -162,31 +194,55 @@ internal static class HistoryCatchUp
     /// <summary>Text compared without its white space: a prompt of two blocks comes back joined differently.</summary>
     static string Normalized(string text) => string.Concat(text.Where(c => !char.IsWhiteSpace(c)));
 
-    /// <summary>A message's or tool call's ID, kept apart by kind (IDs are unique per kind of thing).</summary>
-    static string? IdOf(JsonNode? update)
+    /// <summary>A message's or tool call's ID, apart by kind, to find a part of a turn in the history.</summary>
+    static string? AnchorId(JsonNode? update)
     {
         var kind = (string?)update?["sessionUpdate"];
-        if (SessionJournal.IsChunkKind(kind)) return (string?)update!["messageId"] is { } m ? "m:" + m : null;
-        if (kind is "tool_call" or "tool_call_update") return (string?)update!["toolCallId"] is { } t ? "t:" + t : null;
+        if (SessionJournal.IsChunkKind(kind)) return update!["messageId"] is JsonValue m && m.TryGetValue<string>(out var id) ? $"{kind}:{id}" : null;
+        if (kind is "tool_call" or "tool_call_update") return update!["toolCallId"] is JsonValue t && t.TryGetValue<string>(out var id) ? "tool:" + id : null;
         return null;
     }
 
-    static HashSet<string> KnownIds(IReadOnlyList<JsonNode> journal)
+    /// <summary>
+    /// What the journal already has of an update: a message by its ID, a tool call by its ID and
+    /// status, so a tool call the journal has only started still gets the update that ends it.
+    /// </summary>
+    static string KnownKey(JsonNode? update)
+    {
+        var id = AnchorId(update);
+        if (id is null) return "";
+        return id.StartsWith("tool:", StringComparison.Ordinal) ? $"{id}:{(update!["status"] is JsonValue s && s.TryGetValue<string>(out var status) ? status : "")}" : id;
+    }
+
+    static HashSet<string> KnownKeys(IReadOnlyList<JsonNode> journal)
     {
         var known = new HashSet<string>(StringComparer.Ordinal);
         foreach (var entry in journal)
-            if (IdOf(entry) is { } id) known.Add(id);
+            if (KnownKey(entry) is { Length: > 0 } key) known.Add(key);
         return known;
     }
-
-    /// <summary>A part of a user message that the agent added to it, as Kimi adds a system reminder to each.</summary>
-    static bool IsInjected(JsonObject update) =>
-        (string?)update["sessionUpdate"] == "user_message_chunk"
-        && ((string?)update["content"]?["text"])?.TrimStart().StartsWith("<system-reminder>", StringComparison.Ordinal) == true;
 
     static bool IsAgentPart(JsonObject update) => (string?)update["sessionUpdate"] is "agent_message_chunk" or "agent_thought_chunk" or "tool_call" or "tool_call_update";
 
     static bool IsNotice(JsonObject entry) => (string?)entry["_meta"]?[GorynychProtocol.MetaOrigin] == NoticeOrigin;
+
+    /// <summary>
+    /// A user message chunk without the system reminders it starts with (Kimi puts one of its own
+    /// after every replayed user message, as a part of its own); null when nothing else is left. A
+    /// reminder anywhere else is part of what the person wrote and stays.
+    /// </summary>
+    static JsonObject? WithoutReminder(JsonObject update)
+    {
+        if ((string?)update["sessionUpdate"] != "user_message_chunk" || update["content"]?["text"] is not JsonValue v || !v.TryGetValue<string>(out var text)) return update;
+        var rest = text;
+        while (rest.TrimStart().StartsWith(Reminder, StringComparison.Ordinal) && rest.IndexOf(ReminderEnd, StringComparison.Ordinal) is var end && end >= 0)
+            rest = rest[(end + ReminderEnd.Length)..];
+        if (ReferenceEquals(rest, text)) return update;
+        if (rest.Trim().Length == 0) return null;
+        var copy = (JsonObject)update.DeepClone();
+        copy["content"]!["text"] = rest.TrimStart();
+        return copy;
+    }
 
     /// <summary>A copy marked as coming from the agent's own history, unless the agent named its origin.</summary>
     static JsonObject Native(JsonObject update)

@@ -425,7 +425,7 @@ public sealed class CodexAdapterTests
         Assert.AreEqual(("t1-u1", "Fix the flaky test"), ((string?)Of(zed, "user_message_chunk")[0]["messageId"], (string?)Of(zed, "user_message_chunk")[0]["content"]!["text"]));
         Assert.AreEqual("t1-msg1", (string?)Of(zed, "agent_message_chunk")[0]["messageId"]);
         Assert.AreEqual("completed", (string?)Of(zed, "tool_call")[0]["status"]);
-        Assert.IsTrue(zed.Snapshot().Where(u => (string?)u["sessionUpdate"] != "config_option_update").All(u => (string?)u["_meta"]?["gorynych/origin"] == "native"));
+        Assert.IsTrue(zed.Snapshot().All(u => u["_meta"]?["gorynych/origin"] is null), "a first import is just that: not marked native");
         var listed = fake.Last("thread/turns/list");
         Assert.AreEqual(("desc", "full"), ((string?)listed["sortDirection"], (string?)listed["itemsView"]));
         Assert.AreEqual("turn-0", conductor.Feed("t1").Journal.NativeMark, "the thread's newest turn");
