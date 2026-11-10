@@ -317,8 +317,9 @@ public sealed class ReadOnlySessionsTests
     {
         // It went between the look and the note, with no event of its lock file: the open looks once more.
         await using var rig = new Rig(heldAtStart: true, lockRecheck: TimeSpan.FromHours(1));
-        rig.LetGoAfterOneLook();
         await using var zed = await rig.ZedAsync();
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject()).WaitAsync(Wait); // the service learns of it
+        rig.LetGoAfterOneLook(); // the open's own look is the one
         var meta = await MetaOfAsync(zed, AcpMethods.Agent.SessionResume);
         Assert.AreEqual(GorynychProtocol.InteractivityFull, Interactivity(meta));
         Assert.AreEqual(1, rig.Fake.All("thread/resume").Length, "taken");
