@@ -224,6 +224,15 @@ field names the message that each `agent_message_chunk`, `agent_thought_chunk` a
 - The journal keeps the updates as they were published, so a replay on `session/load` has the
   live stream's IDs. When it compacts, it merges text chunks only when they share a `messageId`.
 
+**Commands.** The adapter MAY send `available_commands_update` at any time, as ACP allows; each
+list replaces the one before.
+
+- The service keeps the latest list as the session's state and does not journal it. A client
+  that loads or resumes the session gets the current list from the service, so the adapter
+  need not send it again on a load or resume, and a list the same as the current one is not
+  passed on (Kimi sends its list twice on each).
+- Fallback: an adapter that sends none leaves its sessions with no commands.
+
 ## 6. Service turns: opinions and reports
 
 A *service turn* is a turn the service runs on a session on another session's behalf: an
@@ -478,6 +487,7 @@ DSH speaks ACP, and its adapter is a thin proxy.
 | System prompt ([§6.2](#62-the-gorynych-mcp-server)) | `sessionCapabilities.systemPrompt: {}` (append only): `--append-system-prompt`, after the adapter's live-note authorization; other modes and non-text content fail with `-32602` | as headless | not advertised by 2.5.2: the MCP instructions and the requests' texts | append only: `developerInstructions`; Codex keeps those a thread was created with | per launch: `personaSuffix` in the `--patch`, not advertised |
 | Hidden from `gorynych-outside` ([§1](#1-building-and-starting-an-adapter)) | yes: `claude` is the service's child and starts MCP servers as its own children (probe); the adapter's `--settings` also denies `mcp__gorynych-outside` | as headless | yes: `kimi acp` is the service's child and starts MCP servers as its own children (probe) | yes: `codex.exe` is the service's child and starts MCP servers as its own children (probe); also turned off per thread when the user registered it | yes: DSH (node) is the service's child and starts MCP servers as its own children (probe) |
 | … on Linux and macOS | runs there (not tried yet); only the deny rule would hide it | runs on Windows only (ConPTY) | not hidden: the parent walk is Windows only yet, so every caller counts as outside | hidden: turned off per thread | not hidden, as for Kimi |
+| Commands ([§5](#5-prompts-and-turns)) | none sent | none sent | after the `session/new` answer, and twice on each `session/load` and `session/resume` (before the replay, after the answer) | none sent | none seen (new and prompts in the recorded 0.2.2-rc.1 traffic) |
 | Message IDs ([§5](#5-prompts-and-turns)) | answers: the API's `msg_…`; live notes: the `uuid` the adapter wrote them with; texts Claude gives no ID: a new UUID | answers: `MessageDisplay`'s `message_id`; typed and channel messages: the hook's `prompt_id` (the transcript's `promptId`), a new UUID for a channel message within a turn; texts Claude gives no ID: a new UUID | none sent by 2.5.2: the service assigns them | item IDs (`msg_…`, `rs_…`, UUIDv7 user messages); the service's prompt ID kept as `clientUserMessageId` | DSH's on answers; thoughts as `<id>:thought` |
 | Live-note path ([§6.4](#64-the-live-note-path)) | user messages on stdin, `reply` routed by `--reply-url`; `-32600` while not running | the development channel; `-32600` while not running | none (`-32601`) | none (`-32601`); `turn/steer` could carry notes into a running turn later | none (`-32601`) |
 | Turns of its own marked ([§7](#7-closing-and-unloading)) | yes: from the first update of a turn the client did not start (a live note's, or one Claude began itself) to its `result` or the exit | yes: channel and terminal turns, from `UserPromptSubmit` to `Stop` or exit | none to mark: Kimi runs no turn of its own | none: one writer, so the adapter's process drives every turn | none marked: autonomous work after a cancel falls back to idle since the last update |

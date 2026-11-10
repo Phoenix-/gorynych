@@ -56,8 +56,8 @@ server ([Agents outside Gorynych](#agents-outside-gorynych)).
 | `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`, and its extension flags in `agentCapabilities._meta`, as ACP's extensibility rules advertise custom capabilities: `gorynych/sessionsChanged: true` (see [List changes](#list-changes)) and `gorynych/archive: true` (see [Archive](#archive)). The result's own `_meta` has the data `gorynych/serviceId` and `gorynych/agents`, and, deprecated and kept for one release for clients built before the flags moved, the two flags again. No `sessionCapabilities.systemPrompt` yet ([adapter-contract.md](adapter-contract.md#15-open-questions)). |
 | `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`, and a spawned session also `_meta["gorynych/parentSessionId"]` (absent for a session a client created). A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out, and so are archived sessions unless the request has `_meta["gorynych/includeArchived"]: true`; then an archived one carries `_meta["gorynych/archived"]: true`. |
 | `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers` and, for an adapter that advertises `sessionCapabilities.systemPrompt`, the peer instructions as `systemPrompt` in `append` mode (see [What agents are told](#what-agents-are-told)), forwards, records the session as a draft, attaches the client. A client's own `systemPrompt` is refused with `-32602`, here and on `session/load` and `session/resume`: the service does not advertise the capability. |
-| `session/load` | Opens the session in the agent, catching the journal up with the agent's own history first ([History made outside Gorynych](#history-made-outside-gorynych); a session the journal has never seen is imported so), replays the service journal as `session/update`, then attaches the client. Returns the session state (below). |
-| `session/resume` | Opens the session in the agent and attaches the client, without replay. Returns the session state (below). |
+| `session/load` | Opens the session in the agent, catching the journal up with the agent's own history first ([History made outside Gorynych](#history-made-outside-gorynych); a session the journal has never seen is imported so), replays the service journal as `session/update`, then the current list of commands (below), then attaches the client. Returns the session state (below). |
+| `session/resume` | Opens the session in the agent and attaches the client, without replay, after sending it the current list of commands (below). Returns the session state (below). |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
 | `session/close` | Detaches the client. When no other client has the session open, a draft is discarded (see below); any other session has a running turn that a client's prompt started cancelled, as ACP asks of a close (a service turn and a turn of the agent's own go on), and is unloaded from its agent once it has been idle for `--unload-after` minutes ([Unloading idle sessions](#unloading-idle-sessions)). A client that disconnects without it lets go of its sessions all the same, but cancels nothing. |
@@ -73,6 +73,17 @@ from its `session/new`, `session/load` and `session/resume` responses, its
 `config_option_update` and `current_mode_update` notifications, and the responses to forwarded
 `session/set_config_option` and `session/set_mode`. A load whose session the agent cannot take
 returns the history with no state.
+
+The agent's **list of commands** (`available_commands_update`) is the session's state too: in
+ACP each list replaces the one before. The service keeps the latest per session, in memory,
+and does not journal it. The session's clients get a new list as the agent sends it; a list
+the same as the current one is not sent again (Kimi sends its list twice on every
+`session/load` and `session/resume`, [adapters.md](adapters.md#kimi-code)). A client that loads
+the session gets the current list after the journal, and one that resumes it gets the list
+before its answer; both while the request is still open, as an agent's own updates on a load
+come. A journal written before the service kept the list so holds its last list only
+([Journal](#journal)); a load sends that one when the agent has sent none since the service
+started (it cannot take the session, say).
 
 **Message IDs.** Every `agent_message_chunk`, `agent_thought_chunk` and `user_message_chunk`
 a client gets carries ACP's `messageId`, the same on all chunks of one message. An agent's own
@@ -1246,10 +1257,12 @@ writes to the overlay are ignored.
 
 ## Journal
 
-Every `session/update` an adapter sends, and every prompt a client sends, is appended to
+Every `session/update` an adapter sends but its list of commands (session state, see
+[Standard methods](#standard-methods)), and every prompt a client sends, is appended to
 `journal/<session>.<hash>.jsonl` as the raw update object, so variants this schema
 version does not know are kept and replayed unchanged, with the `messageId`s clients got
-live. Past the limit (default 5000 entries) the journal merges consecutive text chunks of one
+live. A journal written before the list was kept apart has one for every time the session was
+opened; read back, it keeps the last one only, and is rewritten so once. Past the limit (default 5000 entries) the journal merges consecutive text chunks of one
 message (the same `messageId`; chunks without one, from journals written before the service
 named every message, are never merged) and then drops the oldest entries down to three
 quarters of the limit. Once it has dropped any, or a catch-up could not keep all that the
@@ -1273,5 +1286,5 @@ memory for the next write; ending a draft is the exception (see above). The acti
 a streaming turn tries a write at most once a second after the last attempt, so a file that
 cannot be written does not slow every update down. A session removed in this run is not
 recreated by a late write, and an activity stamp never creates a record: an update an agent
-sends before its `session/new` answer (Kimi announces its commands) must not list the
-session ahead of time.
+sends before its `session/new` answer must not list the session ahead of time. The list of
+commands is no activity and stamps nothing.

@@ -192,6 +192,11 @@ public sealed class Conductor : IAsyncDisposable
             feed.Active(options.Time.GetUtcNow()); // an agent that sends something is not idle (UnloadIfIdleAsync)
             AgentTurn(feed, update);
             if (feed.CollectReplay(update)) return; // the agent's history, replayed for a catch-up (OpenAsync)
+            if (SessionJournal.IsCommands(update))
+            {
+                await feed.PublishCommandsAsync(update); // the session's state, not its history, nor activity
+                return;
+            }
             KeepSpawnTitle(sessionId, update);
             // The end of a turn of the agent's own may carry the mark of its history (KeepMark).
             var mark = update["_meta"]?[GorynychProtocol.MetaHistoryMark]?.DeepClone();
@@ -601,7 +606,7 @@ public sealed class Conductor : IAsyncDisposable
         RefuseSystemPrompt(request.SystemPrompt);
         using var use = await UseAsync(request.SessionId, ct);
         var (_, opened) = await EnsureLiveAsync(use.Record, ct);
-        use.Feed.Attach(client);
+        await use.Feed.ResumeAndAttachAsync(client);
         // An already open session gets the state the agent last reported, so every client sees its switches.
         return opened ?? use.Feed.State();
     }

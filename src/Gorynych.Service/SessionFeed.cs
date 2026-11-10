@@ -249,7 +249,10 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
                 if (o[key] is { } value) state[key] = value.DeepClone();
     }
 
-    /// <summary>Follows the agent's <c>config_option_update</c> and <c>current_mode_update</c>.</summary>
+    /// <summary>
+    /// Follows the agent's <c>config_option_update</c> and <c>current_mode_update</c>. The list of
+    /// commands is state too, but goes through the feed's gate (<see cref="PublishCommandsAsync"/>).
+    /// </summary>
     public void ApplyStateUpdate(JsonObject update)
     {
         switch ((string?)update["sessionUpdate"])
@@ -260,6 +263,31 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             case "current_mode_update":
                 SetCurrent("modes", "currentModeId", update["currentModeId"]);
                 break;
+        }
+    }
+
+    JsonObject? commands; // under gate
+
+    /// <summary>
+    /// Follows the agent's <c>available_commands_update</c>. In ACP each one replaces the list
+    /// before it, so it is the session's state, not its history: it is not journaled. The attached
+    /// clients get a new list as it comes, and a client that loads or resumes the session gets the
+    /// current one (<see cref="ReplayAndAttachAsync"/>, <see cref="ResumeAndAttachAsync"/>). A list
+    /// the same as the current one is not sent again: Kimi sends it twice on every load and resume.
+    /// </summary>
+    public async Task PublishCommandsAsync(JsonObject update)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (Retired || JsonNode.DeepEquals(commands, update)) return;
+            commands = update.DeepClone().AsObject();
+            foreach (var client in Clients())
+                await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update.DeepClone()));
+        }
+        finally
+        {
+            gate.Release();
         }
     }
 
@@ -574,15 +602,45 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         }
     }
 
-    /// <summary>Sends the journal to <paramref name="client"/>, then attaches it, without losing updates in between.</summary>
+    /// <summary>
+    /// Sends the journal to <paramref name="client"/>, then the current list of commands
+    /// (<see cref="PublishCommandsAsync"/>), then attaches it, without losing updates in between.
+    /// A journal written before the list was kept as state may hold a list (the last one, see
+    /// <see cref="SessionJournal"/>): it is sent last, in place of the current one only when the
+    /// agent has sent none since the service started.
+    /// </summary>
     public async Task ReplayAndAttachAsync(ClientConnection client)
     {
         await gate.WaitAsync();
         try
         {
             if (Retired) return;
+            JsonNode? journaled = null;
             foreach (var update in Journal.ReadAll())
+            {
+                if (SessionJournal.IsCommands(update)) { journaled = update; continue; }
                 if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update))) return;
+            }
+            if ((commands?.DeepClone() ?? journaled) is { } list && !await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(list))) return;
+            Attach(client);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Sends <paramref name="client"/> the current list of commands, then attaches it: a
+    /// <c>session/resume</c> replays no history, but the client still needs the session's state.
+    /// </summary>
+    public async Task ResumeAndAttachAsync(ClientConnection client)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (Retired) return;
+            if (commands?.DeepClone() is { } list && !await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(list))) return;
             Attach(client);
         }
         finally

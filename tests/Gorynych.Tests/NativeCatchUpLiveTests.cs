@@ -290,4 +290,61 @@ public sealed class NativeCatchUpLiveTests
             await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = id });
         }
     }
+
+    /// <summary>
+    /// Kimi sends its list of commands twice on every load and resume. Opened twice in a row, a
+    /// session's journal gets no list, and the client that loads it gets the list once, after the
+    /// history, while its load is still open (as Zed takes it); one that resumes it gets it too.
+    /// </summary>
+    [TestMethod]
+    [Timeout(600_000, CooperativeCancellation = true)]
+    public async Task Kimi_TwoOpensInARow_AddNoListOfCommandsToTheJournal_AndTheClientGetsTheListOnce()
+    {
+        RequireLive("kimi");
+        var dir = TestDirs.New();
+        var folder = Directory.CreateDirectory(Path.Combine(dir, "work")).FullName;
+        await using var conductor = Conductor(dir, new KimiAdapter(new KimiAdapterOptions()));
+        string id;
+        await using (var zed = await TestClient.ConnectAsync(conductor, "live", agent: "kimi"))
+        {
+            id = (await zed.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+                new NewSessionRequest { Cwd = folder, McpServers = [] })).SessionId;
+            await zed.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = "Reply with exactly OK and nothing else." }] });
+            await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+        }
+        await conductor.CleanupsIdleAsync();
+        var journal = Path.Combine(dir, "journal", SessionJournal.FileNameFor(id));
+        static int Lists(string path) => File.ReadAllLines(path).Count(l => l.Contains("\"available_commands_update\"", StringComparison.Ordinal));
+        var lines = File.ReadAllLines(journal).Length;
+        Console.WriteLine($"kimi {id}: {lines} journal entries, {Lists(journal)} lists of commands");
+        Assert.AreEqual(0, Lists(journal));
+
+        for (var open = 1; open <= 2; open++)
+        {
+            await using var viewer = await TestClient.ConnectAsync(conductor, $"viewer-{open}", agent: "kimi");
+            await viewer.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject { ["sessionId"] = id, ["cwd"] = folder, ["mcpServers"] = new JsonArray() });
+            var loaded = viewer.Snapshot(); // what came while the load was open
+            var lists = loaded.Where(SessionJournal.IsCommands).ToArray();
+            Console.WriteLine($"kimi {id}: open {open}: {loaded.Length} updates, {lists.Length} list(s) of {lists.FirstOrDefault()?["availableCommands"]?.AsArray().Count} commands; journal {File.ReadAllLines(journal).Length} entries, {Lists(journal)} lists");
+            Assert.AreEqual(1, lists.Length, "the list, once");
+            Assert.AreNotEqual(0, lists[0]["availableCommands"]!.AsArray().Count);
+            Assert.IsTrue(SessionJournal.IsCommands(loaded[^1]), "after the history");
+            StringAssert.Contains(AgentText(loaded, _ => true), "OK");
+
+            await using (var other = await TestClient.ConnectAsync(conductor, $"resumer-{open}", agent: "kimi"))
+            {
+                await other.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = id, ["cwd"] = folder });
+                Assert.AreEqual(1, other.Snapshot().Count(SessionJournal.IsCommands), "a resume gets the list too");
+                await other.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+            }
+            await viewer.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+            await conductor.CleanupsIdleAsync(); // unloaded, so the next load opens it in Kimi again
+            Assert.AreEqual(0, Lists(journal));
+            Assert.AreEqual(lines, File.ReadAllLines(journal).Length, "an open adds nothing to the journal");
+        }
+
+        await using var cleanup = await TestClient.ConnectAsync(conductor, "cleanup", agent: "kimi");
+        await cleanup.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = id });
+    }
 }

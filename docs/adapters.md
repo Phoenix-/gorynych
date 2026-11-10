@@ -18,6 +18,13 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   publishes them ([service-protocol.md](service-protocol.md#standard-methods)).
 - `session/new` returns config options (model, thinking, mode) and modes; the first
   prompt immediately yields `session_info_update` with the prompt as the title.
+- **Its list of commands** (`available_commands_update`, 31 commands in 2.5.2) comes after the
+  `session/new` answer, and twice on every `session/load` and `session/resume`: before the
+  replay and again after the answer (probed with 2.5.2 on 10 November 2026; 2.4.1 also sent it
+  twice in a first prompt). The service keeps the latest as the session's state, not in the
+  journal, and passes on only a list that differs from the one before
+  ([service-protocol.md](service-protocol.md#standard-methods)); journaled, every open of a
+  Kimi session had added two lists.
 - `session/list` returns titles and `updatedAt`. A folder may come with forward slashes
   (`C:/Users/x`); the service lists and keeps it in one spelling
   ([service-protocol.md](service-protocol.md#standard-methods)).

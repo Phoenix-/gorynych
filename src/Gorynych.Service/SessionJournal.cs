@@ -6,8 +6,9 @@ using System.Text.Json.Nodes;
 namespace Gorynych.Service;
 
 /// <summary>
-/// The bounded history of one session: every <c>session/update</c> payload, one JSON object
-/// per line, replayed to a client on <c>session/load</c>. When it grows past the limit,
+/// The bounded history of one session: every <c>session/update</c> payload but the list of
+/// commands (<see cref="IsCommands"/>), one JSON object per line, replayed to a client on
+/// <c>session/load</c>. When it grows past the limit,
 /// consecutive text chunks of one message (one <c>messageId</c>) are merged and the oldest
 /// entries dropped.
 /// </summary>
@@ -76,6 +77,12 @@ public sealed class SessionJournal
 
     /// <summary>An update that only a turn produces: a message, a thought, a tool call or a plan.</summary>
     public static bool IsTurnKind(string? kind) => kind is not null && TurnKinds.Contains(kind);
+
+    /// <summary>
+    /// An <c>available_commands_update</c>: the session's state, which the service keeps apart
+    /// (<see cref="SessionFeed.PublishCommandsAsync"/>) and no longer journals.
+    /// </summary>
+    public static bool IsCommands(JsonNode? update) => update is JsonObject o && (string?)o["sessionUpdate"] == "available_commands_update";
 
     /// <summary>How many entries the journal keeps at most; past it, it compacts.</summary>
     public int MaxEntries => maxEntries;
@@ -226,12 +233,22 @@ public sealed class SessionJournal
         if (!File.Exists(path)) return lines;
         var text = File.ReadAllText(path, Encoding.UTF8);
         var dropped = false;
+        var lists = new List<int>();
         foreach (var l in text.Split('\n'))
         {
             if (l.Length == 0) continue;
             if (TryParse(l) is not { } node) { dropped = true; continue; } // a line torn by a crash
             turns |= IsTurn(node);
+            if (IsCommands(node)) lists.Add(lines.Count);
             lines.Add(l);
+        }
+        // A journal written before the commands were kept as state has a list for every time the
+        // session was opened; each replaced the one before, so only the last one is kept.
+        if (lists.Count > 1)
+        {
+            var stale = lists.Take(lists.Count - 1).ToHashSet();
+            lines = lines.Where((_, i) => !stale.Contains(i)).ToList();
+            dropped = true;
         }
         if (dropped || (text.Length > 0 && text[^1] != '\n')) Rewrite(lines);
         return lines;
