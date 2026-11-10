@@ -60,6 +60,9 @@ approval card, one session list, without reading terminals.
 - **Several machines meet in a service, not in the GUI** (decided 10 November 2026). A service
   brings in the sessions of other machines' services as one more adapter; a GUI may still
   connect to any service directly ([Several machines](#several-machines)).
+- **An update breaks no turn** (decided 10 November 2026). Adapters are to run in host processes
+  of their own, so the conductor can restart under running agents
+  ([Updating without losing work](#updating-without-losing-work)).
 - **ACP v1 between them**, with own additions only through ACP's extension points. The
   service is an ACP conductor (the proxy-chains RFD); adapters are ACP agents.
 - **Adapters are build-time assemblies** (or external ACP executables). Loading assemblies at
@@ -128,6 +131,8 @@ flowchart LR
 - **Adapters are ACP agents.** An external one is an executable that speaks ACP over stdio
   (`kimi acp`); an own one (Claude and Codex) is an assembly with an ACP interface over an
   in-memory link, so moving it into its own process later means only wrapping it in JSON-RPC.
+  That move is planned: adapter hosts, so the conductor can restart without breaking a turn
+  ([Updating without losing work](#updating-without-losing-work)).
   DeepSeek Harness speaks ACP itself; its adapter is a thin in-process proxy in front of
   `dsh --profile acp`.
 
@@ -475,8 +480,8 @@ conductor, as the proxy-chains RFD has it.
 - ACP standardizes only stdio so far. ssh brings key authentication and needs no open port,
   so it also reaches a machine inside a corporate network.
 - The hub starts ssh and starts it again when the connection drops. It then resumes the
-  sessions its clients have open. This is the same code as the bridge's reconnect in
-  [Updating without losing work](#updating-without-losing-work).
+  sessions its clients have open. This uses the same resumable link as the bridge and the
+  adapter hosts ([Updating without losing work](#updating-without-losing-work)).
 - The standard OpenSSH for Windows supports only asynchronous stdio and hangs on synchronous
   pipes.
 
@@ -516,42 +521,80 @@ credentials never move between machines.
 
 ## Updating without losing work
 
-Stopping the service today stops every agent: they are its children on stdio. A running turn
-breaks off mid-step, and pending approvals and questions are lost. What stays is the agents'
-native history, the journals and the overlay, so an idle session loses nothing. Updates
-therefore have to wait for a moment when no agent works.
+Stopping the service today stops every agent. The adapters live in the service's process,
+and the agents are their children on stdio. So a running turn breaks off mid-step, and
+pending approvals and questions are lost. What stays is the agents' native history, the
+journals and the overlay, so an idle session loses nothing.
 
-**Planned: an update that waits for its moment.**
-1. The new build is installed next to the running one: Windows cannot overwrite a running exe.
-2. `gorynych update` asks the running service to drain.
-   - It starts no new turn and holds the prompts that come in.
-   - It waits for the running turns, including those of `ask_agent`, flushes the journals and
-     exits.
-   - Then the new build starts.
-3. The bridge reconnects by itself, so the GUI sees only a pause of a few seconds.
-   - It sends `initialize` again.
-   - It resumes the sessions its client has open, with no replay.
-   - It sends the prompts it held.
-4. Agents of idle sessions start again only when their next prompt comes, as after an idle
-   unload.
+**Planned, agreed on 10 November 2026: the process boundary moves to where ACP already is,
+between the conductor and the adapters.**
 
-Fine points:
-- **When to start holding prompts.** Holding from the start would make every session wait for
-  the longest turn. So the update first watches for a moment of quiet for a few minutes, and
-  holds only after that.
-- **A turn longer than a limit.** The person is asked whether to wait on, or to stop it. When
-  stopped, the new build asks the agent to continue, and only the step that was cut off is
-  lost.
-- **Bridges keep running the old code** until the GUI restarts. So the bridge stays thin, and
-  its reconnect stays compatible across versions.
+**Adapter hosts and a light conductor.**
+- An adapter runs in a small process of its own, an *adapter host*. It is the same executable
+  in another mode, and it owns its agents and all their state.
+- The conductor keeps the journals, the catalog, the routing, the approval policy and the
+  peers server. That is the part that changes most often.
+- Restarting the conductor takes seconds and breaks no turn:
+  1. The old conductor flushes its journals and exits, and the new one starts.
+  2. Each host reconnects and reports its live sessions, its running turns and the approvals
+     not yet answered. It buffered the updates that came while no conductor was there, and
+     hands them over now, so the journal misses nothing.
+  3. The bridge reconnects too. It keeps the client's `session/prompt` open and answers it
+     when the turn ends, so the GUI sees a pause in the stream, not a break.
+- How many hosts depends on the agent:
+  - Claude runs a process per session, so it gets a host per session.
+  - Codex runs one app-server for all threads, Kimi one process, and DSH a process per mode.
+    Each of them gets one host for the adapter.
 
-**Later: turns that live through an update.** A small keeper process that hardly ever changes
-would hold the agents' stdio and pseudo consoles, so a new service could take them over in the
-middle of a turn. It is expensive and has many edge cases:
-- the JSON-RPC IDs of the old service's requests;
-- the Claude adapter's state in mid-turn;
-- the port of the TUI's hooks, which is fixed at launch;
-- the Windows job objects the agents run in.
+**Updating an adapter.**
+- New sessions start on the new host at once.
+- A live session moves over when it is unloaded idle, or when its host has no running turn.
+  That is waiting for one adapter, not for the whole machine, and Claude's host per session
+  makes it one session at a time.
+- A drain is needed only when a host with running turns cannot wait. It starts no new turn,
+  holds the prompts that come in, and waits for the running turns.
+
+**One resumable link, three uses.** The same mechanism serves:
+- the hub and a remote service over ssh;
+- the bridge and the service across a restart;
+- the conductor and its hosts.
+
+Each time one side lives on while the other restarts or loses the connection. After
+reconnecting they shake hands again, list the live sessions, hand over the updates after the
+last acknowledged one, and send the pending requests again. So it is built once.
+
+**Standards for the link.** Checked on 10 November 2026: ACP schema v1.30.0, MCP 2026-07-28.
+- Neither standard redelivers messages missed while disconnected.
+  - ACP's draft RFD for Streamable HTTP and WebSocket keeps sessions across a disconnect, and
+    a client resumes them with `session/load`. But it redelivers nothing sent in between, and
+    leaves message IDs and resumption to v2.
+  - MCP 2026-07-28 dropped resumption by `Last-Event-ID`: the request is its unit of recovery.
+  - The proxy-chains RFD calls restarting a component conductor behaviour, not protocol.
+- So the link uses what ACP has:
+  - Reconnecting is `session/resume` for each live session (stable since April 2026).
+  - It carries a replay cursor shaped like the v2 draft's `replayFrom`:
+    `_meta["gorynych/replayFrom"]` with a `gorynych/after` mark, as the
+    [native catch-up](service-protocol.md#history-made-outside-gorynych) already sends.
+  - The side that lives on sends its pending requests again.
+- To align with later:
+  - v2 of the transport RFD;
+  - a proposed `session/attach` with delta sync after a message ID (not yet checked).
+
+**Edge cases.**
+- **Versions.** A new conductor talks to older hosts: the link's version is announced at
+  `initialize`, and at least the previous one is supported. Bridges keep running the old code
+  until the GUI restarts, so the bridge stays thin.
+- **Orphans.** A host whose conductor does not come back, after a crash or an uninstall,
+  finishes its running turns and exits after a timeout.
+- **The peers server inside an agent** reconnects by itself. An `ask_agent` that was waiting
+  during the restart returns an error that says to ask again.
+- **Job objects.** Hosts are detached from the service's process, as `DetachedProcess` already
+  does for the service.
+- **The first update** onto this scheme still stops the agents.
+
+This replaces the two levels considered first. One was a drain of the whole machine before
+every update. The other was a keeper of the agents' raw stdio, which needs the adapters' state
+rebuilt in mid-turn. With hosts that state never has to be rebuilt, because it lives on.
 
 ## The GUI
 
@@ -601,9 +644,11 @@ Next, in order (**planned**):
 1. A remote service reachable over `ssh -T`: the pipe lets a local ssh client in, and the
    service starts from a scheduled task with a limited token
    ([Several machines](#several-machines)).
-2. The hub: remote services as an adapter, one list, the bridge's reconnect, and the update that
-   waits for its moment ([Updating without losing work](#updating-without-losing-work)).
-3. Questions and child sessions between machines, through the hub.
+2. The resumable link, and the bridge's reconnect over it
+   ([Updating without losing work](#updating-without-losing-work)).
+3. Adapter hosts, and a conductor that restarts without breaking a turn.
+4. The hub: remote services as an adapter over the same link, and one list.
+5. Questions and child sessions between machines, through the hub.
 
 ## Probe results
 
