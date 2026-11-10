@@ -101,7 +101,8 @@ public static class AcpBridge
     /// </summary>
     public static Task<int> RestartAsync(string pipe, bool wait, TimeSpan timeout, bool force, int waitSeconds = 30) => StopAsync("restart", pipe, waitSeconds, async (rpc, processId) =>
     {
-        var waiting = wait && timeout > TimeSpan.Zero ? $"waits up to {timeout.TotalMinutes:0.#} min for the running ones" : "does not wait for the running ones";
+        var waiting = !wait || timeout <= TimeSpan.Zero ? "does not wait for the running ones"
+            : $"waits up to {(timeout < TimeSpan.FromMinutes(1) ? $"{timeout.TotalSeconds:0.#} s" : $"{timeout.TotalMinutes:0.#} min")} for the running ones";
         Console.Error.WriteLine($"gorynych restart: asked the service (process {processId}) to restart; it starts no new turn and {waiting}, " +
             (force ? "then cancels what still runs" : "and stays if any still runs"));
         try

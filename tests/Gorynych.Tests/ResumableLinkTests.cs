@@ -277,7 +277,7 @@ public sealed class ResumableLinkTests
         var restart = admin.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = true, ["timeoutSeconds"] = 1.5 });
         await LinkHarness.Until(() => zed.Log().Contains("restarting"), "the link to hear of it");
         var held = zed.PromptAsync(other, "two");
-        var behind = zed.Zed.SendRequestAsync(GorynychProtocol.MethodRead, new JsonObject { ["sessionId"] = other });
+        var behind = zed.Zed.SendRequestAsync(AcpMethods.Agent.SessionSetMode, new JsonObject { ["sessionId"] = other, ["modeId"] = "plan" });
         // The rest the draining service still serves: a new thread opens, the list comes.
         Assert.IsNotNull(await zed.Zed.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject()).WaitAsync(TimeSpan.FromSeconds(1)));
         await zed.NewSessionAsync().WaitAsync(TimeSpan.FromSeconds(1));
@@ -286,7 +286,8 @@ public sealed class ResumableLinkTests
 
         Assert.IsFalse((bool)(await restart.WaitAsync(Wait))!["restarted"]!, "the turn outlasted the wait");
         await LinkHarness.Until(() => zed.Log().Contains("called its restart off"), "the link to hear of it");
-        await behind.WaitAsync(Wait);
+        // It reached the agent now (which has no modes, and says so).
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => behind.WaitAsync(Wait));
         agent.Release();
 
         Assert.AreEqual("end_turn", (string?)(await running.WaitAsync(Wait))!["stopReason"]);
@@ -324,6 +325,63 @@ public sealed class ResumableLinkTests
         CollectionAssert.AreEquivalent(new[] { "one", "two" }, agent.Prompts.ToArray());
         Assert.AreEqual(1, zed.Connects);
         NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ARefusalThatComesAfterTheCallOff_GoesAgainAtOnceToTheSameService()
+    {
+        // A service that sends, on cue, the order the real one may but cannot be made to: the
+        // call-off of a restart before the refusal of a prompt that restart made.
+        var pair = new DuplexLink();
+        var (si, so) = pair.AgentEnd;
+        var prompts = 0;
+        JsonRpcConnection? fake = null;
+        fake = new JsonRpcConnection(si, so, "fake-service")
+        {
+            RequestHandler = async (req, ct) =>
+            {
+                switch (req.Method)
+                {
+                    case AcpMethods.Agent.Initialize:
+                        return new JsonObject
+                        {
+                            ["protocolVersion"] = 1,
+                            ["agentCapabilities"] = new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.CapLink] = 1 } },
+                        };
+                    case AcpMethods.Agent.SessionNew:
+                        return new JsonObject { ["sessionId"] = "s1" };
+                    case AcpMethods.Agent.SessionPrompt when Interlocked.Increment(ref prompts) == 1:
+                        await fake!.SendNotificationAsync(GorynychProtocol.MethodRestarting, new JsonObject { ["restart"] = 7 });
+                        await fake.SendNotificationAsync(GorynychProtocol.MethodRestartAborted, new JsonObject { ["restart"] = 7 });
+                        throw new JsonRpcException(JsonRpcException.InternalError, "restarting",
+                            new JsonObject { [GorynychProtocol.MetaRestarting] = true, [GorynychProtocol.MetaRestart] = 7 });
+                    case AcpMethods.Agent.SessionPrompt:
+                        return new JsonObject { ["stopReason"] = "end_turn" };
+                    default:
+                        throw new JsonRpcException(JsonRpcException.MethodNotFound, req.Method);
+                }
+            },
+        };
+        fake.Start();
+        var zedPair = new DuplexLink();
+        await using var zed = new JsonRpcConnection(zedPair.ClientEnd.Input, zedPair.ClientEnd.Output, "zed");
+        zed.Start();
+        var link = new ResumableLink(zedPair.AgentEnd.Input, zedPair.AgentEnd.Output, _ => throw new IOException("no other service"));
+        var running = link.RunAsync(pair.ClientEnd);
+        await zed.SendRequestAsync(AcpMethods.Agent.Initialize, new JsonObject { ["protocolVersion"] = 1 }).WaitAsync(Wait);
+        await zed.SendRequestAsync(AcpMethods.Agent.SessionNew, new JsonObject { ["cwd"] = Path.GetTempPath(), ["mcpServers"] = new JsonArray() }).WaitAsync(Wait);
+
+        var result = await zed.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject
+        {
+            ["sessionId"] = "s1", ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "one" }),
+        }).WaitAsync(Wait);
+
+        Assert.AreEqual("end_turn", (string?)result!["stopReason"]);
+        Assert.AreEqual(2, Volatile.Read(ref prompts), "sent again to the service that called the restart off, at once");
+        await zed.DisposeAsync();
+        Assert.AreEqual(0, await running.WaitAsync(Wait), "the client went: the link ends");
+        await fake.DisposeAsync();
     }
 
     [TestMethod]

@@ -808,8 +808,6 @@ public sealed class ResumableLink
                 restarting = false;
                 // First what went out before the connection was lost, then what came since.
                 waiting = again.OrderBy(r => r.Id).Where(r => upstream.ContainsKey(r.Id)).Select(r => (Again(r), (Upstream?)r)).ToList();
-                // A mark from where it was refused says nothing of where it goes now.
-                foreach (var r in again) r.Ended = null;
                 again.Clear();
             }
             waiting.AddRange(outbox);
