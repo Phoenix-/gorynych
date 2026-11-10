@@ -449,6 +449,54 @@ public sealed class ResumableLinkTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ALoadTheClientAsksFor_ShowsItsOwnPrompts_AsAnyHistory()
+    {
+        await using var service = Service(TestDirs.New(), new TurnAgent("turns"));
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        await zed.PromptAsync(sid, "one").WaitAsync(Wait);
+        await zed.Zed.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = sid }).WaitAsync(Wait);
+        lock (zed.Updates) zed.Updates.Clear();
+
+        // Zed drops a thread and loads it again later, through the same bridge.
+        await zed.Zed.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject
+        {
+            ["sessionId"] = sid, ["cwd"] = Path.GetTempPath(), ["mcpServers"] = new JsonArray(),
+        }).WaitAsync(Wait);
+
+        var user = zed.Kinds().Count(k => k == "user_message_chunk");
+        Assert.AreEqual(1, user, "the history shows what the person wrote, though this bridge sent it");
+        Assert.AreEqual("started:one done:one ", zed.Text());
+        lock (zed.Updates) Assert.IsFalse(zed.Updates.Any(u => (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended"), "the marks stay with the link");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ACancelSentWhileTheConnectionIsDown_StopsTheTurnThatRunsOn()
+    {
+        var agent = new TurnAgent("turns") { Hold = true };
+        await using var service = Service(TestDirs.New(), agent);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+
+        zed.ConnectGate = new TaskCompletionSource();
+        zed.Break();
+        await LinkHarness.Until(() => zed.Log().Contains("lost the connection"), "the link to see it");
+        await zed.Zed.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sid });
+        await Task.Delay(200);
+        zed.ConnectGate.SetResult();
+
+        Assert.AreEqual("cancelled", (string?)(await prompt.WaitAsync(Wait))!["stopReason"], "the cancel reached the turn in the service, which ran on");
+        Assert.AreEqual("started:one ", zed.Text(), "it never got to its end");
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
     public async Task ADraftIsKeptForAClientOnTheLink_WhoseConnectionDropped_AndItsFirstPromptRuns()
     {
         var agent = new TurnAgent("turns");

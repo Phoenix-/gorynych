@@ -136,15 +136,23 @@ public sealed class ResumeTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task APromptWhoseClientStays_LeavesNoMark()
+    public async Task APromptWithAnId_LeavesTheMarkOfItsEnd_BeforeItsAnswer_EvenWithItsClientThere_AndOneWithoutAnIdNone()
     {
         var agent = new TurnAgent("turns");
         await using var conductor = TestDirs.Conductor(TestDirs.New(), agent);
         await using var a = await TestClient.ConnectAsync(conductor, "a");
         var sid = (await a.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest { Cwd = Path.GetTempPath() })).SessionId;
+        await Prompt(a, sid, "plain");
+        Assert.IsFalse(conductor.Feed(sid).Journal.ReadAll().Any(e => (string?)e["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended"), "a plain client's answer says how it ended");
+
         var result = await a.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, PromptParams(sid, "one", promptId: "p1")).WaitAsync(Wait);
+
         Assert.AreEqual("end_turn", (string?)result!["stopReason"]);
-        Assert.IsFalse(conductor.Feed(sid).Journal.ReadAll().Any(e => (string?)e["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended"), "its answer said how it ended");
+        // A connection may be gone before the service notices, and its answer with it: the mark says how it ended.
+        var mark = a.Snapshot().Last();
+        Assert.AreEqual("p1", (string?)mark["_meta"]?[GorynychProtocol.MetaPromptId], "the client got it before the answer");
+        Assert.AreEqual("end_turn", (string?)mark["_meta"]?[GorynychProtocol.MetaStopReason]);
+        Assert.AreEqual(1, conductor.Feed(sid).Journal.ReadAll().Count(e => (string?)e["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended"));
     }
 
     [TestMethod]

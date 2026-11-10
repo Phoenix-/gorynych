@@ -79,6 +79,7 @@ public sealed class ResumableLink
     readonly Dictionary<string, JsonObject> live = new(StringComparer.Ordinal);
     readonly Dictionary<string, string> cursors = new(StringComparer.Ordinal);
     readonly HashSet<string> promptIds = new(StringComparer.Ordinal);
+    readonly HashSet<string> resuming = new(StringComparer.Ordinal); // sessions the link's handshake is resuming now
     readonly Dictionary<long, Downstream> downstream = [];
     long nextUpstream;
     long nextDownstream;
@@ -223,8 +224,10 @@ public sealed class ResumableLink
             lock (state)
             {
                 foreach (var r in dropped) upstream.Remove(r.Id);
+                // One that went out (held now, or about to be if its connection is going) is
+                // cancelled again in the agent that comes back, if it runs there.
                 foreach (var r in upstream.Values)
-                    if (r.Held && r.SessionId == sessionId) r.CancelAsked = true;
+                    if (r.Method == AcpMethods.Agent.SessionPrompt && r.SessionId == sessionId && r.Generation != 0) r.CancelAsked = true;
                 foreach (var r in again.Where(r => r.Method == AcpMethods.Agent.SessionPrompt && r.SessionId == sessionId).ToList())
                 {
                     again.Remove(r);
@@ -233,11 +236,29 @@ public sealed class ResumableLink
                 }
             }
             foreach (var r in dropped) await AnswerAsync(r, Result(StopReason.Cancelled));
-            // The running turn: at once, ahead of anything waiting.
-            if (await CurrentAsync() is { } now) await TryWriteAsync(now, message);
+            // The running turn: at once, ahead of anything waiting; with no connection, the next one gets it.
+            await SendNowAsync(message);
             return;
         }
         await SendAsync(message, null);
+    }
+
+    /// <summary>
+    /// Sends a message at once, ahead of what waits in the outbox; with no connection, it goes into
+    /// the outbox for the next one, which gets it after its handshake.
+    /// </summary>
+    async Task SendNowAsync(JsonObject message)
+    {
+        await sendGate.WaitAsync();
+        try
+        {
+            if (current is { IsLost: false } connection && await TryWriteAsync(connection, message)) return;
+            outbox.Add((message, null));
+        }
+        finally
+        {
+            sendGate.Release();
+        }
     }
 
     async Task ClientCancelsAsync(JsonNode? clientId)
@@ -264,11 +285,17 @@ public sealed class ResumableLink
             await AnswerAsync(request, Error(JsonRpcException.RequestCancelled, "Request cancelled"));
             return;
         }
-        if (await CurrentAsync() is { } connection && request.Generation == connection.Generation)
+        int sentOn;
+        lock (state) sentOn = request.Generation;
+        if (await CurrentAsync() is { } connection && sentOn == connection.Generation)
             await TryWriteAsync(connection, Notification(AcpMethods.Protocol.CancelRequest, new JsonObject { ["requestId"] = request.Id }));
     }
 
-    /// <summary>The client answered a request of the agent's: to the connection that asks it now, or kept for the next one.</summary>
+    /// <summary>
+    /// The client answered a request of the agent's: to the connection that asks it now. The answer
+    /// is kept until the turn it belongs to is over: a write to a connection on its way out may land
+    /// and still be lost, and the agent that comes back asks it again (ServiceRequestAsync).
+    /// </summary>
     async Task ClientAnsweredAsync(JsonNode id, JsonObject message)
     {
         if (!TryId(id, out var key)) return;
@@ -285,9 +312,7 @@ public sealed class ResumableLink
             target = question.Connection;
             serviceId = question.ServiceId;
         }
-        if (await TryWriteAsync(target, Response(serviceId, answer)))
-            lock (state) downstream.Remove(key);
-        // Otherwise its connection is gone: the agent that comes back asks it again (ServiceRequestAsync).
+        await TryWriteAsync(target, Response(serviceId, answer));
     }
 
     /// <summary>Sends a client's message to the agent in order, or keeps it for the next connection.</summary>
@@ -372,6 +397,10 @@ public sealed class ResumableLink
                 return;
             }
             upstream.Remove(key);
+            // The turn is over: the answers kept for its questions go.
+            if (request.Method == AcpMethods.Agent.SessionPrompt && request.SessionId is { } turnOver)
+                foreach (var q in downstream.Values.Where(q => q.SessionId == turnOver && q.Answer is not null).ToList())
+                    downstream.Remove(q.ClientFacingId);
         }
         Track(request, message);
         message["id"] = request.ClientId.DeepClone();
@@ -404,7 +433,19 @@ public sealed class ResumableLink
         open.Remove("_meta");
         open.Remove("sessionId");
         live[sessionId] = open;
-        if (Text(result["_meta"]?[GorynychProtocol.MetaPosition]) is { } position) cursors[sessionId] = position;
+        if (Text(result["_meta"]?[GorynychProtocol.MetaPosition]) is { } position) Advance(sessionId, position);
+    }
+
+    /// <summary>
+    /// Moves a session's position on, never back: an answer read after a live update that followed
+    /// it says an earlier position. Positions are numbers; one that is not replaces the known one.
+    /// Under <see cref="state"/>.
+    /// </summary>
+    void Advance(string sessionId, string position)
+    {
+        if (cursors.TryGetValue(sessionId, out var known) && long.TryParse(known, out var at) && long.TryParse(position, out var next) && next <= at)
+            return;
+        cursors[sessionId] = position;
     }
 
     async Task ServiceNotificationAsync(Connection connection, string method, JsonObject message)
@@ -432,19 +473,25 @@ public sealed class ResumableLink
         if (method == AcpMethods.Client.SessionUpdate && message["params"] is JsonObject p && Text(p["sessionId"]) is { } sessionId && p["update"] is JsonObject update)
         {
             var meta = update["_meta"] as JsonObject;
-            if (Text(meta?[GorynychProtocol.MetaPosition]) is { } position) lock (state) cursors[sessionId] = position;
+            if (Text(meta?[GorynychProtocol.MetaPosition]) is { } position) lock (state) Advance(sessionId, position);
             if (Text(meta?[GorynychProtocol.MetaPromptId]) is { } promptId)
             {
-                bool mine;
-                lock (state) mine = promptIds.Contains(promptId);
-                // The end of a prompt's turn whose client was gone: the link's own business.
+                bool mine, hide;
+                lock (state)
+                {
+                    mine = promptIds.Contains(promptId);
+                    // Its client has the text already and never gets it live: the link's resume after a
+                    // reconnect may replay it, and a prompt held across one may run only now. A load
+                    // the client asked for shows it, as any history.
+                    hide = mine && (resuming.Contains(sessionId) || upstream.Values.Any(r => r.PromptId == promptId));
+                }
+                // The end of a prompt's turn: the link's own business.
                 if (Text(meta![GorynychProtocol.MetaAgentTurn]) == "ended")
                 {
-                    if (mine) await EndHeldPromptAsync(promptId, meta);
+                    if (mine) await PromptEndedAsync(promptId, meta);
                     return;
                 }
-                // The text of the client's own prompt, which it never gets live: a resume may send it from the journal.
-                if (mine && Text(update["sessionUpdate"]) == "user_message_chunk") return;
+                if (hide && Text(update["sessionUpdate"]) == "user_message_chunk") return;
             }
         }
         await ToClientAsync(message);
@@ -476,8 +523,7 @@ public sealed class ResumableLink
         if (asked is not null)
         {
             // Asked again by the agent that came back: the client has it already, or answered it meanwhile.
-            if (asked.Answer is { } answer && await TryWriteAsync(connection, Response(id, answer)))
-                lock (state) downstream.Remove(asked.ClientFacingId);
+            if (asked.Answer is { } answer) await TryWriteAsync(connection, Response(id, answer));
             return;
         }
         message["id"] = clientFacing;
@@ -529,10 +575,16 @@ public sealed class ResumableLink
             return;
         }
         var failed = new List<Upstream>();
+        var over = new List<Upstream>();
         lock (state)
             foreach (var request in upstream.Values.Where(r => r.Generation == connection.Generation).ToList())
                 switch (PolicyOf(request.Method))
                 {
+                    case Policy.Hold when request.Ended is not null:
+                        // The mark of its end came, its answer did not: answered as the mark says.
+                        upstream.Remove(request.Id);
+                        over.Add(request);
+                        break;
                     case Policy.Hold:
                         request.Held = true;
                         break;
@@ -548,6 +600,7 @@ public sealed class ResumableLink
         foreach (var request in failed)
             await AnswerAsync(request, Error(JsonRpcException.InternalError,
                 $"The connection to the Gorynych service was lost while {request.Method} was on its way, so it may or may not have been carried out."));
+        foreach (var request in over) await AnswerAsync(request, Outcome(request.Ended!));
         Log("lost the connection to the service; connecting again");
         _ = Task.Run(ReconnectAsync);
     }
@@ -643,6 +696,7 @@ public sealed class ResumableLink
         @params["sessionId"] = sessionId;
         @params["_meta"] = new JsonObject { [GorynychProtocol.MetaReplayFrom] = ReplayFrom(sessionId) };
         JsonObject result;
+        lock (state) resuming.Add(sessionId); // the replay comes before the answer
         try
         {
             result = await RequestAsync(connection, AcpMethods.Agent.SessionResume, @params);
@@ -662,13 +716,17 @@ public sealed class ResumableLink
             await WithdrawStaleQuestionsAsync(sessionId);
             return;
         }
+        finally
+        {
+            lock (state) resuming.Remove(sessionId);
+        }
         var meta = result["_meta"] as JsonObject;
         var inProgress = (meta?[GorynychProtocol.MetaPrompts] as JsonArray ?? []).Select(Text).OfType<string>().ToHashSet(StringComparer.Ordinal);
         var idle = Text(meta?[GorynychProtocol.MetaTurn]) != "running";
         List<Upstream> over, cancel;
         lock (state)
         {
-            if (Text(meta?[GorynychProtocol.MetaPosition]) is { } position) cursors[sessionId] = position;
+            if (Text(meta?[GorynychProtocol.MetaPosition]) is { } position) Advance(sessionId, position);
             var held = upstream.Values.Where(r => r.Held && r.SessionId == sessionId).ToList();
             // Not in progress there: it never got there, or it went with the agent that ran it.
             over = held.Where(r => r.PromptId is null || !inProgress.Contains(r.PromptId)).ToList();
@@ -694,6 +752,9 @@ public sealed class ResumableLink
         await sendGate.WaitAsync();
         try
         {
+            // Lost again since its handshake: LostAsync found it not current and did nothing, so it
+            // must not become current now; the reconnect goes on instead.
+            if (connection.IsLost) throw new IOException("the connection to the service was lost again");
             List<(JsonObject Message, Upstream? Request)> waiting;
             lock (state)
             {
@@ -740,23 +801,33 @@ public sealed class ResumableLink
         return message;
     }
 
-    /// <summary>A held prompt's turn ended in the agent while its connection was gone: answered as it ended.</summary>
-    async Task EndHeldPromptAsync(string promptId, JsonObject meta)
+    /// <summary>
+    /// The mark of a prompt's end. A held prompt (its connection went) is answered as it ended. One
+    /// still on its connection gets its answer next; the mark is kept, should the connection go
+    /// before that answer comes.
+    /// </summary>
+    async Task PromptEndedAsync(string promptId, JsonObject meta)
     {
         Upstream? request;
         lock (state)
         {
-            request = upstream.Values.FirstOrDefault(r => r.Held && r.PromptId == promptId);
-            if (request is not null) upstream.Remove(request.Id);
+            request = upstream.Values.FirstOrDefault(r => r.PromptId == promptId);
+            if (request is null) return;
+            if (!request.Held)
+            {
+                request.Ended = (JsonObject)meta.DeepClone();
+                return;
+            }
+            upstream.Remove(request.Id);
         }
-        if (request is null) return;
-        if (meta[GorynychProtocol.MetaError] is JsonObject error)
-            await AnswerAsync(request, Error(error["code"] is JsonValue c && c.TryGetValue<int>(out var code) ? code : JsonRpcException.InternalError,
-                Text(error["message"]) ?? "the prompt failed"));
-        else
-            await AnswerAsync(request, Result(Text(meta[GorynychProtocol.MetaStopReason]) is { } reason ? new StopReason(reason) : StopReason.EndTurn));
+        await AnswerAsync(request, Outcome(meta));
         if (request.SessionId is { } sessionId) await WithdrawStaleQuestionsAsync(sessionId);
     }
+
+    /// <summary>A prompt's answer from the mark of its end: its stop reason, or its error.</summary>
+    static (string, JsonNode) Outcome(JsonObject meta) => meta[GorynychProtocol.MetaError] is JsonObject error
+        ? Error(error["code"] is JsonValue c && c.TryGetValue<int>(out var code) ? code : JsonRpcException.InternalError, Text(error["message"]) ?? "the prompt failed")
+        : Result(Text(meta[GorynychProtocol.MetaStopReason]) is { } reason ? new StopReason(reason) : StopReason.EndTurn);
 
     /// <summary>
     /// The session has no turn left that an earlier connection's question belongs to: those the client
@@ -934,8 +1005,11 @@ public sealed class ResumableLink
         /// <summary>A prompt in flight when its connection went: answered by how its turn ends.</summary>
         public bool Held { get; set; }
 
-        /// <summary>The client cancelled the held prompt's session meanwhile.</summary>
+        /// <summary>The client cancelled the prompt's session after it went out.</summary>
         public bool CancelAsked { get; set; }
+
+        /// <summary>The mark of its turn's end, which came before its answer.</summary>
+        public JsonObject? Ended { get; set; }
     }
 
     /// <summary>A request of the agent's the client has not answered.</summary>

@@ -748,8 +748,8 @@ public sealed class Conductor : IAsyncDisposable
 
     /// <summary>
     /// <c>session/prompt</c>. A prompt with <c>_meta["gorynych/promptId"]</c> (a client on the
-    /// resumable link) whose client is gone by the end of its turn leaves a mark of that end in the
-    /// journal, so the client finds out how it ended when it comes back (<see cref="MarkPromptEndAsync"/>).
+    /// resumable link) leaves a mark of its turn's end in the journal, so its client finds out how it
+    /// ended should its answer be lost (<see cref="MarkPromptEndAsync"/>).
     /// </summary>
     internal async Task<JsonNode?> PromptAsync(ClientConnection client, JsonRpcRequest request, CancellationToken ct)
     {
@@ -758,6 +758,14 @@ public sealed class Conductor : IAsyncDisposable
         var promptId = PromptIdOf(prompt);
         using var use = await UseAsync(prompt.SessionId, ct);
         var key = use.Feed.BeginPrompt(promptId);
+        // A restart that began while this prompt found its session saw nothing in progress: refused
+        // all the same, so it goes to the next service rather than die with this one.
+        Interlocked.MemoryBarrier();
+        if (Draining)
+        {
+            use.Feed.EndPrompt(key);
+            throw Restarting();
+        }
         JsonNode? result = null;
         Exception? failure = null;
         try
@@ -771,8 +779,10 @@ public sealed class Conductor : IAsyncDisposable
         }
         finally
         {
-            // The mark first: a client resuming meanwhile finds the prompt in progress or its end in the journal.
-            if (promptId is not null && client.Rpc.IsClosed) await MarkPromptEndAsync(use.Feed, promptId, result, failure);
+            // The mark first: a client resuming meanwhile finds the prompt in progress or its end in the
+            // journal. Marked whether or not its client still seems there: a connection may be gone
+            // before the service notices, and then the answer is lost.
+            if (promptId is not null) await MarkPromptEndAsync(use.Feed, promptId, result, failure);
             use.Feed.EndPrompt(key);
         }
     }
@@ -781,7 +791,7 @@ public sealed class Conductor : IAsyncDisposable
         prompt.Meta?[GorynychProtocol.MetaPromptId] is JsonValue v && v.TryGetValue<string>(out var id) && id.Length > 0 ? id : null;
 
     /// <summary>
-    /// Journals and sends the end of a prompt's turn whose client is gone: a <c>session_info_update</c>
+    /// Journals and sends the end of a prompt's turn: a <c>session_info_update</c>
     /// with <c>gorynych/agentTurn: "ended"</c>, the prompt's ID, and its stop reason or error. Never fails.
     /// </summary>
     async Task MarkPromptEndAsync(SessionFeed feed, string promptId, JsonNode? result, Exception? failure)

@@ -101,7 +101,7 @@ server ([Agents outside Gorynych](#agents-outside-gorynych)).
 | `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers` and, for an adapter that advertises `sessionCapabilities.systemPrompt`, the peer instructions as `systemPrompt` in `append` mode (see [What agents are told](#what-agents-are-told)), forwards, records the session as a draft, attaches the client, and once its answer is written sends it the current list of commands (below). A client's own `systemPrompt` is refused with `-32602`, here and on `session/load` and `session/resume`: the service does not advertise the capability. |
 | `session/load` | Opens the session in the agent, catching the journal up with the agent's own history first ([History made outside Gorynych](#history-made-outside-gorynych); a session the journal has never seen is imported so), replays the service journal as `session/update`, then the current list of commands (below), then attaches the client. Returns the session state (below), with the link's state in `_meta` ([The resumable link](#the-resumable-link)). |
 | `session/resume` | Opens the session in the agent and attaches the client, without replay, after sending it the current list of commands (below). With `_meta["gorynych/replayFrom"]` it first sends what the journal has after a position ([The resumable link](#the-resumable-link)). Returns the session state (below), with the link's state in `_meta`. |
-| `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. A prompt with `_meta["gorynych/promptId"]` leaves the mark of its end in the journal if its client is gone by then; during a restart a prompt is refused, not started ([The resumable link](#the-resumable-link)). |
+| `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. A prompt with `_meta["gorynych/promptId"]` leaves the mark of its end in the journal; during a restart a prompt is refused, not started ([The resumable link](#the-resumable-link)). |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
 | `session/close` | Detaches the client. When no other client has the session open, a draft is discarded (see below); any other session has a running turn that a client's prompt started cancelled, as ACP asks of a close (a service turn and a turn of the agent's own go on), and is unloaded from its agent once it has been idle for `--unload-after` minutes ([Unloading idle sessions](#unloading-idle-sessions)). A client that disconnects without it lets go of its sessions all the same, but cancels nothing. |
 | `session/delete` | Closes the session in its agent if it is open, then deletes it there if the agent can (`sessionCapabilities.delete`); otherwise the overlay keeps a tombstone. Drops the journal. A session only the agent knows is found through its list; an unknown or already deleted session succeeds. |
@@ -1337,7 +1337,8 @@ grows with each entry appended and is never given twice; clients get it on every
 and on `session/load` ([The resumable link](#the-resumable-link)). An import that replaces the
 journal gives its entries new positions past the old ones. Compaction never merges the newest
 quarter of the limit (at most 256 entries), so a client resuming after one of them finds it
-there; a merged message stands at the position of its last part. A journal written before
+there; a merged message stands at the position of its last part, so a client further behind may
+get a merged message again in full. A journal written before
 there were positions gets them when it is read back, once. `_gorynych/read` leaves them out.
 
 ## The resumable link
@@ -1364,13 +1365,15 @@ draft.
   `gorynych/position`, where the client is now; `gorynych/turn`, `running` while a turn runs or
   a client's prompt waits for one, else `idle`; and `gorynych/prompts`, the IDs of the session's
   prompts still in progress.
-- **The end of a prompt whose client went.** A client on the link gives each prompt an ID,
+- **The end of a prompt.** A client on the link gives each prompt an ID,
   `_meta["gorynych/promptId"]`, which also goes on the prompt's `user_message_chunk`. When the
-  turn of such a prompt ends after its client went, the service journals and sends a mark: a
+  turn of such a prompt ends, the service journals and sends a mark before the answer: a
   `session_info_update` whose `_meta` has `gorynych/agentTurn: "ended"`, the prompt's ID, and
   `gorynych/stopReason`, or `gorynych/error` `{code, message}` for a prompt that failed. A turn
-  cut off with its agent (the service stopped, the agent crashed) ends `cancelled`. A client
-  that comes back so finds out how its prompt ended, in the replay or live.
+  cut off with its agent (the service stopped, the agent crashed) ends `cancelled`. The mark is
+  written whether or not the client still seems there, since a connection may be gone before the
+  service notices. A client whose answer is lost so finds out how its prompt ended: from the mark
+  it got before the connection went, or from the replay or live when it comes back.
 - **Questions asked again.** An approval or a form waiting for a client goes to the next one
   that attaches ([Standard methods](#standard-methods)), so a client that resumes the session is
   asked again, under a new request ID.
@@ -1421,18 +1424,24 @@ answers method not found, and the command asks it to exit instead.
 - What the client sends while there is no connection waits, in order, and so does a new prompt
   after `_gorynych/restarting`, with everything after it. A `session/cancel` ends a prompt that
   waits to go out with `cancelled` there, and goes at once to the service for a running turn.
-- A prompt that was on its way stays open. When its session is resumed, the link waits for the
-  mark of its end if `gorynych/prompts` lists its ID, and answers with its stop reason or error;
-  it answers the same way when the mark came in the replay; otherwise the prompt runs nowhere (it
-  went with the service before), and it ends `cancelled`. A `session/cancel` sent meanwhile goes
-  to the service that runs it.
+- A prompt that was on its way stays open. If the mark of its end came before the connection
+  went, it is answered so at once. Otherwise, when its session is resumed, the link waits for the
+  mark if `gorynych/prompts` lists its ID, and answers with its stop reason or error; it answers
+  the same way when the mark came in the replay; otherwise the prompt runs nowhere (it went with
+  the service before, or never reached it), and it ends `cancelled`. A `session/cancel` sent
+  meanwhile goes to the service that runs it.
 - A question the client still shows that the service asks again (the same method, session and
-  tool call) is not shown twice: the link joins the two, and an answer the client gave while
-  there was no connection goes to it. A question that has no turn left once its session is
-  resumed is withdrawn from the client with `$/cancel_request`; whether Zed handles that for an
-  agent's request is not confirmed.
-- The link's own traffic stays with it: `_gorynych/restarting`, the marks of its prompts' ends,
-  and its prompts' text, which its client never gets live and a resume may replay.
+  tool call) is not shown twice: the link joins the two. The client's answer is kept until the
+  turn's prompt is answered, so the service that asks again gets it, also an answer given while
+  there was no connection, or one written to a connection on its way out. A question that has no
+  turn left once its session is resumed is withdrawn from the client with `$/cancel_request`;
+  whether Zed handles that for an agent's request is not confirmed.
+- A session's position only moves on: a resume's answer read after a live update that followed
+  it does not take the link back.
+- The link's own traffic stays with it: `_gorynych/restarting`, the marks of prompts' ends, and
+  the text of its client's own prompts where the client never had it live: in the replay of the
+  link's own resume, and from a held prompt that runs only now. A `session/load` the client asks
+  for shows its prompts, as any history.
 - When no service is back within 60 seconds, it fails what waits with an error, says so on
   stderr, and exits with 1.
 
