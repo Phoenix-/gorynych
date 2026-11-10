@@ -27,6 +27,19 @@ sealed class TurnAgent(string name) : IAgentAdapter
     public bool Hold { get; set; }
     public Func<ScriptedAgent, string, CancellationToken, Task>? During { get; set; }
 
+    /// <summary>No <c>started:</c> chunk: the turn sends nothing until it ends.</summary>
+    public bool Quiet { get; set; }
+
+    /// <summary>The params of every <c>session/resume</c> the service sent.</summary>
+    public ConcurrentQueue<JsonObject> Resumes { get; } = new();
+
+    /// <summary>When set, <c>session/list</c> and <c>session/new</c> wait for it.</summary>
+    public TaskCompletionSource? SlowGate { get; set; }
+
+    /// <summary>How many <c>session/list</c> and <c>session/new</c> requests came.</summary>
+    public int Lists;
+    public int News;
+
     /// <summary>The prompts held now end, and later ones do not wait.</summary>
     public void Release() => release.TrySetResult();
 
@@ -54,10 +67,17 @@ sealed class TurnAgent(string name) : IAgentAdapter
             case AcpMethods.Agent.Initialize:
                 return ScriptedAgent.Init();
             case AcpMethods.Agent.SessionNew:
+                Interlocked.Increment(ref News);
+                if (SlowGate is { } slowNew) await slowNew.Task;
                 return AcpJson.ToNode(new NewSessionResponse { SessionId = $"{name}-{Interlocked.Increment(ref sessions)}" });
             case AcpMethods.Agent.SessionList:
+                Interlocked.Increment(ref Lists);
+                if (SlowGate is { } slowList) await slowList.Task;
                 return AcpJson.ToNode(new ListSessionsResponse());
-            case AcpMethods.Agent.SessionResume or AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionClose:
+            case AcpMethods.Agent.SessionResume:
+                if (req.Params is JsonObject resumed) Resumes.Enqueue((JsonObject)resumed.DeepClone());
+                return new JsonObject();
+            case AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionClose:
                 return new JsonObject();
             case AcpMethods.Agent.SessionPrompt:
                 var prompt = req.ParamsAs<PromptRequest>();
@@ -69,7 +89,7 @@ sealed class TurnAgent(string name) : IAgentAdapter
                     cancels[sid] = cancel;
                     try
                     {
-                        await agent.Update(sid, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = $"started:{text} " } });
+                        if (!Quiet) await agent.Update(sid, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = $"started:{text} " } });
                         if (During is { } during) await during(agent, sid, cancel.Token);
                         if (Hold) await release.Task.WaitAsync(cancel.Token);
                     }
@@ -95,14 +115,15 @@ sealed class Wire
 {
     readonly BrokenOnce[] ends;
 
-    public Wire(Conductor conductor, string name)
+    /// <param name="said">Gets what the service writes to the link.</param>
+    public Wire(Conductor conductor, string name, Action<string>? said = null)
     {
         var up = new System.IO.Pipelines.Pipe();
         var down = new System.IO.Pipelines.Pipe();
         var linkIn = new BrokenOnce(down.Reader.AsStream(), reads: true);
         var linkOut = new BrokenOnce(up.Writer.AsStream());
         var serviceIn = new BrokenOnce(up.Reader.AsStream(), reads: true);
-        var serviceOut = new BrokenOnce(down.Writer.AsStream());
+        var serviceOut = new BrokenOnce(down.Writer.AsStream()) { Tap = said };
         ends = [linkIn, linkOut, serviceIn, serviceOut];
         LinkEnd = (linkIn, linkOut);
         Serving = conductor.ServeClientAsync(serviceIn, serviceOut, name);
@@ -150,9 +171,12 @@ sealed class Wire
             catch (OperationCanceledException) when (broken.IsCancellationRequested && !ct.IsCancellationRequested) { return 0; }
         }
 
+        public Action<string>? Tap { get; init; }
+
         public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
         {
             if (broken.IsCancellationRequested) throw new IOException("the pipe is broken");
+            Tap?.Invoke(Encoding.UTF8.GetString(buffer.Span));
             await inner.WriteAsync(buffer, ct);
             if (broken.IsCancellationRequested) throw new IOException("the pipe is broken");
         }
@@ -228,11 +252,19 @@ sealed class LinkHarness : IAsyncDisposable
 
     public int Connects => Volatile.Read(ref connects);
 
+    /// <summary>Everything the services wrote to the link.</summary>
+    public StringBuilder ServiceSaid { get; } = new();
+
+    public string Heard()
+    {
+        lock (ServiceSaid) return ServiceSaid.ToString();
+    }
+
     (Stream, Stream) Connect()
     {
         var n = Interlocked.Increment(ref connects);
         var to = Service ?? throw new IOException("no service on the pipe");
-        wire = new Wire(to, $"link-{n}");
+        wire = new Wire(to, $"link-{n}", s => { lock (ServiceSaid) ServiceSaid.Append(s); });
         return wire.LinkEnd;
     }
 

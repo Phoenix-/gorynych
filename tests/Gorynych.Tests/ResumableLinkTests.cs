@@ -214,6 +214,7 @@ public sealed class ResumableLinkTests
         await Task.Delay(300);
         Assert.IsFalse(held.IsCompleted);
         Assert.IsFalse(first.Prompts.Contains("two"), "a new prompt does not reach the service that restarts");
+        Assert.IsFalse(zed.Heard().Contains("\"gorynych/restarting\":true"), "the link held it: the service had nothing to refuse");
 
         first.Release();
         Assert.AreEqual("end_turn", (string?)(await running.WaitAsync(Wait))!["stopReason"], "the running turn ended in the old service");
@@ -280,6 +281,81 @@ public sealed class ResumableLinkTests
         Assert.AreEqual("cancelled", (string?)(await running.WaitAsync(Wait))!["stopReason"], "cut off with its agent, whether the old service left a mark of it or not");
         Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "two").WaitAsync(Wait))!["stopReason"]);
         NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task APromptsOwnText_IsNotShownToItsClient_WhenAResumeReplaysIt()
+    {
+        var agent = new TurnAgent("turns");
+        await using var service = Service(TestDirs.New(), agent);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        await zed.PromptAsync(sid, "one").WaitAsync(Wait);
+        // The next turn says nothing before the drop: the client's last position is before its prompt's text.
+        agent.Quiet = true;
+        agent.Hold = true;
+        var prompt = zed.PromptAsync(sid, "two");
+        await LinkHarness.Until(() => agent.Prompts.Contains("two"), "the turn");
+
+        zed.Break();
+        await LinkHarness.Until(() => zed.Log().Contains("connected again"), "the reconnect");
+        agent.Release();
+
+        Assert.AreEqual("end_turn", (string?)(await prompt.WaitAsync(Wait))!["stopReason"]);
+        StringAssert.Contains(zed.Heard(), "\"text\":\"two\"", "the resume did send the prompt's text from the journal");
+        Assert.IsFalse(zed.Kinds().Contains("user_message_chunk"), "Zed has the prompt already; it never gets it back");
+        Assert.AreEqual("started:one done:one done:two ", zed.Text());
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ARequestOnItsWayThatMayRunTwice_GoesAgain_AndOneThatMayNot_EndsWithAnError()
+    {
+        var agent = new TurnAgent("turns");
+        await using var service = Service(TestDirs.New(), agent);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        agent.SlowGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var list = zed.Zed.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject());
+        var created = zed.NewSessionAsync();
+        await LinkHarness.Until(() => Volatile.Read(ref agent.Lists) >= 1 && Volatile.Read(ref agent.News) == 1, "both in the agent");
+
+        zed.Break();
+        var e = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => created.WaitAsync(Wait));
+        StringAssert.Contains(e.Message, "may or may not have been carried out");
+        await LinkHarness.Until(() => zed.Log().Contains("connected again"), "the reconnect");
+        agent.SlowGate.SetResult();
+
+        Assert.IsNotNull((await list.WaitAsync(Wait))!["sessions"], "listed by the service it reached again");
+        Assert.IsTrue(Volatile.Read(ref agent.Lists) >= 2, "asked again");
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ADraftOutlivesARestart_AndItsAgentIsToldItIsOne()
+    {
+        var data = TestDirs.New();
+        var service = Service(data, new TurnAgent("turns"));
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        zed.Service = null;
+        zed.Break();
+        await service.DisposeAsync();
+        var agent = new TurnAgent("turns");
+        await using var next = Service(data, agent);
+        zed.Service = next;
+
+        await LinkHarness.Until(() => zed.Log().Contains("connected again"), "the reconnect");
+        var resumed = agent.Resumes.Single();
+        Assert.AreEqual(sid, (string?)resumed["sessionId"]);
+        Assert.IsTrue((bool?)resumed["_meta"]?[GorynychProtocol.MetaDraft] == true, "an agent that wrote nothing of it can open it afresh");
+        Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "one").WaitAsync(Wait))!["stopReason"]);
+        Assert.IsFalse(agent.Resumes.Skip(1).Any(r => r["_meta"]?[GorynychProtocol.MetaDraft] is not null), "no longer a draft");
     }
 
     [TestMethod]
