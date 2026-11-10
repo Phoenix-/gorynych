@@ -39,13 +39,13 @@ public sealed class HostGeneration(string build, IReadOnlyList<string> options)
         var folder = AppContext.BaseDirectory;
         if (Directory.Exists(folder))
             files.AddRange(Directory.EnumerateFiles(folder, "Gorynych.*.dll").Order(StringComparer.OrdinalIgnoreCase));
+        var buffer = new byte[81920];
         foreach (var file in files)
             try
             {
                 using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 hash.AppendData(Encoding.UTF8.GetBytes(Path.GetFileName(file)));
-                Span<byte> buffer = stackalloc byte[81920];
-                for (int n; (n = stream.Read(buffer)) > 0;) hash.AppendData(buffer[..n]);
+                for (int n; (n = stream.Read(buffer)) > 0;) hash.AppendData(buffer, 0, n);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         return $"{AgentHost.Version}+{Convert.ToHexString(hash.GetHashAndReset())[..16].ToLowerInvariant()}";

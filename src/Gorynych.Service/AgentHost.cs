@@ -608,7 +608,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         {
             string[] sessions;
             lock (linksGate) sessions = [.. link.Sessions];
-            hosts.Add(new JsonObject
+            hosts.Add((JsonNode)new JsonObject
             {
                 ["hostId"] = link.HostId, ["slot"] = link.Slot, ["current"] = link.Current, ["forSession"] = link.ForSession,
                 ["build"] = link.Generation?.Build, ["options"] = new JsonArray((link.Generation?.Options ?? []).Select(o => (JsonNode)o).ToArray()),
