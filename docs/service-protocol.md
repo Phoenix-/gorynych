@@ -23,7 +23,8 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
     refused; `PipeTests` checks it through loopback SMB. .NET 10 never sets this flag, so the
     service creates the pipe with `CreateNamedPipeW` itself.
   - A local process that an ssh server started is no remote client, so it gets in, although its
-    token has the NETWORK group. *Unverified* until the first live check over ssh.
+    token has the NETWORK group. This was checked on 10 November 2026: on Windows 11 with
+    OpenSSH, an elevated ssh login of an administrator opened a plain service's pipe.
   - A client checks the pipe's owner before it sends anything. The owner must be the client's
     user or its token's default owner, so a pipe of another user's with the same name is
     refused. The clients do this check themselves: `PipeOptions.CurrentUserOnly` takes only

@@ -482,16 +482,23 @@ conductor, as the proxy-chains RFD has it.
 - The hub starts ssh and starts it again when the connection drops. It then resumes the
   sessions its clients have open. This uses the same resumable link as the bridge and the
   adapter hosts ([Updating without losing work](#updating-without-losing-work)).
-- The standard OpenSSH for Windows supports only asynchronous stdio and hangs on synchronous
-  pipes.
+- An earlier note said that the standard OpenSSH for Windows hangs on synchronous pipes. The
+  first probe saw no hang: OpenSSH for Windows 9.5 and Git's ssh both worked for a client with
+  synchronous pipes.
 
 **The remote service runs on its own, not under ssh.**
 - On Windows a scheduled task starts it at logon, in the person's session and with a limited
   token. Linux and macOS will use `systemd --user` and launchd.
-- The bridge behind ssh only connects. It never starts the service itself there: started from
-  ssh, it would run elevated, in session 0.
+- The bridge behind ssh never starts the service as its own child: started from ssh, the
+  service would run elevated, in session 0. When the pipe is missing, the bridge runs the logon
+  task instead (**done**).
 - A dropped connection then ends only the bridge: the agents work on, and the hub resumes
   their sessions when it reconnects.
+- **Checked live** on 10 November 2026, on a Windows 11 work PC:
+  - The bridge ran the task, and the service came up in the person's session, not elevated.
+  - Claude, Codex and Kimi answered over `ssh -T`.
+  - The connection was dropped 720 characters into Claude's answer. Claude finished the answer
+    with no client, and 75 seconds later a new bridge's `session/load` replayed it whole.
 - The first probe, on 10 November 2026, found that the sshd job lets a child break away. So a
   service started from ssh would survive the drop too, but elevated.
 
@@ -499,12 +506,14 @@ conductor, as the proxy-chains RFD has it.
 ([service-protocol.md](service-protocol.md#endpoint)). Two rules kept it out; the first probe
 found both.
 - The token sshd gives a key login carries the NETWORK group (S-1-5-2). The pipe's deny ACE
-  for NETWORK, meant only for clients over SMB, refuses every ssh client. Remote clients are
-  to be refused with `PIPE_REJECT_REMOTE_CLIENTS` instead.
-- ssh gives an administrator an elevated token, and an elevated client reaches only an
-  elevated service. An elevated client of the same user is to be let into a plain service:
-  that direction is safe. The other direction stays shut: a plain process never drives an
-  elevated service.
+  for NETWORK, meant only for clients over SMB, refused every ssh client. Remote clients are
+  now refused with `PIPE_REJECT_REMOTE_CLIENTS` instead.
+- ssh gives an administrator an elevated token, and an elevated client reached only an
+  elevated service. Now an elevated client of the same user gets into a plain service: that
+  direction is safe. The other direction stays shut: a plain process never drives an elevated
+  service.
+- Checked live on the same day: an elevated ssh login of an administrator got into the plain
+  service that the task had started.
 
 **Versions may differ between machines.** The hub and a remote service speak ACP and the
 extensions each announces at `initialize`, and pass on fields they do not know. A hub can
@@ -644,7 +653,7 @@ Next, in order (**planned**):
 
 1. A remote service reachable over `ssh -T`: the pipe lets a local ssh client in, and the
    service starts from a scheduled task with a limited token
-   ([Several machines](#several-machines)).
+   ([Several machines](#several-machines)). **Done**, and checked live on 10 November 2026.
 2. The resumable link, and the bridge's reconnect over it
    ([Updating without losing work](#updating-without-losing-work)).
 3. Adapter hosts, and a conductor that restarts without breaking a turn.
@@ -687,9 +696,6 @@ Open:
   Sonnet.
 - Renaming Claude sessions from the GUI. Listing those started outside Gorynych is left out
   ([Sessions](#sessions-catalog-titles-archive)).
-- Sessions on remote machines across a dropped connection. Planned answer: the service there
-  starts from a scheduled task, not under ssh, so a drop ends only the bridge
-  ([Several machines](#several-machines)). Not yet checked live.
 
 Risks:
 
