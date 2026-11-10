@@ -384,11 +384,37 @@ sealed class CodexAgent : IAsyncDisposable
             Log($"codex: models or config not read: {e.Message}");
         }
         rpc.Start();
-        // A thread changing hands changes its row in the service's list (gorynych/openElsewhere).
-        lockWatcher = new CodexLockWatcher(locksDirectory, holders,
-            id => rpc.SendNotificationAsync(GorynychProtocol.MethodSessionsChanged, new JsonObject { ["sessionId"] = id, ["change"] = "updated" }),
-            options.LockSettle, options.LockRecheck, Log);
+        // A thread changing hands changes its row in the service's list (gorynych/openElsewhere), and
+        // one open here only for reading can be written to now, or no longer.
+        lockWatcher = new CodexLockWatcher(locksDirectory, holders, ChangedHandsAsync, options.LockSettle, options.LockRecheck, Log);
     }
+
+    /// <summary>
+    /// Threads opened here without being taken, because another Codex app held them: each with its
+    /// holder now (null: it let go, and the thread is taken at its next turn). Read-only while held.
+    /// </summary>
+    readonly ConcurrentDictionary<string, string?> readOnly = new(StringComparer.Ordinal);
+
+    async Task ChangedHandsAsync(string id, string? holder)
+    {
+        await rpc.SendNotificationAsync(GorynychProtocol.MethodSessionsChanged, new JsonObject { ["sessionId"] = id, ["change"] = "updated" });
+        if (!readOnly.TryGetValue(id, out var before) || before == holder) return;
+        readOnly[id] = holder;
+        Log($"codex: thread {id}, open here for reading, is {(holder is null ? "free now" : $"held by {holder} now")}");
+        await rpc.SendUpdateAsync(id, new SessionInfoUpdate { Meta = InteractivityMeta(new JsonObject(), holder) });
+    }
+
+    /// <summary>The session's interactivity, said in full (<c>full</c> too): <c>read-only</c> while another Codex app holds the thread.</summary>
+    static JsonObject InteractivityMeta(JsonObject meta, string? holder)
+    {
+        meta[GorynychProtocol.MetaInteractivity] = holder is null ? GorynychProtocol.InteractivityFull : GorynychProtocol.InteractivityReadOnly;
+        if (holder is null) return meta;
+        meta[GorynychProtocol.MetaInteractivityReason] = ReadOnlyReason(holder);
+        meta[GorynychProtocol.MetaOpenElsewhere] = holder;
+        return meta;
+    }
+
+    static string ReadOnlyReason(string holder) => $"This Codex thread is open in {holder}. Close it there to write here.";
 
     // ---------------------------------------------------------------- ACP from the service
 
@@ -433,20 +459,28 @@ sealed class CodexAgent : IAsyncDisposable
             case AcpMethods.Agent.SessionResume:
             {
                 var p = request.ParamsAs<ResumeSessionRequest>();
-                var t = await OpenAsync(p.SessionId, p.McpServers ?? [], p.SystemPrompt, ct);
+                var (t, holder) = await OpenOrReadAsync(p.SessionId, p.McpServers ?? [], p.SystemPrompt, ct);
+                // Its history is read the same either way: thread/turns/list takes no writer lock.
                 var replayed = p.Meta?[GorynychProtocol.MetaReplayFrom] is JsonObject from ? await ReplayFromAsync(p.SessionId, from, ct) : null;
+                var meta = new JsonObject();
+                if (replayed is not null) meta[GorynychProtocol.MetaReplay] = replayed;
+                if (t is null) InteractivityMeta(meta, holder);
                 return AcpJson.ToNode(new ResumeSessionResponse
                 {
-                    ConfigOptions = ConfigOptions(t.Effective, models),
-                    Meta = replayed is null ? null : new JsonObject { [GorynychProtocol.MetaReplay] = replayed },
+                    ConfigOptions = t is null ? null : ConfigOptions(t.Effective, models),
+                    Meta = meta.Count > 0 ? meta : null,
                 });
             }
             case AcpMethods.Agent.SessionLoad:
             {
                 var p = request.ParamsAs<LoadSessionRequest>();
-                var t = await OpenAsync(p.SessionId, p.McpServers, p.SystemPrompt, ct);
+                var (t, holder) = await OpenOrReadAsync(p.SessionId, p.McpServers, p.SystemPrompt, ct);
                 await ReplayAsync(p.SessionId, ct);
-                return AcpJson.ToNode(new LoadSessionResponse { ConfigOptions = ConfigOptions(t.Effective, models) });
+                return AcpJson.ToNode(new LoadSessionResponse
+                {
+                    ConfigOptions = t is null ? null : ConfigOptions(t.Effective, models),
+                    Meta = t is null ? InteractivityMeta(new JsonObject(), holder) : null,
+                });
             }
             case AcpMethods.Agent.SessionList:
                 return await ListAsync(request.ParamsAs<ListSessionsRequest>(), ct);
@@ -510,8 +544,36 @@ sealed class CodexAgent : IAsyncDisposable
     }
 
     /// <summary>
+    /// Opens a thread: loaded into this app-server when it is free (<see cref="OpenAsync"/>), else
+    /// open for reading only, untaken, while another Codex app holds it (null and its holder). Its
+    /// history is read without taking it, and it is taken at its first turn once it is free.
+    /// </summary>
+    async Task<(CodexThread? Thread, string? Holder)> OpenOrReadAsync(string id, List<McpServer> servers, SystemPrompt? systemPrompt, CancellationToken ct)
+    {
+        try
+        {
+            var t = await OpenAsync(id, servers, systemPrompt, ct);
+            if (readOnly.TryRemove(id, out _)) Log($"codex: thread {id}, open here for reading, is taken now");
+            return (t, null);
+        }
+        catch (HeldElsewhereException held)
+        {
+            readOnly[id] = held.Holder;
+            Log($"codex: thread {id} is open in {held.Holder}; it opens here for reading only, untaken");
+            return (null, held.Holder);
+        }
+    }
+
+    /// <summary>The thread is held by another Codex app (the holder's name), so it cannot be loaded here.</summary>
+    sealed class HeldElsewhereException(string holder) : Exception($"This Codex thread is open in {holder}; close it there, then try again.")
+    {
+        public string Holder { get; } = holder;
+    }
+
+    /// <summary>
     /// Loads a thread into this app-server (<c>thread/resume</c>), with the MCP servers of this
-    /// request: Codex keeps them only while the thread is loaded. A thread already loaded stays as it is.
+    /// request: Codex keeps them only while the thread is loaded. A thread already loaded stays as it
+    /// is. One another Codex app holds fails with <see cref="HeldElsewhereException"/>.
     /// </summary>
     async Task<CodexThread> OpenAsync(string id, List<McpServer> servers, SystemPrompt? systemPrompt, CancellationToken ct)
     {
@@ -528,7 +590,7 @@ sealed class CodexAgent : IAsyncDisposable
             held = holders([id]);
         }
         lockWatcher?.Saw([id], held);
-        if (held.GetValueOrDefault(id) is { } holder) throw OpenElsewhere(holder);
+        if (held.GetValueOrDefault(id) is { } holder) throw new HeldElsewhereException(holder);
         ThreadResumeResponse resumed;
         try
         {
@@ -541,6 +603,12 @@ sealed class CodexAgent : IAsyncDisposable
                 DeveloperInstructions = instructions,
             }, CodexJsonContext.Default.ThreadResumeParams), ct), CodexJsonContext.Default.ThreadResumeResponse);
         }
+        catch (JsonRpcException e) when (e.Message.Contains("active writer", StringComparison.Ordinal))
+        {
+            // The lock was taken after the check, or the holder could not be told (outside Windows).
+            lockWatcher?.Saw([id], new Dictionary<string, string> { [id] = AnotherCodexApp });
+            throw new HeldElsewhereException(AnotherCodexApp);
+        }
         catch (JsonRpcException e)
         {
             throw Explain(e, id);
@@ -550,13 +618,8 @@ sealed class CodexAgent : IAsyncDisposable
         return t;
     }
 
-    /// <summary>
-    /// A thread another Codex app holds: refused with that app's name in the message, and no
-    /// <c>data</c> (Zed shows it as raw JSON); clients have the holder from the list's <c>_meta</c>, the
-    /// service from <c>_gorynych/open_elsewhere</c>.
-    /// </summary>
-    static JsonRpcException OpenElsewhere(string holder) =>
-        new(JsonRpcException.InvalidRequest, $"This Codex thread is open in {holder}; close it there, then try again.");
+    /// <summary>The holder named when app-server refuses a thread whose holder could not be told.</summary>
+    const string AnotherCodexApp = "another Codex app (Codex Desktop, the CLI or VS Code)";
 
     /// <summary>App-server's refusals to load a thread, in words a person and an asking agent can act on.</summary>
     static JsonRpcException Explain(JsonRpcException e, string id)
@@ -697,7 +760,8 @@ sealed class CodexAgent : IAsyncDisposable
                 Cwd = th.Cwd,
                 Title = string.IsNullOrEmpty(th.Name) ? null : th.Name,
                 UpdatedAt = Iso(th.UpdatedAt),
-                Meta = held.TryGetValue(th.Id, out var holder) ? new JsonObject { [GorynychProtocol.MetaOpenElsewhere] = holder } : null,
+                // Held by another Codex app: read-only here until it lets go (docs/service-protocol.md, "Read-only sessions").
+                Meta = held.TryGetValue(th.Id, out var holder) ? InteractivityMeta(new JsonObject(), holder) : null,
             }).ToList(),
             NextCursor = listed.NextCursor,
         });
@@ -714,6 +778,7 @@ sealed class CodexAgent : IAsyncDisposable
     /// </summary>
     async Task CloseAsync(string id, CancellationToken ct)
     {
+        readOnly.TryRemove(id, out _); // open for reading only: nothing of it is loaded here
         if (!threads.TryGetValue(id, out var t) || !t.Loaded) return;
         await StopTurnAsync(t);
         var closed = unloading.GetOrAdd(id, _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
@@ -741,6 +806,7 @@ sealed class CodexAgent : IAsyncDisposable
 
     async Task DeleteAsync(string id, CancellationToken ct)
     {
+        readOnly.TryRemove(id, out _);
         threads.TryGetValue(id, out var t);
         if (t is not null) await StopTurnAsync(t);
         try
@@ -794,6 +860,11 @@ sealed class CodexAgent : IAsyncDisposable
     async Task<JsonNode?> PromptAsync(JsonRpcRequest request, CancellationToken ct)
     {
         var p = request.ParamsAs<PromptRequest>();
+        // Open here for reading only: a resume takes it once it is free (the service resumes it before a turn).
+        if (readOnly.TryGetValue(p.SessionId, out var holder))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, holder is null
+                ? $"Codex session {p.SessionId} is open here for reading only; resume it to take it, then send the prompt again."
+                : $"Codex session {p.SessionId} is read-only here: {ReadOnlyReason(holder)}");
         if (!threads.TryGetValue(p.SessionId, out var t) || !t.Loaded)
             throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Codex has not loaded session {p.SessionId}; resume it first.");
         var input = p.Prompt.Select(InputOf).OfType<UserInput>().ToList();

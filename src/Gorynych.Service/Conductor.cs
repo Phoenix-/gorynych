@@ -549,14 +549,102 @@ public sealed class Conductor : IAsyncDisposable
     /// earlier generation moves now to one of the current, so a stale host takes no new turn and
     /// empties; one whose agent runs a turn of its own or asks something is waited for, then moves; one
     /// that moved while this waited for the turn is followed. What stays in a stale host
-    /// (<see cref="Move.Stay"/>) takes the turn there.
+    /// (<see cref="Move.Stay"/>) takes the turn there. A session its agent opened for reading only is
+    /// opened again first (<see cref="RetakeAsync"/>), and refused while it is still read-only.
     /// </summary>
-    async Task<JsonRpcConnection> RpcForTurnAsync(SessionRecord record, JsonRpcConnection rpc, CancellationToken ct)
+    /// <param name="forAgent">The turn is another session's message (a question, a report): a refusal is worded for an agent.</param>
+    async Task<JsonRpcConnection> RpcForTurnAsync(SessionRecord record, JsonRpcConnection rpc, CancellationToken ct, bool forAgent = false)
     {
         var host = HostOf(record);
-        if (host.RouteOf(record.SessionId) is { Current: true } on && on.Rpc == rpc) return rpc;
-        return (await EnsureLiveAsync(record, ct, holdingTurn: true)).Rpc;
+        var feed = Feed(record.SessionId);
+        if (host.RouteOf(record.SessionId) is { Current: true } on && on.Rpc == rpc && !feed.OpenedReadOnly) return rpc;
+        var live = (await EnsureLiveAsync(record, ct, holdingTurn: true)).Rpc;
+        return feed.OpenedReadOnly ? await RetakeAsync(host, record, live, forAgent, ct) : live;
     }
+
+    // ---------------------------------------------------------------- read-only sessions
+
+    /// <summary>
+    /// A turn for a session its agent opened for reading only: the agent is asked to open it again
+    /// (<c>session/resume</c>, with the catch-up after the journal's mark), which takes it if it is
+    /// free now (Codex takes the thread once the other app let it go), and brings into the journal
+    /// what was made in the other app meanwhile. Still read-only, the turn is refused in words.
+    /// </summary>
+    async Task<JsonRpcConnection> RetakeAsync(AgentHost host, SessionRecord record, JsonRpcConnection rpc, bool forAgent, CancellationToken ct)
+    {
+        var feed = Feed(record.SessionId);
+        await feed.OpenGate.WaitAsync(ct);
+        try
+        {
+            if (feed.OpenedReadOnly && host.RouteOf(record.SessionId) is { } on)
+            {
+                await OpenAsync(host, on.Rpc, store.Get(record.SessionId) ?? record, ct);
+                rpc = on.Rpc;
+            }
+        }
+        finally
+        {
+            feed.OpenGate.Release();
+        }
+        if (feed.ReadOnly is { } state) throw ReadOnlyRefusal(record, state, forAgent);
+        return rpc;
+    }
+
+    /// <summary>
+    /// The refusal of a turn in a read-only session: its ID, why, and what to do, for the person or
+    /// the asking agent; its <c>data</c> says the interactivity, for a client that reads it.
+    /// </summary>
+    static JsonRpcException ReadOnlyRefusal(SessionRecord record, SessionFeed.ReadOnlyState state, bool forAgent) => new(
+        JsonRpcException.InvalidRequest,
+        forAgent
+            ? $"Session {record.SessionId} is read-only for now, so it takes no message: {state.Reason} Ask again once it is free, or ask another session."
+            : $"Session {record.SessionId} is read-only for now: {state.Reason} Then send the prompt again.",
+        new JsonObject { [GorynychProtocol.MetaInteractivity] = GorynychProtocol.InteractivityReadOnly });
+
+    /// <summary>The read-only state a <c>_meta</c> says (<c>gorynych/interactivity</c>); null for full, also when it says nothing.</summary>
+    static SessionFeed.ReadOnlyState? ReadOnlyOf(JsonNode? meta)
+    {
+        if (meta is not JsonObject m || TextOf(m[GorynychProtocol.MetaInteractivity]) != GorynychProtocol.InteractivityReadOnly) return null;
+        return new(TextOf(m[GorynychProtocol.MetaInteractivityReason]) is { Length: > 0 } reason ? reason : "Its agent takes no prompt in it now.",
+            TextOf(m[GorynychProtocol.MetaOpenElsewhere]));
+    }
+
+    static string? TextOf(JsonNode? node) => node is JsonValue v && v.TryGetValue<string>(out var text) ? text : null;
+
+    /// <summary>Says a session's interactivity in a <c>_meta</c>, in full (<c>full</c> too), with why and who holds it while it is read-only.</summary>
+    static JsonObject PutInteractivity(JsonObject meta, SessionFeed.ReadOnlyState? state)
+    {
+        meta[GorynychProtocol.MetaInteractivity] = state is null ? GorynychProtocol.InteractivityFull : GorynychProtocol.InteractivityReadOnly;
+        meta.Remove(GorynychProtocol.MetaInteractivityReason);
+        meta.Remove(GorynychProtocol.MetaOpenElsewhere);
+        if (state is null) return meta;
+        meta[GorynychProtocol.MetaInteractivityReason] = state.Reason;
+        if (state.OpenElsewhere is { } holder) meta[GorynychProtocol.MetaOpenElsewhere] = holder;
+        return meta;
+    }
+
+    /// <summary>
+    /// Takes the session's interactivity from what its agent said. When it changed, the attached
+    /// clients are told: a <c>session_info_update</c> with the value in full, and a notice to those
+    /// that show notices; neither is journaled, since it is the session's state, not its history.
+    /// </summary>
+    async Task SetInteractivityAsync(SessionFeed feed, SessionFeed.ReadOnlyState? state)
+    {
+        if (!feed.SetReadOnly(state)) return;
+        ServiceLog.Info($"{feed.SessionId}: {(state is null ? "can be written to again" : $"read-only: {state.Reason}")}");
+        var update = new JsonObject { ["sessionUpdate"] = "session_info_update", ["_meta"] = PutInteractivity(new JsonObject(), state) };
+        await feed.PublishAsync(update, except: null, () => { }, journal: false);
+        await feed.SendLiveAsync(NoticeOf(state), c => c.TakesNotices);
+    }
+
+    /// <summary>The notice that tells a person the session is read-only now, and why, or that it can be written to again.</summary>
+    static JsonObject NoticeOf(SessionFeed.ReadOnlyState? state) => AcpJson.ToNode<SessionUpdate>(state is null
+        ? new Notice { Severity = NoticeSeverity.Info, Title = "You can write here again", Description = "Nothing else holds this session now." }
+        : new Notice { Severity = NoticeSeverity.Warning, Title = "Read-only for now", Description = state.Reason })!.AsObject();
+
+    /// <summary>A client that opens a read-only session is told why it takes no prompt, if it shows notices.</summary>
+    static Task NoticeOnOpenAsync(SessionFeed feed, ClientConnection client) =>
+        feed.ReadOnly is { } state && client.TakesNotices ? feed.SendLiveAsync(NoticeOf(state), c => ReferenceEquals(c, client)) : Task.CompletedTask;
 
     /// <summary>For each session, its place in the host's stream: what the host sends again must follow it.</summary>
     internal JsonObject HostCursors(string hostId, IEnumerable<string> sessions)
@@ -860,6 +948,12 @@ public sealed class Conductor : IAsyncDisposable
             if (@params!["update"] is not JsonObject update) return;
             // From a host: taken once, though a host that comes back sends what it kept again.
             if (update["_meta"]?[GorynychProtocol.MetaHostSeq] is JsonValue s && s.TryGetValue<string>(out var hostSeq) && !feed.TakeFromHost(hostSeq)) return;
+            // Whether the session can be prompted now: its state, not its history, so it is not journaled.
+            if (TextOf(update["sessionUpdate"]) == "session_info_update" && update["_meta"] is JsonObject said && said.ContainsKey(GorynychProtocol.MetaInteractivity))
+            {
+                await SetInteractivityAsync(feed, ReadOnlyOf(said));
+                return;
+            }
             feed.ApplyStateUpdate(update);
             feed.Active(options.Time.GetUtcNow()); // an agent that sends something is not idle (UnloadIfIdleAsync)
             AgentTurn(feed, update);
@@ -1115,8 +1209,19 @@ public sealed class Conductor : IAsyncDisposable
     SessionInfo Describe(SessionRecord r, SessionInfo? native)
     {
         var meta = native?.Meta?.DeepClone().AsObject() ?? [];
-        // Open in a host of this service's (a stale one, during an update) is not open elsewhere.
-        if (agents.TryGetValue(r.Agent, out var owner) && owner.IsLive(r.SessionId)) meta.Remove(GorynychProtocol.MetaOpenElsewhere);
+        // Open in a host of this service's (a stale one, during an update) is not open elsewhere, and
+        // its interactivity is what its agent said when it opened it, or since.
+        if (agents.TryGetValue(r.Agent, out var owner) && owner.IsLive(r.SessionId))
+        {
+            var state = feeds.TryGetValue(r.SessionId, out var feed) ? feed.ReadOnly : null;
+            if (state is null)
+            {
+                meta.Remove(GorynychProtocol.MetaOpenElsewhere);
+                meta.Remove(GorynychProtocol.MetaInteractivity);
+                meta.Remove(GorynychProtocol.MetaInteractivityReason);
+            }
+            else PutInteractivity(meta, state);
+        }
         meta[GorynychProtocol.MetaAgent] = r.Agent;
         if (r.ParentSessionId is not null) meta[GorynychProtocol.MetaParentSessionId] = r.ParentSessionId;
         if (r.Archived) meta[GorynychProtocol.MetaArchived] = true;
@@ -1126,7 +1231,9 @@ public sealed class Conductor : IAsyncDisposable
             Cwd = FolderPath.Normalize(native?.Cwd ?? r.Cwd),
             AdditionalDirectories = native?.AdditionalDirectories,
             Title = r.TitleSource != SpawnTitle && native?.Title is { Length: > 0 } t ? t : r.Title,
-            UpdatedAt = r.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
+            // The agent's own time wins, as its title does: a catch-up of the journal, or a row that
+            // changes its marks, does not move the session in the list.
+            UpdatedAt = native?.UpdatedAt is { } at && ParseTime(at) is not null ? at : r.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
             Meta = meta,
         };
     }
@@ -1309,6 +1416,10 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"{host.Name} cannot reopen session {record.SessionId}");
         }
         feed.CaptureState(opened);
+        // An agent that can show the session but not take it now says so (gorynych/interactivity): read-only until it can.
+        var readOnly = ReadOnlyOf((opened as JsonObject)?["_meta"]);
+        feed.OpenedReadOnly = readOnly is not null;
+        await SetInteractivityAsync(feed, readOnly);
         try
         {
             if (replayed is { } how && collect) await CatchUpAsync(host, feed, history.Updates, history.Dropped, how, newMark);
@@ -1377,6 +1488,7 @@ public sealed class Conductor : IAsyncDisposable
             response = [];
         }
         var position = await feed.ReplayAndAttachAsync(client);
+        await NoticeOnOpenAsync(feed, client);
         return WithLinkState(response, feed, position);
     }
 
@@ -1392,6 +1504,7 @@ public sealed class Conductor : IAsyncDisposable
         using var use = await UseAsync(request.SessionId, ct);
         var (_, opened) = await EnsureLiveAsync(use.Record, ct);
         var position = await use.Feed.ResumeAndAttachAsync(client, after);
+        await NoticeOnOpenAsync(use.Feed, client);
         // An already open session gets the state the agent last reported, so every client sees its switches.
         return WithLinkState(opened ?? use.Feed.State(), use.Feed, position);
     }
@@ -1422,6 +1535,8 @@ public sealed class Conductor : IAsyncDisposable
         meta[GorynychProtocol.MetaPosition] = SessionJournal.FormatPosition(position);
         meta[GorynychProtocol.MetaTurn] = feed.TurnRunning ? "running" : "idle";
         meta[GorynychProtocol.MetaPrompts] = new JsonArray(feed.PromptsInProgress().Select(p => (JsonNode)p).ToArray());
+        // Whether the client may prompt it, said in full: a client that showed it read-only before learns it is not.
+        PutInteractivity(meta, feed.ReadOnly);
         result["_meta"] = meta;
         return result;
     }
@@ -2789,7 +2904,7 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             if (feed.Retired) return;
-            rpc = await RpcForTurnAsync(use.Record, rpc, cleanupStop.Token);
+            rpc = await RpcForTurnAsync(use.Record, rpc, cleanupStop.Token, forAgent: true);
             if (store.Get(use.Record.SessionId) is { Archived: true })
             {
                 ServiceLog.Info($"report: {childId} -> {use.Record.SessionId} dropped: the parent was archived while the report waited for its turn");
@@ -3190,6 +3305,13 @@ public sealed class Conductor : IAsyncDisposable
                     throw OpenElsewhereError(record, holder, asker, e);
                 throw CouldNotStart(record, e, asker);
             }
+            // Open for reading only, as an agent opens one another app holds: it takes no question, said at once.
+            if (asker.IsAgent && use.Feed.ReadOnly is { } readOnly)
+            {
+                unload = woken;
+                var why = new JsonRpcException(JsonRpcException.InvalidRequest, readOnly.Reason);
+                throw readOnly.OpenElsewhere is { } holder ? OpenElsewhereError(record, holder, asker, why) : CouldNotStart(record, why, asker);
+            }
             // Its mode now, as its agent reports it once it is loaded: for a session that was not, the
             // mode it was loaded in. An agent outside Gorynych is approved by its own host.
             var confirmed = false;
@@ -3402,7 +3524,7 @@ public sealed class Conductor : IAsyncDisposable
             {
                 if (feed.Retired) throw NotFound(record.SessionId);
                 record = Promote(record);
-                rpc = await RpcForTurnAsync(record, rpc, ct);
+                rpc = await RpcForTurnAsync(record, rpc, ct, forAgent: true);
                 var text = OpinionPrompt(asker, messageId, question);
                 var meta = new JsonObject
                 {
@@ -3604,8 +3726,10 @@ public sealed class Conductor : IAsyncDisposable
                 var answer = await rpc.SendRequestAsync(GorynychProtocol.MethodOpenElsewhere,
                     new JsonObject { ["sessionIds"] = new JsonArray(group.Select(r => (JsonNode)r.SessionId).ToArray()) }, bounded.Token);
                 foreach (var (id, holder) in answer?["sessions"] as JsonObject ?? [])
-                    // One open in another host of this service's (a stale one during an update) is not elsewhere.
-                    if (holder is JsonValue v && v.TryGetValue<string>(out var name) && name.Length > 0 && !host.IsLive(id)) held[id] = name;
+                    // One open in another host of this service's (a stale one during an update) is not
+                    // elsewhere, unless it is open there for reading only, held by another app.
+                    if (holder is JsonValue v && v.TryGetValue<string>(out var name) && name.Length > 0
+                        && (!host.IsLive(id) || feeds.TryGetValue(id, out var feed) && feed.ReadOnly is not null)) held[id] = name;
             }
             catch (Exception e) when (!(e is OperationCanceledException && ct.IsCancellationRequested))
             {

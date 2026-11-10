@@ -61,6 +61,9 @@ internal sealed class ClientConnection
     /// </summary>
     public bool OnLink => Init?.Meta?[GorynychProtocol.CapLink] is JsonValue v && v.TryGetValue<int>(out var version) && version >= 1;
 
+    /// <summary>The client shows ACP's <c>notice</c> session updates (<c>clientCapabilities.session.notices</c>); none is sent to another.</summary>
+    public bool TakesNotices => Init?.ClientCapabilities?.Session?.Notices is not null;
+
     /// <summary>Whether this client can take <paramref name="method"/> requests from an agent.</summary>
     public bool Accepts(string method) => method switch
     {

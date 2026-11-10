@@ -200,15 +200,33 @@ it is; after an adapter restart, or a `session/close`, it is not.
   with `-32002`.
 - An agent may let one process at a time hold a session (Codex: one writer per thread). An
   adapter that can tell which other app holds one SHOULD mark it in `session/list` with
-  `_meta["gorynych/openElsewhere"]` (a string naming the holder), SHOULD refuse its load or
-  resume at once, before asking the agent, with a message that names the holder and says to close
-  it there (and no `data`: a client may show it raw), and MAY advertise `gorynych/openElsewhere` and
-  answer `_gorynych/open_elsewhere {sessionIds}` ([service-protocol.md](service-protocol.md#sessions-open-in-another-app)).
-  A guess on the agent's insides MUST fail open: when it cannot tell, it marks nothing and lets
-  the agent answer. When another app takes such a session or lets it go, the adapter SHOULD tell
-  the service with `_gorynych/sessions_changed {sessionId, change: "updated"}`, advertised by
-  `gorynych/sessionsChanged: true` in its `agentCapabilities._meta`, and only for a real
-  change; the service passes it on to its clients. (Codex)
+  `_meta["gorynych/openElsewhere"]` (a string naming the holder), together with
+  `gorynych/interactivity: "read-only"` and its `gorynych/interactivityReason`, and MAY advertise
+  `gorynych/openElsewhere` and answer `_gorynych/open_elsewhere {sessionIds}`
+  ([service-protocol.md](service-protocol.md#sessions-open-in-another-app)). A guess on the
+  agent's insides MUST fail open: when it cannot tell, it marks nothing and lets the agent answer.
+  When another app takes such a session or lets it go, the adapter SHOULD tell the service with
+  `_gorynych/sessions_changed {sessionId, change: "updated"}`, advertised by
+  `gorynych/sessionsChanged: true` in its `agentCapabilities._meta`, and only for a real change;
+  the service passes it on to its clients. (Codex)
+- **A session it can show but not take** (held by another app, for any reason it cannot take a
+  prompt now) the adapter SHOULD open for reading only, rather than refuse
+  ([service-protocol.md](service-protocol.md#read-only-sessions)):
+  - its `session/resume` or `session/load` answer says `_meta["gorynych/interactivity"]:
+    "read-only"`, the reason for a person (`gorynych/interactivityReason`), and the holder
+    (`gorynych/openElsewhere`) when another app holds it; the service takes the flag from every
+    open's answer, so an answer without it is `"full"`;
+  - it reads the history without taking the session, and replays it as at any open, after the
+    mark (Codex: `thread/turns/list` and `thread/items/list` take no writer lock);
+  - when the session can be written to again, or no longer, it sends a `session_info_update`
+    whose `_meta` says `gorynych/interactivity` in full (`"full"` too), with the reason and holder
+    while read-only. Writable again it does not take it yet: the service opens it again before its
+    next turn, and the adapter takes it then. A prompt for a session it holds open for reading only
+    it SHOULD refuse in words, since the service does not send one there;
+  - a session the agent itself holds is `"full"`.
+
+  Fallback: an adapter that refuses the open names the holder and says to close it there (and no
+  `data`: a client may show it raw).
 
 ## 5. Prompts and turns
 

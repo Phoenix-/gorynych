@@ -349,7 +349,7 @@ public sealed class CodexAdapterTests
     }
 
     [TestMethod]
-    public async Task Resume_GivesTheServerAgain_AndExplainsAThreadOpenElsewhereOrArchived()
+    public async Task Resume_GivesTheServerAgain_OpensAThreadOpenElsewhereReadOnly_AndExplainsAnArchivedOne()
     {
         var fake = new FakeAppServer();
         fake.Existing("t-ok", Cwd, name: "Fine");
@@ -365,15 +365,17 @@ public sealed class CodexAdapterTests
         var resumed = fake.Last("thread/resume");
         Assert.AreEqual((true, "svc.exe"), ((bool?)resumed["excludeTurns"], (string?)resumed["config"]!["mcp_servers"]!["gorynych"]!["command"]));
 
-        var open = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-open")));
-        Assert.AreEqual("This Codex thread is open in another Codex app (Codex Desktop, the CLI or VS Code); close it there, then try again.", open.Message);
-        Assert.IsNull(open.ErrorData, "no data: Zed would show it as raw JSON");
+        // App-server refuses it (its holder could not be told): it opens for reading, as a held one does.
+        var open = (await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-open")))!["_meta"]!;
+        Assert.AreEqual(GorynychProtocol.InteractivityReadOnly, (string?)open[GorynychProtocol.MetaInteractivity]);
+        Assert.AreEqual("This Codex thread is open in another Codex app (Codex Desktop, the CLI or VS Code). Close it there to write here.",
+            (string?)open[GorynychProtocol.MetaInteractivityReason]);
         var archived = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-archived")));
         Assert.AreEqual("This Codex thread is archived in Codex. Unarchive it there (codex unarchive t-archived), then try again.", archived.Message);
     }
 
     [TestMethod]
-    public async Task AThreadAnotherGorynychHostLetsGoOf_IsWaitedFor_ThenOpens_AndOneItKeeps_IsRefused()
+    public async Task AThreadAnotherGorynychHostLetsGoOf_IsWaitedFor_ThenOpens_AndOneItKeeps_OpensReadOnly()
     {
         // After an update a session moves off an earlier host of Codex, whose app-server lets go of
         // the thread's writer lock as its close answers, which may lag a moment behind.
@@ -397,9 +399,11 @@ public sealed class CodexAdapterTests
         Assert.IsTrue(looks > 3, "it looked again until the other host let go");
 
         var watch = System.Diagnostics.Stopwatch.StartNew();
-        var kept = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-kept")).WaitAsync(Wait));
-        Assert.AreEqual("This Codex thread is open in another Gorynych host of Codex (pid 4343); close it there, then try again.", kept.Message);
+        var kept = (await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-kept")).WaitAsync(Wait))!["_meta"]!;
+        Assert.AreEqual(GorynychProtocol.InteractivityReadOnly, (string?)kept[GorynychProtocol.MetaInteractivity]);
+        Assert.AreEqual("another Gorynych host of Codex (pid 4343)", (string?)kept[GorynychProtocol.MetaOpenElsewhere]);
         Assert.IsTrue(watch.Elapsed >= TimeSpan.FromSeconds(1.5), "it waited for it about as long as a close waits for app-server");
+        Assert.AreEqual(1, fake.All("thread/resume").Length, "only the one that was let go of was taken");
     }
 
     [TestMethod]
@@ -415,7 +419,7 @@ public sealed class CodexAdapterTests
     }
 
     [TestMethod]
-    public async Task AThreadAnotherCodexAppHolds_IsMarkedInTheList_AndRefusedAtOnce_WithoutAskingAppServer()
+    public async Task AThreadAnotherCodexAppHolds_IsMarkedInTheList_AndOpensReadOnly_WithoutAskingAppServerForIt()
     {
         var fake = new FakeAppServer();
         fake.Existing("t-desk", Cwd, name: "Open in Codex Desktop");
@@ -435,16 +439,20 @@ public sealed class CodexAdapterTests
         var listed = await zed.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
 
         string? Mark(string id) => (string?)listed.Sessions.Single(s => s.SessionId == id).Meta?[GorynychProtocol.MetaOpenElsewhere];
+        string? Interactivity(string id) => (string?)listed.Sessions.Single(s => s.SessionId == id).Meta?[GorynychProtocol.MetaInteractivity];
         Assert.AreEqual(("Codex Desktop", "a terminal codex (pid 4242)", (string?)null), (Mark("t-desk"), Mark("t-term"), Mark("t-free")));
+        Assert.AreEqual(("read-only", "read-only", (string?)null), (Interactivity("t-desk"), Interactivity("t-term"), Interactivity("t-free")), "absent: full");
+        Assert.AreEqual("This Codex thread is open in Codex Desktop. Close it there to write here.",
+            (string?)listed.Sessions.Single(s => s.SessionId == "t-desk").Meta?[GorynychProtocol.MetaInteractivityReason]);
         lock (asked) CollectionAssert.AreEquivalent(new[] { "t-desk", "t-term", "t-free" }, asked.SelectMany(a => a).ToArray(), "once per page, each thread once");
         Assert.IsTrue(conductor.Agents["codex"].TellsOpenElsewhere);
 
-        var desk = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-desk")));
-        Assert.AreEqual("This Codex thread is open in Codex Desktop; close it there, then try again.", desk.Message);
-        Assert.IsNull(desk.ErrorData, "the message names the holder; no data, which Zed would show as raw JSON");
-        var term = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, Resume("t-term")));
-        Assert.AreEqual("This Codex thread is open in a terminal codex (pid 4242); close it there, then try again.", term.Message);
-        Assert.AreEqual(0, fake.All("thread/resume").Length, "app-server was not asked: it would refuse, and Codex Desktop is left alone");
+        var desk = (await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-desk")))!["_meta"]!;
+        Assert.AreEqual(("read-only", "Codex Desktop"), ((string?)desk[GorynychProtocol.MetaInteractivity], (string?)desk[GorynychProtocol.MetaOpenElsewhere]));
+        var term = (await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, Resume("t-term")))!["_meta"]!;
+        Assert.AreEqual(("read-only", "a terminal codex (pid 4242)"), ((string?)term[GorynychProtocol.MetaInteractivity], (string?)term[GorynychProtocol.MetaOpenElsewhere]));
+        Assert.AreEqual(0, fake.All("thread/resume").Length, "app-server was not asked to take them: it would refuse, and Codex Desktop is left alone");
+        StringAssert.Contains(zed.Text(), "Fixed it.", "their history was read all the same");
 
         await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-free"));
         Assert.AreEqual("t-free", (string?)fake.Last("thread/resume")["threadId"]);

@@ -158,6 +158,33 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <summary>A turn of the agent's own runs (<see cref="BeginAgentTurn"/>).</summary>
     public bool AgentTurnRunning => Volatile.Read(ref agentTurn) != 0;
 
+    /// <summary>Why a session is read-only, in words for a person, and who holds it, if another app does.</summary>
+    public sealed record ReadOnlyState(string Reason, string? OpenElsewhere);
+
+    ReadOnlyState? readOnly;
+
+    /// <summary>
+    /// Read-only, as its agent said last (<c>gorynych/interactivity</c> on its open or in an update);
+    /// null: full, a client may prompt it (docs/service-protocol.md, "Read-only sessions").
+    /// </summary>
+    public ReadOnlyState? ReadOnly => Volatile.Read(ref readOnly);
+
+    /// <summary>Sets <see cref="ReadOnly"/>; true when that changed it.</summary>
+    public bool SetReadOnly(ReadOnlyState? state) => !Equals(Interlocked.Exchange(ref readOnly, state), state);
+
+    int openedReadOnly;
+
+    /// <summary>
+    /// Its agent opened it for reading only, and has not opened it in full since: also once it is
+    /// writable again, the agent has not taken it yet (Codex takes the thread at its next resume),
+    /// so a turn opens it again first, which also catches its journal up with what was made meanwhile.
+    /// </summary>
+    public bool OpenedReadOnly
+    {
+        get => Volatile.Read(ref openedReadOnly) != 0;
+        set => Volatile.Write(ref openedReadOnly, value ? 1 : 0);
+    }
+
     int asking;
 
     /// <summary>
@@ -609,6 +636,26 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
                 if (toolTitleOrder.Count > 64) toolTitles.Remove(toolTitleOrder.Dequeue());
             }
             toolTitles[id] = title;
+        }
+    }
+
+    /// <summary>
+    /// Sends an update to the attached clients that <paramref name="to"/> picks, without journaling
+    /// it: something live, not the session's history (a notice).
+    /// </summary>
+    public async Task SendLiveAsync(JsonObject update, Func<ClientConnection, bool> to)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (Retired) return;
+            foreach (var client in Clients())
+                if (to(client))
+                    await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update.DeepClone()));
+        }
+        finally
+        {
+            gate.Release();
         }
     }
 

@@ -215,7 +215,9 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/messageId` | `session/prompt` params `_meta`, service → adapter | the `messageId` the service journals the prompt's text under, for a harness that keeps it with the message (Codex) |
 | `gorynych/setTitle` | an adapter's `agentCapabilities._meta` | `true`: the adapter takes `_gorynych/set_title {sessionId, title}` → `{}`, and the service writes a `spawn_session` name natively ([Child sessions](#child-sessions)) |
 | `gorynych/unloadAfter` | an adapter's `agentCapabilities._meta` | seconds: its sessions' idle time when shorter than `--unload-after` ([Unloading idle sessions](#unloading-idle-sessions)); read as at most a day |
-| `gorynych/openElsewhere` | `SessionInfo._meta` of `session/list`; an adapter's `agentCapabilities._meta` | a string naming another app that has the session open, so its agent cannot load it here until it is closed there (`Codex Desktop`, `VS Code`, `a terminal codex (pid 4242)`); absent: free, or not known. In capabilities, `true`: the adapter takes `_gorynych/open_elsewhere` ([Sessions open in another app](#sessions-open-in-another-app)) |
+| `gorynych/openElsewhere` | `SessionInfo._meta` of `session/list`, the `_meta` of a `session/load` or `session/resume` answer and of a `session_info_update` while the session is read-only; an adapter's `agentCapabilities._meta` | a string naming another app that has the session open, so its agent cannot take it here until it is closed there (`Codex Desktop`, `VS Code`, `a terminal codex (pid 4242)`); absent: free, or not known. In capabilities, `true`: the adapter takes `_gorynych/open_elsewhere` ([Sessions open in another app](#sessions-open-in-another-app)) |
+| `gorynych/interactivity` | `SessionInfo._meta` of `session/list`; the `_meta` of a `session/load` or `session/resume` answer; the `_meta` of a `session_info_update` | `"full"`: a client may prompt the session; `"read-only"`: it may watch it, not prompt it. Absent means `"full"`, as AHP's `ChatInteractivity`; an answer and a change always say it, `"full"` too ([Read-only sessions](#read-only-sessions)) |
+| `gorynych/interactivityReason` | next to `gorynych/interactivity: "read-only"` | why, in words for a person, for any reason (`This Codex thread is open in Codex Desktop. Close it there to write here.`) |
 | `_gorynych/open_elsewhere` | method, service → adapter, `{sessionIds}` → `{sessions: {"<id>": "<holder>"}}` | which of these sessions another app has open now, the held ones only; for the lists agents see |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
@@ -1138,11 +1140,11 @@ app-server until it is closed there. An adapter that can tell who holds a sessio
 (the Codex adapter: [adapters.md](adapters.md#codex), "One writer"):
 
 - `session/list` marks such a session with `_meta["gorynych/openElsewhere"]`: the holder, as a
-  string to show. The service passes it on in its own `session/list`, so a GUI can draw the
-  session as open elsewhere. No key: the session is free, or nobody knows.
-- `session/load` and `session/resume` of such a session fail at once, before the agent is
-  asked, with a message naming the holder (`This Codex thread is open in Codex Desktop; close
-  it there, then try again.`) and no `data` (Zed would append it to the message as raw JSON).
+  string to show, and `gorynych/interactivity: "read-only"` with its reason. The service passes
+  them on in its own `session/list`, so a GUI can draw the session as open elsewhere. No key: the
+  session is free, or nobody knows.
+- `session/load` and `session/resume` of such a session open it for reading only: its history is
+  read without taking it, and it says so ([Read-only sessions](#read-only-sessions)).
 - The adapter advertises `gorynych/openElsewhere` and answers `_gorynych/open_elsewhere
   {sessionIds}` with the held ones. The service asks it, only while its agent runs (a list
   starts no agent) and for at most five seconds, when it builds the list agents see; an adapter
@@ -1162,7 +1164,65 @@ app-server until it is closed there. An adapter that can tell who holds a sessio
   `sessions_changed`) keeps the mark current this way.
 
 Which app holds a session is a heuristic on the agent's insides; an adapter that cannot tell
-marks nothing, and the agent's own refusal still says that something else has it open.
+marks nothing, and the agent's own refusal still says that something else has it open (Codex:
+its app-server refuses the thread, and the adapter opens it for reading as for a holder it knows,
+named `another Codex app`).
+
+## Read-only sessions
+
+A session may be one a client can watch but not prompt: *read-only*. Why is the agent's to say;
+the flag, its reason, what the client is told and what a prompt meets are the conductor's, the same
+for any reason and any agent. The first reason is a Codex thread another Codex app holds
+([Sessions open in another app](#sessions-open-in-another-app)); the hub will add a session whose
+machine cannot be reached.
+
+**What the client gets.** `_meta["gorynych/interactivity"]`, `"full"` or `"read-only"` (absent
+means `"full"`, as AHP's `ChatInteractivity`), and with `"read-only"` its reason for a person,
+`_meta["gorynych/interactivityReason"]`, and the holder when another app holds it,
+`_meta["gorynych/openElsewhere"]`. They come:
+
+- in `SessionInfo._meta` of `session/list` (only while read-only);
+- in the `_meta` of a `session/load` and `session/resume` answer, always, `"full"` too;
+- in the `_meta` of a `session_info_update` whenever the flag changes, always with its value, so
+  a client that turned the input off learns when to turn it back on. Such an update carries
+  nothing else and is not journaled: it is the session's state, not its history.
+
+**Notices.** A client that advertised `clientCapabilities.session.notices` (ACP's session notices,
+RFD *Session Notices*, completed) gets a `notice` update: `warning`, "Read-only for now", with the
+reason, when it opens a read-only session and when one it has open becomes read-only; `info`, "You
+can write here again", when the flag clears. No other client gets one, and none is journaled.
+
+**Opening one.** The agent says it in the `_meta` of its `session/resume` or `session/load` answer
+([adapter-contract.md](adapter-contract.md#4-loading-resuming-and-history)): read-only, with the
+history it read without taking the session. The journal catches up from its mark as at any open
+([History made outside Gorynych](#history-made-outside-gorynych)), also when it had nothing yet: the
+history is imported by reading. The service keeps the flag with the session, and that it opened it
+for reading only.
+
+**A prompt**, or a question from another session (`ask_agent`), to a session opened for reading
+only first opens it again (`session/resume` after the journal's mark): an agent takes it now if it
+can (Codex takes the thread once the other app let it go), and the journal gets what the other app
+made meanwhile.
+
+- Taken: the flag clears (an update with `"full"`, a notice), and the turn runs.
+- Still read-only: the prompt fails with the session's ID, the reason and what to do: `Session
+  <id> is read-only for now: This Codex thread is open in Codex Desktop. Close it there to write
+  here. Then send the prompt again.` Its `data` is `{"gorynych/interactivity": "read-only"}`.
+- A question from another session is refused at once, before it waits for the turn, in the
+  words for an agent ([Opinions between agents](#opinions-between-agents)): `session_id <id> (…)
+  is open in Codex Desktop, which holds it, so it cannot be asked until it is closed there. Ask
+  another session from list_agents, or ask the user to close it in Codex Desktop.`
+
+**On the fly.** The agent tells the service when a session it opened for reading only can be
+written to again, or no longer, with a `session_info_update` carrying `gorynych/interactivity`
+(Codex: when its lock watcher sees the holder go or come back). The service passes it on to the
+attached clients, with a notice. Writable again does not take the session: that waits for its
+first prompt, so another app that takes it back meanwhile makes it read-only once more. A session
+the service's own agent holds is `"full"`: the flag is only about another holder.
+
+**The list's order** follows the agent's own time (`updatedAt` of its `session/list`) wherever the
+agent gives one, so a catch-up of the journal, a mark that changes, or a turn that streams does
+not move a row; the service's own time orders only what the agent does not list.
 
 ## List changes
 

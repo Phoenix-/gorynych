@@ -17,7 +17,7 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
 {
     readonly string? directory;
     readonly Func<IEnumerable<string>, IReadOnlyDictionary<string, string>> holders;
-    readonly Func<string, Task> report;
+    readonly Func<string, string?, Task> report;
     readonly TimeSpan settle;
     readonly TimeSpan recheck;
     readonly Action<string>? log;
@@ -33,9 +33,9 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
     bool disposed; // under gate
     int disposing;
 
-    /// <param name="report">Says that a thread's holder changed (the service then tells its clients).</param>
+    /// <param name="report">Says that a thread's holder changed, and to whom (null: free now); the service then tells its clients.</param>
     public CodexLockWatcher(string? directory, Func<IEnumerable<string>, IReadOnlyDictionary<string, string>> holders,
-        Func<string, Task> report, TimeSpan settle, TimeSpan recheck, Action<string>? log)
+        Func<string, string?, Task> report, TimeSpan settle, TimeSpan recheck, Action<string>? log)
     {
         this.directory = directory;
         this.holders = holders;
@@ -106,7 +106,7 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
             lock (gate) touched.UnionWith(ids);
             return;
         }
-        var changed = new List<string>();
+        var changed = new List<(string Id, string? Holder)>();
         lock (gate)
             foreach (var id in ids)
             {
@@ -115,13 +115,13 @@ internal sealed class CodexLockWatcher : IAsyncDisposable
                 if (before == after) continue;
                 if (after is null) told.Remove(id);
                 else told[id] = after;
-                changed.Add(id);
+                changed.Add((id, after));
             }
-        foreach (var id in changed)
+        foreach (var (id, holder) in changed)
         {
             try
             {
-                await report(id);
+                await report(id, holder);
             }
             catch (Exception e) when (e is not OutOfMemoryException)
             {

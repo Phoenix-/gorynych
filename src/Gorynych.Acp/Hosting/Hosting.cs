@@ -198,6 +198,24 @@ public static class GorynychProtocol
     public const string CapOpenElsewhere = "gorynych/openElsewhere";
 
     /// <summary>
+    /// What a client may do with a session: <see cref="InteractivityFull"/> (absent means it) or
+    /// <see cref="InteractivityReadOnly"/>, as AHP's <c>ChatInteractivity</c>. In <c>SessionInfo._meta</c>
+    /// of <c>session/list</c>, the <c>_meta</c> of a <c>session/load</c> or <c>session/resume</c> answer,
+    /// and the <c>_meta</c> of a <c>session_info_update</c>, where a change always says the value
+    /// (docs/service-protocol.md, "Read-only sessions").
+    /// </summary>
+    public const string MetaInteractivity = "gorynych/interactivity";
+
+    /// <summary>Why a session is read-only, in words for a person, next to <see cref="MetaInteractivity"/>.</summary>
+    public const string MetaInteractivityReason = "gorynych/interactivityReason";
+
+    /// <summary>A <see cref="MetaInteractivity"/>: the client may send prompts.</summary>
+    public const string InteractivityFull = "full";
+
+    /// <summary>A <see cref="MetaInteractivity"/>: the client may watch the session, not prompt it.</summary>
+    public const string InteractivityReadOnly = "read-only";
+
+    /// <summary>
     /// In <c>agentCapabilities._meta</c>: <c>true</c> when the adapter takes <see cref="MetaReplayFrom"/>
     /// on <c>session/resume</c> and reports <see cref="MetaHistoryMark"/> (docs/adapter-contract.md, §4).
     /// </summary>

@@ -803,20 +803,25 @@ Next, in order (**planned**):
    over once it is idle; with it a host per Claude session. **Done** on 10 November 2026
    ([service-protocol.md](service-protocol.md#updating-adapters)).
 5. Read-only sessions, first for a Codex thread open in another app (agreed on 10 November
-   2026). Today opening such a thread shows the journal, which may be stale, when Gorynych has
-   one, and fails when it has none. Instead:
+   2026). Opening such a thread used to show the journal, which may be stale, when Gorynych had
+   one, and fail when it had none. Instead (**the service part done** on 10 November 2026,
+   [service-protocol.md](service-protocol.md#read-only-sessions); the Zed part in the fork):
    - the service shows the thread's current history, read without taking the thread
-     (`thread/turns/list`);
+     (`thread/turns/list`, which takes no writer lock: probed), also when it had no journal;
    - it says so with an ACP session notice (`notice`, which Zed shows), and refuses a prompt
      in words while the thread is held, but sends it once the thread is free;
    - the flag reaches the client: `_meta["gorynych/interactivity"]`, `full` or `read-only`
-     (absent means `full`, as AHP's `ChatInteractivity` has it), with the reason
-     (`gorynych/openElsewhere`), on `session/load`, in `session/list` and in
-     `session_info_update`;
+     (absent means `full`, as AHP's `ChatInteractivity` has it), with the reason for a person
+     (`gorynych/interactivityReason`) and the holder (`gorynych/openElsewhere`), on
+     `session/load` and `session/resume`, in `session/list` and in `session_info_update`, which
+     always says the value when it changes;
+   - it is the conductor's own, for any reason an agent gives: Codex is the first, and the hub
+     will add a machine that cannot be reached;
    - Zed learns read-only sessions as such, not only for Codex: the input is off and the reason
      shown, as Zed does for a subagent's thread, and it comes back when the flag clears. It is
      built in the fork so that it can go to Zed itself, and a session interactivity like AHP's
-     is proposed to ACP as an RFD, so that Zed can take a standard field rather than our `_meta`;
+     is proposed to ACP as an RFD, so that Zed can take a standard field rather than our `_meta`
+     (a draft, not sent: [proposals/acp-session-interactivity.md](proposals/acp-session-interactivity.md));
    - the first `session/list` already carries the marks, and its order follows Codex's own
      times, so the list does not jump.
 6. The hub: remote services as an adapter over the same link, and one list.

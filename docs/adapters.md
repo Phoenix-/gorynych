@@ -600,7 +600,7 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 | --- | --- |
 | `session/new` | `thread/start {cwd, config, developerInstructions}`. Nothing is on disk before the first turn, and the thread is not listed until then (`gorynych/draftsNotDurable`: the service drops an unused draft instead of hiding it) |
 | `session/list` | `thread/list {cwd, cursor, limit 50, archived: false, sortKey: updated_at, useStateDbOnly: true}`; `title` is the thread's `name` (none until a name is set or generated: the service shows its provisional title), `updatedAt` from unix seconds |
-| `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}`; with `gorynych/replayFrom`, then the thread's turns after the mark (below). `gorynych/draft` changes nothing: the app-server names a thread, so a thread never prompted is not there after the adapter restarts |
+| `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}`, or for a thread another Codex app holds, nothing: it opens for reading only (One writer, below); with `gorynych/replayFrom`, then the thread's turns after the mark (below), read the same either way. `gorynych/draft` changes nothing: the app-server names a thread, so a thread never prompted is not there after the adapter restarts |
 | `session/load` | the same, then the history from `thread/items/list`, page by page, as the updates below. The service no longer uses it: a thread the journal has not seen is imported through the replay from the start |
 | `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), up to 5 s for the turn to end, then `thread/unsubscribe`. App-server is started with `-c thread_unload_delay_secs=0`, so it unloads the thread at once, and the close returns once `thread/closed` came (at most 10 s, else it fails, and the service counts the thread as still held there): the thread's writer lock is then free for another Codex app. A turn that has not ended by then ends `cancelled`: Codex sends nothing more of an unsubscribed thread |
 | `session/delete` | stops a running turn as `session/close` does, then `thread/delete`; a thread Codex no longer has answers `-32002` |
@@ -622,7 +622,7 @@ over app-server's JSON-RPC. The design and the probes behind it are in
   them (checked live), so a thread keeps the text of the service that created it.
 - **One writer.** A thread has one writer process. While Gorynych's app-server has a thread
   loaded, Codex Desktop, the CLI or VS Code cannot continue it, and Gorynych cannot resume a
-  thread one of them has open. Within its own process the adapter drives every turn, so there
+  thread one of them has open: it opens it for reading only instead (below). Within its own process the adapter drives every turn, so there
   are no turns of Codex's own to mark (`gorynych/agentTurn`).
   - **The mechanism.** Codex takes an OS lock on `<CODEX_HOME>/thread-writer-locks/<thread
     id>.lock` (an empty file; Rust `File::try_lock`, `LockFileEx` on Windows; codex-rs
@@ -645,15 +645,33 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     final, so a false one would lock a free thread out. (A codex that runs as `node` would be
     ignored too; none was seen: npm's shim starts the native `codex.exe`, which holds the lock.)
     `CODEX_HOME` comes from the service's environment, else `~/.codex`.
-  - **What it does with it.** `session/load` and `session/resume` of a held thread fail at once
-    with `This Codex thread is open in <holder>; close it there, then try again.`, before
-    `thread/resume` (so the other app is left alone). Held by another Gorynych host, it is looked at
-    again every 250 ms for up to 10 s first: after an update a session moves off an earlier host,
-    whose app-server lets go of the thread as its close answers. The error has no `data`: Zed appends it
-    to the message as raw JSON, and the message names the holder already. `session/list` marks each held thread with
-    `_meta["gorynych/openElsewhere"]`, the folder read once per page, and the adapter answers
+  - **What it does with it.** `session/load` and `session/resume` of a held thread open it for
+    reading only, without `thread/resume` (so the other app is left alone): the thread's history
+    is read with `thread/turns/list` and `thread/items/list`, after the journal's mark as at any
+    resume, and the answer says `_meta["gorynych/interactivity"]: "read-only"`, the reason
+    (`This Codex thread is open in <holder>. Close it there to write here.`) and the holder
+    (`gorynych/openElsewhere`); it has no `configOptions` (Codex reports a thread's settings only
+    when it loads it). Held by another Gorynych host, it is looked at again every 250 ms for up to
+    10 s first: after an update a session moves off an earlier host, whose app-server lets go of
+    the thread as its close answers. `session/list` marks each held thread with
+    `_meta["gorynych/openElsewhere"]` and `gorynych/interactivity: "read-only"` with its reason,
+    the folder read once per page, so the first list already has them, and the adapter answers
     `_gorynych/open_elsewhere` for the service's session lists
-    ([service-protocol.md](service-protocol.md#sessions-open-in-another-app)).
+    ([service-protocol.md](service-protocol.md#read-only-sessions)).
+  - **Reading takes no lock.** Probed on 10 November 2026 with Codex 0.167
+    (`research/probes/codex/read_held_probe.py`): with one app-server holding a thread (it ran a
+    turn and kept it loaded), a second one read it with `thread/read`, `thread/turns/list` and
+    `thread/items/list`. The lock file stayed open in the holder only, and the reader never had the
+    thread loaded. The reader saw the holder's next turn as soon as it ended. Its `thread/resume` was
+    refused (`already has an active writer`), and it took the thread 0.5 s after the holder's
+    `thread/unsubscribe`. `thread/list` with `useStateDbOnly`, as the adapter lists, moves a
+    thread's `updatedAt` at the end of each turn, also in another app-server's list; without it,
+    `updatedAt` stays at the thread's start (`updated_at_probe.py`).
+  - **Writable again.** A thread open for reading only is not taken when its holder lets go: the
+    adapter tells the service (`session_info_update` with `gorynych/interactivity: "full"`), and
+    takes the thread at the service's next resume, before the next turn. Taken back by the other app
+    meanwhile, it is read-only again (an update with `"read-only"`). A prompt for a thread open here
+    for reading only is refused in words; the service resumes it first, so it never sends one.
   - **Changes as they happen.** While the adapter runs it watches the lock folder
     (`FileSystemWatcher`, file names only): a lock file appears when an app takes a thread and
     is usually deleted when it lets go. Once a burst of changes settles (0.75 s), it finds the
@@ -666,14 +684,15 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     new one if not, after which it looks at every thread seen too. For each real change of
     holder it sends the service `_gorynych/sessions_changed {sessionId, change: "updated"}`
     (`gorynych/sessionsChanged`), which the service passes on to its clients, so Zed lists the
-    thread again and shows the new mark. With no folder it watches nothing until the folder
+    thread again and shows the new mark; for a thread open here for reading only, also the
+    `session_info_update` with its interactivity. With no folder it watches nothing until the folder
     appears (looked for at the same 60 s); a watcher that fails leaves the timer alone. When the
     adapter stops, a callback of the watcher still queued finds it stopped and does nothing.
   - **A heuristic on Codex's insides.** Any failure (no folder, a file that does not open, a
     status other than success, a holder that is not Codex or cannot be read) means "not known":
     nothing is marked and the open goes on to app-server. Outside Windows nothing is known. App-server's own refusal, `thread <id> already
-    has an active writer`, stays the fallback: `This Codex thread is open in another Codex app
-    (Codex Desktop, the CLI or VS Code); close it there, then try again.`
+    has an active writer`, stays the fallback: the thread opens for reading only all the same,
+    held by `another Codex app (Codex Desktop, the CLI or VS Code)`.
   - **Checked live** on 9 November 2026 with Codex 0.167 (CLI) and Codex Desktop 26.1029: of 18
     threads listed, three held by Codex Desktop and two by codex in terminals were marked as
     such, and resuming one of Codex Desktop's failed at once with its name.
