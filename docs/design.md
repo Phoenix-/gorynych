@@ -248,7 +248,7 @@ Titles and archive live in the harness when it has them; otherwise in the servic
 
 | Harness | List | Title | Archive |
 | --- | --- | --- | --- |
-| Claude Code | the adapter's own list of the sessions it started; sessions started elsewhere (the Agent SDK's `listSessions`, or the transcripts in `~/.claude/projects`): **planned** | Claude writes `ai-title` itself; `/rename` writes `custom-title`. A name given at spawn stays in the overlay | none in Claude Code: overlay |
+| Claude Code | the adapter's own list of the sessions it started; sessions started elsewhere: **left out**, possible but laborious and fragile (below) | Claude writes `ai-title` itself; `/rename` writes `custom-title`. A name given at spawn stays in the overlay | none in Claude Code: overlay |
 | Kimi Code | ACP `session/list` | first prompt; a name given at spawn stays in the overlay | Kimi has one, but `kimi acp` cannot reach it: overlay |
 | Codex | `thread/list` | `thread/name/set` for a name given at spawn; a thread without a name shows the service's provisional title | Codex will not resume an archived thread, so the archive stays in the overlay |
 
@@ -263,6 +263,39 @@ Titles and archive live in the harness when it has them; otherwise in the servic
 - **One thread, one writer.** Codex lets one process write a thread; a thread that Codex Desktop
   or the CLI holds is marked in the session list with the app that holds it, and fails to open
   through Gorynych at once, naming that app (`gorynych/openElsewhere`, **done**).
+- **Claude sessions started elsewhere: possible, but laborious and fragile, so left out for
+  now.** This was looked at on 10 November 2026 with Claude Code 2.1.321; nothing below was
+  probed yet.
+  - *What already works.* Claude Desktop, the terminal `claude` and the adapter write their
+    transcripts to the same `~/.claude/projects`. `claude -p --resume <id>` takes any of them,
+    and the catch-up imports a session the journal has never seen
+    ([service-protocol.md](service-protocol.md#history-made-outside-gorynych)).
+  - *Listing.*
+    - What to read: the head of each transcript (the folder, the first prompt) and its tail
+      (`ai-title`, `custom-title`), as the Agent SDK's `listSessions` does. Subagent
+      transcripts are skipped.
+    - Telling sessions apart: every line carries `entrypoint`: `claude-desktop`, `cli`, or
+      `sdk-cli` for `claude -p`. `sdk-cli` covers Gorynych's own sessions, but also scripts,
+      hooks and probes.
+    - The size here: 510 transcripts in 72 folders, 3.7 GB.
+  - *Why it is fragile.*
+    - As far as we know, Claude does not stop a second process from resuming a live session.
+      With two writers, the transcript forks into two branches. Each process sees only its
+      own turns, and the next resume silently drops one branch from the context.
+    - Unlike Codex, nothing native would refuse the open, so the only guard would be
+      Gorynych's own. The one source for it is the live-session registry
+      `~/.claude/sessions/<pid>.json`, which backs Claude's cross-session messaging but is not
+      documented. Each entry has `sessionId`, `pid`, `entrypoint` and `status`, and for
+      Desktop its `local_…` id and sidebar title.
+    - If the registry's format changes, the guard fails open: nothing is marked, and opening
+      the session forks its transcript.
+  - *Why it is worth less than with Codex.*
+    - Claude Desktop keeps its own session list, so sessions started in Gorynych would not
+      show there. The switch would work one way only.
+    - Desktop also keeps a process for every open session, as Codex Desktop holds its threads.
+  - *The safe variant, if it is ever needed.* Open an outside session as a fork
+    (`--resume <id> --fork-session`): a new session with the same history, the original left
+    untouched. The registry would then serve only as an "open in Claude Desktop" hint.
 - **Renaming from the GUI** goes to the native side (Codex `thread/name/set`, Claude `/rename`
   typed through the PTY after `Stop`): **planned**.
 
@@ -471,7 +504,8 @@ Open:
 - Text between tool calls in a long turn: whether all of it comes through `MessageDisplay`.
 - The opinion authorization in the system prompt was checked with Haiku only, not with Opus or
   Sonnet.
-- Listing Claude sessions started outside Gorynych, and renaming from the GUI.
+- Renaming Claude sessions from the GUI. Listing those started outside Gorynych is left out
+  ([Sessions](#sessions-catalog-titles-archive)).
 - A session keeper on remote machines: a headless agent behind `ssh -T` dies when the
   connection drops.
 
