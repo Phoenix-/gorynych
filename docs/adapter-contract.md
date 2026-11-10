@@ -111,6 +111,13 @@ the agent the `mcpServers` it gets ([§6.2](#62-the-gorynych-mcp-server)).
   SHOULD say so with `agentCapabilities._meta["gorynych/draftsNotDurable"]: true`; the service
   then closes an unused draft and drops it, with no delete and no tombstone. (Codex, which
   writes a thread at its first turn)
+- **A draft across a restart.** The service keeps a draft while a client on the resumable link
+  may come back for it ([service-protocol.md](service-protocol.md#the-resumable-link)), and
+  then opens it with `session/resume` and `_meta["gorynych/draft"]: true`. An adapter whose
+  agent kept nothing of it and that chooses its own IDs SHOULD open it afresh under that ID
+  (Claude: a new session with `--session-id`). Fallback: the resume fails as for any unknown
+  session, and the client's next prompt there fails with it. (Codex: its app-server names a
+  thread, so a draft does not outlive the adapter)
 
 **List.** The adapter SHOULD implement `session/list` (`sessionCapabilities.list`) with the
 `cwd` filter, `title` and `updatedAt`, and MUST NOT list a session it deleted.

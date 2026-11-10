@@ -10,7 +10,9 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
 ## Endpoint
 
 - One service per user and endpoint, enforced by a named mutex
-  (`Gorynych.Service.<pipe>`, current user, all logon sessions).
+  (`Gorynych.Service.<pipe>`, current user, all logon sessions). A service started while
+  another holds it waits up to 15 seconds for it, then exits (code 3): one that a bridge starts
+  while the old one is still on its way out of a restart takes over once that one is gone.
 - Transport: a named pipe, default `gorynych-acp-<user name>`, carrying the ACP stdio
   framing (JSON-RPC 2.0, one message per line). Elsewhere than Windows the pipe is a Unix
   socket, open only to the user, and clients connect with `PipeOptions.CurrentUserOnly`.
@@ -69,7 +71,9 @@ also the `gorynych` MCP server agents start over stdio:
 for external ACP clients: `acp --agent claude|kimi|codex|dsh` (see [external-clients.md](external-clients.md)),
 `shutdown [--pipe …]`, which sends the running service `_gorynych/shutdown` and waits up
 to 30 seconds for its process to end (exit code 0; 1 when no service runs on the pipe; 2 when
-it still runs), and `task install [--pipe …] [service options]` / `task uninstall [--pipe …]`.
+it still runs), `restart [--pipe …] [--timeout <minutes>] [--no-wait]`, which sends
+`_gorynych/restart` and waits the same way, with the same exit codes
+([The resumable link](#the-resumable-link)), and `task install [--pipe …] [service options]` / `task uninstall [--pipe …]`.
 `task install` registers the logon task `Gorynych.Service.<pipe>` for the current user, or
 replaces it, with `schtasks /Create /XML`. How a remote machine is set up with it is in
 [external-clients.md](external-clients.md#a-remote-machine).
@@ -92,12 +96,12 @@ server ([Agents outside Gorynych](#agents-outside-gorynych)).
 
 | Method | What the service does |
 | --- | --- |
-| `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`, and its extension flags in `agentCapabilities._meta`, as ACP's extensibility rules advertise custom capabilities: `gorynych/sessionsChanged: true` (see [List changes](#list-changes)) and `gorynych/archive: true` (see [Archive](#archive)). The result's own `_meta` has the data `gorynych/serviceId` and `gorynych/agents`, and, deprecated and kept for one release for clients built before the flags moved, the two flags again. No `sessionCapabilities.systemPrompt` yet ([adapter-contract.md](adapter-contract.md#15-open-questions)). |
+| `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`, and its extension flags in `agentCapabilities._meta`, as ACP's extensibility rules advertise custom capabilities: `gorynych/sessionsChanged: true` (see [List changes](#list-changes)), `gorynych/archive: true` (see [Archive](#archive)) and `gorynych/link: 1` (see [The resumable link](#the-resumable-link)). The result's own `_meta` has the data `gorynych/serviceId` and `gorynych/agents`, and, deprecated and kept for one release for clients built before the flags moved, the first two flags again. No `sessionCapabilities.systemPrompt` yet ([adapter-contract.md](adapter-contract.md#15-open-questions)). |
 | `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`, and a spawned session also `_meta["gorynych/parentSessionId"]` (absent for a session a client created). A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out, and so are archived sessions unless the request has `_meta["gorynych/includeArchived"]: true`; then an archived one carries `_meta["gorynych/archived"]: true`. |
 | `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers` and, for an adapter that advertises `sessionCapabilities.systemPrompt`, the peer instructions as `systemPrompt` in `append` mode (see [What agents are told](#what-agents-are-told)), forwards, records the session as a draft, attaches the client, and once its answer is written sends it the current list of commands (below). A client's own `systemPrompt` is refused with `-32602`, here and on `session/load` and `session/resume`: the service does not advertise the capability. |
-| `session/load` | Opens the session in the agent, catching the journal up with the agent's own history first ([History made outside Gorynych](#history-made-outside-gorynych); a session the journal has never seen is imported so), replays the service journal as `session/update`, then the current list of commands (below), then attaches the client. Returns the session state (below). |
-| `session/resume` | Opens the session in the agent and attaches the client, without replay, after sending it the current list of commands (below). Returns the session state (below). |
-| `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. |
+| `session/load` | Opens the session in the agent, catching the journal up with the agent's own history first ([History made outside Gorynych](#history-made-outside-gorynych); a session the journal has never seen is imported so), replays the service journal as `session/update`, then the current list of commands (below), then attaches the client. Returns the session state (below), with the link's state in `_meta` ([The resumable link](#the-resumable-link)). |
+| `session/resume` | Opens the session in the agent and attaches the client, without replay, after sending it the current list of commands (below). With `_meta["gorynych/replayFrom"]` it first sends what the journal has after a position ([The resumable link](#the-resumable-link)). Returns the session state (below), with the link's state in `_meta`. |
+| `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. A prompt with `_meta["gorynych/promptId"]` leaves the mark of its end in the journal if its client is gone by then; during a restart a prompt is refused, not started ([The resumable link](#the-resumable-link)). |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
 | `session/close` | Detaches the client. When no other client has the session open, a draft is discarded (see below); any other session has a running turn that a client's prompt started cancelled, as ACP asks of a close (a service turn and a turn of the agent's own go on), and is unloaded from its agent once it has been idle for `--unload-after` minutes ([Unloading idle sessions](#unloading-idle-sessions)). A client that disconnects without it lets go of its sessions all the same, but cancels nothing. |
 | `session/delete` | Closes the session in its agent if it is open, then deletes it there if the agent can (`sessionCapabilities.delete`); otherwise the overlay keeps a tombstone. Drops the journal. A session only the agent knows is found through its list; an unknown or already deleted session succeeds. |
@@ -184,7 +188,16 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/parentSessionId` | `SessionInfo._meta` in `session/list`; `session_info_update._meta`; the `_meta` of a spawned session's first `user_message_chunk` | the session that started this one with `spawn_session`; absent for a session a client created |
 | `gorynych/origin` | `user_message_chunk._meta`; with `native`, the `_meta` of any update | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel, TUI), `live` (one written into a running headless Claude on its input), `spawn` (a spawned session's first prompt), `report` (a child's report delivered as a turn) or `terminal`; `native` on every update the journal took from the agent's own history, made outside Gorynych; `notice` on an entry the service wrote into the journal itself ([History made outside Gorynych](#history-made-outside-gorynych)) |
 | `gorynych/notice` | `_meta` of a `user_message_chunk` with `gorynych/origin: "notice"` | what the service's entry says: `historyRewritten` |
-| `gorynych/replayFrom` | an adapter's `agentCapabilities._meta`; `session/resume` params `_meta`, service → adapter | in capabilities, `true`: the adapter replays its own history after a mark. On a resume, where to replay from: `{"type": "gorynych/after", "mark": "<mark>"}` or `{"type": "start"}` ([History made outside Gorynych](#history-made-outside-gorynych)) |
+| `gorynych/replayFrom` | an adapter's `agentCapabilities._meta`; `session/resume` params `_meta`, service → adapter and client → service | in capabilities, `true`: the adapter replays its own history after a mark. On a resume, where to replay from: `{"type": "gorynych/after", "mark": "<mark>"}` or `{"type": "start"}` ([History made outside Gorynych](#history-made-outside-gorynych)); from a client, the mark is a journal position ([The resumable link](#the-resumable-link)) |
+| `gorynych/link` | the service's `agentCapabilities._meta`; a client's `initialize` params `_meta` | the version of the resumable link, `1`. From the service: it takes everything in [The resumable link](#the-resumable-link). From a client: it is on the link, so it may come back for its sessions, drafts too |
+| `gorynych/position` | `_meta` of every `session/update` the service journals; `session/load` and `session/resume` result `_meta` | the update's position in the session's journal, an opaque string; in a result, the position the client is at once the answer is written |
+| `gorynych/turn` | `session/load` and `session/resume` result `_meta` | `running` while a turn of the session runs or a client's prompt waits for one, else `idle` |
+| `gorynych/prompts` | `session/load` and `session/resume` result `_meta` | the `gorynych/promptId`s of the session's prompts still in progress |
+| `gorynych/promptId` | `session/prompt` params `_meta`, client → service; the `_meta` of the prompt's `user_message_chunk`; the mark of its end | the ID a client on the link gives its prompt |
+| `gorynych/stopReason` | the `_meta` of the mark that ends a prompt's turn (`gorynych/agentTurn: "ended"` with `gorynych/promptId`) | the turn's ACP stop reason |
+| `gorynych/error` | the `_meta` of the mark that ends a prompt's turn | `{code, message}`: the prompt failed so |
+| `gorynych/restarting` | the `data` of an error | `true`: the service did not carry the request out because it is restarting; it may go again, as it is, to the next service |
+| `gorynych/draft` | `session/resume` params `_meta`, service → adapter | `true` for a draft: an adapter that keeps nothing before the first prompt and no longer knows the session opens it afresh under its ID ([adapter-contract.md](adapter-contract.md#3-new-sessions-the-list-and-discovery)) |
 | `gorynych/replay` | `session/resume` result `_meta`, adapter → service | what was replayed: `{"from": "mark" \| "start", "mark": "<new mark>"}` |
 | `gorynych/historyMark` | `session/prompt` result `_meta`; the `_meta` of the update that ends a turn of the agent's own (`gorynych/agentTurn: "ended"`) | the adapter's opaque mark of how far into its own history the journal now goes |
 | `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, `parent_claude` for a spawn, `child_kimi` for a report, `outside_claude-code` for an agent outside Gorynych (`outside_<client name>`): a label for GUIs only; the text the agent gets names the session by its ID instead (see [What agents are told](#what-agents-are-told)) |
@@ -198,8 +211,10 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/open_elsewhere` | method, service → adapter, `{sessionIds}` → `{sessions: {"<id>": "<holder>"}}` | which of these sessions another app has open now, the held ones only; for the lists agents see |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
-| `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, adapters |
+| `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, `restarting`, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
+| `_gorynych/restart` | method, `{wait?, timeoutSeconds?}` → `{processId, waitedSeconds, cancelledTurns}` | asks the service to exit for an update without breaking its clients' work ([The resumable link](#the-resumable-link)) |
+| `_gorynych/restarting` | notification to clients, `{}` | the service has begun a restart: a client on the link holds its new prompts for the next service |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes in on its input (headless) or through its channel (TUI), and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards, and to the agent adds `_meta` with `gorynych/sender`, `gorynych/fromSessionId` and `gorynych/outside` as the journal keeps them on a request in a turn, for the user message the agent reports for it. An agent that answers method not found, or `-32600` because it is not running, is asked in a turn instead ([adapter-contract.md](adapter-contract.md#64-the-live-note-path)) |
 | `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `status` (`open` when its agent has it loaded now, `saved` when not, the words of ACP's draft session-status RFD), `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")`, and `callerParent` the session that started it with `spawn_session`, when there is one. Without `includeArchived`, `hiddenArchived` counts the archived sessions left out (never the caller) |
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
@@ -1264,8 +1279,11 @@ A draft is discarded when
 
 - `session/close` arrives for it and no other client has it open, or
 - the last client attached to it disconnects (in the background, so the disconnect is not
-  held up), or
-- the service starts and finds it marked in the overlay from an earlier run.
+  held up). A client on the resumable link (`gorynych/link` in its `initialize` `_meta`) may
+  come back for it, so its draft waits two minutes first, and one a client has again by then
+  stays; or
+- the service starts and finds it marked in the overlay from an earlier run. The sweep waits
+  two minutes too, so the bridges that come back after a restart resume their drafts first.
 
 A native delete cannot be undone, so a discard keeps the session whenever it is unsure:
 
@@ -1313,6 +1331,116 @@ quarters of the limit. Once it has dropped any, or a catch-up could not keep all
 agent's own history gained ([History made outside Gorynych](#history-made-outside-gorynych)), a
 marker file next to it (`<journal>.trimmed`) says so, for `_gorynych/read`'s `trimmed`. A line torn by a crash is dropped
 when the journal is read back.
+
+Every entry has its **position**, `_meta["gorynych/position"]`, a number written as a string that
+grows with each entry appended and is never given twice; clients get it on every update, live
+and on `session/load` ([The resumable link](#the-resumable-link)). An import that replaces the
+journal gives its entries new positions past the old ones. Compaction never merges the newest
+quarter of the limit (at most 256 entries), so a client resuming after one of them finds it
+there; a merged message stands at the position of its last part. A journal written before
+there were positions gets them when it is read back, once. `_gorynych/read` leaves them out.
+
+## The resumable link
+
+A client keeps its sessions through a dropped connection or a restart of the service when both
+ends speak the resumable link, version 1 (`gorynych/link` in the service's
+`agentCapabilities._meta`). The stdio bridge does, for Zed and any other plain client (below).
+Neither ACP nor MCP redelivers what was sent while a connection was down
+([design.md](design.md#updating-without-losing-work)), so the link uses what ACP has: a
+`session/resume` for each open session, with a cursor shaped like the `replayFrom` of ACP v2's
+draft.
+
+**What the service gives.**
+
+- **Positions.** Every update the service journals carries its position ([Journal](#journal)).
+  A client keeps the last one it got for each session.
+- **Resume after a position.** A `session/resume` with
+  `_meta["gorynych/replayFrom"]: {"type": "gorynych/after", "mark": "<position>"}` sends, before
+  its answer, what the journal has after that position, then the current list of commands, then
+  attaches the client, so nothing in between is lost or sent twice. `{"type": "start"}` sends
+  the whole journal. A mark the service never gave, or another type, is refused with `-32602`.
+  After a position that compaction has since dropped, what is left after it is sent.
+- **The link's state**, in the `_meta` of every `session/load` and `session/resume` answer:
+  `gorynych/position`, where the client is now; `gorynych/turn`, `running` while a turn runs or
+  a client's prompt waits for one, else `idle`; and `gorynych/prompts`, the IDs of the session's
+  prompts still in progress.
+- **The end of a prompt whose client went.** A client on the link gives each prompt an ID,
+  `_meta["gorynych/promptId"]`, which also goes on the prompt's `user_message_chunk`. When the
+  turn of such a prompt ends after its client went, the service journals and sends a mark: a
+  `session_info_update` whose `_meta` has `gorynych/agentTurn: "ended"`, the prompt's ID, and
+  `gorynych/stopReason`, or `gorynych/error` `{code, message}` for a prompt that failed. A turn
+  cut off with its agent (the service stopped, the agent crashed) ends `cancelled`. A client
+  that comes back so finds out how its prompt ended, in the replay or live.
+- **Questions asked again.** An approval or a form waiting for a client goes to the next one
+  that attaches ([Standard methods](#standard-methods)), so a client that resumes the session is
+  asked again, under a new request ID.
+
+**Restart.** `_gorynych/restart {wait?, timeoutSeconds?}`, which the `restart` command sends:
+
+1. No new turn starts from then on. `session/prompt`, `_gorynych/opinion` and `_gorynych/spawn`
+   are refused with `-32603` and `data: {"gorynych/restarting": true}`: not carried out, so they
+   may go again to the next service. Everything else is served.
+2. Every client gets `_gorynych/restarting`, and so does a client that connects later.
+3. The service waits for the running turns: a client's, a service turn, one of the agent's own,
+   and a prompt waiting for one. It waits five minutes at most; `--timeout <minutes>` sets
+   another limit, and `--no-wait` (`wait: false`) waits for none.
+4. It cancels what still runs (`session/cancel` to the agent) and gives it 5 seconds to end.
+5. It answers `{processId, waitedSeconds, cancelledTurns}` and exits. The journals are written
+   as each update comes; the overlay is written at the exit.
+
+The next service is started by the next bridge that needs it, or by the logon task. An update
+of a running install therefore goes so ([getting-started.md](getting-started.md#update)):
+rename the running `Gorynych.Service.exe` aside (Windows allows a rename, not an overwrite),
+copy the new one in its place, and run `Gorynych.Service.exe restart`. The bridges keep running
+their old code until their client restarts them, and they start the executable at the path they
+were started from, where the new one now is. A service without restart (an older version)
+answers method not found, and the command asks it to exit instead.
+
+**The bridge** (`acp`) keeps one connection for its client across all of this, through
+`ResumableLink` in `Gorynych.Acp`, which the hub and the adapter hosts are to use too:
+
+- It passes every message through, in order, under IDs of its own toward each side, so the IDs
+  of an earlier connection never meet those of the next one.
+- It adds `gorynych/link: 1` to the client's `initialize` `_meta`. It resumes only a service
+  that advertises the link: with an older one, a dropped connection ends the bridge, as before.
+- It follows the sessions the client has open (`session/new`, `session/load` and
+  `session/resume` open one; `session/close` and `session/delete` end it) and the last position
+  of each.
+- When the connection drops it connects again, after 0.2, 0.5 and 1 seconds and then every 2
+  seconds, starting the service when its pipe is missing, as at its own start
+  ([Endpoint](#endpoint)). It sends the client's `initialize` again, whose answer the client
+  never sees, and resumes every open session after its position. What came meanwhile reaches the
+  client once, and nothing it had already.
+- The client's requests that were on their way: `session/list`, `session/close`,
+  `session/delete`, `session/set_mode`, `session/set_config_option`, `session/set_model`,
+  `authenticate`, `logout`, `_gorynych/status`, `_gorynych/read`, `_gorynych/peers` and
+  `_gorynych/archive` go again. A `session/load` or `session/resume` goes again as a resume
+  from where its replay had got to. A `session/prompt` stays open (below). Anything else
+  (`session/new`, `_gorynych/opinion`, …) ends with an error that says it may or may not have
+  been carried out. A request refused with `gorynych/restarting` goes again as it is.
+- What the client sends while there is no connection waits, in order, and so does a new prompt
+  after `_gorynych/restarting`, with everything after it. A `session/cancel` ends a prompt that
+  waits to go out with `cancelled` there, and goes at once to the service for a running turn.
+- A prompt that was on its way stays open. When its session is resumed, the link waits for the
+  mark of its end if `gorynych/prompts` lists its ID, and answers with its stop reason or error;
+  it answers the same way when the mark came in the replay; otherwise the prompt runs nowhere (it
+  went with the service before), and it ends `cancelled`. A `session/cancel` sent meanwhile goes
+  to the service that runs it.
+- A question the client still shows that the service asks again (the same method, session and
+  tool call) is not shown twice: the link joins the two, and an answer the client gave while
+  there was no connection goes to it. A question that has no turn left once its session is
+  resumed is withdrawn from the client with `$/cancel_request`; whether Zed handles that for an
+  agent's request is not confirmed.
+- The link's own traffic stays with it: `_gorynych/restarting`, the marks of its prompts' ends,
+  and its prompts' text, which its client never gets live and a resume may replay.
+- When no service is back within 60 seconds, it fails what waits with an error, says so on
+  stderr, and exits with 1.
+
+**Not covered yet.** A draft opened before a restart resumes only where its agent can take it:
+Kimi keeps its drafts, and the Claude adapter opens one afresh under its ID (`gorynych/draft`,
+[adapter-contract.md](adapter-contract.md#3-new-sessions-the-list-and-discovery)); a Codex
+thread never prompted fails at its first prompt after a restart. Until the adapter hosts exist,
+a restart still stops the agents with their running turns, which is why it waits for them first.
 
 ## Overlay
 

@@ -229,6 +229,49 @@ public sealed partial class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ADraftResumedAfterARestart_StartsAfreshUnderItsId_ButAnUnknownSessionIsNotFound()
+    {
+        var dir = TestDirs.New();
+        var agent = await new ClaudeAdapter(Options(dir)).StartAsync(CancellationToken.None);
+        var acp = new JsonRpcConnection(agent.Input, agent.Output, "direct-client")
+        {
+            RequestHandler = (_, _) => Task.FromResult<JsonNode?>(AcpJson.ToNode(new RequestPermissionResponse
+            {
+                Outcome = new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId }, // the folder's trust
+            })),
+        };
+        acp.Start();
+        try
+        {
+            await acp.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
+            JsonObject Resume(string id, bool draft) => new()
+            {
+                ["sessionId"] = id, ["cwd"] = dir, ["mcpServers"] = new JsonArray(),
+                ["_meta"] = draft ? new JsonObject { [GorynychProtocol.MetaDraft] = true } : null,
+            };
+            var e = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => acp.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume(Guid.NewGuid().ToString(), draft: false)));
+            Assert.AreEqual(JsonRpcException.ResourceNotFound, e.Code, "without the mark, a session nobody knows is not made up");
+
+            // A session the service created before this adapter restarted, and nobody prompted.
+            var draftId = Guid.NewGuid().ToString();
+            await acp.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume(draftId, draft: true));
+            var r = await acp.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = draftId, Prompt = [new TextContent { Text = "hi" }] });
+
+            Assert.AreEqual(StopReason.EndTurn, r.StopReason);
+            var args = LaunchArgs(draftId);
+            Assert.AreEqual(draftId, args[args.IndexOf("--session-id") + 1], "a new Claude session, under the draft's ID");
+            CollectionAssert.DoesNotContain(args, "--resume");
+        }
+        finally
+        {
+            await acp.DisposeAsync();
+            await agent.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task Options_ApplyToTheRunningClaude_AndCarryIntoTheNextLaunch_AndTheTitleIsClaudesOwn()
     {
         var dir = TestDirs.New();

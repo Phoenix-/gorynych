@@ -10,7 +10,9 @@ namespace Gorynych.Service;
 /// commands (<see cref="IsCommands"/>), one JSON object per line, replayed to a client on
 /// <c>session/load</c>. When it grows past the limit,
 /// consecutive text chunks of one message (one <c>messageId</c>) are merged and the oldest
-/// entries dropped.
+/// entries dropped. Every entry has its position, <c>_meta["gorynych/position"]</c>, which grows
+/// with each one appended and is never given twice: a client that resumes the session after one
+/// gets what follows it (<see cref="ReadAfter"/>).
 /// </summary>
 public sealed class SessionJournal
 {
@@ -20,11 +22,20 @@ public sealed class SessionJournal
     /// <summary>Updates that only a turn produces; the rest (commands, modes, config) also come with an empty session.</summary>
     static readonly HashSet<string> TurnKinds = ["user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan"];
 
+    const string PositionKey = Gorynych.Acp.Hosting.GorynychProtocol.MetaPosition;
+
+    /// <summary>
+    /// How many of the newest entries compaction never merges: a client on the resumable link
+    /// resumes after one of them, which must still stand alone under its position.
+    /// </summary>
+    internal const int TailKept = 256;
+
     readonly string path;
     readonly int maxEntries;
     readonly Lock gate = new();
     List<string>? lines;
     bool turns;
+    long last; // the newest entry's position; valid once loaded
 
     public SessionJournal(string path, int maxEntries)
     {
@@ -89,14 +100,19 @@ public sealed class SessionJournal
 
     public void Append(JsonNode update) => AppendMany([update]);
 
-    /// <summary>Appends several updates with one write (and at most one compaction).</summary>
+    /// <summary>
+    /// Appends several updates with one write (and at most one compaction). Each gets its position
+    /// in its <c>_meta</c> here, on the object passed, so what is sent after it carries it too.
+    /// </summary>
     public void AppendMany(IReadOnlyList<JsonNode> updates)
     {
         if (updates.Count == 0) return;
-        var added = updates.Select(u => u.ToJsonString(LineOptions)).ToList();
         lock (gate)
         {
             var all = Load();
+            foreach (var update in updates)
+                if (update is JsonObject o) SetPosition(o, ++last);
+            var added = updates.Select(u => u.ToJsonString(LineOptions)).ToList();
             all.AddRange(added);
             turns |= updates.Any(IsTurn);
             if (all.Count > maxEntries)
@@ -117,6 +133,57 @@ public sealed class SessionJournal
             return Load().Select(TryParse).OfType<JsonNode>().ToList();
     }
 
+    /// <summary>The newest entry's position, 0 for an empty journal.</summary>
+    public long LastPosition
+    {
+        get
+        {
+            lock (gate)
+            {
+                Load();
+                return last;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The entries after <paramref name="position"/>, oldest first, but the list of commands (the
+    /// session's state, which a client gets apart). After a position compaction has dropped, what
+    /// is left after it; after one past the end, nothing.
+    /// </summary>
+    public List<JsonNode> ReadAfter(long position)
+    {
+        lock (gate)
+            return Load().Select(TryParse).OfType<JsonNode>().Where(e => PositionOf(e) > position && !IsCommands(e)).ToList();
+    }
+
+    /// <summary>An entry's position (<c>_meta["gorynych/position"]</c>), 0 when it has none.</summary>
+    public static long PositionOf(JsonNode? entry) =>
+        entry?["_meta"]?[PositionKey] is JsonValue v && v.TryGetValue<string>(out var text) && long.TryParse(text, out var p) && p > 0 ? p : 0;
+
+    /// <summary>Reads a position a client sends back; false for anything the journal never gave.</summary>
+    public static bool TryParsePosition(string? text, out long position) =>
+        long.TryParse(text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out position);
+
+    /// <summary>A position as clients get it: an opaque string.</summary>
+    public static string FormatPosition(long position) => position.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    static void SetPosition(JsonObject entry, long position)
+    {
+        if (entry["_meta"] is not JsonObject meta) entry["_meta"] = meta = [];
+        meta[PositionKey] = FormatPosition(position);
+    }
+
+    /// <summary>A <c>_meta</c> without the position, for comparing two entries' own <c>_meta</c>; null when nothing else is in it.</summary>
+    static JsonObject? OwnMeta(JsonNode? meta)
+    {
+        if (meta is not JsonObject o) return null;
+        if (!o.ContainsKey(PositionKey)) return o.Count == 0 ? null : o;
+        var copy = o.DeepClone().AsObject();
+        copy.Remove(PositionKey);
+        return copy.Count == 0 ? null : copy;
+    }
+
     static JsonNode? TryParse(string line)
     {
         try { return JsonNode.Parse(line); }
@@ -129,6 +196,7 @@ public sealed class SessionJournal
         {
             lines = [];
             turns = false;
+            last = 0;
             mark = null;
             markRead = true;
             File.Delete(path);
@@ -191,12 +259,17 @@ public sealed class SessionJournal
     /// last <see cref="KeptHistoryCount"/> of them. The new <paramref name="mark"/> is written first:
     /// a crash before the journal is written then leaves the earlier journal and a mark past it,
     /// which a later open finds nothing after, rather than a second import. <paramref name="trimmed"/>
-    /// says that the entries are only the end of the history.
+    /// says that the entries are only the end of the history. Every entry gets a new position past
+    /// the old ones, on the object passed: the clients get them all again as new.
     /// </summary>
     public void Replace(IEnumerable<JsonNode> entries, DateTimeOffset now, string? mark, bool trimmed)
     {
         lock (gate)
         {
+            Load(); // for the last position
+            var list = entries.ToList();
+            foreach (var entry in list)
+                if (entry is JsonObject o) SetPosition(o, ++last);
             if (File.Exists(path))
             {
                 // Numbered after any kept at the same instant, so they sort as they were made.
@@ -214,8 +287,8 @@ public sealed class SessionJournal
                 this.mark = mark;
                 markRead = true;
             }
-            var all = entries.Select(e => e.ToJsonString(LineOptions)).ToList();
-            turns = all.Select(TryParse).Any(IsTurn);
+            var all = list.Select(e => e.ToJsonString(LineOptions)).ToList();
+            turns = list.Any(IsTurn);
             File.Delete(TrimmedPath); // the whole history again, unless it is trimmed once more
             if (trimmed)
                 try { File.WriteAllText(TrimmedPath, ""); }
@@ -230,10 +303,12 @@ public sealed class SessionJournal
     {
         if (lines is not null) return lines;
         lines = [];
+        last = 0;
         if (!File.Exists(path)) return lines;
         var text = File.ReadAllText(path, Encoding.UTF8);
         var dropped = false;
         var lists = new List<int>();
+        var nodes = new List<JsonNode>();
         foreach (var l in text.Split('\n'))
         {
             if (l.Length == 0) continue;
@@ -241,6 +316,7 @@ public sealed class SessionJournal
             turns |= IsTurn(node);
             if (IsCommands(node)) lists.Add(lines.Count);
             lines.Add(l);
+            nodes.Add(node);
         }
         // A journal written before the commands were kept as state has a list for every time the
         // session was opened; each replaced the one before, so only the last one is kept.
@@ -248,20 +324,40 @@ public sealed class SessionJournal
         {
             var stale = lists.Take(lists.Count - 1).ToHashSet();
             lines = lines.Where((_, i) => !stale.Contains(i)).ToList();
+            nodes = nodes.Where((_, i) => !stale.Contains(i)).ToList();
             dropped = true;
         }
-        if (dropped || (text.Length > 0 && text[^1] != '\n')) Rewrite(lines);
+        // Every entry has a position, growing in file order. A journal written before there were
+        // positions, or by an older build after them, gets the missing ones here, once.
+        var numbered = false;
+        for (var i = 0; i < nodes.Count; i++)
+        {
+            var position = PositionOf(nodes[i]);
+            if (position > last)
+            {
+                last = position;
+                continue;
+            }
+            if (nodes[i] is not JsonObject entry) continue;
+            SetPosition(entry, ++last);
+            lines[i] = entry.ToJsonString(LineOptions);
+            numbered = true;
+        }
+        if (dropped || numbered || (text.Length > 0 && text[^1] != '\n')) Rewrite(lines);
         return lines;
     }
 
     void Compact(List<string> all)
     {
-        // First merge streamed text chunks; that alone usually shrinks a journal a lot.
+        // First merge streamed text chunks; that alone usually shrinks a journal a lot. The newest
+        // entries stay as they are, so a client resuming after one finds it under its position.
+        var mergeable = all.Count - Math.Min(TailKept, maxEntries / 4);
         var merged = new List<string>(all.Count);
         JsonObject? pending = null;
-        foreach (var line in all)
+        for (var i = 0; i < all.Count; i++)
         {
-            var node = TryParse(line) as JsonObject;
+            var line = all[i];
+            var node = i < mergeable ? TryParse(line) as JsonObject : null;
             if (pending is not null && node is not null && TryMerge(pending, node)) continue;
             if (pending is not null) merged.Add(pending.ToJsonString(LineOptions));
             pending = node is not null && IsTextChunk(node) ? node : null;
@@ -285,18 +381,20 @@ public sealed class SessionJournal
 
     /// <summary>
     /// Merges <paramref name="next"/> into <paramref name="into"/> when both are text chunks of one
-    /// message: the same kind, the same <c>messageId</c> and the same <c>_meta</c> (a message from the
-    /// agent's own history has <c>gorynych/origin: native</c> on every chunk). Chunks without an ID
-    /// are never merged, since nothing says that two of them belong to one message (the service
-    /// gives every chunk it publishes an ID; only journals written before it did lack them).
+    /// message: the same kind, the same <c>messageId</c> and the same <c>_meta</c> but the position (a
+    /// message from the agent's own history has <c>gorynych/origin: native</c> on every chunk). Chunks
+    /// without an ID are never merged, since nothing says that two of them belong to one message (the
+    /// service gives every chunk it publishes an ID; only journals written before it did lack them).
+    /// The merged entry stands at the position of its last part.
     /// </summary>
     static bool TryMerge(JsonObject into, JsonObject next)
     {
         if (!IsTextChunk(next)) return false;
         if ((string?)into["sessionUpdate"] != (string?)next["sessionUpdate"]) return false;
         if ((string?)into["messageId"] is not { } id || (string?)next["messageId"] != id) return false;
-        if (!JsonNode.DeepEquals(into["_meta"], next["_meta"])) return false;
+        if (!JsonNode.DeepEquals(OwnMeta(into["_meta"]), OwnMeta(next["_meta"]))) return false;
         into["content"]!["text"] = (string?)into["content"]!["text"] + (string?)next["content"]!["text"];
+        if (PositionOf(next) is > 0 and var position) SetPosition(into, position);
         return true;
     }
 

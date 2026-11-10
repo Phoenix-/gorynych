@@ -175,6 +175,13 @@ public static class GorynychProtocol
     public const string CapDraftsNotDurable = "gorynych/draftsNotDurable";
 
     /// <summary>
+    /// In <c>session/resume</c> params <c>_meta</c>, service → adapter: <c>true</c> for a draft, a session
+    /// created and never prompted. An adapter that keeps nothing before the first prompt and no longer
+    /// knows the session (it restarted) opens it afresh under its ID (docs/adapter-contract.md, §3).
+    /// </summary>
+    public const string MetaDraft = "gorynych/draft";
+
+    /// <summary>
     /// A string naming another app that has the session open, so its agent cannot load it here until
     /// it is closed there ("Codex Desktop", "a terminal codex (pid 4242)"): in <c>SessionInfo._meta</c>
     /// of <c>session/list</c> (absent: free, or not known) (docs/service-protocol.md, "Sessions open in another app").
@@ -264,6 +271,75 @@ public static class GorynychProtocol
 
     /// <summary>Asks the service to exit.</summary>
     public const string MethodShutdown = "_gorynych/shutdown";
+
+    /// <summary>
+    /// Asks the service to exit for an update without breaking its clients' work:
+    /// <c>{wait?, timeoutSeconds?}</c> → <c>{processId, waitedSeconds, cancelledTurns}</c>. It starts
+    /// no new turn, waits for the running ones (unless <c>wait</c> is false) up to the timeout,
+    /// cancels what still runs, and exits; a client on the resumable link reconnects to the next
+    /// service (docs/service-protocol.md, "The resumable link").
+    /// </summary>
+    public const string MethodRestart = "_gorynych/restart";
+
+    /// <summary>
+    /// A notification to clients, <c>{}</c>: the service is restarting. A client on the resumable
+    /// link holds its new prompts from now on and sends them to the next service.
+    /// </summary>
+    public const string MethodRestarting = "_gorynych/restarting";
+
+    /// <summary>
+    /// In <c>agentCapabilities._meta</c> of the service's <c>initialize</c> result: the version of the
+    /// resumable link it speaks (1): positions on updates, <c>session/resume</c> from a position,
+    /// the turn state, <see cref="MethodRestarting"/>. A client of a service without it does not reconnect.
+    /// </summary>
+    public const string CapLink = "gorynych/link";
+
+    /// <summary>The version of the resumable link this build speaks.</summary>
+    public const int LinkVersion = 1;
+
+    /// <summary>
+    /// On every <c>session/update</c> the service journals, as a client gets it live or on
+    /// <c>session/load</c>: the update's position in the session's journal, an opaque string. A
+    /// <c>session/resume</c> with <c>replayFrom</c> <c>{"type": "gorynych/after", "mark": "&lt;position&gt;"}</c>
+    /// sends what follows it. Also in the <c>session/load</c> and <c>session/resume</c> result's
+    /// <c>_meta</c>: the position the client is at once the answer is written.
+    /// </summary>
+    public const string MetaPosition = "gorynych/position";
+
+    /// <summary>
+    /// In a <c>session/resume</c> and <c>session/load</c> result's <c>_meta</c>: <c>"running"</c> while a
+    /// turn of the session runs or a prompt for it waits, else <c>"idle"</c>.
+    /// </summary>
+    public const string MetaTurn = "gorynych/turn";
+
+    /// <summary>
+    /// On a <c>session/prompt</c>, client → service: an ID the client gives the prompt, so that after a
+    /// reconnect it can tell whether the prompt is still in progress (<see cref="MetaPrompts"/>) and
+    /// find the mark of its end. On that mark: the prompt the ended turn answered.
+    /// </summary>
+    public const string MetaPromptId = "gorynych/promptId";
+
+    /// <summary>
+    /// In a <c>session/resume</c> and <c>session/load</c> result's <c>_meta</c>: the
+    /// <see cref="MetaPromptId"/>s of the session's prompts still in progress (running, or waiting for
+    /// the turn before them).
+    /// </summary>
+    public const string MetaPrompts = "gorynych/prompts";
+
+    /// <summary>
+    /// On the mark that ends a turn (<see cref="MetaAgentTurn"/> <c>"ended"</c>): the turn's ACP stop
+    /// reason. Absent means <c>end_turn</c>.
+    /// </summary>
+    public const string MetaStopReason = "gorynych/stopReason";
+
+    /// <summary>On the mark that ends a turn whose prompt failed: the error, <c>{code, message}</c>.</summary>
+    public const string MetaError = "gorynych/error";
+
+    /// <summary>
+    /// In the <c>data</c> of an error: <c>true</c> when the service did not carry the request out
+    /// because it is restarting, so it may be sent again to the next service as it is.
+    /// </summary>
+    public const string MetaRestarting = "gorynych/restarting";
 
     /// <summary>The default local endpoint: one named pipe per user.</summary>
     public static string DefaultPipeName => "gorynych-acp-" + Sanitize(Environment.UserName);

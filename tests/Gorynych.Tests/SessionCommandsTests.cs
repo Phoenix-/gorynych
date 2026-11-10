@@ -265,11 +265,13 @@ public sealed class SessionCommandsTests
     }
 
     [TestMethod]
-    public void AJournalWithOneList_IsLeftAsItIs()
+    public void AJournalWithOneList_IsLeftAsItIs_OnceItsEntriesHavePositions()
     {
         var path = Path.Combine(TestDirs.New(), SessionJournal.FileNameFor("s1"));
-        var text = Line(List("only")) + Line(Chunk("user_message_chunk", "go"));
-        File.WriteAllText(path, text);
+        File.WriteAllText(path, Line(List("only")) + Line(Chunk("user_message_chunk", "go")));
+        // Written before there were positions: numbered once.
+        CollectionAssert.AreEqual(new long[] { 1, 2 }, new SessionJournal(path, 100).ReadAll().Select(SessionJournal.PositionOf).ToArray());
+        var text = File.ReadAllText(path);
         var written = File.GetLastWriteTimeUtc(path);
 
         Assert.AreEqual(2, new SessionJournal(path, 100).ReadAll().Count);

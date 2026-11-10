@@ -50,6 +50,13 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
   restart.
 - Sessions created but never prompted (drafts) are deleted when the client closes them or
   goes away, and are not listed ([service-protocol.md](service-protocol.md#drafts-and-deletion)).
+  A bridge that went is given two minutes to come back for them.
+- The connection outlives the service: when the pipe drops or the service restarts
+  (`Gorynych.Service.exe restart`), the bridge connects to the next service, resumes the open
+  sessions after the last update the client got, keeps a prompt in flight open until its turn
+  ends there (or answers `cancelled` when it went with the old service), and shows a pending
+  approval once. The client sees a pause, not a break
+  ([service-protocol.md](service-protocol.md#the-resumable-link)).
 - A session an agent spawned is an ordinary session in `session/list`, with its parent in
   `_meta["gorynych/parentSessionId"]`. The service asks the person to approve a spawn with
   a `session/request_permission` on the parent session, unless the user asked for it in their
@@ -80,7 +87,8 @@ and what the service does about it:
 - `session/new` is eager: it fires when a thread view is created (the panel opens, `+`),
   before any prompt. Zed does not keep the IDs of such drafts, so every restart makes
   another one, and quitting kills the bridge without `session/close`. The service deletes
-  these drafts when the bridge disconnects, and sweeps any left over at its next start.
+  these drafts two minutes after the bridge disconnects, unless it came back for them, and
+  sweeps any left over at its next start, two minutes in.
 - `session/close` is sent, because the service advertises `close`, when Zed drops a thread:
   a thread or draft removed or replaced, idle threads beyond the five it keeps, an
   abandoned new or load. Archiving and quitting send nothing. When no other client has the

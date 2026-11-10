@@ -573,10 +573,16 @@ public sealed class HistoryCatchUpTests
             journal.Append(chunk);
         }
 
-        var merged = journal.ReadAll().Single();
+        var read = journal.ReadAll();
+        var merged = read[0];
 
         StringAssert.StartsWith((string?)merged["content"]?["text"], "part0 part1 ");
         Assert.AreEqual("native", (string?)merged["_meta"]?[GorynychProtocol.MetaOrigin]);
+        // The newest quarter stays apart, for a client that resumes after one of them.
+        Assert.AreEqual(1 + 16 / 4, read.Count);
+        Assert.AreEqual("part13 ", (string?)read[1]["content"]?["text"]);
+        Assert.AreEqual(13, SessionJournal.PositionOf(merged), "a merged entry stands where its last part stood");
+        Assert.AreEqual(14, SessionJournal.PositionOf(read[1]));
     }
 
     [TestMethod]

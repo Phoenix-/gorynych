@@ -109,6 +109,9 @@ sealed class TestClient : IAsyncDisposable
     /// <summary>The <c>_gorynych/sessions_changed</c> notifications received, in order.</summary>
     public List<JsonObject> Changes { get; } = [];
 
+    /// <summary>The methods of the other notifications received, in order.</summary>
+    public List<string> Notices { get; } = [];
+
     public InitializeResponse? Initialized { get; private set; }
     public List<ElicitationFormMode> Forms { get; } = [];
 
@@ -156,6 +159,8 @@ sealed class TestClient : IAsyncDisposable
                 }
             else if (method == GorynychProtocol.MethodSessionsChanged && p is JsonObject change)
                 lock (client.Changes) client.Changes.Add(change);
+            else
+                lock (client.Notices) client.Notices.Add(method);
             return Task.CompletedTask;
         };
         client.Rpc.RequestHandler = async (req, ct) =>

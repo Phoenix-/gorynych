@@ -222,12 +222,13 @@ public sealed class BridgeTests
     [TestMethod]
     public void ScopeInitialize_AddsTheAgent_AndKeepsTheClientsOwnMeta()
     {
-        var line = AcpBridge.ScopeInitialize("""{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"_meta":{"zed":true}}}""", "kimi");
-        var p = JsonNode.Parse(line)!["params"]!;
+        var scope = AcpBridge.LinkOptions("kimi").InitializeMeta;
+        var p = Gorynych.Acp.Link.ResumableLink.AddMeta(JsonNode.Parse("""{"protocolVersion":1,"_meta":{"zed":true}}""")!.AsObject(), scope);
         Assert.AreEqual("kimi", (string?)p["_meta"]!["gorynych/agent"]);
         Assert.IsTrue((bool)p["_meta"]!["zed"]!);
-        var other = """{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"C:\\w","mcpServers":[],"text":"\"initialize\""}}""";
-        Assert.AreEqual(other, AcpBridge.ScopeInitialize(other, "kimi"), "only initialize is touched");
+        var own = Gorynych.Acp.Link.ResumableLink.AddMeta(JsonNode.Parse("""{"_meta":{"gorynych/agent":"codex"}}""")!.AsObject(), scope);
+        Assert.AreEqual("codex", (string?)own["_meta"]!["gorynych/agent"], "the client's own choice wins");
+        Assert.AreEqual("kimi", (string?)Gorynych.Acp.Link.ResumableLink.AddMeta(null, scope)["_meta"]!["gorynych/agent"]);
     }
 }
 

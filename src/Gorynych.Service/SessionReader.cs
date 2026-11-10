@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using Gorynych.Acp.Hosting;
 
 namespace Gorynych.Service;
 
@@ -193,7 +194,11 @@ internal static partial class SessionReader
             update["content"] = new JsonObject { ["type"] = "text", ["text"] = room is { } r && text.Length > r ? CutMiddle(text, r) : text };
             if (i.MessageId is not null) update["messageId"] = i.MessageId;
         }
-        if (i.Meta is not null) update["_meta"] = i.Meta.DeepClone();
+        if (i.Meta?.DeepClone().AsObject() is { } meta)
+        {
+            meta.Remove(GorynychProtocol.MetaPosition); // for clients that resume; a page has its own cursor
+            if (meta.Count > 0) update["_meta"] = meta;
+        }
         return update;
     }
 

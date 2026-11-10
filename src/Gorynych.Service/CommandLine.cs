@@ -26,6 +26,9 @@ internal sealed class CommandLine
               the stdio bridge for ACP clients such as Zed; starts the service when its pipe is missing
           Gorynych.Service shutdown [--pipe <name>]
               asks the running service to exit and waits for it
+          Gorynych.Service restart [--pipe <name>] [--timeout <minutes>] [--no-wait]
+              asks the running service to exit for an update: it starts no new turn, waits for the
+              running ones (5 minutes at most by default), and its bridges start the new one
           Gorynych.Service task install [--pipe <name>] [service options]
           Gorynych.Service task uninstall [--pipe <name>]
               registers or removes the Windows logon task that starts the service in this user's session
@@ -57,7 +60,7 @@ internal sealed class CommandLine
         Action = action;
     }
 
-    /// <summary>null for the service itself, else <c>acp</c>, <c>shutdown</c>, <c>task</c> or <c>peers</c>.</summary>
+    /// <summary>null for the service itself, else <c>acp</c>, <c>shutdown</c>, <c>restart</c>, <c>task</c> or <c>peers</c>.</summary>
     public string? Command { get; }
 
     /// <summary><c>install</c> or <c>uninstall</c> for <c>task</c>.</summary>
@@ -101,6 +104,9 @@ internal sealed class CommandLine
                 break;
             case "shutdown":
                 known = (["--pipe"], []);
+                break;
+            case "restart":
+                known = (["--pipe", "--timeout"], ["--no-wait"]);
                 break;
             case "peers":
                 known = (["--pipe", "--token", "--channel-url", "--reply-url"], []);
@@ -167,7 +173,7 @@ internal sealed class CommandLine
         {
             "--claude-transport" => value is "headless" or "tui",
             "--claude-channels" => value is "ask" or "accept" or "decline",
-            "--unload-after" => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var m) && m >= 0 && Minutes(m),
+            "--unload-after" or "--timeout" => MinutesOf(value) is not null,
             _ => true,
         };
         if (ok) return;
@@ -175,7 +181,11 @@ internal sealed class CommandLine
         {
             "--claude-transport" => $"--claude-transport takes headless or tui, not '{value}'",
             "--claude-channels" => $"--claude-channels takes ask, accept or decline, not '{value}'",
-            _ => $"--unload-after takes a number of minutes, 0 or more, not '{value}'",
+            _ => $"{name} takes a number of minutes, 0 or more, not '{value}'",
         });
     }
+
+    /// <summary>A number of minutes, 0 or more, that makes a time span; null for anything else.</summary>
+    public static TimeSpan? MinutesOf(string? value) =>
+        double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var m) && m >= 0 && Minutes(m) ? TimeSpan.FromMinutes(m) : null;
 }

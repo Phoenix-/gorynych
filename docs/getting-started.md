@@ -245,20 +245,30 @@ timeouts and how to try it without registering:
 
 ## Update
 
-1. Quit Zed. Its bridges run `Gorynych.Service.exe` and keep the file locked.
-2. Stop the service. Turns still running are cancelled:
+Zed can stay open: its threads go on with the new service
+([service-protocol.md](service-protocol.md#the-resumable-link)).
+
+1. Windows will not overwrite an exe that runs (the service, Zed's bridges, an outside server),
+   but it allows a rename. The stamp keeps the name free while a copy from an earlier update
+   still runs; delete the `*.old.exe` files once nothing runs them.
    ```powershell
-   & "$env:LOCALAPPDATA\Programs\Gorynych\Gorynych.Service.exe" shutdown
+   $dir = "$env:LOCALAPPDATA\Programs\Gorynych"; $stamp = Get-Date -Format yyyyMMddHHmmss
+   Rename-Item "$dir\Gorynych.Service.exe" "Gorynych.Service.$stamp.old.exe"
+   Rename-Item "$dir\outside\Gorynych.Outside.exe" "Gorynych.Outside.$stamp.old.exe"
    ```
-3. If an agent outside Gorynych runs the outside server, Windows will not overwrite its exe, but
-   it allows a rename:
+2. Install the new build as above. `Expand-Archive -Force` writes the new files in place.
+3. Restart the service. It starts no new turn, waits up to five minutes for the running ones
+   (`--timeout <minutes>` changes that, `--no-wait` waits for none), cancels what still runs,
+   and exits; Zed's bridges hold the prompts sent meanwhile, start the new service and carry on:
    ```powershell
-   Rename-Item "$env:LOCALAPPDATA\Programs\Gorynych\outside\Gorynych.Outside.exe" Gorynych.Outside.old.exe
+   & "$dir\Gorynych.Service.exe" restart
    ```
-   That agent keeps the old copy until it restarts its MCP servers. Delete a
-   `Gorynych.Outside.old.exe` left from an earlier update first, once nothing runs it.
-4. Install the new build as above. `Expand-Archive -Force` overwrites the old files.
-5. Start Zed.
+   The bridges themselves keep running the old copy until Zed restarts them, and an agent outside
+   Gorynych keeps its outside server until it restarts its MCP servers.
+
+**The first update onto this scheme**, from a build without `restart`: the command asks the old
+service to exit instead, which cancels its running turns, and the bridges Zed runs are old too,
+so they end with it. Quit Zed before it and start it again after.
 
 If a file is still in use, look for processes that are left over:
 `Get-Process Gorynych.Service, Gorynych.Outside`.

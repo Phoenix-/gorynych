@@ -123,6 +123,10 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   `session/resume`, and lives until `session/close` or the service's idle unload. It gets the
   TUI's cleaned environment without `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`, which in
   `-p` would win over the plan login.
+- A `session/resume` with `_meta["gorynych/draft"]: true` for a session the adapter does not
+  know (it restarted before the draft's first prompt, which is when it records a session)
+  opens it afresh under its ID, so its first prompt launches with `--session-id`. Without the
+  mark an unknown session is not found (both transports).
 - The session handles only the lines of its current process: a process it gave up (stopped off
   the plan, or after an interrupt without a result) may still have output in the pipe, which is
   dropped, so it can neither open a turn nor answer an approval.
@@ -596,7 +600,7 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 | --- | --- |
 | `session/new` | `thread/start {cwd, config, developerInstructions}`. Nothing is on disk before the first turn, and the thread is not listed until then (`gorynych/draftsNotDurable`: the service drops an unused draft instead of hiding it) |
 | `session/list` | `thread/list {cwd, cursor, limit 50, archived: false, sortKey: updated_at, useStateDbOnly: true}`; `title` is the thread's `name` (none until a name is set or generated: the service shows its provisional title), `updatedAt` from unix seconds |
-| `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}`; with `gorynych/replayFrom`, then the thread's turns after the mark (below) |
+| `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}`; with `gorynych/replayFrom`, then the thread's turns after the mark (below). `gorynych/draft` changes nothing: the app-server names a thread, so a thread never prompted is not there after the adapter restarts |
 | `session/load` | the same, then the history from `thread/items/list`, page by page, as the updates below. The service no longer uses it: a thread the journal has not seen is imported through the replay from the start |
 | `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), up to 5 s for the turn to end, then `thread/unsubscribe`. App-server is started with `-c thread_unload_delay_secs=0`, so it unloads the thread at once, and the close returns once `thread/closed` came (at most 10 s): the thread's writer lock is then free for another Codex app. A turn that has not ended by then ends `cancelled`: Codex sends nothing more of an unsubscribed thread |
 | `session/delete` | stops a running turn as `session/close` does, then `thread/delete`; a thread Codex no longer has answers `-32002` |

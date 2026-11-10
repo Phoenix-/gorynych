@@ -550,7 +550,9 @@ between the conductor and the adapters.**
      not yet answered. It buffered the updates that came while no conductor was there, and
      hands them over now, so the journal misses nothing.
   3. The bridge reconnects too. It keeps the client's `session/prompt` open and answers it
-     when the turn ends, so the GUI sees a pause in the stream, not a break.
+     when the turn ends, so the GUI sees a pause in the stream, not a break (the bridge's part
+     is **done**; until the hosts exist, the turn ends with the old conductor, so the bridge
+     answers `cancelled`, and `restart` waits for running turns first).
 - How many hosts depends on the agent:
   - Claude runs a process per session, so it gets a host per session.
   - Codex runs one app-server for all threads, Kimi one process, and DSH a process per mode.
@@ -566,7 +568,9 @@ between the conductor and the adapters.**
 
 **One resumable link, three uses.** The same mechanism serves:
 - the hub and a remote service over ssh;
-- the bridge and the service across a restart;
+- the bridge and the service across a restart (**done** on 10 November 2026:
+  `ResumableLink` and `Gorynych.Service restart`,
+  [service-protocol.md](service-protocol.md#the-resumable-link));
 - the conductor and its hosts.
 
 Each time one side lives on while the other restarts or loses the connection. After
@@ -586,6 +590,19 @@ last acknowledged one, and send the pending requests again. So it is built once.
     `_meta["gorynych/replayFrom"]` with a `gorynych/after` mark, as the
     [native catch-up](service-protocol.md#history-made-outside-gorynych) already sends.
   - The side that lives on sends its pending requests again.
+- How the bridge's link meets each point (10 November 2026):
+  - The resume: the bridge sends `session/resume` for every session its client has open, after
+    sending the client's `initialize` again. Its version goes in `agentCapabilities._meta`
+    (`gorynych/link: 1`), and a bridge with an older service does not reconnect.
+  - The cursor: every journaled update carries its position (`gorynych/position`), which is the
+    `mark` of `gorynych/after`; the service sends what follows it before the resume's answer.
+  - Pending requests: the service, which lives on in a dropped connection, sends a pending
+    approval to the client that resumes, and the bridge joins it to the one its client has. The
+    bridge, which lives on in a restart, sends again the client's requests that may run twice,
+    holds a prompt in flight until the mark of its turn's end (`gorynych/promptId`), and fails
+    any other with an error. ACP has no message IDs to deliver once by, so the bridge keeps
+    IDs of its own toward each side.
+  - Still open: v2's own `replayFrom` and `session/attach`, to move to once they are stable.
 - To align with later:
   - v2 of the transport RFD;
   - a proposed `session/attach` with delta sync after a message ID (not yet checked).

@@ -658,20 +658,23 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <see cref="SessionJournal"/>): it is sent last, in place of the current one only when the
     /// agent has sent none since the service started.
     /// </summary>
-    public async Task ReplayAndAttachAsync(ClientConnection client)
+    /// <returns>The position the client is at: what it gets next follows it.</returns>
+    public async Task<long> ReplayAndAttachAsync(ClientConnection client)
     {
         await gate.WaitAsync();
         try
         {
-            if (Retired) return;
+            var position = Journal.LastPosition;
+            if (Retired) return position;
             JsonNode? journaled = null;
             foreach (var update in Journal.ReadAll())
             {
                 if (SessionJournal.IsCommands(update)) { journaled = update; continue; }
-                if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update))) return;
+                if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update))) return position;
             }
-            if ((commands?.DeepClone() ?? journaled) is { } list && !await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(list))) return;
+            if ((commands?.DeepClone() ?? journaled) is { } list && !await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(list))) return position;
             Attach(client);
+            return position;
         }
         finally
         {
@@ -680,21 +683,73 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     }
 
     /// <summary>
-    /// Sends <paramref name="client"/> the current list of commands, then attaches it: a
-    /// <c>session/resume</c> replays no history, but the client still needs the session's state.
+    /// Sends <paramref name="client"/> what the journal has after <paramref name="after"/> (a client
+    /// on the resumable link coming back; nothing for a plain <c>session/resume</c>, which replays no
+    /// history), then the current list of commands, which the client needs all the same, then
+    /// attaches it, without losing updates in between.
     /// </summary>
-    public async Task ResumeAndAttachAsync(ClientConnection client)
+    /// <returns>The position the client is at: what it gets next follows it.</returns>
+    public async Task<long> ResumeAndAttachAsync(ClientConnection client, long? after = null)
     {
         await gate.WaitAsync();
         try
         {
-            if (Retired) return;
-            if (commands?.DeepClone() is { } list && !await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(list))) return;
+            var position = Journal.LastPosition;
+            if (Retired) return position;
+            if (after is { } from)
+                foreach (var update in Journal.ReadAfter(from))
+                    if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update))) return position;
+            if (commands?.DeepClone() is { } list && !await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(list))) return position;
             Attach(client);
+            return position;
         }
         finally
         {
             gate.Release();
+        }
+    }
+
+    readonly Dictionary<long, string?> prompts = []; // under clientsGate: the client prompts in progress, by a number of the feed's own
+    long promptCount;
+
+    /// <summary>
+    /// A client's prompt for the session is in progress, from its arrival to its answer, waiting for
+    /// the turn before it included; <paramref name="promptId"/> is the ID its client gave it, if any
+    /// (<c>gorynych/promptId</c>). Returns what <see cref="EndPrompt"/> takes.
+    /// </summary>
+    public long BeginPrompt(string? promptId)
+    {
+        lock (clientsGate)
+        {
+            var key = ++promptCount;
+            prompts[key] = promptId;
+            return key;
+        }
+    }
+
+    public void EndPrompt(long key)
+    {
+        lock (clientsGate) prompts.Remove(key);
+    }
+
+    /// <summary>The IDs of the client prompts in progress that have one.</summary>
+    public string[] PromptsInProgress()
+    {
+        lock (clientsGate) return prompts.Values.OfType<string>().ToArray();
+    }
+
+    /// <summary>
+    /// True while a turn runs (a client's, a service turn, one of the agent's own) or a client's
+    /// prompt waits for one: what a client resuming the session is told (<c>gorynych/turn</c>), and
+    /// what a restart waits for.
+    /// </summary>
+    public bool TurnRunning
+    {
+        get
+        {
+            lock (clientsGate)
+                if (prompts.Count > 0) return true;
+            return TurnGate.CurrentCount == 0 || Volatile.Read(ref agentTurn) != 0;
         }
     }
 

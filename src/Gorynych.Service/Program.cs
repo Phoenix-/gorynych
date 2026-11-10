@@ -27,6 +27,10 @@ switch (line.Command)
     // Asks the running service to exit and waits for it; exit code 1 when none runs on the pipe.
     case "shutdown":
         return await AcpBridge.ShutdownAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName);
+    // Asks it to exit for an update without breaking its clients' work; its bridges start the new one.
+    case "restart":
+        return await AcpBridge.RestartAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName, !line.Flag("--no-wait"),
+            CommandLine.MinutesOf(line.Value("--timeout")) ?? Conductor.DefaultRestartTimeout);
     // The stdio entry point for external ACP clients (Zed); starts the service when needed.
     case "acp":
         return await AcpBridge.RunAsync(line.Value("--agent")!, line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName, line.ServiceArguments("--pipe"));
@@ -50,7 +54,17 @@ if (!line.Flag("--console") && Gorynych.Outside.DetachedProcess.ReleaseOwnConsol
 using var instance = new Mutex(initiallyOwned: false, "Gorynych.Service." + pipeName,
     new NamedWaitHandleOptions { CurrentUserOnly = true, CurrentSessionOnly = false });
 bool owned;
-try { owned = instance.WaitOne(0); }
+try
+{
+    owned = instance.WaitOne(0);
+    if (!owned)
+    {
+        // A bridge starts a service when the pipe is missing: the one that holds the mutex may be
+        // on its way out (a restart), so this one waits a while for it rather than leave nobody.
+        ServiceLog.Info($"another service holds {pipeName}; waiting up to 15 s for it to exit");
+        owned = instance.WaitOne(TimeSpan.FromSeconds(15));
+    }
+}
 catch (AbandonedMutexException) { owned = true; }
 if (!owned)
 {
@@ -93,8 +107,9 @@ await using var conductor = new Conductor(new ConductorOptions
     PeerServerCommand = line.Flag("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
 }, adapters);
 
-// Drafts a client left behind in an earlier run (Zed quits without closing them).
-_ = Task.Run(conductor.SweepDraftsAsync);
+// Drafts a client left behind in an earlier run (Zed quits without closing them), once the bridges
+// that come back after a restart had the time to resume theirs.
+_ = Task.Run(() => conductor.SweepDraftsAsync(ConductorOptions.DefaultComeBackGrace));
 
 using var stop = CancellationTokenSource.CreateLinkedTokenSource(conductor.ShutdownRequested);
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; Stop(stop); };

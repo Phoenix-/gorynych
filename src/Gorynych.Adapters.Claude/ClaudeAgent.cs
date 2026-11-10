@@ -210,7 +210,11 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             {
                 var p = request.ParamsAs<ResumeSessionRequest>();
                 var systemPrompt = ClaudeHooks.SystemPromptText(p.SystemPrompt);
-                var session = Session(p.SessionId, p.Cwd);
+                // A draft the service kept while this adapter restarted: nothing of it was written
+                // before its first prompt, so it starts afresh under its ID.
+                var session = IsDraft(p.Meta) && !Knows(p.SessionId, p.Cwd)
+                    ? sessions.GetOrAdd(p.SessionId, id => NewSession(id, RequireDirectory(p.Cwd), resume: false))
+                    : Session(p.SessionId, p.Cwd);
                 if (p.McpServers is { } servers) session.McpServers = servers;
                 session.SystemPrompt = systemPrompt; // it applies per request: none now means none
                 var replayed = p.Meta?[GorynychProtocol.MetaReplayFrom] is JsonObject from ? await ReplayAsync(session, from) : null;
@@ -413,6 +417,13 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         await Channel.NotifyAsync(id, text, request.Params?["_meta"] as JsonObject, ct);
         return new JsonObject();
     }
+
+    static bool IsDraft(JsonObject? meta) => meta?[GorynychProtocol.MetaDraft] is JsonValue v && v.TryGetValue<bool>(out var draft) && draft;
+
+    /// <summary>Whether a session is open here, recorded, or has a transcript of Claude's: not a draft to start afresh.</summary>
+    bool Knows(string id, string? cwd) =>
+        sessions.ContainsKey(id) || state.Get(id) is not null
+        || cwd is not null && File.Exists(TranscriptTitles.ExpectedPath(cwd, id, options.ProjectsDirectory));
 
     IClaudeSession Session(string id, string? cwd)
     {

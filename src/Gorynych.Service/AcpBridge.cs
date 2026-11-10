@@ -1,11 +1,10 @@
 using System.ComponentModel;
 using System.IO.Pipes;
-using System.Text;
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
+using Gorynych.Acp.Link;
 using Gorynych.Outside;
 
 namespace Gorynych.Service;
@@ -13,21 +12,20 @@ namespace Gorynych.Service;
 /// <summary>
 /// The stdio entry point for external ACP clients (Zed and the like), which spawn an agent and
 /// speak ACP over its stdin and stdout: <c>Gorynych.Service acp --agent claude|kimi|codex|dsh [--pipe P]</c>.
-/// It starts the service if needed, connects to its pipe and passes messages through. The one
-/// change it makes is to add <c>_meta["gorynych/agent"]</c> to the client's <c>initialize</c>,
+/// It starts the service if needed, connects to its pipe and passes messages through on the
+/// resumable link (<see cref="ResumableLink"/>), so the client keeps one connection while the
+/// service restarts. It adds <c>_meta["gorynych/agent"]</c> to the client's <c>initialize</c>,
 /// which scopes the connection to that agent, so the client itself stays plain ACP.
 /// </summary>
 public static class AcpBridge
 {
-    static readonly JsonSerializerOptions Wire = Acp.AcpJson.TextOptions;
-
     /// <param name="serviceArgs">Arguments for the service if the bridge has to start it.</param>
     public static async Task<int> RunAsync(string agent, string pipe, IReadOnlyList<string> serviceArgs)
     {
         NamedPipeClientStream service;
         try
         {
-            service = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromMilliseconds(300)) ?? await StartAndConnectAsync(pipe, serviceArgs);
+            service = await ConnectOrStartAsync(pipe, serviceArgs);
         }
         catch (NotStartedException e)
         {
@@ -44,16 +42,28 @@ public static class AcpBridge
             Console.Error.WriteLine($"gorynych acp: cannot reach the service on pipe {pipe}: {e.Message}{Hint(e)}");
             return 1;
         }
-        await using (service)
+        var link = new ResumableLink(Console.OpenStandardInput(), Console.OpenStandardOutput(), async _ =>
         {
-            var up = Task.Run(() => ClientToServiceAsync(Console.OpenStandardInput(), service, agent));
-            var down = Task.Run(() => service.CopyToAsync(new FlushingStream(Console.OpenStandardOutput())));
-            await Task.WhenAny(up, down);
-        }
-        return 0;
+            var again = await ConnectOrStartAsync(pipe, serviceArgs);
+            return (again, again);
+        }, LinkOptions(agent));
+        return await link.RunAsync((service, service));
     }
 
-    /// <summary>What a refused connection to the pipe usually means (docs/service-protocol.md, Endpoint).</summary>
+    /// <summary>
+    /// The bridge's link: it scopes the client's <c>initialize</c> to its agent, says on stderr what
+    /// happens to the connection, and gives up when no service is back within 60 seconds.
+    /// </summary>
+    internal static ResumableLinkOptions LinkOptions(string agent) => new()
+    {
+        Log = m => Console.Error.WriteLine($"gorynych acp: {m}"),
+        InitializeMeta = new JsonObject { [GorynychProtocol.MetaAgent] = agent },
+    };
+
+    /// <summary>Connects to the service's pipe; when it is missing, starts the service and waits for it.</summary>
+    static async Task<NamedPipeClientStream> ConnectOrStartAsync(string pipe, IReadOnlyList<string> serviceArgs) =>
+        await ServicePipe.ConnectAsync(pipe, TimeSpan.FromMilliseconds(300)) ?? await StartAndConnectAsync(pipe, serviceArgs);
+
     /// <summary>The elevation hint for a pipe whose ACL refused this process; none for a pipe someone else owns.</summary>
     internal static string Hint(Exception e) => e is UnauthorizedAccessException and not ServicePipe.ForeignPipeException ? " " + ElevationHint : "";
 
@@ -67,7 +77,46 @@ public static class AcpBridge
     /// to end. 0 when it stopped, 1 when no service runs on the pipe or it could not be asked, 2
     /// when it was asked but still runs.
     /// </summary>
-    public static async Task<int> ShutdownAsync(string pipe, int waitSeconds = 30)
+    public static Task<int> ShutdownAsync(string pipe, int waitSeconds = 30) => StopAsync("shutdown", pipe, waitSeconds, async (rpc, processId) =>
+    {
+        await rpc.SendRequestAsync(GorynychProtocol.MethodShutdown, new JsonObject());
+        Console.Error.WriteLine($"gorynych shutdown: asked the service (process {processId}) to exit; turns still running are cancelled");
+    });
+
+    /// <summary>
+    /// <c>Gorynych.Service restart [--pipe P] [--timeout M] [--no-wait]</c>: asks the running service to
+    /// restart (<c>_gorynych/restart</c>): it starts no new turn, waits up to <paramref name="timeout"/> for
+    /// the running ones unless <paramref name="wait"/> is false, cancels the rest, and exits; then this
+    /// waits for its process to end. The bridges connected to it start the next service, with the
+    /// executable now at the path they were started from, or its logon task: so an update renames the
+    /// running executable aside, copies the new one in its place, and runs this. Exit codes as for
+    /// <see cref="ShutdownAsync"/>. A service without restart (an older version) is asked to exit instead.
+    /// </summary>
+    public static Task<int> RestartAsync(string pipe, bool wait, TimeSpan timeout, int waitSeconds = 30) => StopAsync("restart", pipe, waitSeconds, async (rpc, processId) =>
+    {
+        Console.Error.WriteLine(wait
+            ? $"gorynych restart: asked the service (process {processId}) to restart; it starts no new turn and waits up to {timeout.TotalMinutes:0.#} min for the running ones"
+            : $"gorynych restart: asked the service (process {processId}) to restart without waiting for its turns");
+        try
+        {
+            var reply = await rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = wait, ["timeoutSeconds"] = timeout.TotalSeconds });
+            var cancelled = (int?)reply?["cancelledTurns"] ?? 0;
+            Console.Error.WriteLine($"gorynych restart: it waited {(double?)reply?["waitedSeconds"] ?? 0:0.#} s" +
+                (cancelled > 0 ? $" and cancelled {cancelled} turn{(cancelled == 1 ? "" : "s")} that still ran" : "") + "; it is exiting");
+        }
+        catch (JsonRpcException e) when (e.Code == JsonRpcException.MethodNotFound)
+        {
+            await rpc.SendRequestAsync(GorynychProtocol.MethodShutdown, new JsonObject());
+            Console.Error.WriteLine("gorynych restart: the service is an older version without restart, so it was asked to exit; its running turns are cancelled");
+        }
+    }, stopped: "; the next bridge or the logon task starts the new one");
+
+    /// <summary>
+    /// Connects to the running service, asks it with <paramref name="ask"/>, and waits up to
+    /// <paramref name="waitSeconds"/> for its process to end: 0 when it stopped, 1 when no service runs
+    /// on the pipe or it could not be asked, 2 when it was asked but still runs.
+    /// </summary>
+    static async Task<int> StopAsync(string command, string pipe, int waitSeconds, Func<JsonRpcConnection, int, Task> ask, string stopped = "")
     {
         NamedPipeClientStream? stream;
         try
@@ -76,16 +125,16 @@ public static class AcpBridge
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            Console.Error.WriteLine($"gorynych shutdown: cannot reach the service on pipe {pipe}: {e.Message}{Hint(e)}");
+            Console.Error.WriteLine($"gorynych {command}: cannot reach the service on pipe {pipe}: {e.Message}{Hint(e)}");
             return 1;
         }
         if (stream is null)
         {
-            Console.Error.WriteLine($"gorynych shutdown: no service is running on pipe {pipe}");
+            Console.Error.WriteLine($"gorynych {command}: no service is running on pipe {pipe}");
             return 1;
         }
         int processId;
-        await using (var rpc = new JsonRpcConnection(stream, stream, "shutdown"))
+        await using (var rpc = new JsonRpcConnection(stream, stream, command))
         {
             rpc.Start();
             try
@@ -93,18 +142,17 @@ public static class AcpBridge
                 await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
                 {
                     ProtocolVersion = AcpMethods.ProtocolVersion,
-                    ClientInfo = new Implementation { Name = "gorynych-shutdown", Version = AgentHost.Version },
+                    ClientInfo = new Implementation { Name = "gorynych-" + command, Version = AgentHost.Version },
                 });
                 processId = (int?)(await rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()))?["processId"] ?? 0;
-                await rpc.SendRequestAsync(GorynychProtocol.MethodShutdown, new JsonObject());
+                await ask(rpc, processId);
             }
             catch (Exception e) when (e is IOException or JsonRpcException)
             {
-                Console.Error.WriteLine($"gorynych shutdown: the service on pipe {pipe} did not take the request: {e.Message}");
+                Console.Error.WriteLine($"gorynych {command}: the service on pipe {pipe} did not take the request: {e.Message}");
                 return 1;
             }
         }
-        Console.Error.WriteLine($"gorynych shutdown: asked the service (process {processId}) to exit; turns still running are cancelled");
         try
         {
             using var process = System.Diagnostics.Process.GetProcessById(processId);
@@ -113,40 +161,11 @@ public static class AcpBridge
         catch (ArgumentException) { } // already gone
         catch (TimeoutException)
         {
-            Console.Error.WriteLine($"gorynych shutdown: the service (process {processId}) still runs after {waitSeconds} s");
+            Console.Error.WriteLine($"gorynych {command}: the service (process {processId}) still runs after {waitSeconds} s");
             return 2;
         }
-        Console.Error.WriteLine("gorynych shutdown: the service has stopped");
+        Console.Error.WriteLine($"gorynych {command}: the service has stopped{stopped}");
         return 0;
-    }
-
-    /// <summary>Passes the client's lines to the service, scoping its <c>initialize</c> to <paramref name="agent"/>.</summary>
-    static async Task ClientToServiceAsync(Stream input, Stream service, string agent)
-    {
-        using var reader = new StreamReader(input, new UTF8Encoding(false), detectEncodingFromByteOrderMarks: false, bufferSize: 1 << 16);
-        string? line;
-        while ((line = await reader.ReadLineAsync()) is not null)
-        {
-            if (line.Length == 0) continue;
-            var forwarded = line.Contains("\"initialize\"", StringComparison.Ordinal) ? ScopeInitialize(line, agent) : line;
-            await service.WriteAsync(Encoding.UTF8.GetBytes(forwarded + "\n"));
-            await service.FlushAsync();
-        }
-    }
-
-    /// <summary>Adds <c>_meta["gorynych/agent"]</c> to an <c>initialize</c> request unless the client set one.</summary>
-    public static string ScopeInitialize(string line, string agent)
-    {
-        JsonObject? message;
-        try { message = JsonNode.Parse(line) as JsonObject; }
-        catch (JsonException) { return line; }
-        if (message is null || (string?)message["method"] != "initialize" || message["id"] is null) return line;
-        var @params = message["params"] as JsonObject ?? [];
-        var meta = @params["_meta"] as JsonObject ?? [];
-        if (meta[GorynychProtocol.MetaAgent] is null) meta[GorynychProtocol.MetaAgent] = agent;
-        @params["_meta"] = meta;
-        message["params"] = @params;
-        return message.ToJsonString(Wire);
     }
 
     /// <summary>
@@ -179,24 +198,4 @@ public static class AcpBridge
 
     /// <summary>The bridge started no service, on purpose; the message says why.</summary>
     sealed class NotStartedException(string message) : Exception(message);
-
-    /// <summary>Writes through to stdout and flushes every write, so each message leaves at once.</summary>
-    sealed class FlushingStream(Stream inner) : Stream
-    {
-        public override bool CanRead => false;
-        public override bool CanSeek => false;
-        public override bool CanWrite => true;
-        public override long Length => throw new NotSupportedException();
-        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
-        public override void Flush() => inner.Flush();
-        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-        public override void SetLength(long value) => throw new NotSupportedException();
-        public override void Write(byte[] buffer, int offset, int count) { inner.Write(buffer, offset, count); inner.Flush(); }
-        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
-        {
-            await inner.WriteAsync(buffer, ct);
-            await inner.FlushAsync(ct);
-        }
-    }
 }

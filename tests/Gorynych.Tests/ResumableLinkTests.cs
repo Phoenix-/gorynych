@@ -1,0 +1,424 @@
+using System.Diagnostics;
+using System.Text.Json.Nodes;
+using Gorynych.Acp;
+using Gorynych.Acp.Hosting;
+using Gorynych.Acp.JsonRpc;
+using Gorynych.Acp.Link;
+using Gorynych.Service;
+
+namespace Gorynych.Tests;
+
+/// <summary>
+/// The resumable link (<see cref="ResumableLink"/>) between a plain ACP client and the service, as
+/// the stdio bridge runs it for Zed: the connection drops, or the service restarts, and the client
+/// sees no break.
+/// </summary>
+[TestClass]
+public sealed class ResumableLinkTests
+{
+    static readonly TimeSpan Wait = TimeSpan.FromSeconds(20);
+
+    static Conductor Service(string data, IAgentAdapter agent) => TestDirs.Conductor(data, agent);
+
+    static void NoBreakSeen(LinkHarness zed)
+    {
+        StringAssert.DoesNotMatch(zed.Log(), new System.Text.RegularExpressions.Regex("zed: .*unknown id"), "Zed got no answer it did not ask for (a second initialize)");
+        lock (zed.Notices) CollectionAssert.DoesNotContain(zed.Notices, GorynychProtocol.MethodRestarting, "the link keeps its own notices");
+        lock (zed.Updates)
+            Assert.IsFalse(zed.Updates.Any(u => u["_meta"]?[GorynychProtocol.MetaPromptId] is not null), "nor the marks of its prompts, nor their text");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    [DataRow(true, DisplayName = "the turn ends while the connection is down")]
+    [DataRow(false, DisplayName = "the turn ends after the link resumed")]
+    public async Task APromptInFlight_StaysOpenAcrossADrop_AndIsAnsweredWhenItsTurnEnds(bool endsWhileDown)
+    {
+        var agent = new TurnAgent("turns") { Hold = true };
+        await using var service = Service(TestDirs.New(), agent);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+
+        zed.ConnectGate = new TaskCompletionSource();
+        zed.Break();
+        await LinkHarness.Until(() => zed.Log().Contains("lost the connection"), "the link to see it");
+        if (endsWhileDown)
+        {
+            agent.Release();
+            await LinkHarness.Until(() => !service.Feed(sid).TurnRunning, "the turn's end, with no client");
+        }
+        zed.ConnectGate.SetResult();
+        await LinkHarness.Until(() => zed.Log().Contains("connected again"), "the reconnect");
+        if (!endsWhileDown)
+        {
+            Assert.IsFalse(prompt.IsCompleted, "held open while its turn runs");
+            agent.Release();
+        }
+
+        Assert.AreEqual("end_turn", (string?)(await prompt.WaitAsync(Wait))!["stopReason"], "answered as its turn ended");
+        Assert.AreEqual("started:one done:one ", zed.Text(), "every update once, none lost");
+        NoBreakSeen(zed);
+        Assert.AreEqual(2, zed.Connects);
+
+        // The connection is whole again.
+        Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "two").WaitAsync(Wait))!["stopReason"]);
+        Assert.AreEqual("started:one done:one started:two done:two ", zed.Text());
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    [DataRow(true, DisplayName = "answered while the connection is down")]
+    [DataRow(false, DisplayName = "answered after the link resumed")]
+    public async Task AQuestionInFlight_IsShownOnce_AndItsAnswerReachesTheAgent(bool answeredWhileDown)
+    {
+        var chosen = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var agent = new TurnAgent("turns")
+        {
+            During = async (a, sid, ct) =>
+            {
+                var r = await a.Rpc.RequestAsync<RequestPermissionRequest, RequestPermissionResponse>(AcpMethods.Client.SessionRequestPermission, new RequestPermissionRequest
+                {
+                    SessionId = sid,
+                    ToolCall = new ToolCallUpdate { ToolCallId = "t1", Title = "Write a file" },
+                    Options =
+                    [
+                        new PermissionOption { OptionId = "allow", Name = "Allow", Kind = PermissionOptionKind.AllowOnce },
+                        new PermissionOption { OptionId = "reject", Name = "Reject", Kind = PermissionOptionKind.RejectOnce },
+                    ],
+                }, ct);
+                chosen.TrySetResult(r.Outcome is SelectedPermissionOutcome s ? s.OptionId : "none");
+            },
+        };
+        await using var service = Service(TestDirs.New(), agent);
+        await using var zed = new LinkHarness(service);
+        var answer = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        zed.Approve = async (r, ct) =>
+        {
+            await answer.Task;
+            return "reject";
+        };
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => { lock (zed.Approvals) return zed.Approvals.Count == 1; }, "the question");
+
+        zed.ConnectGate = new TaskCompletionSource();
+        zed.Break();
+        await LinkHarness.Until(() => zed.Log().Contains("lost the connection"), "the link to see it");
+        if (answeredWhileDown)
+        {
+            answer.SetResult();
+            await Task.Delay(200); // the answer reaches the link, which keeps it
+        }
+        zed.ConnectGate.SetResult();
+        await LinkHarness.Until(() => zed.Log().Contains("connected again"), "the reconnect");
+        if (!answeredWhileDown)
+        {
+            await Task.Delay(200); // the service asks again, and the link joins it to the one Zed has
+            answer.SetResult();
+        }
+
+        Assert.AreEqual("reject", await chosen.Task.WaitAsync(Wait), "the agent got Zed's answer");
+        Assert.AreEqual("end_turn", (string?)(await prompt.WaitAsync(Wait))!["stopReason"]);
+        lock (zed.Approvals) Assert.AreEqual(1, zed.Approvals.Count, "asked once, though the service asked twice");
+        lock (zed.Notices) CollectionAssert.DoesNotContain(zed.Notices, AcpMethods.Protocol.CancelRequest, "nothing withdrawn");
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task APromptThatFailsWhileTheConnectionIsDown_EndsWithTheAgentsError()
+    {
+        var fail = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var agent = new TurnAgent("turns")
+        {
+            During = async (_, _, _) =>
+            {
+                await fail.Task;
+                throw new JsonRpcException(-32042, "the agent fell over");
+            },
+        };
+        await using var service = Service(TestDirs.New(), agent);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+
+        zed.ConnectGate = new TaskCompletionSource();
+        zed.Break();
+        await LinkHarness.Until(() => zed.Log().Contains("lost the connection"), "the link to see it");
+        fail.SetResult();
+        await LinkHarness.Until(() => !service.Feed(sid).TurnRunning, "the failed turn's end");
+        zed.ConnectGate.SetResult();
+
+        var e = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => prompt.WaitAsync(Wait));
+        Assert.AreEqual(-32042, e.Code);
+        Assert.AreEqual("the agent fell over", e.Message, "as the agent said it, from the mark its end left");
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AfterARestart_TheLinkResumesTheSession_AndTheNextPromptRunsThere()
+    {
+        var data = TestDirs.New();
+        var first = new TurnAgent("turns");
+        var service = Service(data, first);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "one").WaitAsync(Wait))!["stopReason"]);
+
+        // The service exits; for a while there is no pipe; then the next one starts on the same data.
+        zed.Service = null;
+        await service.DisposeAsync();
+        zed.Break();
+        await LinkHarness.Until(() => zed.Log().Contains("lost the connection"), "the link to see it");
+        var list = zed.Zed.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject());
+        await Task.Delay(300);
+        Assert.IsFalse(list.IsCompleted, "a request waits for the next service");
+        var second = new TurnAgent("turns");
+        await using var next = Service(data, second);
+        zed.Service = next;
+
+        await list.WaitAsync(Wait);
+        Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "two").WaitAsync(Wait))!["stopReason"]);
+        Assert.AreEqual("started:one done:one started:two done:two ", zed.Text(), "nothing again, nothing lost");
+        CollectionAssert.AreEqual(new[] { "two" }, second.Prompts.ToArray());
+        Assert.IsTrue(next.Feed(sid).Journal.ReadAll().Count(e => (string?)e["sessionUpdate"] == "user_message_chunk") == 2, "one journal, both turns");
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ARestartThatWaits_LetsTheRunningTurnEnd_AndANewPromptWaitsForTheNextService()
+    {
+        var data = TestDirs.New();
+        var first = new TurnAgent("turns") { Hold = true };
+        var service = Service(data, first);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var other = await zed.NewSessionAsync().WaitAsync(Wait);
+        var running = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text().Contains("started:one"), "the turn");
+
+        await using var admin = await TestClient.ConnectAsync(service, "admin");
+        var restart = admin.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = true, ["timeoutSeconds"] = 30 });
+        await LinkHarness.Until(() => zed.Log().Contains("restarting"), "the link to hear of it");
+        var held = zed.PromptAsync(other, "two");
+        await Task.Delay(300);
+        Assert.IsFalse(held.IsCompleted);
+        Assert.IsFalse(first.Prompts.Contains("two"), "a new prompt does not reach the service that restarts");
+
+        first.Release();
+        Assert.AreEqual("end_turn", (string?)(await running.WaitAsync(Wait))!["stopReason"], "the running turn ended in the old service");
+        Assert.AreEqual(0, (int)(await restart.WaitAsync(Wait))!["cancelledTurns"]!);
+        await LinkHarness.Until(() => service.ShutdownRequested.IsCancellationRequested, "the exit");
+        zed.Service = null;
+        await service.DisposeAsync();
+        zed.Break();
+
+        var second = new TurnAgent("turns");
+        await using var next = Service(data, second);
+        zed.Service = next;
+        Assert.AreEqual("end_turn", (string?)(await held.WaitAsync(Wait))!["stopReason"], "the held prompt ran in the next service");
+        CollectionAssert.AreEqual(new[] { "two" }, second.Prompts.ToArray());
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ARestartThatDoesNotWait_EndsThePromptCancelled_AndTheSessionGoesOnInTheNextService()
+    {
+        var data = TestDirs.New();
+        var first = new TurnAgent("turns") { Hold = true };
+        var service = Service(data, first);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var running = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text().Contains("started:one"), "the turn");
+
+        await using (var admin = await TestClient.ConnectAsync(service, "admin"))
+            Assert.AreEqual(1, (int)(await admin.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = false }).WaitAsync(Wait))!["cancelledTurns"]!);
+        Assert.AreEqual("cancelled", (string?)(await running.WaitAsync(Wait))!["stopReason"]);
+        zed.Service = null;
+        await service.DisposeAsync();
+        zed.Break();
+        await using var next = Service(data, new TurnAgent("turns"));
+        zed.Service = next;
+
+        Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "two").WaitAsync(Wait))!["stopReason"]);
+        StringAssert.EndsWith(zed.Text(), "started:two done:two ");
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task APromptInFlightWhenTheServiceDies_EndsCancelled_ForTheNextServiceHasNoTurnForIt()
+    {
+        var data = TestDirs.New();
+        var service = Service(data, new TurnAgent("turns") { Hold = true });
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var running = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text().Contains("started:one"), "the turn");
+
+        // Gone without a restart: its agents with it.
+        zed.Service = null;
+        zed.Break();
+        await service.DisposeAsync();
+        await using var next = Service(data, new TurnAgent("turns"));
+        zed.Service = next;
+
+        Assert.AreEqual("cancelled", (string?)(await running.WaitAsync(Wait))!["stopReason"], "cut off with its agent, whether the old service left a mark of it or not");
+        Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "two").WaitAsync(Wait))!["stopReason"]);
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ADraftIsKeptForAClientOnTheLink_WhoseConnectionDropped_AndItsFirstPromptRuns()
+    {
+        var agent = new TurnAgent("turns");
+        await using var service = Service(TestDirs.New(), agent);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait); // Zed opens one for every new thread
+
+        zed.Break();
+        await LinkHarness.Until(() => zed.Log().Contains("connected again"), "the reconnect");
+        await Task.Delay(300); // a plain client's draft is discarded by now
+
+        Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "one").WaitAsync(Wait))!["stopReason"]);
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task TheLinkGivesUp_WhenNoServiceComesBack_AndWhatWaitedEndsWithAnError()
+    {
+        var service = Service(TestDirs.New(), new TurnAgent("turns") { Hold = true });
+        await using var zed = new LinkHarness(service, new ResumableLinkOptions
+        {
+            RetryDelays = [TimeSpan.FromMilliseconds(100)],
+            GiveUpAfter = TimeSpan.FromSeconds(1),
+        });
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var running = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text().Contains("started:one"), "the turn");
+        zed.Service = null;
+        zed.Break();
+        await service.DisposeAsync();
+        var list = zed.Zed.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject());
+
+        Assert.AreEqual(1, await zed.Running.WaitAsync(Wait), "it ends, saying it failed");
+        var e = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => running.WaitAsync(Wait));
+        StringAssert.Contains(e.Message, "lost");
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => list.WaitAsync(Wait));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ALinkToAServiceThatDoesNotResume_EndsWithTheConnection_AsAPipeWould()
+    {
+        var pair = new DuplexLink();
+        var (si, so) = pair.AgentEnd;
+        var old = new JsonRpcConnection(si, so, "old-service")
+        {
+            RequestHandler = (req, ct) => Task.FromResult(AcpJson.ToNode(new InitializeResponse { ProtocolVersion = 1, AgentCapabilities = new AgentCapabilities() })),
+        };
+        old.Start();
+        var (ci, co) = pair.ClientEnd;
+        var zedPair = new DuplexLink();
+        var zed = new JsonRpcConnection(zedPair.ClientEnd.Input, zedPair.ClientEnd.Output, "zed");
+        zed.Start();
+        var connects = 0;
+        var link = new ResumableLink(zedPair.AgentEnd.Input, zedPair.AgentEnd.Output, _ => { connects++; throw new IOException("no"); });
+        var running = link.RunAsync((ci, co));
+        await zed.SendRequestAsync(AcpMethods.Agent.Initialize, new JsonObject { ["protocolVersion"] = 1 }).WaitAsync(Wait);
+
+        await old.DisposeAsync();
+
+        Assert.AreEqual(0, await running.WaitAsync(Wait));
+        Assert.AreEqual(0, connects, "no attempt to connect again");
+        await zed.DisposeAsync();
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ACancelOfAPromptThatWaitsToGoOut_EndsItThere()
+    {
+        var data = TestDirs.New();
+        var service = Service(data, new TurnAgent("turns"));
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        zed.Service = null;
+        zed.Break();
+        await LinkHarness.Until(() => zed.Log().Contains("lost the connection"), "the link to see it");
+
+        var waiting = zed.PromptAsync(sid, "one");
+        await zed.Zed.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sid });
+
+        Assert.AreEqual("cancelled", (string?)(await waiting.WaitAsync(Wait))!["stopReason"], "it never went out");
+        var agent = new TurnAgent("turns");
+        await service.DisposeAsync();
+        await using var next = Service(data, agent);
+        zed.Service = next;
+        Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "two").WaitAsync(Wait))!["stopReason"]);
+        CollectionAssert.AreEqual(new[] { "two" }, agent.Prompts.ToArray(), "the cancelled one never ran");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task Restart_StopsTheService_AndTheBridgeStartsTheNextOne_AsOneConnection()
+    {
+        var pipe = "gorynych-restart-" + Guid.NewGuid().ToString("N")[..8];
+        if (Outside.ServiceLaunch.IsRemoteLogon()) Assert.Inconclusive("from an ssh login or session 0 the bridge starts no service without the logon task");
+        await using var zed = new PlainClient("acp", "--agent", "kimi", "--pipe", pipe, "--data", TestDirs.New());
+        var init = await zed.InitializeAsync();
+        Assert.AreEqual(GorynychProtocol.LinkVersion, (int?)init!["agentCapabilities"]!["_meta"]![GorynychProtocol.CapLink]);
+        var before = (int)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()).WaitAsync(Wait))!["processId"]!;
+
+        var (code, stderr) = await RunAsync("restart", "--pipe", pipe, "--no-wait");
+
+        Assert.AreEqual(0, code, stderr);
+        StringAssert.Contains(stderr, "the next bridge or the logon task starts the new one");
+        var after = (int)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()).WaitAsync(Wait))!["processId"]!;
+        Assert.AreNotEqual(before, after, "the bridge started the next service and went on");
+        var sessions = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject()).WaitAsync(Wait);
+        Assert.IsNotNull(sessions!["sessions"]);
+        await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodShutdown, new JsonObject()).WaitAsync(Wait);
+    }
+
+    static async Task<(int Code, string Stderr)> RunAsync(params string[] args)
+    {
+        using var process = Process.Start(new ProcessStartInfo(BridgeTests.ServiceExe(), args)
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true,
+        })!;
+        var stderr = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync().WaitAsync(Wait * 3);
+        return (process.ExitCode, await stderr);
+    }
+
+    [TestMethod]
+    public void TheRestartCommand_TakesATimeoutInMinutes_AndNoWait()
+    {
+        var line = CommandLine.Parse(["restart", "--pipe", "p", "--timeout", "2.5", "--no-wait"]);
+        Assert.AreEqual("restart", line.Command);
+        Assert.AreEqual(TimeSpan.FromMinutes(2.5), CommandLine.MinutesOf(line.Value("--timeout")));
+        Assert.IsTrue(line.Flag("--no-wait"));
+        StringAssert.Contains(Assert.ThrowsExactly<UsageException>(() => CommandLine.Parse(["restart", "--timeout", "-1"])).Message, "--timeout takes a number of minutes");
+        StringAssert.Contains(Assert.ThrowsExactly<UsageException>(() => CommandLine.Parse(["restart", "--console"])).Message, "restart does not take '--console'");
+        StringAssert.Contains(CommandLine.Usage, "Gorynych.Service restart");
+    }
+}

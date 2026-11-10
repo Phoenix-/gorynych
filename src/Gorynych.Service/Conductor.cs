@@ -46,6 +46,15 @@ public sealed class ConductorOptions
     /// <summary>The clock of <see cref="UnloadAfter"/>; tests pass one they move by hand.</summary>
     public TimeProvider Time { get; init; } = TimeProvider.System;
 
+    /// <summary>
+    /// How long a draft waits for a client on the resumable link that went (its connection dropped,
+    /// the service restarted) before it is discarded: longer than the link keeps trying.
+    /// </summary>
+    public TimeSpan ComeBackGrace { get; init; } = DefaultComeBackGrace;
+
+    /// <summary>The default of <see cref="ComeBackGrace"/>: two minutes.</summary>
+    public static readonly TimeSpan DefaultComeBackGrace = TimeSpan.FromMinutes(2);
+
     /// <summary>For tests: awaited when a catch-up of the journal starts, after the agent answered the open.</summary>
     internal Func<string, Task>? CatchingUp { get; init; }
 
@@ -122,7 +131,90 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>Cancelled when a client asks the service to exit.</summary>
     public CancellationToken ShutdownRequested => shutdown.Token;
 
-    public void RequestShutdown() => shutdown.Cancel();
+    public void RequestShutdown()
+    {
+        try { shutdown.Cancel(); }
+        catch (ObjectDisposedException) { } // disposed: stopped already
+    }
+
+    // ---------------------------------------------------------------- restart
+
+    readonly Lock restartGate = new();
+    Task<JsonObject>? restart;
+    volatile bool draining;
+
+    /// <summary>How long a restart waits for the running turns by default.</summary>
+    public static readonly TimeSpan DefaultRestartTimeout = TimeSpan.FromMinutes(5);
+
+    /// <summary>How long the turns a restart cancels get to end before it exits all the same.</summary>
+    internal static readonly TimeSpan CancelGrace = TimeSpan.FromSeconds(5);
+
+    /// <summary>True once a restart began: no new turn starts (<see cref="Restarting"/>).</summary>
+    public bool Draining => draining;
+
+    /// <summary>
+    /// The error for a request that would start a turn while the service restarts: not carried out,
+    /// so a client on the resumable link sends it again to the next service (<c>data["gorynych/restarting"]</c>).
+    /// </summary>
+    internal static JsonRpcException Restarting() => new(JsonRpcException.InternalError,
+        "The Gorynych service is restarting; send it again in a moment.", new JsonObject { [GorynychProtocol.MetaRestarting] = true });
+
+    /// <summary>
+    /// <c>_gorynych/restart {wait?, timeoutSeconds?}</c>: the service starts no new turn and tells its
+    /// clients (<c>_gorynych/restarting</c>), waits for the running turns (<see cref="DrainAsync"/>),
+    /// answers, and exits. A second request while one runs waits for the same drain.
+    /// </summary>
+    internal async Task<JsonNode?> RestartAsync(JsonRpcRequest request)
+    {
+        var wait = request.Params?["wait"] is not JsonValue w || !w.TryGetValue<bool>(out var waits) || waits;
+        var timeout = request.Params?["timeoutSeconds"] is JsonValue t && t.TryGetValue<double>(out var seconds) && double.IsFinite(seconds) && seconds >= 0
+            ? TimeSpan.FromSeconds(Math.Min(seconds, TimeSpan.FromDays(1).TotalSeconds))
+            : DefaultRestartTimeout;
+        Task<JsonObject> drain;
+        lock (restartGate) drain = restart ??= Task.Run(() => DrainAsync(wait ? timeout : TimeSpan.Zero));
+        var result = await drain;
+        // Exit once the answer is out; and in any case soon, should the asking client be gone.
+        request.AfterResult(() => { RequestShutdown(); return Task.CompletedTask; });
+        _ = Task.Delay(TimeSpan.FromSeconds(2)).ContinueWith(_ => RequestShutdown(), TaskScheduler.Default);
+        return result.DeepClone();
+    }
+
+    /// <summary>
+    /// Starts no new turn from now on, tells the clients, waits up to <paramref name="timeout"/> for
+    /// the turns that run (a client's, a service turn, one of the agent's own, a prompt waiting for
+    /// one), then cancels what still runs and gives it <see cref="CancelGrace"/> to end. The journals
+    /// are written as each update comes, so nothing is left to flush but the overlay, which the
+    /// exit writes.
+    /// </summary>
+    async Task<JsonObject> DrainAsync(TimeSpan timeout)
+    {
+        draining = true;
+        ServiceLog.Info($"restart: no new turn starts; waiting up to {timeout.TotalSeconds:0.#} s for the running ones");
+        foreach (var c in clients.Keys) c.Notify(GorynychProtocol.MethodRestarting, new JsonObject());
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (Running().Any() && waited.Elapsed < timeout) await Task.Delay(100);
+        var seconds = Math.Round(waited.Elapsed.TotalSeconds, 1);
+        var left = Running().ToList();
+        foreach (var feed in left)
+        {
+            ServiceLog.Info($"restart: cancelling the turn of {feed.SessionId}");
+            try
+            {
+                await ForwardNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = feed.SessionId }, feed.SessionId)
+                    .WaitAsync(CancelGrace);
+            }
+            catch (Exception e) when (e is IOException or JsonRpcException or ObjectDisposedException or TimeoutException)
+            {
+                ServiceLog.Warn($"restart: the cancel of {feed.SessionId} did not reach its agent: {e.Message}");
+            }
+        }
+        var grace = System.Diagnostics.Stopwatch.StartNew();
+        while (left.Count > 0 && Running().Any() && grace.Elapsed < CancelGrace) await Task.Delay(100);
+        ServiceLog.Info($"restart: waited {seconds} s, cancelled {left.Count} turns; exiting");
+        return new JsonObject { ["processId"] = Environment.ProcessId, ["waitedSeconds"] = seconds, ["cancelledTurns"] = left.Count };
+    }
+
+    IEnumerable<SessionFeed> Running() => feeds.Values.Where(f => !f.Retired && f.TurnRunning);
 
     /// <summary>Serves one client until it disconnects.</summary>
     public async Task ServeClientAsync(Stream input, Stream output, string name)
@@ -144,7 +236,7 @@ public sealed class Conductor : IAsyncDisposable
             // A client that goes away lets go of its sessions, as session/close would: a GUI that
             // quits sends none. That includes one it was detached from while it went, by a request
             // or an update that failed first.
-            foreach (var sessionId in client.Held) LetGo(sessionId);
+            foreach (var sessionId in client.Held) LetGo(sessionId, client.OnLink);
         }
     }
 
@@ -480,17 +572,17 @@ public sealed class Conductor : IAsyncDisposable
         if (host.CanResume && (host.ReplaysFrom || !host.CanLoad))
         {
             var mark = host.ReplaysFrom ? feed.Journal.NativeMark : null;
+            var meta = new JsonObject();
+            if (host.ReplaysFrom)
+                meta[GorynychProtocol.MetaReplayFrom] = mark is null
+                    ? new JsonObject { ["type"] = GorynychProtocol.ReplayFromStart }
+                    : new JsonObject { ["type"] = GorynychProtocol.ReplayAfterMark, ["mark"] = mark };
+            // Kept across a restart for a client on the resumable link: an agent that wrote nothing of it opens it afresh.
+            if (record.Draft) meta[GorynychProtocol.MetaDraft] = true;
             var resume = new ResumeSessionRequest
             {
                 SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId), SystemPrompt = SystemPromptFor(host),
-                Meta = host.ReplaysFrom
-                    ? new JsonObject
-                    {
-                        [GorynychProtocol.MetaReplayFrom] = mark is null
-                            ? new JsonObject { ["type"] = GorynychProtocol.ReplayFromStart }
-                            : new JsonObject { ["type"] = GorynychProtocol.ReplayAfterMark, ["mark"] = mark },
-                    }
-                    : null,
+                Meta = meta.Count > 0 ? meta : null,
             };
             if (host.ReplaysFrom && collect) feed.BeginReplay(feed.Journal.MaxEntries);
             try
@@ -604,24 +696,121 @@ public sealed class Conductor : IAsyncDisposable
             ServiceLog.Warn($"{host.Name}: cannot reopen {record.SessionId}: {e.Message}");
             response = [];
         }
-        await feed.ReplayAndAttachAsync(client);
-        return response;
+        var position = await feed.ReplayAndAttachAsync(client);
+        return WithLinkState(response, feed, position);
     }
 
+    /// <summary>
+    /// <c>session/resume</c>. With <c>_meta["gorynych/replayFrom"]</c> (a client on the resumable link
+    /// coming back), the client first gets what the journal has after its position, or all of it
+    /// from <c>{"type": "start"}</c>; a plain resume replays nothing.
+    /// </summary>
     internal async Task<JsonNode?> ResumeAsync(ClientConnection client, ResumeSessionRequest request, CancellationToken ct)
     {
         RefuseSystemPrompt(request.SystemPrompt);
+        var after = ReplayFrom(request.Meta?[GorynychProtocol.MetaReplayFrom]);
         using var use = await UseAsync(request.SessionId, ct);
         var (_, opened) = await EnsureLiveAsync(use.Record, ct);
-        await use.Feed.ResumeAndAttachAsync(client);
+        var position = await use.Feed.ResumeAndAttachAsync(client, after);
         // An already open session gets the state the agent last reported, so every client sees its switches.
-        return opened ?? use.Feed.State();
+        return WithLinkState(opened ?? use.Feed.State(), use.Feed, position);
     }
 
+    /// <summary>The position a client's <c>replayFrom</c> asks to resume after; null without one.</summary>
+    static long? ReplayFrom(JsonNode? from)
+    {
+        if (from is null) return null;
+        static string? Text(JsonNode? node) => node is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
+        return Text(from["type"]) switch
+        {
+            GorynychProtocol.ReplayFromStart => 0,
+            GorynychProtocol.ReplayAfterMark when SessionJournal.TryParsePosition(Text(from["mark"]), out var position) => position,
+            GorynychProtocol.ReplayAfterMark => throw new JsonRpcException(JsonRpcException.InvalidParams,
+                $"replayFrom: '{Text(from["mark"])}' is not a position this service gave"),
+            var type => throw new JsonRpcException(JsonRpcException.InvalidParams, $"replayFrom: unknown type '{type}'"),
+        };
+    }
+
+    /// <summary>
+    /// A load's or resume's answer with what a client on the resumable link needs: the position it
+    /// is at, whether a turn runs, and which of its prompts are still in progress.
+    /// </summary>
+    static JsonNode WithLinkState(JsonNode? response, SessionFeed feed, long position)
+    {
+        var result = response as JsonObject ?? [];
+        var meta = result["_meta"] as JsonObject ?? [];
+        meta[GorynychProtocol.MetaPosition] = SessionJournal.FormatPosition(position);
+        meta[GorynychProtocol.MetaTurn] = feed.TurnRunning ? "running" : "idle";
+        meta[GorynychProtocol.MetaPrompts] = new JsonArray(feed.PromptsInProgress().Select(p => (JsonNode)p).ToArray());
+        result["_meta"] = meta;
+        return result;
+    }
+
+    /// <summary>
+    /// <c>session/prompt</c>. A prompt with <c>_meta["gorynych/promptId"]</c> (a client on the
+    /// resumable link) whose client is gone by the end of its turn leaves a mark of that end in the
+    /// journal, so the client finds out how it ended when it comes back (<see cref="MarkPromptEndAsync"/>).
+    /// </summary>
     internal async Task<JsonNode?> PromptAsync(ClientConnection client, JsonRpcRequest request, CancellationToken ct)
     {
+        if (Draining) throw Restarting();
         var prompt = request.ParamsAs<PromptRequest>();
+        var promptId = PromptIdOf(prompt);
         using var use = await UseAsync(prompt.SessionId, ct);
+        var key = use.Feed.BeginPrompt(promptId);
+        JsonNode? result = null;
+        Exception? failure = null;
+        try
+        {
+            return result = await PromptInProgressAsync(client, request, prompt, use, ct);
+        }
+        catch (Exception e)
+        {
+            failure = e;
+            throw;
+        }
+        finally
+        {
+            // The mark first: a client resuming meanwhile finds the prompt in progress or its end in the journal.
+            if (promptId is not null && client.Rpc.IsClosed) await MarkPromptEndAsync(use.Feed, promptId, result, failure);
+            use.Feed.EndPrompt(key);
+        }
+    }
+
+    static string? PromptIdOf(PromptRequest prompt) =>
+        prompt.Meta?[GorynychProtocol.MetaPromptId] is JsonValue v && v.TryGetValue<string>(out var id) && id.Length > 0 ? id : null;
+
+    /// <summary>
+    /// Journals and sends the end of a prompt's turn whose client is gone: a <c>session_info_update</c>
+    /// with <c>gorynych/agentTurn: "ended"</c>, the prompt's ID, and its stop reason or error. Never fails.
+    /// </summary>
+    async Task MarkPromptEndAsync(SessionFeed feed, string promptId, JsonNode? result, Exception? failure)
+    {
+        var meta = new JsonObject { [GorynychProtocol.MetaAgentTurn] = "ended", [GorynychProtocol.MetaPromptId] = promptId };
+        if (failure is null)
+            meta[GorynychProtocol.MetaStopReason] = result?["stopReason"] is JsonValue r && r.TryGetValue<string>(out var reason) ? reason : "end_turn";
+        // Its client went while the session was being opened, so it never ran; or the agent went
+        // under it (the service stops, the agent crashed): the turn was cut off, not refused.
+        else if (failure is OperationCanceledException or IOException)
+            meta[GorynychProtocol.MetaStopReason] = "cancelled";
+        else
+            meta[GorynychProtocol.MetaError] = new JsonObject
+            {
+                ["code"] = failure is JsonRpcException j ? j.Code : JsonRpcException.InternalError,
+                ["message"] = failure.Message,
+            };
+        try
+        {
+            await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(new SessionInfoUpdate { Meta = meta })!.AsObject(), except: null, () => { });
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            ServiceLog.Warn($"{feed.SessionId}: the end of prompt {promptId} could not be journaled: {e.Message}");
+        }
+    }
+
+    async Task<JsonNode?> PromptInProgressAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionUse use, CancellationToken ct)
+    {
         var record = Promote(use.Record);
         var (rpc, _) = await EnsureLiveAsync(record, ct);
         var feed = use.Feed;
@@ -665,9 +854,16 @@ public sealed class Conductor : IAsyncDisposable
         // Journal the user's message, show it to the session's other clients, and use the
         // first prompt as the title until the harness provides one.
         var messageId = SessionFeed.NewMessageId(); // one message, however many blocks
+        // The prompt's ID, if its client gave one, goes with its text: that client never gets the
+        // text live, and drops it when a resume after a reconnect sends it from the journal.
+        var promptId = PromptIdOf(prompt);
         foreach (var block in prompt.Prompt)
         {
-            var update = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk { Content = block, MessageId = messageId })!.AsObject();
+            var update = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
+            {
+                Content = block, MessageId = messageId,
+                Meta = promptId is null ? null : new JsonObject { [GorynychProtocol.MetaPromptId] = promptId },
+            })!.AsObject();
             await feed.PublishAsync(update, except: client, () => store.Touch(record.SessionId));
         }
         await ProvisionalTitleAsync(feed, record, prompt.Prompt);
@@ -1105,13 +1301,18 @@ public sealed class Conductor : IAsyncDisposable
     /// A client went away without <c>session/close</c> (a GUI that quits sends none). It stops
     /// nothing: a draft is discarded, as before, and any other session its last client left starts
     /// its idle timer (<see cref="IdleFromNow"/>). Runs in the background, so a disconnecting
-    /// client is not held up by its agent.
+    /// client is not held up by its agent. A client on the resumable link may come back for its
+    /// draft (Zed opens one for every new thread): it waits <see cref="ConductorOptions.ComeBackGrace"/>,
+    /// and a client that has it again by then keeps it.
     /// </summary>
-    void LetGo(string sessionId) => RunCleanup(async () =>
+    void LetGo(string sessionId, bool comesBack = false) => RunCleanup(async () =>
     {
         if (store.Get(sessionId) is not { Deleted: false } record) return;
         if (record.Draft)
         {
+            if (comesBack)
+                try { await Task.Delay(options.ComeBackGrace, options.Time, cleanupStop.Token); }
+                catch (OperationCanceledException) { return; }
             await DiscardDraftAsync(sessionId, CancellationToken.None);
             return;
         }
@@ -1133,9 +1334,16 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>Completes when the drafts being discarded in the background are done.</summary>
     public Task CleanupsIdleAsync() => Task.WhenAll(cleanups.Keys);
 
-    /// <summary>Deletes the drafts an earlier run left behind (a client quit without closing them). Called once at start.</summary>
-    public async Task SweepDraftsAsync()
+    /// <summary>
+    /// Deletes the drafts an earlier run left behind (a client quit without closing them). Called once
+    /// at start, after <paramref name="wait"/>: a client on the resumable link that comes back after a
+    /// restart resumes its drafts by then, and keeps them.
+    /// </summary>
+    public async Task SweepDraftsAsync(TimeSpan wait = default)
     {
+        if (wait > TimeSpan.Zero)
+            try { await Task.Delay(wait, options.Time, cleanupStop.Token); }
+            catch (OperationCanceledException) { return; }
         foreach (var sessionId in startupDrafts)
         {
             try
@@ -1173,6 +1381,7 @@ public sealed class Conductor : IAsyncDisposable
     /// </summary>
     internal async Task<JsonNode?> SpawnAsync(JsonRpcRequest request, CancellationToken ct)
     {
+        if (Draining) throw Restarting();
         var token = (string?)request.Params?["_meta"]?[GorynychProtocol.MetaPeerToken];
         if (token is null || !peerTokens.TryGetValue(token, out var parentId))
             throw new JsonRpcException(JsonRpcException.InvalidRequest, "Only an agent's session can spawn one: unknown peer token");
@@ -2165,6 +2374,7 @@ public sealed class Conductor : IAsyncDisposable
     /// </summary>
     internal async Task<JsonNode?> AskAsync(string target, string text, Asker asker, Action<string>? onState, CancellationToken ct)
     {
+        if (Draining) throw Restarting();
         var use = await UseAskedAsync(target, asker, ct);
         var turnHasUse = false; // an opinion turn releases the use when the turn ends, which may be after the answer
         var unload = false; // the person declined a question into a session this call loaded only for it
@@ -2673,6 +2883,7 @@ public sealed class Conductor : IAsyncDisposable
         ["clients"] = clients.Count,
         ["sessions"] = store.All().Count,
         ["pendingRequests"] = feeds.Values.Sum(f => f.PendingRequests),
+        ["restarting"] = draining,
         ["agents"] = new JsonArray(agents.Values.Select(a => (JsonNode)a.Describe()).ToArray()),
     };
 

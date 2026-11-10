@@ -55,6 +55,12 @@ internal sealed class ClientConnection
     /// </summary>
     public string? AgentScope => (string?)Init?.Meta?[GorynychProtocol.MetaAgent];
 
+    /// <summary>
+    /// The client is on the resumable link (<c>initialize</c> <c>_meta["gorynych/link"]</c>): when it
+    /// goes, it may come back and resume its sessions, drafts too.
+    /// </summary>
+    public bool OnLink => Init?.Meta?[GorynychProtocol.CapLink] is JsonValue v && v.TryGetValue<int>(out var version) && version >= 1;
+
     /// <summary>Whether this client can take <paramref name="method"/> requests from an agent.</summary>
     public bool Accepts(string method) => method switch
     {
@@ -70,6 +76,9 @@ internal sealed class ClientConnection
                 Init = request.ParamsAs<InitializeRequest>();
                 if (AgentScope is { } scope && !conductor.Agents.ContainsKey(scope))
                     throw new JsonRpcException(JsonRpcException.InvalidParams, $"Unknown agent '{scope}'. Known: {string.Join(", ", conductor.Agents.Keys)}");
+                // A client that comes during a restart learns of it as the others did.
+                if (conductor.Draining)
+                    request.AfterResult(() => { Notify(GorynychProtocol.MethodRestarting, new JsonObject()); return Task.CompletedTask; });
                 return AcpJson.ToNode(Initialize());
             case AcpMethods.Agent.Authenticate:
             case AcpMethods.Agent.Logout:
@@ -108,6 +117,9 @@ internal sealed class ClientConnection
                 ServiceLog.Info($"{Rpc.Name}: asked the service to exit");
                 _ = Task.Delay(200).ContinueWith(_ => conductor.RequestShutdown(), TaskScheduler.Default);
                 return new JsonObject();
+            case GorynychProtocol.MethodRestart:
+                ServiceLog.Info($"{Rpc.Name}: asked the service to restart");
+                return await conductor.RestartAsync(request);
             default:
                 // Anything else about a session (modes, config options) goes to its agent.
                 if ((string?)request.Params?["sessionId"] is { } sid)
@@ -152,7 +164,15 @@ internal sealed class ClientConnection
     };
 
     /// <summary>The service's extension flags, advertised in <c>agentCapabilities._meta</c>.</summary>
-    static JsonObject Extensions() => new()
+    static JsonObject Extensions()
+    {
+        var flags = DeprecatedFlags();
+        flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
+        return flags;
+    }
+
+    /// <summary>The flags that were in the result's <c>_meta</c> before they moved.</summary>
+    static JsonObject DeprecatedFlags() => new()
     {
         [GorynychProtocol.MetaSessionsChanged] = true,
         [GorynychProtocol.MetaArchive] = true,
@@ -168,7 +188,7 @@ internal sealed class ClientConnection
                 .Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["displayName"] = a.DisplayName }).ToArray()),
         };
         // Deprecated: the flags' old place, kept for one release for clients built before they moved.
-        foreach (var (key, value) in Extensions()) meta[key] = value?.DeepClone();
+        foreach (var (key, value) in DeprecatedFlags()) meta[key] = value?.DeepClone();
         return meta;
     }
 
