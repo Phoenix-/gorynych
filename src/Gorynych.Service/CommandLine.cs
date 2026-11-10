@@ -20,7 +20,7 @@ internal sealed class CommandLine
 
     public const string Usage = """
         Usage:
-          Gorynych.Service [service options]
+          Gorynych.Service [serve] [service options]
               runs the service in the foreground (docs/service-protocol.md)
           Gorynych.Service acp --agent claude|kimi|codex|dsh [--pipe <name>] [service options]
               the stdio bridge for ACP clients such as Zed; starts the service when its pipe is missing
@@ -85,6 +85,8 @@ internal sealed class CommandLine
     {
         var command = args.Length > 0 && !args[0].StartsWith('-') ? args[0] : null;
         var rest = command is null ? 0 : 1;
+        // "serve" names the service itself, as no command does; it was ignored before, and starts still use it.
+        if (command == "serve") command = null;
         string? action = null;
         (string[] Values, string[] Flags) known;
         switch (command)

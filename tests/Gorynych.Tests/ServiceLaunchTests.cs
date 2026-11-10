@@ -121,6 +121,9 @@ public sealed class ServiceLaunchTests
         Assert.AreEqual("p", serve.Value("--pipe"));
         Assert.IsTrue(serve.Flag("--console"));
         Assert.AreEqual("0.5", serve.Value("--unload-after"));
+        serve = CommandLine.Parse(["serve", "--pipe", "p"]);
+        Assert.IsNull(serve.Command, "serve names the service itself");
+        Assert.AreEqual("p", serve.Value("--pipe"));
 
         var acp = CommandLine.Parse(["acp", "--agent", "kimi", "--pipe", "p", "--data", "d", "--no-channel", "--claude-transport", "tui"]);
         Assert.AreEqual("acp", acp.Command);
@@ -142,7 +145,8 @@ public sealed class ServiceLaunchTests
         foreach (var (wrong, problem) in new[]
         {
             (new[] { "--bogus" }, "unknown option '--bogus'"),
-            (["serve"], "unknown command 'serve'"),
+            (["start"], "unknown command 'start'"),
+            (["serve", "--bogus"], "unknown option '--bogus'"),
             (["--pipe"], "--pipe needs a value"),
             (["--pipe", "--data", "d"], "--pipe needs a value"),
             (["--claude-model", "--no-peers"], "--claude-model needs a value"),

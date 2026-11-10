@@ -50,7 +50,7 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   service ID), `sessions.json` (the overlay), `journal/`, `claude/` (the Claude adapter's
   session list and `channels.json`, the person's answer about development channels), `logs/`.
 
-Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex|dsh]
+Command line: `Gorynych.Service [serve] [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex|dsh]
 [--claude-model <model>] [--unload-after <minutes>] [--claude-transport headless|tui]
 [--claude-channels ask|accept|decline] [--no-channel] [--no-peers] [--console]`.
 `--unload-after` is how long a session stays loaded in its agent once it is idle with no
@@ -82,7 +82,7 @@ replaces it, with `schtasks /Create /XML`. How a remote machine is set up with i
 
 Every command takes only its own options, and every option that takes a value needs one. A
 wrong command line, `--help`, `-h` or `/?` prints the usage and exits with 2 without running
-anything. No arguments at all run the service, as before.
+anything. No command, or `serve`, runs the service with the options that follow, as before.
 
 Agents outside Gorynych use a separate small executable, `Gorynych.Outside.exe`, as their MCP
 server ([Agents outside Gorynych](#agents-outside-gorynych)).
