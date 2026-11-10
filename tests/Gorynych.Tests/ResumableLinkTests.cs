@@ -354,6 +354,7 @@ public sealed class ResumableLinkTests
                     case AcpMethods.Agent.SessionPrompt when Interlocked.Increment(ref prompts) == 1:
                         await fake!.SendNotificationAsync(GorynychProtocol.MethodRestarting, new JsonObject { ["restart"] = 7 });
                         await fake.SendNotificationAsync(GorynychProtocol.MethodRestartAborted, new JsonObject { ["restart"] = 7 });
+                        await Task.Delay(300); // the link has released what it held by now: nothing
                         throw new JsonRpcException(JsonRpcException.InternalError, "restarting",
                             new JsonObject { [GorynychProtocol.MetaRestarting] = true, [GorynychProtocol.MetaRestart] = 7 });
                     case AcpMethods.Agent.SessionPrompt:
