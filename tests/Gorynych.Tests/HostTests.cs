@@ -962,9 +962,9 @@ public sealed class HostTests
         /// <summary>How long a host it starts runs, without ever connecting.</summary>
         public TimeSpan AliveFor { get; init; }
 
-        public bool IsAlive(string adapter) => Launches > 0 && since.Elapsed < AliveFor;
+        public bool IsAlive(string adapter, string slot) => Launches > 0 && since.Elapsed < AliveFor;
 
-        public void Launch(string adapter)
+        public void Launch(string adapter, string slot)
         {
             Interlocked.Increment(ref Launches);
             since.Restart();
@@ -998,8 +998,8 @@ public sealed class HostTests
     sealed class AfterAnOrphan(InProcessHosts hosts, TimeSpan orphanFor) : IHostLauncher
     {
         readonly System.Diagnostics.Stopwatch since = System.Diagnostics.Stopwatch.StartNew();
-        public bool IsAlive(string adapter) => hosts.IsAlive(adapter) || since.Elapsed < orphanFor;
-        public void Launch(string adapter) => hosts.Launch(adapter);
+        public bool IsAlive(string adapter, string slot) => hosts.IsAlive(adapter, slot) || since.Elapsed < orphanFor;
+        public void Launch(string adapter, string slot) => hosts.Launch(adapter, slot);
     }
 
     [TestMethod]
@@ -1029,7 +1029,7 @@ public sealed class HostTests
         // is wrong; on a machine without the agent, the adapter fails): it is seen to by its process.
         var data = TestDirs.New();
         var pipe = "gorynych-test-" + Guid.NewGuid().ToString("N")[..8];
-        var launcher = new ProcessHostLauncher(BridgeTests.ServiceExe(), pipe, data, ["--claude-transport", "bogus"]);
+        var launcher = new ProcessHostLauncher(BridgeTests.ServiceExe(), pipe, data, _ => ["--claude-transport", "bogus"]);
         await using var service = new Conductor(new ConductorOptions
         {
             DataDirectory = data, ServiceId = "test-service", Hosts = launcher, HostToken = HostNames.EnsureToken(data),
@@ -1039,7 +1039,7 @@ public sealed class HostTests
         var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => NewSession(gui));
         Assert.IsLessThan(10, took.Elapsed.TotalSeconds, "not the 30 seconds of a host that never comes");
         StringAssert.Contains(failed.Message, "The claude host exited before it connected to Gorynych");
-        Assert.IsFalse(launcher.IsAlive("claude"));
+        Assert.IsFalse(launcher.IsAlive("claude", ""));
     }
 
     [TestMethod]
@@ -1051,7 +1051,7 @@ public sealed class HostTests
         // is taken: it runs, by its process, and the request waits for it and then gives its words.
         var hostData = TestDirs.New();
         var pipe = "gorynych-test-" + Guid.NewGuid().ToString("N")[..8];
-        var launcher = new ProcessHostLauncher(BridgeTests.ServiceExe(), pipe, hostData, []);
+        var launcher = new ProcessHostLauncher(BridgeTests.ServiceExe(), pipe, hostData, _ => []);
         var interval = AgentHost.HostCheckInterval;
         AgentHost.HostCheckInterval = TimeSpan.FromMilliseconds(1);
         try

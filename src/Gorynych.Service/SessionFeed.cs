@@ -150,6 +150,18 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <summary>Marks the end of the agent's own turn; false when none was marked.</summary>
     public bool EndAgentTurn() => Interlocked.Exchange(ref agentTurn, 0) == 1;
 
+    /// <summary>A turn of the agent's own runs (<see cref="BeginAgentTurn"/>).</summary>
+    public bool AgentTurnRunning => Volatile.Read(ref agentTurn) != 0;
+
+    int asking;
+
+    /// <summary>How many of the agent's requests (approvals, forms) wait for an answer: the session does not move meanwhile.</summary>
+    public int Asking => Volatile.Read(ref asking);
+
+    public void BeginAsking() => Interlocked.Increment(ref asking);
+
+    public void EndAsking() => Interlocked.Decrement(ref asking);
+
     long lastActivity = DateTimeOffset.MinValue.UtcTicks;
 
     /// <summary>When the agent last sent an update for the session, on the conductor's clock.</summary>
@@ -768,7 +780,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <see cref="TurnGate"/> and counts as a client's prompt in progress until the host reports its end.
     /// </summary>
     /// <param name="HostTurn">The host's number for it, which its <c>_gorynych/turn_ended</c> carries.</param>
-    public sealed record AdoptedTurn(long Key, string? PromptId, string Agent, long? HostTurn);
+    /// <param name="HostId">The host it runs in.</param>
+    public sealed record AdoptedTurn(long Key, string? PromptId, string Agent, long? HostTurn, string? HostId = null);
 
     AdoptedTurn? adopted; // under clientsGate
 

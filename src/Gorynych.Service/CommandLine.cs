@@ -58,7 +58,7 @@ internal sealed class CommandLine
         ["--pipe", "--data", "--default-agent", "--claude-model", "--unload-after", "--claude-transport", "--claude-channels", "--hosts"];
 
     /// <summary>The options an adapter host takes: those of the adapters, and where the service is.</summary>
-    static readonly string[] HostValues = ["--adapter", "--pipe", "--data", "--claude-model", "--claude-transport", "--claude-channels"];
+    static readonly string[] HostValues = ["--adapter", "--slot", "--pipe", "--data", "--claude-model", "--claude-transport", "--claude-channels"];
 
     /// <summary>The adapters a host runs, as the service names them.</summary>
     public static readonly string[] AdapterNames = ["claude", "kimi", "codex", "dsh"];

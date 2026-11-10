@@ -8,12 +8,15 @@ namespace Gorynych.Tests;
 /// <summary>
 /// Adapter hosts in the test's process: each runs a fake adapter and dials whichever conductor
 /// <see cref="Service"/> names now, as a host process dials the host pipe of the service that runs.
+/// Each host has its slot, and runs the <see cref="Build"/> it was started with, as a process runs
+/// the executable it was started from.
 /// </summary>
 sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLauncher
 {
     public const string Token = "0123456789abcdef0123456789abcdef-test";
 
-    readonly ConcurrentDictionary<string, Running> hosts = new(StringComparer.Ordinal);
+    readonly ConcurrentDictionary<string, Running> hosts = new(StringComparer.Ordinal); // adapter/slot -> the host
+    readonly ConcurrentQueue<Running> started = new();
     int launches;
 
     /// <summary>The conductor the hosts reach now; null: none runs.</summary>
@@ -26,23 +29,45 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
     public List<string> Said { get; } = [];
     public int Launches => Volatile.Read(ref launches);
 
-    public sealed record Running(AdapterHost Host, Task<int> Run, AgentInstance Agent);
+    /// <summary>What the hosts it starts from now on run, as the executable on disk; an update changes it.</summary>
+    public string Build { get; set; } = "build-1";
 
-    public Running this[string adapter] => hosts[adapter];
+    /// <summary>The adapter options the hosts it starts from now on run with, and a conductor made now expects.</summary>
+    public Func<string, IReadOnlyList<string>> Options { get; set; } = _ => [];
 
-    public bool IsAlive(string adapter) => hosts.TryGetValue(adapter, out var running) && !running.Run.IsCompleted;
+    /// <summary>A conductor made now tells hosts' generations apart (<see cref="ConductorOptions.HostGeneration"/>).</summary>
+    public bool Generations { get; set; }
 
-    public void Launch(string adapter)
+    /// <summary>The adapters with a host per session, for a conductor made now.</summary>
+    public HashSet<string> SessionHosts { get; } = new(StringComparer.Ordinal);
+
+    public sealed record Running(string Adapter, string Slot, string Build, AdapterHost Host, Task<int> Run, AgentInstance Agent);
+
+    /// <summary>The adapter's host started last.</summary>
+    public Running this[string adapter] => started.Last(r => r.Adapter == adapter);
+
+    /// <summary>The adapter's hosts, in the order they were started.</summary>
+    public Running[] Of(string adapter) => started.Where(r => r.Adapter == adapter).ToArray();
+
+    /// <summary>The adapter's hosts that run now.</summary>
+    public Running[] Alive(string adapter) => Of(adapter).Where(r => !r.Run.IsCompleted).ToArray();
+
+    public bool IsAlive(string adapter, string slot) => hosts.TryGetValue(adapter + "/" + slot, out var running) && !running.Run.IsCompleted;
+
+    public void Launch(string adapter, string slot)
     {
         Interlocked.Increment(ref launches);
         var agent = adapters(adapter).StartAsync(CancellationToken.None).GetAwaiter().GetResult();
         var host = new AdapterHost(agent, ConnectAsync, new AdapterHostOptions
         {
-            Adapter = adapter, Token = Token, RetryDelays = [TimeSpan.FromMilliseconds(50)],
+            Adapter = adapter, Token = Token, RetryDelays = [TimeSpan.FromMilliseconds(50)], Slot = slot,
+            Generation = new HostGeneration(Build, Options(adapter)),
             OrphanIdle = OrphanIdle, OrphanBusy = OrphanBusy, CancelGrace = CancelGrace, BufferBytes = BufferBytes,
             Log = m => { lock (Said) Said.Add(m); },
         });
-        hosts[adapter] = new Running(host, host.RunAsync(), agent);
+        var running = new Running(adapter, slot, Build, host, host.RunAsync(), agent);
+        hosts[adapter + "/" + slot] = running;
+        started.Enqueue(running);
     }
 
     readonly List<Wire> wires = [];
@@ -69,12 +94,12 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
     }
 
     /// <summary>
-    /// The host dies, as its process would: its connection drops, and its agent goes with it. Or only
-    /// its connection drops (<paramref name="agentToo"/> false), and the host lives on.
+    /// The adapter's host started last dies, as its process would: its connection drops, and its agent
+    /// goes with it. Or only its connection drops (<paramref name="agentToo"/> false), and the host lives on.
     /// </summary>
     public async Task KillAsync(string adapter, bool agentToo = true)
     {
-        var running = hosts[adapter];
+        var running = this[adapter];
         BreakAll();
         if (agentToo) await running.Agent.DisposeAsync();
     }
@@ -84,9 +109,16 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
         lock (Said) return string.Join("\n", Said);
     }
 
-    /// <summary>A conductor on <paramref name="data"/> that runs its adapters in these hosts.</summary>
-    public Conductor Conductor(string data, params IAgentAdapter[] names) => new(new ConductorOptions
+    /// <summary>A conductor on <paramref name="data"/> that runs its adapters in these hosts, and expects the build they run now.</summary>
+    public Conductor Conductor(string data, params IAgentAdapter[] names)
     {
-        DataDirectory = data, ServiceId = "test-service", Hosts = this, HostToken = Token,
-    }, names);
+        var build = Build;
+        var options = Options;
+        return new(new ConductorOptions
+        {
+            DataDirectory = data, ServiceId = "test-service", Hosts = this, HostToken = Token,
+            HostGeneration = Generations ? a => new HostGeneration(build, options(a)) : null,
+            SessionHosts = new HashSet<string>(SessionHosts, StringComparer.Ordinal),
+        }, names);
+    }
 }

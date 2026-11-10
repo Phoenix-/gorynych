@@ -20,6 +20,12 @@ public sealed class AdapterHostOptions
     /// <summary>This host's ID, new in every run: the first half of its <c>gorynych/hostSeq</c>s.</summary>
     public string HostId { get; init; } = $"h{GorynychProtocol.NewRunTag()}{Environment.ProcessId:x}";
 
+    /// <summary>Which host of its adapter it is (<see cref="IHostLauncher"/>), as the conductor started it.</summary>
+    public string Slot { get; init; } = "";
+
+    /// <summary>What it runs: its build and its adapter's options; the conductor compares it with the generation it would start.</summary>
+    public HostGeneration? Generation { get; init; }
+
     /// <summary>How long a host with nothing running waits for a conductor before it exits.</summary>
     public TimeSpan OrphanIdle { get; init; } = TimeSpan.FromMinutes(2);
 
@@ -377,7 +383,13 @@ public sealed class AdapterHost
                     {
                         ["token"] = options.Token, ["hostId"] = options.HostId, ["adapter"] = options.Adapter,
                         ["link"] = GorynychProtocol.HostLinkVersion, ["pid"] = Environment.ProcessId, ["version"] = AgentHost.Version,
+                        ["slot"] = options.Slot,
                     };
+                    if (options.Generation is { } generation)
+                    {
+                        hello["build"] = generation.Build;
+                        hello["options"] = new JsonArray(generation.Options.Select(o => (JsonNode)o).ToArray());
+                    }
                     if (!await TryWriteAsync(connection, Notification(GorynychProtocol.MethodHostHello, hello))) continue;
                     // The conductor takes it, or closes it.
                     var outcome = await Task.WhenAny(connection.Activated.Task, connection.Gone.Task, Task.Delay(TimeSpan.FromSeconds(60), stopping.Token));

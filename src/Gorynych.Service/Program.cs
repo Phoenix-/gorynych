@@ -85,7 +85,7 @@ string? hostToken = null;
 if (hosted)
 {
     hostToken = Gorynych.Service.Hosts.HostNames.EnsureToken(dataDirectory);
-    hosts = new Gorynych.Service.Hosts.ProcessHostLauncher(Environment.ProcessPath!, pipeName, dataDirectory, AdapterArguments(line));
+    hosts = new Gorynych.Service.Hosts.ProcessHostLauncher(Environment.ProcessPath!, pipeName, dataDirectory, a => AdapterArguments(line, a));
     ServiceLog.Info($"service: the adapters run in hosts, which a restart leaves running (pipe {Gorynych.Service.Hosts.HostNames.Pipe(pipeName)})");
 }
 
@@ -98,6 +98,9 @@ await using var conductor = new Conductor(new ConductorOptions
     PeerServerCommand = line.Flag("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
     Hosts = hosts,
     HostToken = hostToken,
+    // A host of another build, or with other options for its adapter, is stale: its sessions move once idle.
+    HostGeneration = hosted ? a => new Gorynych.Service.Hosts.HostGeneration(Gorynych.Service.Hosts.HostGeneration.ThisBuild, AdapterArguments(line, a)) : null,
+    SessionHosts = new HashSet<string>(["claude"], StringComparer.Ordinal),
 }, adapters);
 
 // Drafts a client left behind in an earlier run (Zed quits without closing them), once the bridges
@@ -153,12 +156,20 @@ static List<IAgentAdapter> Adapters(CommandLine line, string dataDirectory) =>
 ];
 
 // The service's options a host needs for its adapter.
-static List<string> AdapterArguments(CommandLine line)
+// The options of the service's that an adapter's host runs with: those of that adapter. They are
+// part of a host's generation, so a service restarted with other ones moves the sessions to new hosts.
+static List<string> AdapterArguments(CommandLine line, string adapter)
 {
     var args = new List<string>();
-    foreach (var name in new[] { "--claude-model", "--claude-transport", "--claude-channels" })
+    (string[] Values, string[] Flags) mine = adapter switch
+    {
+        "claude" => (["--claude-model", "--claude-transport", "--claude-channels"], ["--no-channel"]),
+        "dsh" => ([], ["--no-peers"]),
+        _ => ([], []),
+    };
+    foreach (var name in mine.Values)
         if (line.Value(name) is { } value) args.AddRange([name, value]);
-    foreach (var flag in new[] { "--no-channel", "--no-peers" })
+    foreach (var flag in mine.Flags)
         if (line.Flag(flag)) args.Add(flag);
     return args;
 }
@@ -172,7 +183,10 @@ static async Task<int> HostCommand(CommandLine line)
     var data = DataDirectory(line);
     ServiceLog.Init(Path.Combine(data, "logs"), console: line.Flag("--console"), name: "host-" + adapterName);
     if (!line.Flag("--console")) Gorynych.Outside.DetachedProcess.ReleaseOwnConsole();
-    using var instance = new Mutex(initiallyOwned: false, Gorynych.Service.Hosts.HostNames.Mutex(pipe, adapterName), Gorynych.Service.Hosts.HostNames.MutexOptions);
+    var slot = line.Value("--slot") ?? "";
+    // What it runs is read now, before an update can rename its executable aside.
+    var generation = new Gorynych.Service.Hosts.HostGeneration(Gorynych.Service.Hosts.HostGeneration.ThisBuild, AdapterArguments(line, adapterName));
+    using var instance = new Mutex(initiallyOwned: false, Gorynych.Service.Hosts.HostNames.Mutex(pipe, adapterName, slot), Gorynych.Service.Hosts.HostNames.MutexOptions);
     try
     {
         if (!instance.WaitOne(0))
@@ -205,7 +219,7 @@ static async Task<int> HostCommand(CommandLine line)
         var stream = await ServicePipe.ConnectAsync(Gorynych.Service.Hosts.HostNames.Pipe(pipe), TimeSpan.FromSeconds(1), ct)
             ?? throw new IOException("no conductor on the host pipe");
         return (stream, stream);
-    }, new Gorynych.Service.Hosts.AdapterHostOptions { Adapter = adapterName, Token = token, Log = ServiceLog.Info });
+    }, new Gorynych.Service.Hosts.AdapterHostOptions { Adapter = adapterName, Token = token, Slot = slot, Generation = generation, Log = ServiceLog.Info });
     ServiceLog.Info($"host {adapterName} {host.HostId} starting, pid {Environment.ProcessId}, pipe {pipe}, data {data}");
     var code = await host.RunAsync();
     ServiceLog.Info($"host {adapterName} {host.HostId} exits ({code})");

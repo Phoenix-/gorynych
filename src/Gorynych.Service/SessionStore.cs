@@ -59,6 +59,18 @@ public sealed class SessionRecord
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<string>? HostPrompts { get; set; }
 
+    /// <summary>
+    /// The host the session was open in when the service exited (its ID and slot): the next service
+    /// waits for that host to come back before it opens the session anywhere else, so it is never open
+    /// in two hosts at once.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? HostOf { get; set; }
+
+    /// <inheritdoc cref="HostOf"/>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? HostSlot { get; set; }
+
     /// <summary>A spawned session reports the end of each of its turns to its parent.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool ReportToParent { get; set; }
@@ -271,5 +283,6 @@ public sealed class SessionStore
         CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt, Draft = r.Draft, Deleted = r.Deleted,
         ParentSessionId = r.ParentSessionId, ReportToParent = r.ReportToParent, Archived = r.Archived, PeerToken = r.PeerToken,
         HostSeen = r.HostSeen, HostPrompts = r.HostPrompts is null ? null : [.. r.HostPrompts],
+        HostOf = r.HostOf, HostSlot = r.HostSlot,
     };
 }

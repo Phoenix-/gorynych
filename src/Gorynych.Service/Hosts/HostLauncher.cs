@@ -10,21 +10,25 @@ namespace Gorynych.Service.Hosts;
 /// <summary>Starts the adapter hosts of a conductor that runs its adapters in hosts.</summary>
 public interface IHostLauncher
 {
-    /// <summary>Whether a host of the adapter runs, connected or on its way to a conductor: from its start on.</summary>
-    bool IsAlive(string adapter);
+    /// <summary>
+    /// Whether the host of the adapter's <paramref name="slot"/> runs, connected or on its way to a
+    /// conductor: from its start on. A slot is a host: the adapter-wide one of a generation, or one
+    /// for a session; the empty slot is a host of an earlier version, which ran the whole adapter.
+    /// </summary>
+    bool IsAlive(string adapter, string slot);
 
-    /// <summary>Starts a host of the adapter, which then dials the conductor.</summary>
-    void Launch(string adapter);
+    /// <summary>Starts the host of the adapter's slot, which then dials the conductor.</summary>
+    void Launch(string adapter, string slot);
 
-    /// <summary>What the host this launcher started last said as it failed, if it said anything; for the error a request gets.</summary>
-    string? WhyExited(string adapter) => null;
+    /// <summary>What the host this launcher started last for the slot said as it failed, if it said anything; for the error a request gets.</summary>
+    string? WhyExited(string adapter, string slot) => null;
 }
 
 /// <summary>
 /// Hosts as processes of this executable (<c>Gorynych.Service host --adapter …</c>), detached from
 /// the service's process and job as the service is from its bridge, so they outlive it.
 /// </summary>
-public sealed class ProcessHostLauncher(string exe, string pipe, string dataDirectory, IReadOnlyList<string> adapterArguments) : IHostLauncher
+public sealed class ProcessHostLauncher(string exe, string pipe, string dataDirectory, Func<string, IReadOnlyList<string>> adapterArguments) : IHostLauncher
 {
     readonly Lock gate = new();
     readonly Dictionary<string, (System.Diagnostics.Process? Process, string Log, long From)> started = new(StringComparer.Ordinal);
@@ -33,15 +37,19 @@ public sealed class ProcessHostLauncher(string exe, string pipe, string dataDire
     /// It holds its mutex, or it is the one this launcher started and its process still runs: from
     /// its start on, before it takes the mutex, so a host that exits at once is seen to.
     /// </summary>
-    public bool IsAlive(string adapter)
+    public bool IsAlive(string adapter, string slot)
     {
-        if (HostNames.IsHeld(pipe, adapter)) return true;
-        lock (gate) return started.TryGetValue(adapter, out var host) && host.Process is { } process && !process.HasExited;
+        if (HostNames.IsHeld(pipe, adapter, slot)) return true;
+        lock (gate) return started.TryGetValue(Key(adapter, slot), out var host) && host.Process is { } process && !process.HasExited;
     }
 
-    public void Launch(string adapter)
+    static string Key(string adapter, string slot) => adapter + "/" + slot;
+
+    public void Launch(string adapter, string slot)
     {
-        List<string> args = ["host", "--adapter", adapter, "--pipe", pipe, "--data", dataDirectory, .. adapterArguments];
+        List<string> args = ["host", "--adapter", adapter, "--pipe", pipe, "--data", dataDirectory];
+        if (slot.Length > 0) args.AddRange(["--slot", slot]);
+        args.AddRange(adapterArguments(adapter));
         ServiceLog.Info($"{adapter}: starting its host ({exe} {string.Join(' ', args)})");
         var log = Path.Combine(dataDirectory, "logs", $"host-{adapter}-{DateTime.Now:yyyyMMdd}.log");
         var from = File.Exists(log) ? new FileInfo(log).Length : 0;
@@ -52,17 +60,24 @@ public sealed class ProcessHostLauncher(string exe, string pipe, string dataDire
         catch (ArgumentException) { } // gone already
         lock (gate)
         {
-            if (started.TryGetValue(adapter, out var before)) before.Process?.Dispose();
-            started[adapter] = (process, log, from);
+            if (started.TryGetValue(Key(adapter, slot), out var before)) before.Process?.Dispose();
+            started[Key(adapter, slot)] = (process, log, from);
+            // The hosts that ended: let go of their handles.
+            foreach (var (key, ended) in started.Where(h => h.Value.Process is { HasExited: true }).ToList())
+                if (key != Key(adapter, slot))
+                {
+                    ended.Process!.Dispose();
+                    started.Remove(key);
+                }
         }
     }
 
     /// <summary>The last error the host wrote in its log since it was started.</summary>
-    public string? WhyExited(string adapter)
+    public string? WhyExited(string adapter, string slot)
     {
         (System.Diagnostics.Process? Process, string Log, long From) host;
         lock (gate)
-            if (!started.TryGetValue(adapter, out host)) return null;
+            if (!started.TryGetValue(Key(adapter, slot), out host)) return null;
         try
         {
             using var file = new FileStream(host.Log, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -89,15 +104,20 @@ public static class HostNames
     /// <summary>The pipe a conductor takes its hosts on, next to its clients' pipe.</summary>
     public static string Pipe(string servicePipe) => servicePipe + ".hosts";
 
-    /// <summary>One host per adapter and pipe, across logon sessions, as the service's own mutex.</summary>
-    public static string Mutex(string servicePipe, string adapter) => $"Gorynych.Host.{servicePipe}.{adapter}";
+    /// <summary>
+    /// One host per slot of an adapter and pipe, across logon sessions, as the service's own mutex: so
+    /// no two hosts of a generation run the adapter. The empty slot is the mutex of a host of an
+    /// earlier version, which ran the whole adapter.
+    /// </summary>
+    public static string Mutex(string servicePipe, string adapter, string slot = "") =>
+        slot.Length == 0 ? $"Gorynych.Host.{servicePipe}.{adapter}" : $"Gorynych.Host.{servicePipe}.{adapter}.{slot}";
 
     public static NamedWaitHandleOptions MutexOptions => new() { CurrentUserOnly = true, CurrentSessionOnly = false };
 
     /// <summary>Whether a host of the adapter holds its mutex: it runs.</summary>
-    public static bool IsHeld(string servicePipe, string adapter)
+    public static bool IsHeld(string servicePipe, string adapter, string slot = "")
     {
-        if (!System.Threading.Mutex.TryOpenExisting(Mutex(servicePipe, adapter), MutexOptions, out var mutex)) return false;
+        if (!System.Threading.Mutex.TryOpenExisting(Mutex(servicePipe, adapter, slot), MutexOptions, out var mutex)) return false;
         mutex.Dispose();
         return true;
     }
