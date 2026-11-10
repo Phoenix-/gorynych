@@ -1022,6 +1022,56 @@ public sealed class HostTests
     }
 
     [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHostProcessThatExitsAtOnce_FailsTheRequestAtOnce_NotAfterTheWait()
+    {
+        // A host whose adapter cannot start exits before it takes its mutex (here its command line
+        // is wrong; on a machine without the agent, the adapter fails): it is seen to by its process.
+        var data = TestDirs.New();
+        var pipe = "gorynych-test-" + Guid.NewGuid().ToString("N")[..8];
+        var launcher = new ProcessHostLauncher(BridgeTests.ServiceExe(), pipe, data, ["--claude-transport", "bogus"]);
+        await using var service = new Conductor(new ConductorOptions
+        {
+            DataDirectory = data, ServiceId = "test-service", Hosts = launcher, HostToken = HostNames.EnsureToken(data),
+        }, [new TurnAgent("claude")]);
+        await using var gui = await TestClient.ConnectAsync(service, "gui");
+        var took = System.Diagnostics.Stopwatch.StartNew();
+        var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => NewSession(gui));
+        Assert.IsLessThan(10, took.Elapsed.TotalSeconds, "not the 30 seconds of a host that never comes");
+        StringAssert.Contains(failed.Message, "The claude host exited before it connected to Gorynych");
+        Assert.IsFalse(launcher.IsAlive("claude"));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHostStillStarting_IsWaitedFor_AndWhenItFailsTheRequestSaysWhy()
+    {
+        // A host that finds no token in its data folder: it takes its mutex, waits 10 s for the token,
+        // says so in its log and exits. Looked at every millisecond from its start, before its mutex
+        // is taken: it runs, by its process, and the request waits for it and then gives its words.
+        var hostData = TestDirs.New();
+        var pipe = "gorynych-test-" + Guid.NewGuid().ToString("N")[..8];
+        var launcher = new ProcessHostLauncher(BridgeTests.ServiceExe(), pipe, hostData, []);
+        var interval = AgentHost.HostCheckInterval;
+        AgentHost.HostCheckInterval = TimeSpan.FromMilliseconds(1);
+        try
+        {
+            await using var service = new Conductor(new ConductorOptions
+            {
+                DataDirectory = TestDirs.New(), ServiceId = "test-service", Hosts = launcher, HostToken = InProcessHosts.Token,
+            }, [new TurnAgent("kimi")]);
+            await using var gui = await TestClient.ConnectAsync(service, "gui");
+            var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => NewSession(gui));
+            StringAssert.Contains(failed.Message, "The kimi host exited before it connected to Gorynych: no ");
+            StringAssert.Contains(failed.Message, "host.token; the service writes it before it starts a host;");
+        }
+        finally
+        {
+            AgentHost.HostCheckInterval = interval;
+        }
+    }
+
+    [TestMethod]
     public void TheHostToken_IsTheUsersAlone_AndAnOldOneIsMadeSo()
     {
         var data = TestDirs.New();
