@@ -174,11 +174,13 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             var said = await hello.Task.WaitAsync(TimeSpan.FromSeconds(10), shutdown.Token);
-            var adapter = (string?)said["adapter"];
-            var hostId = (string?)said["hostId"];
+            // What a process of the user's sends, before it proved anything: read as it may be.
+            static string? Text(JsonNode? node) => node is JsonValue v && v.TryGetValue<string>(out var text) ? text : null;
+            var adapter = Text(said["adapter"]);
+            var hostId = Text(said["hostId"]);
             var link = said["link"] is JsonValue l && l.TryGetValue<int>(out var version) ? version : 0;
             string? refusal = null;
-            if (!HostNames.SameToken((string?)said["token"], options.HostToken)) refusal = "its token is not this service's";
+            if (!HostNames.SameToken(Text(said["token"]), options.HostToken)) refusal = "its token is not this service's";
             else if (adapter is null || !agents.ContainsKey(adapter)) refusal = $"this service has no adapter '{adapter}'";
             else if (string.IsNullOrEmpty(hostId)) refusal = "it has no ID";
             else if (link < GorynychProtocol.MinHostLinkVersion || link > GorynychProtocol.HostLinkVersion)
@@ -186,15 +188,19 @@ public sealed class Conductor : IAsyncDisposable
             else if (options.Hosts is null) refusal = "this service runs its adapters in its own process";
             if (refusal is not null)
             {
-                ServiceLog.Warn($"{name}: a host was refused: {refusal}");
+                // Stopped, not only closed: else it would try again until it is an orphan, and keep the
+                // adapter's mutex, so that no host of this service's could start meanwhile.
+                ServiceLog.Warn($"{name}: a host was refused, and stopped: {refusal}");
+                try { await rpc.SendRequestAsync(GorynychProtocol.MethodHostStop, new JsonObject()).WaitAsync(TimeSpan.FromSeconds(2)); }
+                catch (Exception e) when (e is IOException or JsonRpcException or TimeoutException) { }
                 await rpc.DisposeAsync();
                 return;
             }
             if (!await agents[adapter!].AttachAsync(rpc, hostId!, shutdown.Token)) await rpc.DisposeAsync();
         }
-        catch (Exception e) when (e is TimeoutException or OperationCanceledException or IOException or JsonRpcException)
+        catch (Exception e)
         {
-            ServiceLog.Warn($"{name}: a host did not get through its handshake: {e.Message}");
+            ServiceLog.Warn($"{name}: a host did not get through its handshake: {(e is TimeoutException or OperationCanceledException or IOException or JsonRpcException ? e.Message : e.ToString())}");
             await rpc.DisposeAsync();
         }
     }
@@ -204,7 +210,7 @@ public sealed class Conductor : IAsyncDisposable
     /// (<see cref="SessionFeed.AdoptedTurn"/>), so a new prompt waits for it, a resuming client is
     /// told it is in progress, and the end the host reports later is marked.
     /// </summary>
-    internal async Task AdoptAsync(AgentHost host, JsonObject report)
+    internal async Task AdoptAsync(AgentHost host, JsonObject report, CancellationToken ct)
     {
         foreach (var turn in (report["turns"] as JsonArray ?? []).OfType<JsonObject>())
         {
@@ -213,7 +219,13 @@ public sealed class Conductor : IAsyncDisposable
             long? hostTurn = turn["turn"] is JsonValue t && t.TryGetValue<long>(out var number) ? number : null;
             var feed = Feed(sessionId);
             if (feed.Adopted is not null) continue;
-            await feed.TurnGate.WaitAsync();
+            // Nothing takes the turn of a session of this adapter before its host is here; were it
+            // taken all the same, the turn runs untaken, and its end is marked when it comes.
+            if (!await feed.TurnGate.WaitAsync(AdoptWait, ct))
+            {
+                ServiceLog.Warn($"{host.Name} {sessionId}: the session's turn stayed taken for {AdoptWait.TotalSeconds:0} s; its turn in the host is not taken back");
+                continue;
+            }
             var key = feed.BeginPrompt(promptId);
             feed.Handed(key);
             if (!feed.Adopt(new SessionFeed.AdoptedTurn(key, promptId, host.Name, hostTurn)))
@@ -229,6 +241,8 @@ public sealed class Conductor : IAsyncDisposable
             ServiceLog.Info($"{host.Name} {sessionId}: took back a turn running in its host{(promptId is null ? "" : $" (prompt {promptId})")}");
         }
     }
+
+    internal static TimeSpan AdoptWait { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>The end of an adopted turn: the session is free again.</summary>
     void EndAdopted(SessionFeed feed, SessionFeed.AdoptedTurn turn)
@@ -260,7 +274,7 @@ public sealed class Conductor : IAsyncDisposable
             var feed = Feed(record.SessionId);
             foreach (var promptId in left)
             {
-                if (running.Contains(promptId) || feed.Journal.HasEndMark(promptId)) continue;
+                if (running.Contains(promptId) || feed.HasEndMark(promptId)) continue;
                 ServiceLog.Warn($"{host.Name} {record.SessionId}: prompt {promptId} went on in a host that is gone; it ends cancelled");
                 await MarkPromptEndAsync(feed, promptId, null, new IOException("its host went"));
             }
@@ -302,11 +316,7 @@ public sealed class Conductor : IAsyncDisposable
             ? new JsonRpcException(error["code"] is JsonValue c && c.TryGetValue<int>(out var code) ? code : JsonRpcException.InternalError, (string?)error["message"] ?? "the prompt failed")
             : null;
         KeepMark(feed, result);
-        if (promptId is not null)
-        {
-            feed.MarkedByHost(promptId); // its answer, if it comes here, marks it no more
-            await MarkPromptEndAsync(feed, promptId, result, failure, hostSeq);
-        }
+        if (promptId is not null) await MarkPromptEndAsync(feed, promptId, result, failure, hostSeq); // its answer, if it comes here, marks it no more
         long? hostTurn = report["turn"] is JsonValue t && t.TryGetValue<long>(out var number) ? number : null;
         if (feed.EndAdopted(hostTurn) is not { } turn) return;
         if (store.Get(sessionId)?.ParentSessionId is not null)
@@ -1124,8 +1134,8 @@ public sealed class Conductor : IAsyncDisposable
             // before the service notices, and then the answer is lost. A prompt a restart refused
             // ended nowhere: it goes again, as it is. A turn that goes on in a host this service leaves
             // running for a restart is not over: the next service marks its end when the host reports
-            // it. One its host reported the end of is marked already (OnTurnEndedAsync).
-            if (promptId is not null && !use.Feed.TakeMarkedByHost(promptId) && !IsRestartingRefusal(failure) && !livesOn)
+            // it. One its host reported the end of is marked already (OnTurnEndedAsync), and is marked no more.
+            if (promptId is not null && !IsRestartingRefusal(failure) && !livesOn)
                 await MarkPromptEndAsync(use.Feed, promptId, result, failure);
             use.Feed.EndPrompt(key);
         }
@@ -1140,10 +1150,17 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>
     /// Journals and sends the end of a prompt's turn: a <c>session_info_update</c>
     /// with <c>gorynych/agentTurn: "ended"</c>, the prompt's ID, and its stop reason or error. Never fails.
+    /// A prompt whose end is marked already is marked no more: its answer after its host's report, or
+    /// a report after a service ended it for a host it took for gone.
     /// </summary>
     /// <param name="hostSeq">The host's report it comes from, journaled with it so that it is marked once.</param>
     async Task MarkPromptEndAsync(SessionFeed feed, string promptId, JsonNode? result, Exception? failure, string? hostSeq = null)
     {
+        if (!feed.ClaimEndMark(promptId))
+        {
+            ServiceLog.Info($"{feed.SessionId}: the end of prompt {promptId} is marked already");
+            return;
+        }
         var meta = new JsonObject { [GorynychProtocol.MetaAgentTurn] = "ended", [GorynychProtocol.MetaPromptId] = promptId };
         if (hostSeq is not null) meta[GorynychProtocol.MetaHostSeq] = hostSeq;
         if (failure is null)
@@ -3328,7 +3345,11 @@ public sealed class Conductor : IAsyncDisposable
             {
                 if (feed.Retired || store.Get(feed.SessionId) is not { } record) continue;
                 var seen = feed.LastTakenFromHost ?? record.HostSeen;
-                List<string>? left = StopHostsOnExit ? record.HostPrompts : [.. feed.HandedPromptIds()];
+                // Kept before and not settled in this run (no host of the adapter came), and those that
+                // reached a host in this run; but none whose end is marked. A shutdown stops the hosts,
+                // so its turns end there: those that left no mark are ended by the next service.
+                List<string>? left = [.. (record.HostPrompts ?? []).Concat(feed.HandedPromptIds())
+                    .Distinct(StringComparer.Ordinal).Where(p => !feed.HasEndMark(p))];
                 if (left is { Count: 0 }) left = null;
                 if (record.HostSeen != seen || !SameList(record.HostPrompts, left))
                     store.Update(feed.SessionId, record.Agent, r => { r.HostSeen = seen; r.HostPrompts = left; });

@@ -112,18 +112,51 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         Task waiting;
         lock (attachGate) waiting = attached.Task;
         if (connection is { IsClosed: false } ready) return ready;
-        if (!hosts.IsAlive(Name)) hosts.Launch(Name);
-        try
+        if (hostFailure is { } failed && Environment.TickCount64 < failed.RetryAt)
+            throw HostFailed($"{failed.Why} Gorynych starts it again in {(failed.RetryAt - Environment.TickCount64 + 999) / 1000} seconds.");
+        var alive = hosts.IsAlive(Name);
+        if (!alive) hosts.Launch(Name);
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (await Task.WhenAny(waiting, Task.Delay(HostCheckInterval, ct)) != waiting)
         {
-            await waiting.WaitAsync(AttachTimeout, ct);
+            ct.ThrowIfCancellationRequested();
+            // One that ran and runs no more exited before it connected: its log says why.
+            if (hosts.IsAlive(Name)) alive = true;
+            else if (alive) Fail($"The {DisplayName} host exited before it connected to Gorynych; its log is in Gorynych's logs folder (host-{Name}-*.log).");
+            if (waited.Elapsed >= AttachTimeout)
+                Fail($"The {DisplayName} host did not connect to Gorynych within {AttachTimeout.TotalSeconds:0} seconds; its log is in Gorynych's logs folder " +
+                    $"(host-{Name}-*.log). If its process (Gorynych.Service host --adapter {Name}) hangs, stopping it lets Gorynych start another.");
         }
-        catch (TimeoutException)
-        {
-            throw new JsonRpcException(JsonRpcException.InternalError,
-                $"The {DisplayName} host did not connect to Gorynych within {AttachTimeout.TotalSeconds:0} seconds; its log is in Gorynych's logs folder (host-{Name}-*.log).");
-        }
+        hostFailure = null;
         return connection ?? throw new IOException($"{Name}: its host went as it connected");
     }
+
+    /// <summary>
+    /// The host could not be had: the requests that come in the next while fail at once with the same
+    /// words, rather than each wait for a host that fails again; the while doubles up to 5 minutes.
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    void Fail(string why)
+    {
+        var backoff = hostFailure is { } before ? TimeSpan.FromTicks(Math.Min(before.Backoff.Ticks * 2, MaxHostBackoff.Ticks)) : HostBackoff;
+        hostFailure = new HostFailure(why, Environment.TickCount64 + (long)backoff.TotalMilliseconds, backoff);
+        ServiceLog.Warn($"{Name}: {why}");
+        throw HostFailed(why);
+    }
+
+    static JsonRpcException HostFailed(string why) => new(JsonRpcException.InternalError, why);
+
+    sealed record HostFailure(string Why, long RetryAt, TimeSpan Backoff);
+
+    HostFailure? hostFailure; // under startGate
+
+    /// <summary>How often a request that waits for the host looks whether it still runs.</summary>
+    internal static TimeSpan HostCheckInterval { get; set; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>How long after a host could not be had the next one is not started; it doubles up to <see cref="MaxHostBackoff"/>.</summary>
+    internal static TimeSpan HostBackoff { get; set; } = TimeSpan.FromSeconds(10);
+
+    internal static readonly TimeSpan MaxHostBackoff = TimeSpan.FromMinutes(5);
 
     /// <summary>
     /// A host of this adapter connected and proved itself (<see cref="Conductor.ServeHostAsync"/>):
@@ -173,13 +206,15 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         JsonNode? replayed;
         try
         {
-            if (report is not null) await conductor.AdoptAsync(this, report);
+            if (report is not null) await conductor.AdoptAsync(this, report, ct);
             var after = conductor.HostCursors(hostId, sessions.Concat(Strings(report?["buffered"])).Distinct(StringComparer.Ordinal));
             replayed = await rpc.SendRequestAsync(GorynychProtocol.MethodHostReplay, new JsonObject { ["after"] = after }, ct);
         }
-        catch
+        catch when (!ct.IsCancellationRequested)
         {
-            // It went in the middle of its handshake, with the turns it brought back: they end as a
+            // This service exits (ct): the host lives on with its turns, for the next one, which takes
+            // them back; they are kept at the exit (Conductor.DisposeAsync). Otherwise it went in the
+            // middle of its handshake, with the turns it brought back: they end as a
             // host's that dies do, and the host is stopped if it comes again.
             ServiceLog.Warn($"{Name}: host {hostId} went before it was taken back; its turns end");
             lock (attachGate) goneHosts.Add(hostId);

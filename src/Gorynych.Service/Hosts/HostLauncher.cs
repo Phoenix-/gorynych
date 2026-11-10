@@ -1,4 +1,7 @@
+using System.Runtime.Versioning;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using Gorynych.Outside;
 
@@ -50,26 +53,71 @@ public static class HostNames
         return true;
     }
 
-    /// <summary>The token file in the service's data folder, as only the user can read it.</summary>
+    /// <summary>The token file in the service's data folder, which only the user can read.</summary>
     public static string TokenPath(string dataDirectory) => Path.Combine(dataDirectory, "host.token");
 
-    /// <summary>The conductor's token for its hosts, made once and kept: a host started by an earlier run proves itself with it.</summary>
+    /// <summary>
+    /// The conductor's token for its hosts, made once and kept: a host started by an earlier run
+    /// proves itself with it. Only the user may read the file, whatever the folder lets others do:
+    /// on Windows its DACL allows the user alone and inherits nothing, elsewhere its mode is 0600
+    /// from its creation on. A token an earlier version wrote gets those rights now. It keeps other
+    /// users out; a process of the same user can read it, as it can the rest of the user's files.
+    /// </summary>
     public static string EnsureToken(string dataDirectory)
     {
         var path = TokenPath(dataDirectory);
-        if (File.Exists(path) && File.ReadAllText(path, Encoding.UTF8).Trim() is { Length: >= 32 } kept) return kept;
+        if (File.Exists(path))
+        {
+            Protect(path);
+            if (File.ReadAllText(path, Encoding.UTF8).Trim() is { Length: >= 32 } kept) return kept;
+        }
         var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
-        Gorynych.Acp.Hosting.AtomicFile.WriteAllText(path, token, Encoding.UTF8);
-        if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        var tmp = path + ".tmp";
+        File.Delete(tmp);
+        using (var file = CreateOwnerOnly(tmp)) file.Write(Encoding.ASCII.GetBytes(token));
+        File.Move(tmp, path, overwrite: true); // a move keeps the file's own rights
         return token;
     }
 
-    /// <summary>The token as a host reads it; null while there is none (the conductor writes it before it starts a host).</summary>
+    static FileStream CreateOwnerOnly(string path) => OperatingSystem.IsWindows()
+        ? new FileInfo(path).Create(FileMode.CreateNew, FileSystemRights.FullControl, FileShare.None, 4096, FileOptions.None, OwnerOnly())
+        : new FileStream(path, new FileStreamOptions
+        {
+            Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None,
+            UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+        });
+
+    /// <summary>Gives an existing token file the rights a new one has.</summary>
+    internal static void Protect(string path)
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows()) new FileInfo(path).SetAccessControl(OwnerOnly());
+            else File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+        catch (Exception e) when (e is UnauthorizedAccessException or IOException or PrivilegeNotHeldException)
+        {
+            ServiceLog.Warn($"service: could not keep {path} to the user alone: {e.Message}");
+        }
+    }
+
+    /// <summary>The user alone, with all rights; nothing inherited from the folder.</summary>
+    [SupportedOSPlatform("windows")]
+    internal static FileSecurity OwnerOnly()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var security = new FileSecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(identity.User!, FileSystemRights.FullControl, AccessControlType.Allow));
+        return security;
+    }
+
+    /// <summary>The token as a host reads it; null while there is none (the conductor writes it before it starts a host), or it cannot be read.</summary>
     public static string? ReadToken(string dataDirectory)
     {
         var path = TokenPath(dataDirectory);
         try { return File.Exists(path) ? File.ReadAllText(path, Encoding.UTF8).Trim() : null; }
-        catch (IOException) { return null; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
     }
 
     /// <summary>Compares two tokens in constant time.</summary>

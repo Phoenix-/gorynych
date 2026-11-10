@@ -636,9 +636,11 @@ last acknowledged one, and send the pending requests again. So it is built once.
 
 **Edge cases** (as decided in 3a).
 - **Versions.** A new conductor talks to older hosts: the host link's version is in the host's
-  hello and its `initialize` answer (`gorynych/host`), and a conductor takes a range of them that
-  keeps at least the previous one. Bridges keep running the old code until the GUI restarts, so
-  the bridge stays thin.
+  hello and its `initialize` answer (`gorynych/host`), and a conductor takes a range of them. There
+  is only version 1 yet; from the next one on, the range keeps at least the previous version.
+  Bridges keep running the old code until the GUI restarts, so the bridge stays thin.
+- **Options.** A host keeps the adapter options it was started with (`--claude-*`) until it exits;
+  applying new ones to running hosts belongs to 3b.
 - **Orphans.** A host whose conductor does not come back, after a crash or an uninstall, lets its
   turns run for up to 10 minutes and exits once nothing runs (2 minutes after it lost the
   conductor at the earliest, also when it is idle); at 10 minutes it cancels what still runs and

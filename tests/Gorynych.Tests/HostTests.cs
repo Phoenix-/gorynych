@@ -584,7 +584,7 @@ public sealed class HostTests
         };
         await using var raw = new RawHost(service, hello, _ => new JsonObject());
         await raw.Rpc.Completion.WaitAsync(Wait);
-        lock (raw.Asked) CollectionAssert.AreEqual(Array.Empty<string>(), raw.Asked, "not even initialized");
+        lock (raw.Asked) CollectionAssert.AreEqual(new[] { GorynychProtocol.MethodHostStop }, raw.Asked, "stopped, and not even initialized");
         Assert.IsNull(service.Agents["turns"].HostId);
     }
 
@@ -718,6 +718,270 @@ public sealed class HostTests
         });
         await LinkHarness.Until(() => after is not null, "the replay asked for");
         Assert.AreEqual(7, (long)after!["s1"]!, "after what the old service took, though its journal ends at 6");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    [DataRow("{\"token\":{},\"hostId\":\"h\",\"adapter\":\"turns\",\"link\":1}", DisplayName = "a token that is no string")]
+    [DataRow("{\"token\":\"x\",\"hostId\":[1],\"adapter\":\"turns\",\"link\":1}", DisplayName = "a host ID that is no string")]
+    [DataRow("{\"token\":\"x\",\"hostId\":\"h\",\"adapter\":7,\"link\":\"one\"}", DisplayName = "an adapter and a link of the wrong kinds")]
+    public async Task AHelloOfTheWrongShape_IsRefused_AndItsConnectionClosed(string hello)
+    {
+        var agent = new TurnAgent("turns");
+        var hosts = new InProcessHosts(_ => agent);
+        await using var service = hosts.Conductor(TestDirs.New(), agent);
+        await using var raw = new RawHost(service, JsonNode.Parse(hello)!.AsObject(), _ => new JsonObject());
+        await raw.Rpc.Completion.WaitAsync(Wait);
+        lock (raw.Asked) CollectionAssert.DoesNotContain(raw.Asked, AcpMethods.Agent.Initialize);
+        Assert.IsNull(service.Agents["turns"].HostId);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ATurnLeftToAHostThatDied_IsStillEndedAfterAServiceInBetweenThatNoHostReached()
+    {
+        var data = TestDirs.New();
+        var agent = new TurnAgent("turns") { Hold = true };
+        var hosts = new InProcessHosts(_ => agent);
+        var service = hosts.Conductor(data, agent);
+        hosts.Service = service;
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+        zed.ConnectGate = new TaskCompletionSource(); // Zed stays away until the third service
+        await RestartAsync(service);
+        await GoneAsync(service, zed, hosts);
+        var first = hosts["turns"];
+        await hosts.KillAsync("turns");
+        await first.Run.WaitAsync(Wait);
+        agent.Release();
+
+        // A service in between reads the session, so it has its feed, but no host of the adapter comes to it.
+        var between = Next(data, hosts, zed, agent);
+        await using (var reader = await TestClient.ConnectAsync(between, "reader"))
+            await reader.Rpc.SendRequestAsync(GorynychProtocol.MethodRead, new JsonObject { ["sessionId"] = sid }).WaitAsync(Wait);
+        Assert.AreEqual(1, hosts.Launches, "no host started for it");
+        await RestartAsync(between);
+        await GoneAsync(between, zed, hosts);
+        Assert.AreEqual(1, between.Store.Get(sid)!.HostPrompts?.Count, "still kept");
+
+        await using var third = Next(data, hosts, zed, agent);
+        zed.ConnectGate.SetResult();
+        Assert.AreEqual("cancelled", (string?)(await prompt.WaitAsync(Wait))!["stopReason"], "ended by the service the next host came to");
+        Assert.AreEqual(1, EndMarks(third, sid));
+        Assert.IsNull(third.Store.Get(sid)!.HostPrompts);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AnEndAlreadyMarked_IsNotMarkedAgain_WhateverReportsItLater()
+    {
+        var agent = new TurnAgent("turns");
+        var hosts = new InProcessHosts(_ => agent);
+        await using var service = hosts.Conductor(TestDirs.New(), agent);
+        JsonObject Init(bool back) => new()
+        {
+            ["protocolVersion"] = 1, ["agentCapabilities"] = new JsonObject(),
+            ["_meta"] = new JsonObject { [GorynychProtocol.MetaHost] = new JsonObject { ["hostId"] = "h", ["link"] = 1, ["reattached"] = back } },
+        };
+        var first = new RawHost(service, Hello(hostId: "h1"), req => req.Method switch
+        {
+            AcpMethods.Agent.Initialize => Init(false),
+            AcpMethods.Agent.SessionNew => new JsonObject { ["sessionId"] = "s1" },
+            _ => new JsonObject(),
+        });
+        await LinkHarness.Until(() => service.Agents["turns"].HostId == "h1", "the first host");
+        await using var gui = await TestClient.ConnectAsync(service, "gui");
+        Assert.AreEqual("s1", await NewSession(gui));
+        await first.DisposeAsync();
+        await LinkHarness.Until(() => !service.Agents["turns"].IsRunning, "the first host gone");
+
+        // A turn a service before left to the adapter's host; this host does not report it, so it is
+        // ended cancelled, and the end the host reports after all is not marked again.
+        service.Store.Update("s1", "turns", r => r.HostPrompts = ["p1"]);
+        await using var second = new RawHost(service, Hello(hostId: "h2"), req => req.Method switch
+        {
+            AcpMethods.Agent.Initialize => Init(true),
+            GorynychProtocol.MethodHostState => new JsonObject { ["sessions"] = new JsonArray("s1") },
+            _ => new JsonObject(),
+        });
+        await LinkHarness.Until(() => service.Agents["turns"].HostId == "h2", "the second host");
+        Assert.AreEqual(1, EndMarks(service, "s1"));
+        Task Ended(int seq, string stop) => second.Rpc.SendNotificationAsync(GorynychProtocol.MethodTurnEnded, new JsonObject
+        {
+            ["sessionId"] = "s1", ["promptId"] = "p1", ["turn"] = 4, ["result"] = new JsonObject { ["stopReason"] = stop },
+            ["_meta"] = new JsonObject { [GorynychProtocol.MetaHostSeq] = $"h2/{seq}" },
+        });
+        await Ended(9, "end_turn");
+        await Ended(10, "end_turn"); // and a second report, under another number
+        await Task.Delay(300);
+        Assert.AreEqual(1, EndMarks(service, "s1"));
+        var mark = Journal(service, "s1").Single(u => (string?)u["_meta"]?[GorynychProtocol.MetaPromptId] == "p1" && u["_meta"]?[GorynychProtocol.MetaAgentTurn] is not null);
+        Assert.AreEqual("cancelled", (string?)mark["_meta"]![GorynychProtocol.MetaStopReason]);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AServiceThatExitsInTheMiddleOfAHandshake_EndsNoTurnOfThatHost()
+    {
+        var agent = new TurnAgent("turns");
+        var hosts = new InProcessHosts(_ => agent);
+        var data = TestDirs.New();
+        var service = hosts.Conductor(data, agent);
+        service.Store.Update("s1", "turns", r => r.Title = "kept");
+        await using var raw = new RawHost(service, Hello(hostId: "h2"), req =>
+        {
+            switch (req.Method)
+            {
+                case AcpMethods.Agent.Initialize:
+                    return new JsonObject
+                    {
+                        ["protocolVersion"] = 1, ["agentCapabilities"] = new JsonObject(),
+                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaHost] = new JsonObject { ["hostId"] = "h2", ["link"] = 1, ["reattached"] = true } },
+                    };
+                case GorynychProtocol.MethodHostState:
+                    return new JsonObject
+                    {
+                        ["sessions"] = new JsonArray("s1"),
+                        ["turns"] = new JsonArray(new JsonObject { ["sessionId"] = "s1", ["turn"] = 3, ["promptId"] = "p1" }),
+                    };
+                default:
+                    service.RequestShutdown(); // host_replay: the service exits meanwhile
+                    Thread.Sleep(500);
+                    return new JsonObject();
+            }
+        });
+        await LinkHarness.Until(() => service.ShutdownRequested.IsCancellationRequested, "the exit");
+        await Task.Delay(500);
+        Assert.AreEqual(0, EndMarks(service, "s1"), "the host lives on with its turn, for the next service");
+        await service.DisposeAsync();
+        CollectionAssert.AreEqual(new[] { "p1" }, service.Store.Get("s1")!.HostPrompts!.ToArray(), "kept for the next one");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task UpdatesPastTheBuffersBytes_AreLetGo_AndTheJournalSaysItIsTrimmed()
+    {
+        var data = TestDirs.New();
+        var agent = new TurnAgent("turns") { Hold = true };
+        var hosts = new InProcessHosts(_ => agent) { BufferBytes = 4096 };
+        var service = hosts.Conductor(data, agent);
+        hosts.Service = service;
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+        await RestartAsync(service);
+        await GoneAsync(service, zed, hosts);
+        for (var i = 0; i < 10; i++)
+            await agent.Current!.Update(sid, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = new string((char)('a' + i), 1000) } });
+        await using var next = Next(data, hosts, zed, agent);
+        await LinkHarness.Until(() => next.Feed(sid).Journal.Trimmed, "the journal to say it lacks some");
+        StringAssert.EndsWith(JournalText(next, sid), new string('j', 1000), "the newest are there");
+        agent.Release();
+        Assert.AreEqual("end_turn", (string?)(await prompt.WaitAsync(Wait))!["stopReason"]);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AQuestionPastTheLimit_IsRefusedToTheAgent_WhileTheOthersWait()
+    {
+        var agent = new TurnAgent("turns");
+        var instance = await agent.StartAsync(CancellationToken.None);
+        var host = new AdapterHost(instance, _ => throw new IOException("no conductor"), new AdapterHostOptions
+        {
+            Adapter = "turns", Token = InProcessHosts.Token, QuestionLimit = 1, RetryDelays = [TimeSpan.FromMilliseconds(50)],
+        });
+        var run = host.RunAsync();
+        Task<JsonNode?> Ask(string tool) => agent.Current!.Rpc.SendRequestAsync(AcpMethods.Client.SessionRequestPermission, new JsonObject
+        {
+            ["sessionId"] = "s1", ["toolCall"] = new JsonObject { ["toolCallId"] = tool, ["title"] = tool },
+            ["options"] = new JsonArray(new JsonObject { ["optionId"] = "allow", ["name"] = "Allow", ["kind"] = "allow_once" }),
+        });
+        var waits = Ask("t1");
+        await Task.Delay(200);
+        var refused = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => Ask("t2").WaitAsync(Wait));
+        StringAssert.Contains(refused.Message, "1 questions of this agent waiting");
+        Assert.IsFalse(waits.IsCompleted, "the first waits for a conductor");
+        Assert.AreEqual(1, (int)host.Report()["requests"]!);
+        await instance.DisposeAsync();
+        await run.WaitAsync(Wait);
+    }
+
+    /// <summary>A host the test starts by hand: it may never connect, or exit before it does.</summary>
+    sealed class HandLauncher : IHostLauncher
+    {
+        public int Launches;
+        readonly System.Diagnostics.Stopwatch since = new();
+
+        /// <summary>How long a host it starts runs, without ever connecting.</summary>
+        public TimeSpan AliveFor { get; init; }
+
+        public bool IsAlive(string adapter) => Launches > 0 && since.Elapsed < AliveFor;
+
+        public void Launch(string adapter)
+        {
+            Interlocked.Increment(ref Launches);
+            since.Restart();
+        }
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHostThatExitsBeforeItConnects_FailsTheRequestAtOnce_AndIsNotStartedAgainForAWhile()
+    {
+        var agent = new TurnAgent("turns");
+        var launcher = new HandLauncher { AliveFor = TimeSpan.FromSeconds(1) };
+        await using var service = new Conductor(new ConductorOptions
+        {
+            DataDirectory = TestDirs.New(), ServiceId = "test-service", Hosts = launcher, HostToken = InProcessHosts.Token,
+        }, [agent]);
+        await using var gui = await TestClient.ConnectAsync(service, "gui");
+        var took = System.Diagnostics.Stopwatch.StartNew();
+        var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => NewSession(gui));
+        Assert.IsLessThan(10, took.Elapsed.TotalSeconds, "not the 30 seconds of a host that never comes");
+        StringAssert.Contains(failed.Message, "The turns host exited before it connected to Gorynych; its log is in Gorynych's logs folder (host-turns-*.log).");
+        var again = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => NewSession(gui));
+        StringAssert.Contains(again.Message, "Gorynych starts it again in");
+        Assert.AreEqual(1, launcher.Launches, "not started again meanwhile");
+    }
+
+    [TestMethod]
+    public void TheHostToken_IsTheUsersAlone_AndAnOldOneIsMadeSo()
+    {
+        var data = TestDirs.New();
+        var token = HostNames.EnsureToken(data);
+        Assert.AreEqual(64, token.Length);
+        Assert.AreEqual(token, HostNames.EnsureToken(data), "kept");
+        var path = HostNames.TokenPath(data);
+        AssertOwnerOnly(path);
+
+        // One an earlier version wrote, with the folder's rights.
+        var old = TestDirs.New();
+        File.WriteAllText(HostNames.TokenPath(old), new string('a', 64));
+        if (!OperatingSystem.IsWindows()) File.SetUnixFileMode(HostNames.TokenPath(old), (UnixFileMode)0b110_100_100);
+        Assert.AreEqual(new string('a', 64), HostNames.EnsureToken(old));
+        AssertOwnerOnly(HostNames.TokenPath(old));
+    }
+
+    static void AssertOwnerOnly(string path)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.AreEqual(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(path));
+            return;
+        }
+        var security = new FileInfo(path).GetAccessControl();
+        Assert.IsTrue(security.AreAccessRulesProtected, "nothing inherited from the folder");
+        var rules = security.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier))
+            .Cast<System.Security.AccessControl.FileSystemAccessRule>().ToArray();
+        using var me = System.Security.Principal.WindowsIdentity.GetCurrent();
+        Assert.AreEqual(1, rules.Length, string.Join(", ", rules.Select(r => $"{r.IdentityReference} {r.FileSystemRights}")));
+        Assert.AreEqual(me.User, rules[0].IdentityReference);
+        Assert.AreEqual(System.Security.AccessControl.AccessControlType.Allow, rules[0].AccessControlType);
     }
 
     [TestMethod]

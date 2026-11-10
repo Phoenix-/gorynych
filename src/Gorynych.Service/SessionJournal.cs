@@ -127,9 +127,12 @@ public sealed class SessionJournal
         }
     }
 
-    /// <summary>Whether the journal has the mark of the end of the prompt <paramref name="promptId"/>.</summary>
-    public bool HasEndMark(string promptId) => ReadAll().OfType<JsonObject>().Any(e =>
-        e["_meta"] is JsonObject meta && (string?)meta[Gorynych.Acp.Hosting.GorynychProtocol.MetaAgentTurn] == "ended" && (string?)meta[Gorynych.Acp.Hosting.GorynychProtocol.MetaPromptId] == promptId);
+    /// <summary>The prompts whose end the journal has the mark of.</summary>
+    public HashSet<string> EndMarkedPromptIds() => ReadAll().OfType<JsonObject>()
+        .Select(e => e["_meta"] is JsonObject meta && meta[Gorynych.Acp.Hosting.GorynychProtocol.MetaAgentTurn] is JsonValue t
+            && t.TryGetValue<string>(out var turn) && turn == "ended" && meta[Gorynych.Acp.Hosting.GorynychProtocol.MetaPromptId] is JsonValue v
+            && v.TryGetValue<string>(out var id) ? id : null)
+        .OfType<string>().ToHashSet(StringComparer.Ordinal);
 
     public List<JsonNode> ReadAll()
     {

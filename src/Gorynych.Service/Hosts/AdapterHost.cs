@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
+using Gorynych.Acp.JsonRpc;
 
 namespace Gorynych.Service.Hosts;
 
@@ -33,7 +34,16 @@ public sealed class AdapterHostOptions
         [TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(500), TimeSpan.FromSeconds(1)];
 
     /// <summary>How many session updates it keeps for a conductor that comes back.</summary>
-    public int BufferLimit { get; init; } = 4096;
+    public int BufferLimit { get; init; } = 16384;
+
+    /// <summary>How many bytes of them, at most: a tool's output may be large.</summary>
+    public long BufferBytes { get; init; } = 32 << 20;
+
+    /// <summary>How many of the agent's questions may wait for a conductor at once; one more is refused to the agent.</summary>
+    public int QuestionLimit { get; init; } = 1000;
+
+    /// <summary>How long a conductor's <c>initialize</c> waits for the agent's answer to an earlier one.</summary>
+    public TimeSpan InitializeWait { get; init; } = TimeSpan.FromSeconds(60);
 
     public Action<string>? Log { get; init; }
 }
@@ -79,6 +89,7 @@ public sealed class AdapterHost
     readonly Dictionary<string, Asked> asked = new(StringComparer.Ordinal);
     readonly HashSet<string> live = new(StringComparer.Ordinal);
     readonly Queue<Kept> buffer = new();
+    long bufferedBytes;
     readonly Dictionary<string, long> dropped = new(StringComparer.Ordinal); // per session, the newest update the buffer let go
     long seq;
     long nextToAgent;
@@ -153,26 +164,37 @@ public sealed class AdapterHost
     {
         if (!TryId(id, out var key)) return;
         Forwarded? request;
-        lock (state)
+        await sendGate.WaitAsync();
+        try
         {
-            if (!forwarded.Remove(key, out request)) return;
-            Track(request, message);
+            // How a turn ended goes first, numbered and kept as a session's update is: the conductor
+            // marks the end by it, and one that went before it took it, killed or restarting, finds it
+            // again after its cursor, though the answer itself was lost on the way. The prompt leaves
+            // the running ones as its end enters the buffer, so a report (host_state) has one or the other.
+            string? ended = null;
+            lock (state)
+            {
+                if (!forwarded.Remove(key, out request)) return;
+                Track(request, message);
+                if (request.Method == AcpMethods.Agent.SessionPrompt && request.SessionId is { } sessionId)
+                {
+                    var report = new JsonObject { ["sessionId"] = sessionId, ["turn"] = key };
+                    if (request.PromptId is { } promptId) report["promptId"] = promptId;
+                    if (message["result"] is { } r) report["result"] = r.DeepClone();
+                    if (message["error"] is { } e) report["error"] = e.DeepClone();
+                    ended = Number(Notification(GorynychProtocol.MethodTurnEnded, report));
+                }
+            }
+            if (ended is not null && current is { IsLost: false } connection) await TryWriteLineAsync(connection, ended);
+        }
+        finally
+        {
+            sendGate.Release();
         }
         if (request.Method == AcpMethods.Agent.Initialize)
         {
             if (message["result"] is JsonObject result) message["result"] = WithHostMeta(result, reattached: false);
             initialized.TrySetResult();
-        }
-        // How a turn ended goes first, numbered and kept as a session's update is: the conductor marks
-        // the end by it, and one that went before it took it, killed or restarting, finds it again
-        // after its cursor, though the answer itself was lost on the way.
-        if (request.Method == AcpMethods.Agent.SessionPrompt && request.SessionId is { } sessionId)
-        {
-            var report = new JsonObject { ["sessionId"] = sessionId, ["turn"] = key };
-            if (request.PromptId is { } promptId) report["promptId"] = promptId;
-            if (message["result"] is { } r) report["result"] = r.DeepClone();
-            if (message["error"] is { } e) report["error"] = e.DeepClone();
-            await EmitAsync(Notification(GorynychProtocol.MethodTurnEnded, report));
         }
         message["id"] = request.ConductorId.DeepClone();
         if (!request.Connection.IsLost) await TryWriteAsync(request.Connection, message);
@@ -223,7 +245,26 @@ public sealed class AdapterHost
     {
         var question = new Asked { AgentId = id.DeepClone(), Message = message };
         var key = id.ToJsonString();
-        lock (state) asked[key] = question;
+        bool full;
+        lock (state)
+        {
+            full = asked.Count >= options.QuestionLimit;
+            if (!full) asked[key] = question;
+        }
+        if (full)
+        {
+            Log($"{options.QuestionLimit} of the agent's questions wait already; {method} is refused");
+            await WriteToAgentAsync(new JsonObject
+            {
+                ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                ["error"] = new JsonObject
+                {
+                    ["code"] = JsonRpcException.InternalError,
+                    ["message"] = $"Gorynych has {options.QuestionLimit} questions of this agent waiting for an answer already; ask again once they are answered.",
+                },
+            });
+            return;
+        }
         await sendGate.WaitAsync();
         try
         {
@@ -262,31 +303,44 @@ public sealed class AdapterHost
         await sendGate.WaitAsync();
         try
         {
-            var @params = message["params"] as JsonObject;
-            var sessionId = Text(@params?["sessionId"]);
-            lock (state)
-            {
-                var number = ++seq;
-                var mark = $"{options.HostId}/{number}";
-                var carrier = Text(message["method"]) == AcpMethods.Client.SessionUpdate ? @params?["update"] as JsonObject : @params;
-                if (carrier is not null && sessionId is not null)
-                {
-                    if (carrier["_meta"] is not JsonObject meta) carrier["_meta"] = meta = [];
-                    meta[GorynychProtocol.MetaHostSeq] = mark;
-                    buffer.Enqueue(new Kept(number, sessionId, message));
-                    while (buffer.Count > options.BufferLimit)
-                    {
-                        var old = buffer.Dequeue();
-                        dropped[old.SessionId] = old.Seq;
-                    }
-                }
-            }
-            if (current is { IsLost: false } connection) await TryWriteAsync(connection, message);
+            string line;
+            lock (state) line = Number(message);
+            if (current is { IsLost: false } connection) await TryWriteLineAsync(connection, line);
         }
         finally
         {
             sendGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Numbers a notification of the agent's (<c>gorynych/hostSeq</c>) and keeps it, if it is a
+    /// session's, within the buffer's bounds; returns its line. Under <see cref="sendGate"/> and
+    /// <see cref="state"/>, so the numbers follow the order the conductor gets them in.
+    /// </summary>
+    string Number(JsonObject message)
+    {
+        var @params = message["params"] as JsonObject;
+        var sessionId = Text(@params?["sessionId"]);
+        var number = ++seq;
+        var carrier = Text(message["method"]) == AcpMethods.Client.SessionUpdate ? @params?["update"] as JsonObject : @params;
+        var kept = carrier is not null && sessionId is not null;
+        if (kept)
+        {
+            if (carrier!["_meta"] is not JsonObject meta) carrier["_meta"] = meta = [];
+            meta[GorynychProtocol.MetaHostSeq] = $"{options.HostId}/{number}";
+        }
+        var line = message.ToJsonString(Wire);
+        if (!kept) return line;
+        buffer.Enqueue(new Kept(number, sessionId!, line));
+        bufferedBytes += line.Length;
+        while (buffer.Count > options.BufferLimit || (bufferedBytes > options.BufferBytes && buffer.Count > 1))
+        {
+            var old = buffer.Dequeue();
+            bufferedBytes -= old.Line.Length;
+            dropped[old.SessionId] = old.Seq;
+        }
+        return line;
     }
 
     // ---------------------------------------------------------------- the conductor's side
@@ -468,7 +522,23 @@ public sealed class AdapterHost
                 if (known is null && !forward)
                 {
                     // An earlier conductor's initialize is still on its way: its answer is this one's too.
-                    await initialized.Task.WaitAsync(stopping.Token);
+                    try
+                    {
+                        await initialized.Task.WaitAsync(options.InitializeWait, stopping.Token);
+                    }
+                    catch (TimeoutException)
+                    {
+                        await TryWriteAsync(connection, new JsonObject
+                        {
+                            ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                            ["error"] = new JsonObject
+                            {
+                                ["code"] = JsonRpcException.InternalError,
+                                ["message"] = $"The agent has not answered its first initialize in {options.InitializeWait.TotalSeconds:0} seconds.",
+                            },
+                        });
+                        return;
+                    }
                     lock (state) known = initialize;
                 }
                 if (known is not null)
@@ -540,7 +610,7 @@ public sealed class AdapterHost
                 questions = asked.Values.ToList();
             }
             foreach (var kept in replay)
-                if (!await TryWriteAsync(connection, (JsonObject)kept.Message.DeepClone())) throw new IOException("the connection went");
+                if (!await TryWriteLineAsync(connection, kept.Line)) throw new IOException("the connection went");
             current = connection;
             lock (state) aloneSince = long.MaxValue;
             foreach (var question in questions) await AskAsync(connection, question);
@@ -611,9 +681,11 @@ public sealed class AdapterHost
         }
     }
 
-    static async Task<bool> TryWriteAsync(Connection connection, JsonObject message)
+    static Task<bool> TryWriteAsync(Connection connection, JsonObject message) => TryWriteLineAsync(connection, message.ToJsonString(Wire));
+
+    static async Task<bool> TryWriteLineAsync(Connection connection, string line)
     {
-        var bytes = Encoding.UTF8.GetBytes(message.ToJsonString(Wire) + "\n");
+        var bytes = Encoding.UTF8.GetBytes(line + "\n");
         try
         {
             await connection.WriteGate.WaitAsync(connection.Lost.Token);
@@ -661,7 +733,8 @@ public sealed class AdapterHost
 
     void Log(string message) => options.Log?.Invoke($"host {options.Adapter} {options.HostId}: {message}");
 
-    sealed record Kept(long Seq, string SessionId, JsonObject Message);
+    /// <summary>A session's notification as the host sent it, kept for a conductor that comes back.</summary>
+    sealed record Kept(long Seq, string SessionId, string Line);
 
     /// <summary>A conductor's request on its way to the agent.</summary>
     sealed class Forwarded

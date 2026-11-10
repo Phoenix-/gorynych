@@ -1526,10 +1526,18 @@ The rest is on the **host pipe**, `<pipe>.hosts`, made like the service's
 
 1. The host connects and sends `_gorynych/host_hello {token, hostId, adapter, link, pid, version}`
    first. `token` is the content of `host.token` in the data folder, which the service writes
-   (random, the user's only), and the conductor compares it in constant time. `hostId` is new in
-   every run of a host. The conductor closes a connection that sends no hello within 10 seconds,
-   or a wrong token, an adapter it does not have, no `hostId`, or a link version it does not take;
-   so does a service without hosts. A plain client cannot pass for a host: it has no token.
+   (32 random bytes), and the conductor compares it in constant time. `hostId` is new in every run
+   of a host. The conductor closes a connection that sends no hello within 10 seconds, or one whose
+   fields are not strings where they should be. It refuses a wrong token, an adapter it does not
+   have, no `hostId`, or a link version it does not take, and so does a service without hosts: it
+   stops such a host (`_gorynych/host_stop`) and closes the connection, so that the host does not
+   try again until it is an orphan, holding the adapter's mutex meanwhile.
+   - **Who can pass for a host.** Only the user can read the token file, whatever the data folder
+     lets others do: on Windows its DACL allows the user alone and inherits nothing from the
+     folder, and elsewhere it is created with mode 0600. The service gives a token file an
+     earlier version wrote these rights at its start. So another user, or another account the
+     folder is open to (a sandbox's), cannot connect as a host. A process of the same user can
+     read the token, as it can the user's other files, and so pass for a host.
 2. The conductor sends `initialize` as to any adapter. The first conductor's goes to the agent;
    for a later one the host answers from the agent's first answer, with
    `_meta["gorynych/host"] = {hostId, link, reattached: true}`, so the agent is initialized once.
@@ -1544,8 +1552,8 @@ The rest is on the **host pipe**, `<pipe>.hosts`, made like the service's
    the newest of this host's numbers in the session's journal. The host sends what it kept after
    each cursor, then the agent's open questions again under new IDs, and answers
    `{replayed, trimmed}`; from then on it sends everything to this conductor. `trimmed` lists the
-   sessions it had let go of updates for that the journal lacks (it keeps the latest 4096 session
-   notifications): their journal is marked trimmed, as one over its bound is.
+   sessions it had let go of updates for that the journal lacks (it keeps the latest 16384 session
+   notifications, 32 MB at most): their journal is marked trimmed, as one over its bound is.
 
 Then requests for the adapter go to the host, and the conductor serves it as it served the
 adapter in its own process.
@@ -1622,16 +1630,42 @@ ends its turns cancelled, as a dead host's.
 **A host that dies** (a crash, a kill): its connection closes, so its prompts in flight end
 `cancelled`, and so do the turns the conductor took back from it, with their marks; the next
 request starts a new host. So does a host that goes in the middle of its handshake, with the
-turns it brought back. A host whose link broke while it lived is stopped when it comes back
-(`_gorynych/host_stop`): its turns were ended already. A host that dies while no service runs
-takes the ends of its turns with it: so a service that exits for a restart keeps in the overlay
-the prompts that go on in its hosts (`hostPrompts`), and the next one, once the adapter's host is
-taken, ends cancelled each of them that host does not run and whose end is not in the journal.
+turns it brought back; but not one whose handshake the service's own exit cut off, which lives on
+with its turns for the next service. A host whose link broke while it lived is stopped when it
+comes back (`_gorynych/host_stop`): its turns were ended already. A host that dies while no
+service runs takes the ends of its turns with it: so a service keeps in the overlay, at its exit,
+the prompts that reached its hosts and have no end in the journal, with those it was left and
+could not settle (`hostPrompts`), and the next one, once the adapter's host is taken, ends
+cancelled each of them that host does not run and whose end is not in the journal.
+
+**One end per prompt.** A prompt's end is marked once, whatever reports it: its answer, its host's
+`_gorynych/turn_ended`, a host taken for gone. A report that comes after the mark marks nothing.
+
+**A host that cannot be had.** A request waits up to 30 seconds for the adapter's host to
+connect. One that ran and runs no more before it connected fails the request at once. Either way
+the requests of the next 10 seconds fail at once with the same words, rather than each wait, and
+the while doubles with each failure up to 5 minutes; a host that connects ends it. A host that runs
+but never connects (it hangs) keeps the adapter's mutex, so no other is started until its
+process is stopped or it exits as an orphan; the error says so.
+
+**Limits.** A host keeps the latest 16384 session notifications, 32 MB at most, for the next
+conductor, and up to 1000 of the agent's questions; one more question is refused to the agent
+with an error. A conductor that connects while an earlier one's `initialize` is on its way waits
+60 seconds for the agent's answer, then gets an error.
+
+**The host pipe.** A service with hosts that cannot open `<pipe>.hosts` says so in its log and on
+stderr and exits with 1, rather than leave every request waiting for a host that cannot connect.
+
+**Options.** A host runs with the adapter options of the service that started it
+(`--claude-*`, `--no-channel`, `--no-peers`) until it exits: a service restarted with other
+options keeps the hosts that run. Stopping the service (`shutdown`) stops them, and the next
+service starts new ones with its own options; replacing them while turns run is step 3b.
 
 **Versions.** The host link has a version of its own, `link` in the hello and in
-`gorynych/host`: `1`. A conductor takes the versions from its oldest to its newest (now 1 to 1),
-and a newer conductor keeps taking at least the one before, so the hosts a previous version left
-running come back to it. The executable's version is in the hello (`version`).
+`gorynych/host`. There is only version 1 yet, and a conductor takes 1 to 1. From the next version
+of the link on, a conductor keeps taking at least the one before, so the hosts a previous version
+left running come back to it; until then a host of another Gorynych version comes back as long as
+it speaks link 1. The executable's version is in the hello (`version`).
 
 **Granularity.** One host per adapter, for all four. Claude runs a process per session, and gets a
 host per session with the update of adapters ([design.md](design.md#updating-without-losing-work),

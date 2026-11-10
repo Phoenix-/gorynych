@@ -22,6 +22,7 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
     public TimeSpan OrphanIdle { get; set; } = TimeSpan.FromMinutes(2);
     public TimeSpan OrphanBusy { get; set; } = TimeSpan.FromMinutes(10);
     public TimeSpan CancelGrace { get; set; } = TimeSpan.FromSeconds(10);
+    public long BufferBytes { get; set; } = 32 << 20;
     public List<string> Said { get; } = [];
     public int Launches => Volatile.Read(ref launches);
 
@@ -38,7 +39,7 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
         var host = new AdapterHost(agent, ConnectAsync, new AdapterHostOptions
         {
             Adapter = adapter, Token = Token, RetryDelays = [TimeSpan.FromMilliseconds(50)],
-            OrphanIdle = OrphanIdle, OrphanBusy = OrphanBusy, CancelGrace = CancelGrace,
+            OrphanIdle = OrphanIdle, OrphanBusy = OrphanBusy, CancelGrace = CancelGrace, BufferBytes = BufferBytes,
             Log = m => { lock (Said) Said.Add(m); },
         });
         hosts[adapter] = new Running(host, host.RunAsync(), agent);

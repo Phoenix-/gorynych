@@ -800,22 +800,27 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         }
     }
 
-    readonly HashSet<string> markedByHost = new(StringComparer.Ordinal); // under clientsGate
+    HashSet<string>? endMarks; // under clientsGate once read: the prompts whose end the journal has
 
-    /// <summary>
-    /// A host reported the end of a prompt of this service's still waiting for its answer, and its
-    /// end is marked already: the answer that follows marks it no more.
-    /// </summary>
-    public void MarkedByHost(string promptId)
+    HashSet<string> EndMarks()
     {
-        lock (clientsGate)
-            if (prompts.Values.Any(p => p.PromptId == promptId)) markedByHost.Add(promptId);
+        if (Volatile.Read(ref endMarks) is { } known) return known;
+        var read = Journal.EndMarkedPromptIds(); // outside clientsGate: the journal has a lock of its own
+        lock (clientsGate) return endMarks ??= read;
     }
 
-    /// <summary>Whether the end of the prompt was marked from its host's report (<see cref="MarkedByHost"/>), once.</summary>
-    public bool TakeMarkedByHost(string promptId)
+    /// <summary>Whether the end of the prompt is marked in the journal.</summary>
+    public bool HasEndMark(string promptId)
     {
-        lock (clientsGate) return markedByHost.Remove(promptId);
+        var marks = EndMarks();
+        lock (clientsGate) return marks.Contains(promptId);
+    }
+
+    /// <summary>Claims the mark of the prompt's end: false when it is marked already, once per prompt.</summary>
+    public bool ClaimEndMark(string promptId)
+    {
+        var marks = EndMarks();
+        lock (clientsGate) return marks.Add(promptId);
     }
 
     readonly Dictionary<string, long> hostSeen = new(StringComparer.Ordinal); // under clientsGate: per host, the last of its updates taken

@@ -108,12 +108,24 @@ using var stop = CancellationTokenSource.CreateLinkedTokenSource(conductor.Shutd
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; Stop(stop); };
 AppDomain.CurrentDomain.ProcessExit += (_, _) => Stop(stop);
 
-// Hosts left running by the service before (a restart) come back on their own pipe.
-var hostListener = hosted ? PipeListener.RunHostsAsync(conductor, Gorynych.Service.Hosts.HostNames.Pipe(pipeName), stop.Token) : Task.CompletedTask;
-await PipeListener.RunAsync(conductor, pipeName, stop.Token);
-await hostListener;
+// Hosts left running by the service before (a restart) come back on their own pipe. Without it no
+// adapter could run: the service says so and exits, rather than leave every request waiting for a
+// host that cannot connect.
+var hostPipe = Gorynych.Service.Hosts.HostNames.Pipe(pipeName);
+var hostListener = hosted ? PipeListener.RunHostsAsync(conductor, hostPipe, stop.Token) : Task.CompletedTask;
+var hostPipeFailed = false;
+_ = hostListener.ContinueWith(t =>
+{
+    hostPipeFailed = true;
+    var why = $"service: the host pipe {hostPipe} failed, so no adapter host can connect: {t.Exception?.GetBaseException().Message}; the service exits";
+    ServiceLog.Error(why);
+    if (!ServiceLog.Console) Console.Error.WriteLine(why);
+    conductor.RequestShutdown();
+}, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+if (!hostListener.IsFaulted) await PipeListener.RunAsync(conductor, pipeName, stop.Token);
+try { await hostListener; } catch { hostPipeFailed = true; }
 ServiceLog.Info(conductor.StopHostsOnExit ? "service stopping" : "service stopping; its hosts keep their agents for the next one");
-return 0;
+return hostPipeFailed ? 1 : 0;
 
 static string DataDirectory(CommandLine line) => Path.GetFullPath(line.Value("--data")
     ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gorynych"));
