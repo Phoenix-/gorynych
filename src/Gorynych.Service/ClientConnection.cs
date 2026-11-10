@@ -77,7 +77,7 @@ internal sealed class ClientConnection
             case AcpMethods.Agent.SessionList:
                 return AcpJson.ToNode(await conductor.ListAsync(request.ParamsAs<ListSessionsRequest>(), ct, AgentScope));
             case AcpMethods.Agent.SessionNew:
-                return AcpJson.ToNode(await conductor.NewSessionAsync(this, request.ParamsAs<NewSessionRequest>(), ct));
+                return AcpJson.ToNode(await conductor.NewSessionAsync(this, request.ParamsAs<NewSessionRequest>(), request.AfterResult, ct));
             case AcpMethods.Agent.SessionLoad:
                 return await conductor.LoadAsync(this, request.ParamsAs<LoadSessionRequest>(), ct);
             case AcpMethods.Agent.SessionResume:

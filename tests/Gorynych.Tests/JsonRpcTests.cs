@@ -45,6 +45,46 @@ public sealed class JsonRpcTests
     }
 
     [TestMethod]
+    public async Task WhatARequestDoesAfterItsResult_ReachesThePeerAfterTheResult_AndNothingAfterAnError()
+    {
+        var (client, agent) = Link();
+        var logs = new List<string>();
+        agent.Log = s => { lock (logs) logs.Add(s); };
+        agent.RequestHandler = (req, ct) =>
+        {
+            req.AfterResult(() => agent.SendNotificationAsync("note", new JsonObject { ["after"] = req.Method }));
+            req.AfterResult(() => throw new InvalidOperationException("broken"));
+            req.AfterResult(() => agent.SendNotificationAsync("note", new JsonObject { ["after"] = req.Method + " again" }));
+            return req.Method == "fails"
+                ? throw new JsonRpcException(JsonRpcException.InternalError, "no")
+                : Task.FromResult<JsonNode?>(new JsonObject { ["done"] = req.Method });
+        };
+        var received = new List<string>();
+        client.Trace = (way, line) =>
+        {
+            if (way != "<") return;
+            var m = JsonNode.Parse(line)!;
+            lock (received) received.Add(m["method"] is null ? $"{(m["result"] is null ? "error" : "result")} {m["id"]}" : $"note {m["params"]!["after"]}");
+        };
+        client.Start();
+        agent.Start();
+
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => client.SendRequestAsync("fails", null).WaitAsync(TimeSpan.FromSeconds(10)));
+        await client.SendRequestAsync("works", null).WaitAsync(TimeSpan.FromSeconds(10));
+        for (var i = 0; i < 200; i++)
+        {
+            lock (received) if (received.Count >= 4) break;
+            await Task.Delay(10);
+        }
+        await Task.Delay(50);
+
+        lock (received) CollectionAssert.AreEqual(new[] { "error 1", "result 2", "note works", "note works again" }, received);
+        lock (logs) Assert.IsTrue(logs.Any(l => l.Contains("after the result of works", StringComparison.Ordinal)), "a failing action is logged, and the next one still runs");
+        await client.DisposeAsync();
+        await agent.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task Errors_AndMissingMethods_ComeBackAsJsonRpcErrors()
     {
         var (client, agent) = Link();

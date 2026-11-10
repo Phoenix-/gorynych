@@ -48,6 +48,9 @@ public sealed class ConductorOptions
 
     /// <summary>For tests: awaited when a catch-up of the journal starts, after the agent answered the open.</summary>
     internal Func<string, Task>? CatchingUp { get; init; }
+
+    /// <summary>For tests: awaited in <c>session/new</c> once its client is attached, before the answer is written.</summary>
+    internal Func<string, Task>? Answering { get; init; }
 }
 
 /// <summary>
@@ -393,7 +396,8 @@ public sealed class Conductor : IAsyncDisposable
         };
     }
 
-    internal async Task<NewSessionResponse> NewSessionAsync(ClientConnection client, NewSessionRequest request, CancellationToken ct)
+    /// <param name="afterAnswer">Runs an action once the answer is written to the client (<see cref="JsonRpcRequest.AfterResult"/>).</param>
+    internal async Task<NewSessionResponse> NewSessionAsync(ClientConnection client, NewSessionRequest request, Action<Func<Task>> afterAnswer, CancellationToken ct)
     {
         // An explicit choice in the request wins; otherwise the agent the connection is scoped to.
         RefuseSystemPrompt(request.SystemPrompt);
@@ -408,7 +412,10 @@ public sealed class Conductor : IAsyncDisposable
         store.Update(response.SessionId, host.Name, r => { r.Cwd = FolderPath.Normalize(request.Cwd); r.Draft = true; });
         var feed = Feed(response.SessionId);
         feed.CaptureState(AcpJson.ToNode(response));
-        feed.Attach(client);
+        // Attached now, for the agent's requests; its list of commands only once it has the answer.
+        feed.AttachUnanswered(client);
+        afterAnswer(() => feed.AnsweredAsync(client));
+        if (options.Answering is { } hold) await hold(response.SessionId);
         response.Meta ??= [];
         response.Meta[GorynychProtocol.MetaAgent] = host.Name;
         ServiceLog.Info($"{host.Name}: new session {response.SessionId} in {request.Cwd}");

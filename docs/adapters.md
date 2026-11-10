@@ -24,7 +24,9 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
   twice in a first prompt). The service keeps the latest as the session's state, not in the
   journal, and passes on only a list that differs from the one before
   ([service-protocol.md](service-protocol.md#standard-methods)); journaled, every open of a
-  Kimi session had added two lists.
+  Kimi session had added two lists. The one list after `session/new` may reach the service
+  before the client has its answer; the service sends it to that client after the answer, so a
+  new Kimi thread in Zed has its slash commands.
 - `session/list` returns titles and `updatedAt`. A folder may come with forward slashes
   (`C:/Users/x`); the service lists and keeps it in one spelling
   ([service-protocol.md](service-protocol.md#standard-methods)).

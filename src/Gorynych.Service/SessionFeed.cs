@@ -225,6 +225,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         {
             retired = true;
             clients.Clear();
+            unanswered.Clear();
             signal = clientAttached;
         }
         signal.TrySetResult();
@@ -272,7 +273,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// Follows the agent's <c>available_commands_update</c>. In ACP each one replaces the list
     /// before it, so it is the session's state, not its history: it is not journaled. The attached
     /// clients get a new list as it comes, and a client that loads or resumes the session gets the
-    /// current one (<see cref="ReplayAndAttachAsync"/>, <see cref="ResumeAndAttachAsync"/>). A list
+    /// current one (<see cref="ReplayAndAttachAsync"/>, <see cref="ResumeAndAttachAsync"/>), as does
+    /// the one that created it, once it has its answer (<see cref="AnsweredAsync"/>). A list
     /// the same as the current one is not sent again: Kimi sends it twice on every load and resume.
     /// </summary>
     public async Task PublishCommandsAsync(JsonObject update)
@@ -283,7 +285,53 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             if (Retired || JsonNode.DeepEquals(commands, update)) return;
             commands = update.DeepClone().AsObject();
             foreach (var client in Clients())
-                await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update.DeepClone()));
+                if (!IsUnanswered(client))
+                    await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update.DeepClone()));
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    /// <summary>Whether the agent has sent a list of commands for the session (for tests).</summary>
+    internal bool HasCommands => Volatile.Read(ref commands) is not null;
+
+    readonly HashSet<ClientConnection> unanswered = []; // under clientsGate
+
+    bool IsUnanswered(ClientConnection client)
+    {
+        lock (clientsGate) return unanswered.Contains(client);
+    }
+
+    /// <summary>
+    /// Attaches the client that created the session with <c>session/new</c>, before its answer is
+    /// written. A client knows the session only from that answer and drops its updates before it
+    /// (Zed does), while the agent may send its list of commands right after its own answer (Kimi
+    /// does), before the client has the session's ID. So the list is not sent to this client until
+    /// <see cref="AnsweredAsync"/>.
+    /// </summary>
+    public void AttachUnanswered(ClientConnection client)
+    {
+        lock (clientsGate)
+            if (!retired) unanswered.Add(client);
+        Attach(client);
+    }
+
+    /// <summary>
+    /// The answer to the client's <c>session/new</c> is written (<see cref="AttachUnanswered"/>):
+    /// sends it the current list of commands, if the agent has sent one. A list that comes later
+    /// reaches it live, so it gets each list once.
+    /// </summary>
+    public async Task AnsweredAsync(ClientConnection client)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            bool attached; // and still unanswered: a detach or a deletion meanwhile took it out
+            lock (clientsGate) attached = unanswered.Remove(client);
+            if (!attached || commands is null) return;
+            await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(commands.DeepClone()));
         }
         finally
         {
@@ -420,6 +468,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         lock (clientsGate)
         {
             detached = clients.Remove(client);
+            unanswered.Remove(client);
             none = !clients.Any(c => !c.Rpc.IsClosed);
         }
         if (detached && none && notify) LastClientLeft?.Invoke();

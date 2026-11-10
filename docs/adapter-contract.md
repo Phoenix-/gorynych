@@ -231,6 +231,10 @@ list replaces the one before.
   that loads or resumes the session gets the current list from the service, so the adapter
   need not send it again on a load or resume, and a list the same as the current one is not
   passed on (Kimi sends its list twice on each).
+- The adapter MAY send the list before or after its `session/new` answer (Kimi sends it
+  right after). Either way the client that created the session gets it once, after the
+  service's own answer to it is written: a client drops a session's updates until it has the
+  session's ID.
 - Fallback: an adapter that sends none leaves its sessions with no commands.
 
 ## 6. Service turns: opinions and reports

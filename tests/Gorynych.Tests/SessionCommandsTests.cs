@@ -16,18 +16,21 @@ public sealed class SessionCommandsTests
 {
     static readonly string Cwd = Path.GetTempPath();
 
+    /// <summary>How long a request may take: a request that never ends fails the test instead of hanging it.</summary>
+    static readonly TimeSpan Answer = TimeSpan.FromSeconds(10);
+
     static Task<JsonNode?> NewAsync(TestClient client) =>
-        client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew, new JsonObject { ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
+        client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew, new JsonObject { ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() }).WaitAsync(Answer);
 
     static Task<JsonNode?> LoadAsync(TestClient client) =>
-        client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject { ["sessionId"] = "s1", ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
+        client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject { ["sessionId"] = "s1", ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() }).WaitAsync(Answer);
 
     static Task<JsonNode?> ResumeAsync(TestClient client) =>
-        client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = "s1", ["cwd"] = Cwd });
+        client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = "s1", ["cwd"] = Cwd }).WaitAsync(Answer);
 
     static Task PromptAsync(TestClient client, string text) =>
         client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
-            new PromptRequest { SessionId = "s1", Prompt = [new TextContent { Text = text }] });
+            new PromptRequest { SessionId = "s1", Prompt = [new TextContent { Text = text }] }).WaitAsync(Answer);
 
     static string JournalOf(string dir) => Path.Combine(dir, "journal", SessionJournal.FileNameFor("s1"));
 
@@ -91,9 +94,109 @@ public sealed class SessionCommandsTests
         await Until(() => Lists(other).Length == 2);
         await Task.Delay(50);
 
-        CollectionAssert.AreEqual(new[] { "compact,status,skill" }, Lists(zed), "live, once");
+        CollectionAssert.AreEqual(new[] { "compact,status", "compact,status,skill" }, Lists(zed), "the first after its answer, the new one live, each once");
         CollectionAssert.AreEqual(new[] { "compact,status", "compact,status,skill" }, Lists(other));
         Assert.AreEqual(0, ListsIn(JournalOf(dir)));
+    }
+
+    /// <summary>The lines <paramref name="client"/> receives from now on, in order.</summary>
+    static List<string> Received(TestClient client)
+    {
+        var lines = new List<string>();
+        client.Rpc.Trace = (way, line) => { if (way == "<") lock (lines) lines.Add(line); };
+        return lines;
+    }
+
+    /// <summary>The list came after the answer to <c>session/new</c>: before it, Zed does not know the session and drops it.</summary>
+    static void AssertListAfterTheAnswer(List<string> lines)
+    {
+        string[] got;
+        lock (lines) got = lines.ToArray();
+        var answer = Array.FindIndex(got, l => l.Contains("\"result\"", StringComparison.Ordinal) && l.Contains("\"sessionId\":\"s1\"", StringComparison.Ordinal));
+        var list = Array.FindIndex(got, l => l.Contains("\"available_commands_update\"", StringComparison.Ordinal));
+        Assert.IsTrue(answer >= 0 && list > answer, $"the answer at {answer}, the list at {list}");
+    }
+
+    [TestMethod]
+    public async Task ANewSession_GetsTheListTheAgentSentBeforeItsAnswer_AfterTheAnswer()
+    {
+        var kimi = new CommandsAgent(); // the list comes before the agent's own answer
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var lines = Received(zed);
+        await NewAsync(zed);
+        await Until(() => Lists(zed).Length == 1);
+        await Task.Delay(50);
+
+        CollectionAssert.AreEqual(new[] { "compact,status" }, Lists(zed), "once");
+        AssertListAfterTheAnswer(lines);
+    }
+
+    [TestMethod]
+    public async Task ANewSession_GetsAListThatComesAfterItsAnswer_Once()
+    {
+        var after = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var kimi = new CommandsAgent { ListAfterNew = after.Task };
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var lines = Received(zed);
+        await NewAsync(zed);
+        after.SetResult(); // the agent sends its list once the client has its answer
+        await Until(() => Lists(zed).Length == 1);
+        await Task.Delay(50);
+
+        CollectionAssert.AreEqual(new[] { "compact,status" }, Lists(zed), "live, and not again");
+        AssertListAfterTheAnswer(lines);
+    }
+
+    [TestMethod]
+    public async Task ANewSession_GetsAListThatComesWhileItsAnswerIsOnTheWay_AfterTheAnswer_Once()
+    {
+        var send = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var kimi = new CommandsAgent { ListAfterNew = send.Task };
+        Conductor? service = null;
+        await using var conductor = service = new Conductor(new ConductorOptions
+        {
+            DataDirectory = TestDirs.New(),
+            ServiceId = "test-service",
+            // The client is attached, its answer not written yet: the agent's list comes now.
+            Answering = async id =>
+            {
+                send.SetResult();
+                await Until(() => service!.Feed(id).HasCommands);
+            },
+        }, [kimi.Adapter]);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var lines = Received(zed);
+        await NewAsync(zed);
+        await Until(() => Lists(zed).Length == 1);
+        await Task.Delay(50);
+
+        CollectionAssert.AreEqual(new[] { "compact,status" }, Lists(zed), "once");
+        AssertListAfterTheAnswer(lines);
+    }
+
+    [TestMethod]
+    public async Task ANewSessionsClient_DetachedBeforeItsAnswer_GetsNoList()
+    {
+        var kimi = new CommandsAgent();
+        Conductor? service = null;
+        await using var conductor = service = new Conductor(new ConductorOptions
+        {
+            DataDirectory = TestDirs.New(),
+            ServiceId = "test-service",
+            Answering = id =>
+            {
+                var feed = service!.Feed(id);
+                foreach (var client in feed.Clients()) feed.Detach(client); // a send to it failed, say
+                return Task.CompletedTask;
+            },
+        }, [kimi.Adapter]);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        await NewAsync(zed);
+        await Task.Delay(100);
+
+        Assert.AreEqual(0, Lists(zed).Length);
     }
 
     [TestMethod]
@@ -211,6 +314,9 @@ public sealed class SessionCommandsTests
         public string[]? Next { get; set; }
         public bool LoadFails { get; init; }
 
+        /// <summary>When set, the list comes after the agent's answer to <c>session/new</c>, once this completes.</summary>
+        public Task? ListAfterNew { get; init; }
+
         public CommandsAgent()
         {
             Adapter = new ScriptedAdapter("kimi", async (agent, req, ct) =>
@@ -219,6 +325,13 @@ public sealed class SessionCommandsTests
                 {
                     case AcpMethods.Agent.Initialize:
                         return ScriptedAgent.Init(list: true, resume: true, load: true);
+                    case AcpMethods.Agent.SessionNew when ListAfterNew is { } later:
+                        req.AfterResult(async () =>
+                        {
+                            await later;
+                            await Notify(agent, List(current));
+                        });
+                        return new JsonObject { ["sessionId"] = "s1" };
                     case AcpMethods.Agent.SessionNew:
                         await Notify(agent, List(current));
                         return new JsonObject { ["sessionId"] = "s1" };

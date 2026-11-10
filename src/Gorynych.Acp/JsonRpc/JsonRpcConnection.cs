@@ -13,6 +13,29 @@ public sealed record JsonRpcRequest(JsonNode Id, string Method, JsonNode? Params
     /// handler can tell whether a notification (such as <c>session/cancel</c>) came after it.
     /// </summary>
     public long Sequence { get; init; }
+
+    readonly List<Func<Task>> afterResult = [];
+
+    /// <summary>
+    /// Runs <paramref name="action"/> once the request's result has been written to the peer, so
+    /// what it sends reaches the peer after the result: an ACP client knows a new session only
+    /// from the <c>session/new</c> result, and drops its updates before it. Actions run in the
+    /// order they were added; none runs when the request fails or its result cannot be written.
+    /// </summary>
+    public void AfterResult(Func<Task> action)
+    {
+        lock (afterResult) afterResult.Add(action);
+    }
+
+    internal Func<Task>[] TakeAfterResult()
+    {
+        lock (afterResult)
+        {
+            var actions = afterResult.ToArray();
+            afterResult.Clear();
+            return actions;
+        }
+    }
 }
 
 /// <summary>A JSON-RPC error, thrown by a request handler or received as a response.</summary>
@@ -262,11 +285,13 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     {
         using var owned = cts;
         JsonObject response;
+        var succeeded = false;
         try
         {
             if (RequestHandler is null) throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {request.Method}");
             var result = await RequestHandler(request, cts.Token).ConfigureAwait(false);
             response = new JsonObject { ["jsonrpc"] = "2.0", ["id"] = request.Id.DeepClone(), ["result"] = result ?? new JsonObject() };
+            succeeded = true;
         }
         catch (Exception e)
         {
@@ -288,7 +313,11 @@ public sealed class JsonRpcConnection : IAsyncDisposable
             incoming.TryRemove(key, out _);
         }
         try { await WriteAsync(response).ConfigureAwait(false); }
-        catch (Exception e) when (e is IOException or OperationCanceledException) { }
+        catch (Exception e) when (e is IOException or OperationCanceledException) { return; }
+        if (!succeeded) return;
+        foreach (var action in request.TakeAfterResult())
+            try { await action().ConfigureAwait(false); }
+            catch (Exception e) { Log?.Invoke($"{Name}: after the result of {request.Method}: {e}"); }
     }
 
     void Close()

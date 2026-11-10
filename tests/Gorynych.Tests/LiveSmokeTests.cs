@@ -5,6 +5,7 @@ using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
 using Gorynych.Adapters.Claude;
 using Gorynych.Adapters.Kimi;
+using Gorynych.Service;
 
 namespace Gorynych.Tests;
 
@@ -481,6 +482,51 @@ public sealed class LiveSmokeTests
         await conductor.CleanupsIdleAsync();
         Assert.IsNull(conductor.Store.Get(draft), "the service closed and deleted the draft without an error");
         CollectionAssert.DoesNotContain(await check.ListAsync(dir), draft, "Kimi no longer has it");
+    }
+
+    /// <summary>
+    /// Kimi sends its only list of commands for a new session right after its <c>session/new</c>
+    /// answer, which may reach the service before or after the client has its own answer. Five new
+    /// sessions in a row (the first starts Kimi, the rest find it running), each from its own
+    /// client as Zed opens a thread: each client gets the list once, after its answer, when Zed
+    /// knows the session. Each draft is deleted again as its client leaves.
+    /// </summary>
+    [TestMethod]
+    [Timeout(300_000, CooperativeCancellation = true)]
+    public async Task Kimi_ANewSession_GetsItsListOfCommandsOnce_AfterItsAnswer()
+    {
+        RequireLive();
+        var dir = TestDirs.New();
+        await using var check = await RawKimiAsync();
+        await using var conductor = TestDirs.Conductor(dir, new KimiAdapter(new KimiAdapterOptions()));
+        for (var n = 1; n <= 5; n++)
+        {
+            string id;
+            await using (var zed = await TestClient.ConnectAsync(conductor, $"zed-{n}"))
+            {
+                var lines = new List<string>();
+                zed.Rpc.Trace = (way, line) => { if (way == "<") lock (lines) lines.Add(line); };
+                id = (await zed.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+                {
+                    Cwd = dir,
+                    McpServers = [],
+                    Meta = new JsonObject { [GorynychProtocol.MetaAgent] = "kimi" },
+                })).SessionId;
+                for (var i = 0; i < 100 && !zed.Snapshot().Any(SessionJournal.IsCommands); i++) await Task.Delay(100);
+                await Task.Delay(1000); // a second list would have come by now
+                var lists = zed.Snapshot().Where(SessionJournal.IsCommands).ToArray();
+                string[] got;
+                lock (lines) got = lines.ToArray();
+                var answer = Array.FindIndex(got, l => l.Contains("\"result\"", StringComparison.Ordinal) && l.Contains(id, StringComparison.Ordinal));
+                var list = Array.FindIndex(got, l => l.Contains("\"available_commands_update\"", StringComparison.Ordinal));
+                Console.WriteLine($"kimi {id}: new session {n}: {lists.Length} list(s) of {lists.FirstOrDefault()?["availableCommands"]?.AsArray().Count} commands; the answer is line {answer}, the list line {list}");
+                Assert.AreEqual(1, lists.Length, "the list, once");
+                Assert.AreNotEqual(0, lists[0]["availableCommands"]!.AsArray().Count);
+                Assert.IsTrue(answer >= 0 && list > answer, "after the answer");
+            }
+            await conductor.CleanupsIdleAsync();
+            CollectionAssert.DoesNotContain(await check.ListAsync(dir), id, "the draft is gone from Kimi");
+        }
     }
 
     /// <summary>A separate <c>kimi acp</c> to look at Kimi's own session list.</summary>
