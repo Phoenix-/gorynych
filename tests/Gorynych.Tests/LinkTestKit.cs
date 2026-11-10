@@ -123,7 +123,8 @@ sealed class Wire
 
     /// <param name="said">Gets what the service writes to the link.</param>
     /// <param name="sent">Gets what the link writes to the service.</param>
-    public Wire(Conductor conductor, string name, Action<string>? said = null, Action<string>? sent = null)
+    /// <param name="host">The conductor takes it as an adapter host's connection, not a client's.</param>
+    public Wire(Conductor conductor, string name, Action<string>? said = null, Action<string>? sent = null, bool host = false)
     {
         var up = new System.IO.Pipelines.Pipe();
         var down = new System.IO.Pipelines.Pipe();
@@ -133,7 +134,7 @@ sealed class Wire
         var serviceOut = new BrokenOnce(down.Writer.AsStream()) { Tap = said };
         ends = [linkIn, linkOut, serviceIn, serviceOut];
         LinkEnd = (linkIn, linkOut);
-        Serving = conductor.ServeClientAsync(serviceIn, serviceOut, name);
+        Serving = host ? conductor.ServeHostAsync(serviceIn, serviceOut, name) : conductor.ServeClientAsync(serviceIn, serviceOut, name);
     }
 
     /// <summary>The service reads nothing more until <see cref="Go"/>: what the link sends waits in the pipe.</summary>

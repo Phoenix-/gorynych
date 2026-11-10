@@ -319,4 +319,82 @@ public sealed class PeersTests
             await listening;
         }
     }
+
+    /// <summary>
+    /// A service of the test's own for the peers server's requests: each connection is the next one,
+    /// as after a restart, and <paramref name="answer"/> gets its number with each request.
+    /// </summary>
+    static PeersServer.ServiceRoute Route(Func<int, JsonRpcRequest, JsonRpcConnection, Task<JsonNode?>> answer, double waitSeconds = 5)
+    {
+        var connections = 0;
+        return new PeersServer.ServiceRoute(_ =>
+        {
+            var n = Interlocked.Increment(ref connections);
+            var link = new DuplexLink();
+            var service = new JsonRpcConnection(link.AgentEnd.Input, link.AgentEnd.Output, $"service-{n}");
+            service.RequestHandler = (req, _) => answer(n, req, service);
+            service.Start();
+            var client = new JsonRpcConnection(link.ClientEnd.Input, link.ClientEnd.Output, "peers->service");
+            client.Start();
+            return Task.FromResult(client);
+        }, "test-pipe") { RestartWait = TimeSpan.FromSeconds(waitSeconds), RetryDelay = TimeSpan.FromMilliseconds(50) };
+    }
+
+    static async Task<(string Text, bool Error)> Ask(PeersServer.ServiceRoute route, string tool = "ask_agent")
+    {
+        using var http = new HttpClient();
+        var args = tool == "ask_agent"
+            ? new JsonObject { ["session_id"] = "s-42", ["question"] = "SQLite?" }
+            : new JsonObject { ["agent"] = "kimi", ["prompt"] = "Write the tests" };
+        var result = await PeersServer.CallAsync(http, route, "token", null, tool, args, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(20));
+        return ((string)result["content"]![0]!["text"]!, (bool)result["isError"]!);
+    }
+
+    static JsonRpcException Restarting() => new(JsonRpcException.InternalError, "The Gorynych service is restarting; send it again in a moment.",
+        new JsonObject { [GorynychProtocol.MetaRestarting] = true, [GorynychProtocol.MetaRestart] = 1 });
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AQuestionTheServiceRefusedForARestart_GoesToTheNextService()
+    {
+        var route = Route((n, req, _) => n < 3 ? throw Restarting() : Task.FromResult<JsonNode?>(new JsonObject { ["text"] = "SQLite, for one user." }));
+        Assert.AreEqual(("SQLite, for one user.", false), await Ask(route));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AQuestionWhoseServiceWentWhileItWaited_SaysToAskAgain_WithTheSession()
+    {
+        var route = Route(async (n, req, service) =>
+        {
+            await service.DisposeAsync(); // the service exits while the asked session answers
+            return null;
+        });
+        Assert.AreEqual(("Gorynych restarted while session_id s-42 was answering, so its answer was lost. Ask again in a moment: " +
+            "ask_agent with session_id s-42 and the same question.", true), await Ask(route));
+        var spawned = await Ask(route, "spawn_session");
+        Assert.IsTrue(spawned.Error);
+        StringAssert.Contains(spawned.Text, "may or may not have started");
+        StringAssert.Contains(spawned.Text, "list_agents");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AQuestionWhileTheRestartGoesOnTooLong_SaysToAskAgain_AndAServiceThatNeverComesSaysSo()
+    {
+        Assert.AreEqual(("Gorynych is restarting and did not ask session_id s-42. Ask again in a moment: ask_agent with session_id s-42 " +
+            "and the same question.", true), await Ask(Route((_, _, _) => throw Restarting(), waitSeconds: 0.3)));
+
+        var tries = 0;
+        var gone = new PeersServer.ServiceRoute(_ =>
+        {
+            Interlocked.Increment(ref tries);
+            throw new TimeoutException("Gorynych does not answer on pipe test-pipe: it is not running, or did not come back from a restart in time. Try again in a moment.");
+        }, "test-pipe") { RestartWait = TimeSpan.FromSeconds(0.3), RetryDelay = TimeSpan.FromMilliseconds(50) };
+        var (text, error) = await Ask(gone);
+        Assert.IsTrue(error);
+        Assert.AreEqual("Gorynych could not do that: Gorynych does not answer on pipe test-pipe: it is not running, or did not come back " +
+            "from a restart in time. Try again in a moment.", text);
+        Assert.IsGreaterThan(1, tries, "it waited for the service to come back");
+    }
 }

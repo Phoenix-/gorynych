@@ -37,13 +37,13 @@ switch (line.Command)
     // The Windows logon task that starts the service in this user's session (docs/external-clients.md).
     case "task":
         return TaskCommand(line);
+    // An adapter host, which the service starts: one adapter and its agents, outliving a restart of the service.
+    case "host":
+        return await HostCommand(line);
 }
 
 var pipeName = line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName;
-var channels = Channels(line.Value("--claude-channels"));
-var claudeTransport = Transport(line.Value("--claude-transport"));
-var dataDirectory = Path.GetFullPath(line.Value("--data")
-    ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gorynych"));
+var dataDirectory = DataDirectory(line);
 Directory.CreateDirectory(dataDirectory);
 ServiceLog.Init(Path.Combine(dataDirectory, "logs"), console: line.Flag("--console"));
 // Started by the logon task, it has a console window of its own: let it go, so that closing it cannot stop the service.
@@ -77,26 +77,17 @@ ServiceLog.Info($"service {state.ServiceId} starting, pid {Environment.ProcessId
 // Started without breaking away from a host's job (the stdio bridge, the outside server): say so.
 if (Gorynych.Outside.DetachedProcess.KillOnCloseJob() is { } job) ServiceLog.Warn($"service: {job}");
 
-var adapters = new List<IAgentAdapter>
+var adapters = Adapters(line, dataDirectory);
+// Adapter hosts: on by default on Windows, where they are tried; elsewhere only when asked for.
+var hosted = line.Value("--hosts") switch { "on" => true, "off" => false, _ => OperatingSystem.IsWindows() };
+Gorynych.Service.Hosts.IHostLauncher? hosts = null;
+string? hostToken = null;
+if (hosted)
 {
-    new ClaudeAdapter(new ClaudeAdapterOptions
-    {
-        DataDirectory = Path.Combine(dataDirectory, "claude"),
-        Transport = claudeTransport,
-        Model = line.Value("--claude-model"),
-        ChannelServerCommand = line.Flag("--no-channel") ? null : [Environment.ProcessPath!, "peers"],
-        Channels = channels,
-        Log = ServiceLog.Info,
-    }),
-    new KimiAdapter(new KimiAdapterOptions { Log = ServiceLog.Info }),
-    new CodexAdapter(new CodexAdapterOptions { Log = ServiceLog.Info, ClientVersion = AgentHost.Version }),
-    new DshAdapter(new DshAdapterOptions
-    {
-        DataDirectory = Path.Combine(dataDirectory, "dsh"),
-        Instructions = line.Flag("--no-peers") ? null : PeersServer.SystemPrompt,
-        Log = ServiceLog.Info,
-    }),
-};
+    hostToken = Gorynych.Service.Hosts.HostNames.EnsureToken(dataDirectory);
+    hosts = new Gorynych.Service.Hosts.ProcessHostLauncher(Environment.ProcessPath!, pipeName, dataDirectory, AdapterArguments(line));
+    ServiceLog.Info($"service: the adapters run in hosts, which a restart leaves running (pipe {Gorynych.Service.Hosts.HostNames.Pipe(pipeName)})");
+}
 
 await using var conductor = new Conductor(new ConductorOptions
 {
@@ -105,6 +96,8 @@ await using var conductor = new Conductor(new ConductorOptions
     DefaultAgent = line.Value("--default-agent"),
     UnloadAfter = UnloadAfter(line.Value("--unload-after")),
     PeerServerCommand = line.Flag("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
+    Hosts = hosts,
+    HostToken = hostToken,
 }, adapters);
 
 // Drafts a client left behind in an earlier run (Zed quits without closing them), once the bridges
@@ -115,9 +108,97 @@ using var stop = CancellationTokenSource.CreateLinkedTokenSource(conductor.Shutd
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; Stop(stop); };
 AppDomain.CurrentDomain.ProcessExit += (_, _) => Stop(stop);
 
+// Hosts left running by the service before (a restart) come back on their own pipe.
+var hostListener = hosted ? PipeListener.RunHostsAsync(conductor, Gorynych.Service.Hosts.HostNames.Pipe(pipeName), stop.Token) : Task.CompletedTask;
 await PipeListener.RunAsync(conductor, pipeName, stop.Token);
-ServiceLog.Info("service stopping");
+await hostListener;
+ServiceLog.Info(conductor.StopHostsOnExit ? "service stopping" : "service stopping; its hosts keep their agents for the next one");
 return 0;
+
+static string DataDirectory(CommandLine line) => Path.GetFullPath(line.Value("--data")
+    ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gorynych"));
+
+// The adapters, as the service runs them in its process or a host runs one of them.
+static List<IAgentAdapter> Adapters(CommandLine line, string dataDirectory) =>
+[
+    new ClaudeAdapter(new ClaudeAdapterOptions
+    {
+        DataDirectory = Path.Combine(dataDirectory, "claude"),
+        Transport = Transport(line.Value("--claude-transport")),
+        Model = line.Value("--claude-model"),
+        ChannelServerCommand = line.Flag("--no-channel") ? null : [Environment.ProcessPath!, "peers"],
+        Channels = Channels(line.Value("--claude-channels")),
+        Log = ServiceLog.Info,
+    }),
+    new KimiAdapter(new KimiAdapterOptions { Log = ServiceLog.Info }),
+    new CodexAdapter(new CodexAdapterOptions { Log = ServiceLog.Info, ClientVersion = AgentHost.Version }),
+    new DshAdapter(new DshAdapterOptions
+    {
+        DataDirectory = Path.Combine(dataDirectory, "dsh"),
+        Instructions = line.Flag("--no-peers") ? null : PeersServer.SystemPrompt,
+        Log = ServiceLog.Info,
+    }),
+];
+
+// The service's options a host needs for its adapter.
+static List<string> AdapterArguments(CommandLine line)
+{
+    var args = new List<string>();
+    foreach (var name in new[] { "--claude-model", "--claude-transport", "--claude-channels" })
+        if (line.Value(name) is { } value) args.AddRange([name, value]);
+    foreach (var flag in new[] { "--no-channel", "--no-peers" })
+        if (line.Flag(flag)) args.Add(flag);
+    return args;
+}
+
+// host --adapter <name> [--pipe] [--data] [adapter options]: runs one adapter for the service on --pipe,
+// dialling its host pipe; the service starts it (docs/service-protocol.md, "Adapter hosts").
+static async Task<int> HostCommand(CommandLine line)
+{
+    var adapterName = line.Value("--adapter")!;
+    var pipe = line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName;
+    var data = DataDirectory(line);
+    ServiceLog.Init(Path.Combine(data, "logs"), console: line.Flag("--console"), name: "host-" + adapterName);
+    if (!line.Flag("--console")) Gorynych.Outside.DetachedProcess.ReleaseOwnConsole();
+    using var instance = new Mutex(initiallyOwned: false, Gorynych.Service.Hosts.HostNames.Mutex(pipe, adapterName), Gorynych.Service.Hosts.HostNames.MutexOptions);
+    try
+    {
+        if (!instance.WaitOne(0))
+        {
+            ServiceLog.Info($"host {adapterName}: another host runs this adapter for {pipe}; exiting");
+            return 3;
+        }
+    }
+    catch (AbandonedMutexException) { }
+    string? token = null;
+    for (var i = 0; i < 100 && (token = Gorynych.Service.Hosts.HostNames.ReadToken(data)) is null; i++) await Task.Delay(100);
+    if (token is null)
+    {
+        ServiceLog.Error($"host {adapterName}: no {Gorynych.Service.Hosts.HostNames.TokenPath(data)}; the service writes it before it starts a host");
+        return 1;
+    }
+    var adapter = Adapters(line, data).Single(a => a.Name == adapterName);
+    AgentInstance agent;
+    try
+    {
+        agent = await adapter.StartAsync(CancellationToken.None);
+    }
+    catch (Exception e)
+    {
+        ServiceLog.Error($"host {adapterName}: the adapter did not start: {e.Message}");
+        return 1;
+    }
+    var host = new Gorynych.Service.Hosts.AdapterHost(agent, async ct =>
+    {
+        var stream = await ServicePipe.ConnectAsync(Gorynych.Service.Hosts.HostNames.Pipe(pipe), TimeSpan.FromSeconds(1), ct)
+            ?? throw new IOException("no conductor on the host pipe");
+        return (stream, stream);
+    }, new Gorynych.Service.Hosts.AdapterHostOptions { Adapter = adapterName, Token = token, Log = ServiceLog.Info });
+    ServiceLog.Info($"host {adapterName} {host.HostId} starting, pid {Environment.ProcessId}, pipe {pipe}, data {data}");
+    var code = await host.RunAsync();
+    ServiceLog.Info($"host {adapterName} {host.HostId} exits ({code})");
+    return code;
+}
 
 static ServiceState LoadState(string path)
 {

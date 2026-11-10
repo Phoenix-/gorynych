@@ -36,6 +36,12 @@ public sealed class SessionRecord
     /// <summary>The session that started this one with <c>spawn_session</c>; null for one a client created.</summary>
     public string? ParentSessionId { get; set; }
 
+    /// <summary>
+    /// The token of the session's peers server (<c>gorynych/peerToken</c>), kept so that the service
+    /// that comes after a restart knows the agent that still holds it.
+    /// </summary>
+    public string? PeerToken { get; set; }
+
     /// <summary>A spawned session reports the end of each of its turns to its parent.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool ReportToParent { get; set; }
@@ -246,6 +252,6 @@ public sealed class SessionStore
     {
         SessionId = r.SessionId, Agent = r.Agent, Cwd = r.Cwd, Title = r.Title, TitleSource = r.TitleSource,
         CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt, Draft = r.Draft, Deleted = r.Deleted,
-        ParentSessionId = r.ParentSessionId, ReportToParent = r.ReportToParent, Archived = r.Archived,
+        ParentSessionId = r.ParentSessionId, ReportToParent = r.ReportToParent, Archived = r.Archived, PeerToken = r.PeerToken,
     };
 }

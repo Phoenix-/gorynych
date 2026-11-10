@@ -199,7 +199,7 @@ public sealed class BridgeTests
             Assert.IsTrue(service.HasExited, "it waited for the process to end");
 
             (code, stderr) = await RunAsync("shutdown", "--pipe", pipe);
-            Assert.AreEqual(1, code);
+            Assert.AreEqual(1, code, stderr);
             StringAssert.Contains(stderr, $"no service is running on pipe {pipe}");
         }
         finally

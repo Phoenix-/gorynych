@@ -174,14 +174,49 @@ public sealed class SessionJournal
         meta[PositionKey] = FormatPosition(position);
     }
 
-    /// <summary>A <c>_meta</c> without the position, for comparing two entries' own <c>_meta</c>; null when nothing else is in it.</summary>
+    /// <summary>
+    /// A <c>_meta</c> without the position and the place in a host's stream, for comparing two
+    /// entries' own <c>_meta</c>; null when nothing else is in it.
+    /// </summary>
     static JsonObject? OwnMeta(JsonNode? meta)
     {
         if (meta is not JsonObject o) return null;
-        if (!o.ContainsKey(PositionKey)) return o.Count == 0 ? null : o;
+        if (!o.ContainsKey(PositionKey) && !o.ContainsKey(HostSeqKey)) return o.Count == 0 ? null : o;
         var copy = o.DeepClone().AsObject();
         copy.Remove(PositionKey);
+        copy.Remove(HostSeqKey);
         return copy.Count == 0 ? null : copy;
+    }
+
+    const string HostSeqKey = Gorynych.Acp.Hosting.GorynychProtocol.MetaHostSeq;
+
+    /// <summary>Reads a host's <c>"&lt;hostId&gt;/&lt;seq&gt;"</c>.</summary>
+    public static bool TryParseHostSeq(string? text, out string hostId, out long number)
+    {
+        hostId = "";
+        number = 0;
+        var slash = text?.LastIndexOf('/') ?? -1;
+        if (slash <= 0 || !long.TryParse(text!.AsSpan(slash + 1), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out number))
+            return false;
+        hostId = text![..slash];
+        return true;
+    }
+
+    /// <summary>The place in a host's stream of the newest entry from that host, 0 when it has none.</summary>
+    public long LastHostSeq(string hostId)
+    {
+        lock (gate)
+        {
+            var lines = Load();
+            for (var i = lines.Count - 1; i >= 0; i--)
+            {
+                if (!lines[i].Contains(hostId, StringComparison.Ordinal)) continue;
+                if (TryParse(lines[i]) is { } entry && entry["_meta"]?[HostSeqKey] is JsonValue v && v.TryGetValue<string>(out var mark)
+                    && TryParseHostSeq(mark, out var id, out var number) && id == hostId)
+                    return number;
+            }
+            return 0;
+        }
     }
 
     static JsonNode? TryParse(string line)
@@ -395,6 +430,8 @@ public sealed class SessionJournal
         if (!JsonNode.DeepEquals(OwnMeta(into["_meta"]), OwnMeta(next["_meta"]))) return false;
         into["content"]!["text"] = (string?)into["content"]!["text"] + (string?)next["content"]!["text"];
         if (PositionOf(next) is > 0 and var position) SetPosition(into, position);
+        // And at its last part's place in a host's stream, which a host that comes back sends what follows.
+        if (next["_meta"]?[HostSeqKey]?.DeepClone() is { } hostSeq && into["_meta"] is JsonObject meta) meta[HostSeqKey] = hostSeq;
         return true;
     }
 

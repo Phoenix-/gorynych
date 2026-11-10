@@ -11,7 +11,14 @@ namespace Gorynych.Service;
 /// <summary>Accepts clients on the service's named pipe and hands each to the conductor.</summary>
 public static partial class PipeListener
 {
-    public static async Task RunAsync(Conductor conductor, string pipeName, CancellationToken ct)
+    public static Task RunAsync(Conductor conductor, string pipeName, CancellationToken ct) =>
+        RunAsync(pipeName, "client", (server, name) => conductor.ServeClientAsync(server, server, name), ct);
+
+    /// <summary>The same for the conductor's adapter hosts, on their own pipe (<c>&lt;pipe&gt;.hosts</c>).</summary>
+    public static Task RunHostsAsync(Conductor conductor, string pipeName, CancellationToken ct) =>
+        RunAsync(pipeName, "host", (server, name) => conductor.ServeHostAsync(server, server, name), ct);
+
+    static async Task RunAsync(string pipeName, string label, Func<NamedPipeServerStream, string, Task> serve, CancellationToken ct)
     {
         var count = 0;
         while (!ct.IsCancellationRequested)
@@ -26,8 +33,8 @@ public static partial class PipeListener
                 await server.DisposeAsync();
                 break;
             }
-            var name = $"client{++count}";
-            _ = Task.Run(() => conductor.ServeClientAsync(server, server, name), CancellationToken.None);
+            var name = $"{label}{++count}";
+            _ = Task.Run(() => serve(server, name), CancellationToken.None);
         }
     }
 

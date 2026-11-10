@@ -197,6 +197,7 @@ internal static partial class SessionReader
         if (i.Meta?.DeepClone().AsObject() is { } meta)
         {
             meta.Remove(GorynychProtocol.MetaPosition); // for clients that resume; a page has its own cursor
+            meta.Remove(GorynychProtocol.MetaHostSeq); // for the journal
             if (meta.Count > 0) update["_meta"] = meta;
         }
         return update;

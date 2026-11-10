@@ -33,6 +33,19 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     public static string Version =>
         typeof(AgentHost).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0] ?? "0.1.0";
 
+    static InitializeRequest InitializeParams() => new()
+    {
+        ProtocolVersion = AcpMethods.ProtocolVersion,
+        ClientCapabilities = new ClientCapabilities
+        {
+            Fs = new FileSystemCapabilities { ReadTextFile = false, WriteTextFile = false },
+            Terminal = false,
+            // The service relays forms to a client that declared them.
+            Elicitation = new ElicitationCapabilities { Form = new ElicitationFormCapabilities() },
+        },
+        ClientInfo = new Implementation { Name = "gorynych", Title = "Gorynych", Version = Version },
+    };
+
     public async Task<JsonRpcConnection> GetAsync(CancellationToken ct)
     {
         if (connection is { IsClosed: false } running) return running;
@@ -40,6 +53,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         try
         {
             if (connection is { IsClosed: false } again) return again;
+            if (conductor.Hosts is { } hosts) return await HostedAsync(hosts, ct);
             ServiceLog.Info($"{Name}: starting");
             var started = await adapter.StartAsync(ct);
             var rpc = new JsonRpcConnection(started.Input, started.Output, Name)
@@ -52,18 +66,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             InitializeResponse init;
             try
             {
-                init = await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
-            {
-                ProtocolVersion = AcpMethods.ProtocolVersion,
-                ClientCapabilities = new ClientCapabilities
-                {
-                    Fs = new FileSystemCapabilities { ReadTextFile = false, WriteTextFile = false },
-                    Terminal = false,
-                    // The service relays forms to a client that declared them.
-                    Elicitation = new ElicitationCapabilities { Form = new ElicitationFormCapabilities() },
-                },
-                ClientInfo = new Implementation { Name = "gorynych", Title = "Gorynych", Version = Version },
-            }, ct);
+                init = await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, InitializeParams(), ct);
             }
             catch
             {
@@ -88,11 +91,109 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         }
     }
 
+    // ---------------------------------------------------------------- in a host
+
+    readonly Lock attachGate = new();
+    TaskCompletionSource attached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    readonly HashSet<string> goneHosts = new(StringComparer.Ordinal);
+
+    /// <summary>The ID of the host that runs the adapter now, if any.</summary>
+    public string? HostId { get; private set; }
+
+    /// <summary>How long a request for the agent waits for its host to connect.</summary>
+    public static TimeSpan AttachTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// The adapter runs in a host: one that runs already is waited for (a host comes back to a new
+    /// conductor on its own), else one is started; under <see cref="startGate"/>.
+    /// </summary>
+    async Task<JsonRpcConnection> HostedAsync(Gorynych.Service.Hosts.IHostLauncher hosts, CancellationToken ct)
+    {
+        Task waiting;
+        lock (attachGate) waiting = attached.Task;
+        if (connection is { IsClosed: false } ready) return ready;
+        if (!hosts.IsAlive(Name)) hosts.Launch(Name);
+        try
+        {
+            await waiting.WaitAsync(AttachTimeout, ct);
+        }
+        catch (TimeoutException)
+        {
+            throw new JsonRpcException(JsonRpcException.InternalError,
+                $"The {DisplayName} host did not connect to Gorynych within {AttachTimeout.TotalSeconds:0} seconds; its log is in Gorynych's logs folder (host-{Name}-*.log).");
+        }
+        return connection ?? throw new IOException($"{Name}: its host went as it connected");
+    }
+
+    /// <summary>
+    /// A host of this adapter connected and proved itself (<see cref="Conductor.ServeHostAsync"/>):
+    /// the conductor initializes it as it would the adapter (a host that comes back answers from what
+    /// its agent said the first time), and if it comes back, takes its report (open sessions, running
+    /// turns), adopts its turns, and has it send what the journal lacks after each session's cursor.
+    /// Then requests for the agent go to it. False when it is refused: a second host, or one this
+    /// conductor already saw go.
+    /// </summary>
+    internal async Task<bool> AttachAsync(JsonRpcConnection rpc, string hostId, CancellationToken ct)
+    {
+        lock (attachGate)
+        {
+            if (connection is { IsClosed: false })
+            {
+                ServiceLog.Warn($"{Name}: a second host ({hostId}) connected while {HostId} serves; refused");
+                return false;
+            }
+            if (goneHosts.Contains(hostId))
+            {
+                // This conductor ended its turns when it went: they cannot be taken back now.
+                ServiceLog.Warn($"{Name}: host {hostId} came back after this service saw it go; stopped");
+                _ = rpc.SendRequestAsync(GorynychProtocol.MethodHostStop, new JsonObject());
+                return false;
+            }
+        }
+        rpc.RequestHandler = (req, token) => conductor.OnAgentRequestAsync(this, req, token);
+        rpc.NotificationHandler = (method, p) => conductor.OnAgentNotificationAsync(this, method, p);
+        var init = await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, InitializeParams(), ct);
+        var reattached = init.Meta?[GorynychProtocol.MetaHost]?["reattached"] is JsonValue r && r.TryGetValue<bool>(out var back) && back;
+        JsonObject? report = null;
+        if (reattached) report = await rpc.SendRequestAsync(GorynychProtocol.MethodHostState, new JsonObject(), ct) as JsonObject;
+        var sessions = Strings(report?["sessions"]);
+        lock (liveGate)
+        {
+            live.Clear();
+            foreach (var s in sessions) live.Add(s);
+        }
+        Info = init;
+        HostId = hostId;
+        if (report is not null) await conductor.AdoptAsync(this, report);
+        var after = conductor.HostCursors(hostId, sessions.Concat(Strings(report?["buffered"])).Distinct(StringComparer.Ordinal));
+        var replayed = await rpc.SendRequestAsync(GorynychProtocol.MethodHostReplay, new JsonObject { ["after"] = after }, ct);
+        foreach (var trimmed in Strings(replayed?["trimmed"])) conductor.HostTrimmed(this, trimmed);
+        TaskCompletionSource signal;
+        lock (attachGate)
+        {
+            connection = rpc;
+            signal = attached;
+        }
+        _ = rpc.Completion.ContinueWith(_ => OnClosed(rpc), TaskScheduler.Default);
+        ServiceLog.Info($"{Name}: host {hostId} {(reattached ? "came back" : "started")}: {init.AgentInfo?.Name} {init.AgentInfo?.Version}, " +
+            $"{sessions.Count} sessions open, {(report?["turns"] as JsonArray)?.Count ?? 0} turns running, {(int?)replayed?["replayed"] ?? 0} updates sent again");
+        signal.TrySetResult();
+        return true;
+    }
+
+    static List<string> Strings(JsonNode? array) =>
+        (array as JsonArray ?? []).Select(n => n is JsonValue v && v.TryGetValue<string>(out var s) ? s : null).OfType<string>().ToList();
+
     void OnClosed(JsonRpcConnection rpc)
     {
         if (!ReferenceEquals(connection, rpc)) return;
         ServiceLog.Warn($"{Name}: connection closed");
         connection = null;
+        lock (attachGate)
+        {
+            if (HostId is { } gone && conductor.Hosts is not null) goneHosts.Add(gone);
+            attached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
         lock (liveGate) live.Clear();
         conductor.OnAgentStopped(this);
     }
@@ -151,13 +252,22 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         ["name"] = Name,
         ["displayName"] = DisplayName,
         ["running"] = IsRunning,
+        ["host"] = HostId,
         ["agentInfo"] = Info?.AgentInfo is { } a ? AcpJson.ToNode(a) : null,
     };
 
+    /// <summary>
+    /// Stops the adapter. One in a host is stopped only when the service shuts down
+    /// (<see cref="Conductor.StopHostsOnExit"/>); for a restart its host keeps its agents and comes
+    /// back to the next conductor.
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         var rpc = Interlocked.Exchange(ref connection, null);
         var running = Interlocked.Exchange(ref instance, null);
+        if (rpc is not null && conductor.Hosts is not null && conductor.StopHostsOnExit)
+            try { await rpc.SendRequestAsync(GorynychProtocol.MethodHostStop, new JsonObject()).WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (Exception e) when (e is IOException or JsonRpcException or TimeoutException) { ServiceLog.Warn($"{Name}: the host did not take its stop: {e.Message}"); }
         if (rpc is not null) await rpc.DisposeAsync();
         if (running is not null) await running.DisposeAsync();
     }

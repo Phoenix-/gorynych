@@ -5,6 +5,7 @@ using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
+using Gorynych.Service.Hosts;
 
 namespace Gorynych.Service;
 
@@ -60,6 +61,15 @@ public sealed class ConductorOptions
 
     /// <summary>For tests: awaited in <c>session/new</c> once its client is attached, before the answer is written.</summary>
     internal Func<string, Task>? Answering { get; init; }
+
+    /// <summary>
+    /// Runs every adapter in an adapter host of its own (docs/service-protocol.md, "Adapter hosts"),
+    /// so a restart breaks no turn; null runs them in this process, as before.
+    /// </summary>
+    public IHostLauncher? Hosts { get; init; }
+
+    /// <summary>The token a host proves itself with (<c>host.token</c> in the data folder).</summary>
+    public string? HostToken { get; init; }
 
     /// <summary>For tests: awaited when a restart has waited for the running turns.</summary>
     internal Func<Task>? Drained { get; init; }
@@ -124,9 +134,159 @@ public sealed class Conductor : IAsyncDisposable
         store.Removed = r => { if (r.Listed) AnnounceList(r.SessionId, r.Agent, "removed"); };
         store.Active = AnnounceActivity;
         Outside = new OutsideService(this, options.OutsideProgressInterval);
+        // A session's peer token outlives this run: the agent's peers server (in a host) keeps it.
+        foreach (var r in store.All())
+            if (r.PeerToken is { Length: > 0 } token && !r.Deleted)
+            {
+                peerTokens[token] = r.SessionId;
+                sessionTokens[r.SessionId] = token;
+            }
     }
 
     public string DefaultAgent { get; }
+
+    /// <summary>Starts the adapter hosts; null when the adapters run in this process.</summary>
+    internal IHostLauncher? Hosts => options.Hosts;
+
+    /// <summary>
+    /// Whether the hosts stop with this conductor: yes when the service shuts down; no for a
+    /// restart, after which they come back to the next conductor with their agents.
+    /// </summary>
+    public bool StopHostsOnExit { get; private set; } = true;
+
+    // ---------------------------------------------------------------- adapter hosts
+
+    /// <summary>
+    /// A host connected to the host pipe: it must say hello first, with the token from the data
+    /// folder, an adapter this service has, and a link version it takes; then its adapter's
+    /// <see cref="AgentHost"/> takes it on (<see cref="AgentHost.AttachAsync"/>).
+    /// </summary>
+    public async Task ServeHostAsync(Stream input, Stream output, string name)
+    {
+        var rpc = new JsonRpcConnection(input, output, name) { Log = m => ServiceLog.Warn(m) };
+        var hello = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
+        rpc.NotificationHandler = (method, p) =>
+        {
+            if (method == GorynychProtocol.MethodHostHello && p is JsonObject said) hello.TrySetResult(said);
+            return Task.CompletedTask;
+        };
+        rpc.Start();
+        try
+        {
+            var said = await hello.Task.WaitAsync(TimeSpan.FromSeconds(10), shutdown.Token);
+            var adapter = (string?)said["adapter"];
+            var hostId = (string?)said["hostId"];
+            var link = said["link"] is JsonValue l && l.TryGetValue<int>(out var version) ? version : 0;
+            string? refusal = null;
+            if (!HostNames.SameToken((string?)said["token"], options.HostToken)) refusal = "its token is not this service's";
+            else if (adapter is null || !agents.ContainsKey(adapter)) refusal = $"this service has no adapter '{adapter}'";
+            else if (string.IsNullOrEmpty(hostId)) refusal = "it has no ID";
+            else if (link < GorynychProtocol.MinHostLinkVersion || link > GorynychProtocol.HostLinkVersion)
+                refusal = $"it speaks host link {link}, and this service takes {GorynychProtocol.MinHostLinkVersion} to {GorynychProtocol.HostLinkVersion}";
+            else if (options.Hosts is null) refusal = "this service runs its adapters in its own process";
+            if (refusal is not null)
+            {
+                ServiceLog.Warn($"{name}: a host was refused: {refusal}");
+                await rpc.DisposeAsync();
+                return;
+            }
+            if (!await agents[adapter!].AttachAsync(rpc, hostId!, shutdown.Token)) await rpc.DisposeAsync();
+        }
+        catch (Exception e) when (e is TimeoutException or OperationCanceledException or IOException or JsonRpcException)
+        {
+            ServiceLog.Warn($"{name}: a host did not get through its handshake: {e.Message}");
+            await rpc.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// The turns a host that came back has running: each holds its session as a turn would
+    /// (<see cref="SessionFeed.AdoptedTurn"/>), so a new prompt waits for it, a resuming client is
+    /// told it is in progress, and the end the host reports later is marked.
+    /// </summary>
+    internal async Task AdoptAsync(AgentHost host, JsonObject report)
+    {
+        foreach (var turn in (report["turns"] as JsonArray ?? []).OfType<JsonObject>())
+        {
+            if ((string?)turn["sessionId"] is not { } sessionId || removed.ContainsKey(sessionId)) continue;
+            var promptId = (string?)turn["promptId"];
+            long? hostTurn = turn["turn"] is JsonValue t && t.TryGetValue<long>(out var number) ? number : null;
+            var feed = Feed(sessionId);
+            if (feed.Adopted is not null) continue;
+            await feed.TurnGate.WaitAsync();
+            var key = feed.BeginPrompt(promptId);
+            feed.Handed(key);
+            if (!feed.Adopt(new SessionFeed.AdoptedTurn(key, promptId, host.Name, hostTurn)))
+            {
+                feed.EndPrompt(key);
+                feed.TurnGate.Release();
+                continue;
+            }
+            feed.ClientTurn = true;
+            feed.EnterUse();
+            // A spawned session reports the end of its turn to its parent: with the text that comes from now on.
+            if (store.Get(sessionId)?.ParentSessionId is not null) feed.BeginTurnText(ReportLimit + 1);
+            ServiceLog.Info($"{host.Name} {sessionId}: took back a turn running in its host{(promptId is null ? "" : $" (prompt {promptId})")}");
+        }
+    }
+
+    /// <summary>The end of an adopted turn: the session is free again.</summary>
+    void EndAdopted(SessionFeed feed, SessionFeed.AdoptedTurn turn)
+    {
+        feed.EndPrompt(turn.Key);
+        feed.ClientTurn = false;
+        feed.TurnEnded();
+        feed.TurnGate.Release();
+        feed.ExitUse();
+        IdleFromNow(feed.SessionId);
+    }
+
+    /// <summary>For each session, its place in the host's stream: what the host sends again must follow it.</summary>
+    internal JsonObject HostCursors(string hostId, IEnumerable<string> sessions)
+    {
+        var after = new JsonObject();
+        foreach (var sessionId in sessions)
+            if (!removed.ContainsKey(sessionId)) after[sessionId] = Feed(sessionId).HostCursor(hostId);
+        return after;
+    }
+
+    /// <summary>A host kept fewer updates than the session missed: the journal lacks some, and says so.</summary>
+    internal void HostTrimmed(AgentHost host, string sessionId)
+    {
+        ServiceLog.Warn($"{host.Name} {sessionId}: its host had let go of updates this service had not journaled; the journal is marked trimmed");
+        Feed(sessionId).Journal.MarkTrimmed();
+    }
+
+    /// <summary>
+    /// A host reports how a prompt ended, before its answer (<c>_gorynych/turn_ended</c>). The end is
+    /// marked here, with the report's place in the host's stream, so it is in the journal exactly once:
+    /// whether this service sent the prompt and its answer follows, or an earlier one sent it and the
+    /// answer was lost with it. A turn taken back from the host (<see cref="AdoptAsync"/>) is over.
+    /// </summary>
+    async Task OnTurnEndedAsync(AgentHost host, JsonObject report)
+    {
+        if ((string?)report["sessionId"] is not { } sessionId || removed.ContainsKey(sessionId)) return;
+        var feed = Feed(sessionId);
+        var hostSeq = (string?)report["_meta"]?[GorynychProtocol.MetaHostSeq];
+        if (hostSeq is not null && !feed.TakeFromHost(hostSeq)) return; // marked already
+        var promptId = (string?)report["promptId"];
+        var result = report["result"];
+        Exception? failure = report["error"] is JsonObject error
+            ? new JsonRpcException(error["code"] is JsonValue c && c.TryGetValue<int>(out var code) ? code : JsonRpcException.InternalError, (string?)error["message"] ?? "the prompt failed")
+            : null;
+        KeepMark(feed, result);
+        if (promptId is not null)
+        {
+            feed.MarkedByHost(promptId); // its answer, if it comes here, marks it no more
+            await MarkPromptEndAsync(feed, promptId, result, failure, hostSeq);
+        }
+        long? hostTurn = report["turn"] is JsonValue t && t.TryGetValue<long>(out var number) ? number : null;
+        if (feed.EndAdopted(hostTurn) is not { } turn) return;
+        if (store.Get(sessionId)?.ParentSessionId is not null)
+            ReportTurnEnd(sessionId, failure is null ? Outcome(result) : $"failed: {failure.Message}", feed.EndTurnText());
+        EndAdopted(feed, turn);
+        ServiceLog.Info($"{host.Name} {sessionId}: the turn it took back from its host ended{(promptId is null ? "" : $" (prompt {promptId})")}");
+    }
 
     /// <summary>The service's side of the gorynych-outside MCP server, for agents outside Gorynych.</summary>
     internal OutsideService Outside { get; }
@@ -146,6 +306,7 @@ public sealed class Conductor : IAsyncDisposable
     // ---------------------------------------------------------------- restart
 
     readonly Lock restartGate = new();
+    readonly CancellationTokenSource drainStop = new(); // a restart with hosts: prompts waiting for a turn go to the next service
     Task<JsonObject>? restart;
     volatile bool draining;
     long restartNumber;
@@ -155,6 +316,9 @@ public sealed class Conductor : IAsyncDisposable
 
     /// <summary>How long the turns a forced restart cancels get to end before it exits all the same.</summary>
     internal static readonly TimeSpan CancelGrace = TimeSpan.FromSeconds(5);
+
+    /// <summary>How long a restart with hosts waits for the prompts on their way to reach their turn (and be refused).</summary>
+    internal static readonly TimeSpan HostedDrainLimit = TimeSpan.FromSeconds(10);
 
     /// <summary>True while a restart drains: no new turn starts (<see cref="Restarting"/>).</summary>
     public bool Draining => draining;
@@ -218,8 +382,28 @@ public sealed class Conductor : IAsyncDisposable
         var exiting = false;
         try
         {
-            ServiceLog.Info($"restart {number}: no new turn starts; waiting up to {timeout.TotalSeconds:0.#} s for the running ones");
             foreach (var c in clients.Keys) c.Notify(GorynychProtocol.MethodRestarting, RestartNotice());
+            if (options.Hosts is not null)
+            {
+                // The turns live on in their hosts, which come back to the next conductor: nothing of
+                // the agents is waited for or cancelled. Only prompts still on their way to their
+                // agent are, which are refused (and go whole to the next service) once they reach
+                // their turn, waiting for one included.
+                ServiceLog.Info($"restart {number}: the agents run on in their hosts; refusing the prompts still on their way");
+                drainStop.Cancel();
+                var onTheirWay = System.Diagnostics.Stopwatch.StartNew();
+                while (feeds.Values.Any(f => !f.Retired && f.PromptsOnTheirWay > 0) && onTheirWay.Elapsed < HostedDrainLimit) await Task.Delay(50);
+                var inHosts = feeds.Values.Count(f => !f.Retired && f.TurnRunning);
+                ServiceLog.Info($"restart {number}: exiting; {inHosts} turns go on in their hosts");
+                StopHostsOnExit = false;
+                exiting = true;
+                return new JsonObject
+                {
+                    ["restarted"] = true, ["processId"] = Environment.ProcessId, ["waitedSeconds"] = Math.Round(onTheirWay.Elapsed.TotalSeconds, 1),
+                    ["cancelledTurns"] = 0, ["turnsInHosts"] = inHosts,
+                };
+            }
+            ServiceLog.Info($"restart {number}: no new turn starts; waiting up to {timeout.TotalSeconds:0.#} s for the running ones");
             var waited = System.Diagnostics.Stopwatch.StartNew();
             while (Running().Any() && waited.Elapsed < timeout) await Task.Delay(100);
             var seconds = Math.Round(waited.Elapsed.TotalSeconds, 1);
@@ -349,12 +533,19 @@ public sealed class Conductor : IAsyncDisposable
             OnAgentListChanged(host, @params);
             return;
         }
+        if (method == GorynychProtocol.MethodTurnEnded)
+        {
+            if (@params is JsonObject report) await OnTurnEndedAsync(host, report);
+            return;
+        }
         var sessionId = (string?)@params?["sessionId"];
         if (sessionId is null || removed.ContainsKey(sessionId)) return;
         var feed = Feed(sessionId);
         if (method == AcpMethods.Client.SessionUpdate)
         {
             if (@params!["update"] is not JsonObject update) return;
+            // From a host: taken once, though a host that comes back sends what it kept again.
+            if (update["_meta"]?[GorynychProtocol.MetaHostSeq] is JsonValue s && s.TryGetValue<string>(out var hostSeq) && !feed.TakeFromHost(hostSeq)) return;
             feed.ApplyStateUpdate(update);
             feed.Active(options.Time.GetUtcNow()); // an agent that sends something is not idle (UnloadIfIdleAsync)
             AgentTurn(feed, update);
@@ -404,15 +595,36 @@ public sealed class Conductor : IAsyncDisposable
         }
     }
 
-    /// <summary>An agent's connection closed: the turns of its own it marked are over.</summary>
+    /// <summary>
+    /// An agent's connection closed: the turns of its own it marked are over, and so are the turns
+    /// this service took over from its host, which end <c>cancelled</c>, with the mark of their end
+    /// (the host died with them).
+    /// </summary>
     internal void OnAgentStopped(AgentHost host)
     {
         foreach (var feed in feeds.Values)
-            if (store.Get(feed.SessionId)?.Agent == host.Name && feed.EndAgentTurn())
+        {
+            if (store.Get(feed.SessionId)?.Agent != host.Name) continue;
+            if (feed.EndAgentTurn())
             {
                 feed.TurnEnded();
                 feed.ExitUse();
             }
+            // This service exits for a restart and leaves its hosts running: the turn goes on there,
+            // and the next service takes it back.
+            if (Hosts is not null && !StopHostsOnExit) continue;
+            if (feed.EndAdopted(any: true) is { } turn)
+            {
+                ServiceLog.Warn($"{host.Name} {feed.SessionId}: its host went in the middle of a turn it had brought back");
+                Track(Task.Run(async () =>
+                {
+                    if (turn.PromptId is { } promptId) await MarkPromptEndAsync(feed, promptId, null, new IOException("the host went"));
+                    if (store.Get(feed.SessionId)?.ParentSessionId is not null)
+                        ReportTurnEnd(feed.SessionId, "failed: its host went", feed.EndTurnText());
+                    EndAdopted(feed, turn);
+                }));
+            }
+        }
     }
 
     void Remember(AgentHost host, string sessionId, JsonObject update)
@@ -457,6 +669,15 @@ public sealed class Conductor : IAsyncDisposable
             return AcpJson.ToNode(new RequestPermissionResponse { Outcome = new SelectedPermissionOutcome { OptionId = optionId } });
         }
         var feed = Feed(sessionId);
+        // From a host, a question outlives this service when it exits for a restart: its host asks
+        // the next one, which a client's link joins to the one it shows. So the client keeps it, as
+        // its connection goes with this service, rather than see it withdrawn.
+        using var outlived = options.Hosts is null ? null : new CancellationTokenSource();
+        await using var _ = outlived is null ? default : ct.Register(() =>
+        {
+            if (StopHostsOnExit) try { outlived.Cancel(); } catch (ObjectDisposedException) { }
+        });
+        if (outlived is not null) ct = outlived.Token;
         // A use of the session from the first wait for a client to the answer: while a client may
         // still answer, the session is not idle, so it stays loaded (IdleFromNow). Registered under
         // the session's gate, as UseAsync does, so an unload under way finishes first.
@@ -573,7 +794,7 @@ public sealed class Conductor : IAsyncDisposable
         var response = await rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, request, ct);
         BindToken(token, response.SessionId);
         host.MarkLive(response.SessionId);
-        store.Update(response.SessionId, host.Name, r => { r.Cwd = FolderPath.Normalize(request.Cwd); r.Draft = true; });
+        store.Update(response.SessionId, host.Name, r => { r.Cwd = FolderPath.Normalize(request.Cwd); r.Draft = true; r.PeerToken = token; });
         var feed = Feed(response.SessionId);
         feed.CaptureState(AcpJson.ToNode(response));
         // Attached now, for the agent's requests; its list of commands only once it has the answer.
@@ -840,9 +1061,31 @@ public sealed class Conductor : IAsyncDisposable
         }
         JsonNode? result = null;
         Exception? failure = null;
+        var livesOn = false;
         try
         {
-            return result = await PromptInProgressAsync(client, request, prompt, use, ct);
+            return result = await PromptInProgressAsync(client, request, prompt, use, () => use.Feed.Handed(key), ct);
+        }
+        catch (IOException e) when (options.Hosts is not null && !StopHostsOnExit)
+        {
+            // This service exits for a restart and leaves the hosts running.
+            if (!use.Feed.WasHanded(key))
+            {
+                failure = Restarting(); // it never reached the agent: it goes whole to the next service
+                throw failure;
+            }
+            // The turn goes on in its host. Its client gets no answer from here: it takes this
+            // service's exit for a lost connection, and the next service has the turn and marks its end.
+            livesOn = true;
+            failure = e;
+            await Task.Delay(Timeout.Infinite, ct); // until the client's connection goes with this service
+            throw;
+        }
+        catch (IOException e) when (options.Hosts is not null)
+        {
+            // Its host went with the turn (it crashed, or was killed): the turn ended cancelled, as its mark says.
+            ServiceLog.Warn($"{use.Feed.SessionId}: the host went in the middle of the turn: {e.Message}");
+            return result = Cancelled();
         }
         catch (Exception e)
         {
@@ -854,8 +1097,11 @@ public sealed class Conductor : IAsyncDisposable
             // The mark first: a client resuming meanwhile finds the prompt in progress or its end in the
             // journal. Marked whether or not its client still seems there: a connection may be gone
             // before the service notices, and then the answer is lost. A prompt a restart refused
-            // ended nowhere: it goes again, as it is.
-            if (promptId is not null && !IsRestartingRefusal(failure)) await MarkPromptEndAsync(use.Feed, promptId, result, failure);
+            // ended nowhere: it goes again, as it is. A turn that goes on in a host this service leaves
+            // running for a restart is not over: the next service marks its end when the host reports
+            // it. One its host reported the end of is marked already (OnTurnEndedAsync).
+            if (promptId is not null && !use.Feed.TakeMarkedByHost(promptId) && !IsRestartingRefusal(failure) && !livesOn)
+                await MarkPromptEndAsync(use.Feed, promptId, result, failure);
             use.Feed.EndPrompt(key);
         }
     }
@@ -870,9 +1116,11 @@ public sealed class Conductor : IAsyncDisposable
     /// Journals and sends the end of a prompt's turn: a <c>session_info_update</c>
     /// with <c>gorynych/agentTurn: "ended"</c>, the prompt's ID, and its stop reason or error. Never fails.
     /// </summary>
-    async Task MarkPromptEndAsync(SessionFeed feed, string promptId, JsonNode? result, Exception? failure)
+    /// <param name="hostSeq">The host's report it comes from, journaled with it so that it is marked once.</param>
+    async Task MarkPromptEndAsync(SessionFeed feed, string promptId, JsonNode? result, Exception? failure, string? hostSeq = null)
     {
         var meta = new JsonObject { [GorynychProtocol.MetaAgentTurn] = "ended", [GorynychProtocol.MetaPromptId] = promptId };
+        if (hostSeq is not null) meta[GorynychProtocol.MetaHostSeq] = hostSeq;
         if (failure is null)
             meta[GorynychProtocol.MetaStopReason] = result?["stopReason"] is JsonValue r && r.TryGetValue<string>(out var reason) ? reason : "end_turn";
         // Its client went while the session was being opened, so it never ran; or the agent went
@@ -895,7 +1143,7 @@ public sealed class Conductor : IAsyncDisposable
         }
     }
 
-    async Task<JsonNode?> PromptInProgressAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionUse use, CancellationToken ct)
+    async Task<JsonNode?> PromptInProgressAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionUse use, Action handed, CancellationToken ct)
     {
         var record = Promote(use.Record);
         var (rpc, _) = await EnsureLiveAsync(record, ct);
@@ -904,7 +1152,16 @@ public sealed class Conductor : IAsyncDisposable
         if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
         // One turn at a time: an opinion request delivered as a turn waits for this one, and
         // this one for it.
-        await feed.TurnGate.WaitAsync(CancellationToken.None);
+        // With hosts, a restart does not wait for the turn before this prompt, which lives on in its
+        // host: the wait ends, and the prompt goes to the next service, as one that got here first.
+        try
+        {
+            await feed.TurnGate.WaitAsync(options.Hosts is null ? CancellationToken.None : drainStop.Token);
+        }
+        catch (OperationCanceledException) when (drainStop.IsCancellationRequested)
+        {
+            throw Restarting();
+        }
         // A restart that began while this prompt waited for the turn before it: it starts no turn
         // here, which the exit might cut off, but goes whole to the next service.
         if (Draining)
@@ -916,17 +1173,19 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             if (feed.Retired) throw NotFound(record.SessionId); // deleted while this prompt waited for the turn before it
-            if (record.ParentSessionId is null) return await PromptTurnAsync(client, request, prompt, record, rpc, feed);
+            if (record.ParentSessionId is null) return await PromptTurnAsync(client, request, prompt, record, rpc, feed, handed);
             // A spawned session reports the end of the turn to its parent.
             feed.BeginTurnText(ReportLimit + 1);
             JsonNode? result;
             try
             {
-                result = await PromptTurnAsync(client, request, prompt, record, rpc, feed);
+                result = await PromptTurnAsync(client, request, prompt, record, rpc, feed, handed);
             }
             catch (Exception e)
             {
-                ReportTurnEnd(record.SessionId, $"failed: {e.Message}", feed.EndTurnText());
+                // One that goes on in a host this service leaves running for a restart: the next one reports its end.
+                var hostWent = e is IOException && options.Hosts is not null;
+                if (!hostWent || StopHostsOnExit) ReportTurnEnd(record.SessionId, hostWent ? "failed: its host went" : $"failed: {e.Message}", feed.EndTurnText());
                 throw;
             }
             ReportTurnEnd(record.SessionId, Outcome(result), feed.EndTurnText());
@@ -941,7 +1200,7 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     async Task<JsonNode?> PromptTurnAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionRecord record,
-        JsonRpcConnection rpc, SessionFeed feed)
+        JsonRpcConnection rpc, SessionFeed feed, Action handed)
     {
         if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
         // Journal the user's message, show it to the session's other clients, and use the
@@ -969,6 +1228,7 @@ public sealed class Conductor : IAsyncDisposable
         {
             if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
             response = await rpc.StartRequestAsync(request.Method, WithMessageId(request.Params, messageId), CancellationToken.None);
+            handed();
         }
         finally
         {
@@ -1747,6 +2007,7 @@ public sealed class Conductor : IAsyncDisposable
                 // A list that found the session in its agent just now has shown it already: it stays listed.
                 rec.Draft = rec.Cwd.Length == 0;
                 rec.Cwd = cwd;
+                rec.PeerToken = token;
                 rec.ParentSessionId = parent.SessionId;
                 rec.ReportToParent = report;
                 if (title is null) return;
@@ -2921,10 +3182,16 @@ public sealed class Conductor : IAsyncDisposable
         sessionTokens[sessionId] = token;
     }
 
+    /// <summary>
+    /// The peers server for a session being opened, with its token, which the overlay keeps: the
+    /// agent may hold it longer than this service runs (in a host, across a restart).
+    /// </summary>
     List<McpServer> PeersFor(string sessionId)
     {
         var token = sessionTokens.GetOrAdd(sessionId, _ => NewToken());
         peerTokens[token] = sessionId;
+        if (store.Get(sessionId) is { } record && record.PeerToken != token)
+            store.Update(sessionId, record.Agent, r => r.PeerToken = token);
         return WithPeers([], token);
     }
 

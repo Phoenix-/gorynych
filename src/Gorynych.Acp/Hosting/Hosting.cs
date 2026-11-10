@@ -352,6 +352,55 @@ public static class GorynychProtocol
     /// </summary>
     public const string MetaRestarting = "gorynych/restarting";
 
+    /// <summary>
+    /// The version of the link between the conductor and its adapter hosts this build speaks; a
+    /// conductor takes hosts from <see cref="MinHostLinkVersion"/> up to it (docs/service-protocol.md,
+    /// "Adapter hosts").
+    /// </summary>
+    public const int HostLinkVersion = 1;
+
+    /// <summary>The oldest host link a conductor of this build still takes.</summary>
+    public const int MinHostLinkVersion = 1;
+
+    /// <summary>
+    /// A host's first message on a connection to the conductor's host pipe, a notification:
+    /// <c>{token, hostId, adapter, link, pid, version}</c>. The token, in the data folder, proves it
+    /// is a host of this service.
+    /// </summary>
+    public const string MethodHostHello = "_gorynych/host_hello";
+
+    /// <summary>
+    /// Conductor → host: <c>{}</c> → <c>{sessions, turns: [{sessionId, promptId?}], buffered, requests, seq}</c>:
+    /// what the host has while the conductor was away.
+    /// </summary>
+    public const string MethodHostState = "_gorynych/host_state";
+
+    /// <summary>
+    /// Conductor → host: <c>{after: {sessionId: seq}}</c> → <c>{replayed, trimmed}</c>: the host sends
+    /// the session updates it kept that follow each session's cursor, then makes the connection its
+    /// conductor's and asks its pending questions again.
+    /// </summary>
+    public const string MethodHostReplay = "_gorynych/host_replay";
+
+    /// <summary>Conductor → host: <c>{}</c> → <c>{}</c>: stop the agent and exit (the service shuts down).</summary>
+    public const string MethodHostStop = "_gorynych/host_stop";
+
+    /// <summary>
+    /// Host → conductor, a notification: <c>{sessionId, promptId?, result | error}</c>: a prompt whose
+    /// conductor went before its answer ended so in the agent.
+    /// </summary>
+    public const string MethodTurnEnded = "_gorynych/turn_ended";
+
+    /// <summary>
+    /// On what a host sends: <c>"&lt;hostId&gt;/&lt;seq&gt;"</c>, its place in the host's stream, in the
+    /// <c>_meta</c> of a session update (journaled with it) or of a notification's params. The conductor
+    /// takes each once.
+    /// </summary>
+    public const string MetaHostSeq = "gorynych/hostSeq";
+
+    /// <summary>In a host's <c>initialize</c> result <c>_meta</c>: <c>{hostId, link, reattached}</c>.</summary>
+    public const string MetaHost = "gorynych/host";
+
     /// <summary>The default local endpoint: one named pipe per user.</summary>
     public static string DefaultPipeName => "gorynych-acp-" + Sanitize(Environment.UserName);
 

@@ -62,7 +62,8 @@ public static class PeersServer
             "initialize" => Initialize(req, peers, channelUrl is not null),
             "ping" => new JsonObject(),
             "tools/list" => new JsonObject { ["tools"] = new JsonArray(Tools(peers)) },
-            "tools/call" => await CallAsync(http, pipe, token, replyRoute, (string?)req.Params?["name"], req.Params?["arguments"] as JsonObject, ct),
+            "tools/call" => await CallAsync(http, pipe is null ? null : new ServiceRoute(c => ConnectAsync(pipe, c), pipe), token, replyRoute,
+                (string?)req.Params?["name"], req.Params?["arguments"] as JsonObject, ct),
             _ => throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {req.Method}"),
         };
         mcp.Start();
@@ -121,8 +122,77 @@ public static class PeersServer
         }
     }
 
-    static async Task<JsonNode> CallAsync(HttpClient http, string? pipe, string? token, string? channelUrl, string? tool, JsonObject? args, CancellationToken ct)
+    /// <summary>
+    /// The way to the service: a connection of its own for each request, since the service may have
+    /// restarted since the last one (docs/service-protocol.md, "Adapter hosts": the agent and this
+    /// server outlive it in their host).
+    /// </summary>
+    /// <param name="RestartWait">How long a request waits for a service that restarts: for its pipe,
+    /// and while it refuses requests for the restart.</param>
+    internal sealed record ServiceRoute(Func<CancellationToken, Task<JsonRpcConnection>> Connect, string Pipe)
     {
+        public TimeSpan RestartWait { get; init; } = TimeSpan.FromSeconds(30);
+        public TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(500);
+    }
+
+    /// <summary>The connection to the service went once a request was on its way: it may have been carried out, or not.</summary>
+    internal sealed class ServiceLostException(string message) : IOException(message);
+
+    /// <summary>
+    /// One request to the service. One the service could not get (no pipe yet, a connection that broke
+    /// before it was sent) or refused for a restart goes again, to the next service once it is up,
+    /// for up to <see cref="ServiceRoute.RestartWait"/>; a connection lost once it went throws
+    /// <see cref="ServiceLostException"/>.
+    /// </summary>
+    static async Task<JsonNode?> RequestAsync(ServiceRoute route, string method, JsonObject @params, CancellationToken ct)
+    {
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            JsonRpcConnection service;
+            try
+            {
+                service = await route.Connect(ct);
+            }
+            catch (Exception e) when (e is IOException or TimeoutException && waited.Elapsed < route.RestartWait)
+            {
+                await Task.Delay(route.RetryDelay, ct);
+                continue;
+            }
+            await using (service)
+            {
+                Task<JsonNode?> answer;
+                try
+                {
+                    answer = await service.StartRequestAsync(method, @params.DeepClone(), ct);
+                }
+                catch (IOException) when (waited.Elapsed < route.RestartWait)
+                {
+                    await Task.Delay(route.RetryDelay, ct);
+                    continue;
+                }
+                try
+                {
+                    return await answer;
+                }
+                catch (JsonRpcException e) when (IsRestarting(e) && waited.Elapsed < route.RestartWait)
+                {
+                    await Task.Delay(route.RetryDelay, ct);
+                }
+                catch (IOException e)
+                {
+                    throw new ServiceLostException(e.Message);
+                }
+            }
+        }
+    }
+
+    static bool IsRestarting(JsonRpcException e) =>
+        e.ErrorData?[GorynychProtocol.MetaRestarting] is JsonValue v && v.TryGetValue<bool>(out var restarting) && restarting;
+
+    internal static async Task<JsonNode> CallAsync(HttpClient http, ServiceRoute? route, string? token, string? channelUrl, string? tool, JsonObject? args, CancellationToken ct)
+    {
+        var pipe = route?.Pipe;
         try
         {
             switch (tool)
@@ -146,8 +216,7 @@ public static class PeersServer
                     // A request the service asked as a turn (Kimi, or Claude while it was not running) waits in the service.
                     if (!delivered && pipe is not null && token is not null)
                     {
-                        await using var service = await ConnectAsync(pipe, ct);
-                        var result = await service.SendRequestAsync(GorynychProtocol.MethodReply, new JsonObject
+                        var result = await RequestAsync(route!, GorynychProtocol.MethodReply, new JsonObject
                         {
                             ["messageId"] = messageId,
                             ["text"] = text,
@@ -166,16 +235,14 @@ public static class PeersServer
                 {
                     var query = new JsonObject { ["token"] = token };
                     if (args?["include_archived"] is JsonValue all && all.TryGetValue<bool>(out var include) && include) query["includeArchived"] = true;
-                    await using var service = await ConnectAsync(pipe, ct);
-                    return Text(ListAgentsText(await service.SendRequestAsync(GorynychProtocol.MethodPeers, query, ct)));
+                    return Text(ListAgentsText(await RequestAsync(route!, GorynychProtocol.MethodPeers, query, ct)));
                 }
                 case "archive_session" or "restore_session" when pipe is not null && token is not null:
                 {
                     var target = (string?)args?["session_id"];
                     if (string.IsNullOrWhiteSpace(target)) return Text("session_id is required", error: true);
                     var archive = tool == "archive_session";
-                    await using var service = await ConnectAsync(pipe, ct);
-                    var result = await service.SendRequestAsync(GorynychProtocol.MethodArchive, new JsonObject
+                    var result = await RequestAsync(route!, GorynychProtocol.MethodArchive, new JsonObject
                     {
                         ["sessionId"] = target,
                         ["archived"] = archive,
@@ -189,8 +256,7 @@ public static class PeersServer
                     var question = (string?)args?["question"];
                     if (string.IsNullOrWhiteSpace(target) || string.IsNullOrWhiteSpace(question))
                         return Text("session_id and question are required", error: true);
-                    await using var service = await ConnectAsync(pipe, ct);
-                    var reply = await service.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject
+                    var reply = await RequestAsync(route!, GorynychProtocol.MethodOpinion, new JsonObject
                     {
                         ["sessionId"] = target,
                         ["text"] = question,
@@ -214,8 +280,7 @@ public static class PeersServer
                     if (args?["title"] is JsonValue title && title.TryGetValue<string>(out var name) && name.Length > 0) spawn["title"] = name;
                     if (args?["report"] is JsonValue report && report.TryGetValue<bool>(out var reports)) spawn["report"] = reports;
                     if (args?["initiation"] is JsonValue initiation && initiation.TryGetValue<string>(out var how) && how.Length > 0) spawn["initiation"] = how;
-                    await using var service = await ConnectAsync(pipe, ct);
-                    var started = await service.SendRequestAsync(GorynychProtocol.MethodSpawn, spawn, ct);
+                    var started = await RequestAsync(route!, GorynychProtocol.MethodSpawn, spawn, ct);
                     var text = new JsonObject { ["session_id"] = (string?)started?["sessionId"] };
                     if ((string?)started?["note"] is { } note) text["note"] = note;
                     return Text(text.ToJsonString(AcpJson.TextOptions));
@@ -224,16 +289,38 @@ public static class PeersServer
                     return Text($"unknown tool {tool}", error: true);
             }
         }
+        catch (ServiceLostException)
+        {
+            // Error texts are what the agent goes by: what happened, the session, and what to do now.
+            var target = (string?)args?["session_id"];
+            return Text(tool switch
+            {
+                "ask_agent" => $"Gorynych restarted while session_id {target} was answering, so its answer was lost. Ask again in a moment: " +
+                    $"ask_agent with session_id {target} and the same question.",
+                "spawn_session" => "Gorynych restarted while it started the session, so it may or may not have started. In a moment, look for it " +
+                    "with list_agents before you spawn it again.",
+                "reply" => $"Not delivered: Gorynych restarted, and the request {(string?)args?["message_id"]} went with it; its asker is told to ask again.",
+                _ => $"Gorynych restarted while it did that ({tool}), so it may or may not have been done. Check with list_agents in a moment, then try again.",
+            }, error: true);
+        }
+        catch (JsonRpcException e) when (IsRestarting(e) && tool == "ask_agent")
+        {
+            var target = (string?)args?["session_id"];
+            return Text($"Gorynych is restarting and did not ask session_id {target}. Ask again in a moment: ask_agent with session_id {target} " +
+                "and the same question.", error: true);
+        }
         catch (Exception e) when (e is JsonRpcException or IOException or TimeoutException or HttpRequestException)
         {
             return Text($"Gorynych could not do that: {e.Message}", error: true);
         }
     }
 
+    /// <summary>A connection to the service, which waits a while for its pipe: the service may be on its way back from a restart.</summary>
     static async Task<JsonRpcConnection> ConnectAsync(string pipe, CancellationToken ct)
     {
-        var stream = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(5), ct)
-            ?? throw new TimeoutException($"the service did not answer on pipe {pipe}");
+        var stream = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(10), ct)
+            ?? throw new TimeoutException($"Gorynych does not answer on pipe {pipe}: it is not running, or did not come back from a restart in time. " +
+                "Try again in a moment.");
         var rpc = new JsonRpcConnection(stream, stream, "peers->service");
         rpc.Start();
         await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest

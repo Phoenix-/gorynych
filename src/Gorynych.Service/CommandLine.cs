@@ -44,13 +44,24 @@ internal sealed class CommandLine
           --unload-after <minutes>              how long an idle session with no client stays loaded (default 10)
           --claude-transport headless|tui
           --claude-channels ask|accept|decline
+          --hosts on|off                        run each adapter in a host of its own, which a restart leaves
+                                                running (default on Windows; off elsewhere, where it is untried)
           --no-channel  --no-peers
           --console                             also log to the console (not for acp and task install)
+
+        The service starts its adapter hosts itself, as
+          Gorynych.Service host --adapter claude|kimi|codex|dsh [--pipe <name>] [--data <dir>] [adapter options]
 
         """;
 
     static readonly string[] ServiceValues =
-        ["--pipe", "--data", "--default-agent", "--claude-model", "--unload-after", "--claude-transport", "--claude-channels"];
+        ["--pipe", "--data", "--default-agent", "--claude-model", "--unload-after", "--claude-transport", "--claude-channels", "--hosts"];
+
+    /// <summary>The options an adapter host takes: those of the adapters, and where the service is.</summary>
+    static readonly string[] HostValues = ["--adapter", "--pipe", "--data", "--claude-model", "--claude-transport", "--claude-channels"];
+
+    /// <summary>The adapters a host runs, as the service names them.</summary>
+    public static readonly string[] AdapterNames = ["claude", "kimi", "codex", "dsh"];
     static readonly string[] ServiceFlags = ["--no-channel", "--no-peers"];
 
     readonly List<(string Name, string? Value)> options = [];
@@ -109,6 +120,9 @@ internal sealed class CommandLine
             case "restart":
                 known = (["--pipe", "--timeout"], ["--no-wait", "--force"]);
                 break;
+            case "host":
+                known = (HostValues, [.. ServiceFlags, "--console"]);
+                break;
             case "peers":
                 known = (["--pipe", "--token", "--channel-url", "--reply-url"], []);
                 break;
@@ -148,6 +162,7 @@ internal sealed class CommandLine
             line.options.Add((name, value));
         }
         if (command == "acp" && line.Value("--agent") is null) throw new UsageException("acp needs --agent");
+        if (command == "host" && line.Value("--adapter") is null) throw new UsageException("host needs --adapter");
         return line;
     }
 
@@ -175,6 +190,8 @@ internal sealed class CommandLine
             "--claude-transport" => value is "headless" or "tui",
             "--claude-channels" => value is "ask" or "accept" or "decline",
             "--unload-after" or "--timeout" => MinutesOf(value) is not null,
+            "--hosts" => value is "on" or "off",
+            "--adapter" => AdapterNames.Contains(value),
             _ => true,
         };
         if (ok) return;
@@ -182,6 +199,8 @@ internal sealed class CommandLine
         {
             "--claude-transport" => $"--claude-transport takes headless or tui, not '{value}'",
             "--claude-channels" => $"--claude-channels takes ask, accept or decline, not '{value}'",
+            "--hosts" => $"--hosts takes on or off, not '{value}'",
+            "--adapter" => $"--adapter takes {string.Join(", ", AdapterNames)}, not '{value}'",
             _ => $"{name} takes a number of minutes, 0 or more, not '{value}'",
         });
     }

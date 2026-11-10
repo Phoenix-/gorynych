@@ -709,7 +709,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         }
     }
 
-    readonly Dictionary<long, string?> prompts = []; // under clientsGate: the client prompts in progress, by a number of the feed's own
+    readonly Dictionary<long, (string? PromptId, bool Handed)> prompts = []; // under clientsGate: the client prompts in progress, by a number of the feed's own
     long promptCount;
 
     /// <summary>
@@ -722,9 +722,22 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         lock (clientsGate)
         {
             var key = ++promptCount;
-            prompts[key] = promptId;
+            prompts[key] = (promptId, false);
             return key;
         }
+    }
+
+    /// <summary>The prompt went to its agent: in a host, it runs on whatever happens to this service.</summary>
+    public void Handed(long key)
+    {
+        lock (clientsGate)
+            if (prompts.TryGetValue(key, out var prompt)) prompts[key] = (prompt.PromptId, true);
+    }
+
+    /// <summary>Whether the prompt reached its agent (<see cref="Handed"/>).</summary>
+    public bool WasHanded(long key)
+    {
+        lock (clientsGate) return prompts.TryGetValue(key, out var prompt) && prompt.Handed;
     }
 
     public void EndPrompt(long key)
@@ -735,7 +748,101 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <summary>The IDs of the client prompts in progress that have one.</summary>
     public string[] PromptsInProgress()
     {
-        lock (clientsGate) return prompts.Values.OfType<string>().ToArray();
+        lock (clientsGate) return prompts.Values.Select(p => p.PromptId).OfType<string>().ToArray();
+    }
+
+    /// <summary>Client prompts in progress that have not reached their agent yet: a restart with hosts waits only for them.</summary>
+    public int PromptsOnTheirWay
+    {
+        get { lock (clientsGate) return prompts.Values.Count(p => !p.Handed); }
+    }
+
+    /// <summary>
+    /// A turn this service did not start but found running in a host that came back to it: it holds
+    /// <see cref="TurnGate"/> and counts as a client's prompt in progress until the host reports its end.
+    /// </summary>
+    /// <param name="HostTurn">The host's number for it, which its <c>_gorynych/turn_ended</c> carries.</param>
+    public sealed record AdoptedTurn(long Key, string? PromptId, string Agent, long? HostTurn);
+
+    AdoptedTurn? adopted; // under clientsGate
+
+    public AdoptedTurn? Adopted
+    {
+        get { lock (clientsGate) return adopted; }
+    }
+
+    /// <summary>Holds the session for a turn a host came back with; false if one is held already.</summary>
+    public bool Adopt(AdoptedTurn turn)
+    {
+        lock (clientsGate)
+        {
+            if (adopted is not null) return false;
+            adopted = turn;
+            return true;
+        }
+    }
+
+    /// <summary>Lets go of the adopted turn; null when there was none (or it was another one).</summary>
+    public AdoptedTurn? EndAdopted(long? hostTurn = null, bool any = false)
+    {
+        lock (clientsGate)
+        {
+            if (adopted is null || (!any && (hostTurn is null || adopted.HostTurn != hostTurn))) return null;
+            var turn = adopted;
+            adopted = null;
+            return turn;
+        }
+    }
+
+    readonly HashSet<string> markedByHost = new(StringComparer.Ordinal); // under clientsGate
+
+    /// <summary>
+    /// A host reported the end of a prompt of this service's still waiting for its answer, and its
+    /// end is marked already: the answer that follows marks it no more.
+    /// </summary>
+    public void MarkedByHost(string promptId)
+    {
+        lock (clientsGate)
+            if (prompts.Values.Any(p => p.PromptId == promptId)) markedByHost.Add(promptId);
+    }
+
+    /// <summary>Whether the end of the prompt was marked from its host's report (<see cref="MarkedByHost"/>), once.</summary>
+    public bool TakeMarkedByHost(string promptId)
+    {
+        lock (clientsGate) return markedByHost.Remove(promptId);
+    }
+
+    readonly Dictionary<string, long> hostSeen = new(StringComparer.Ordinal); // under clientsGate: per host, the last of its updates taken
+
+    /// <summary>
+    /// The last place in a host's stream this session has (<c>gorynych/hostSeq</c>), from what it took
+    /// in this run, else from the journal: what the host sends again must follow it.
+    /// </summary>
+    public long HostCursor(string hostId)
+    {
+        lock (clientsGate)
+        {
+            if (hostSeen.TryGetValue(hostId, out var seen)) return seen;
+            var fromJournal = Journal.LastHostSeq(hostId);
+            hostSeen[hostId] = fromJournal;
+            return fromJournal;
+        }
+    }
+
+    /// <summary>
+    /// Takes an update or a report from a host once: false for one at or before the session's place
+    /// in that host's stream, which the journal has already.
+    /// </summary>
+    public bool TakeFromHost(string hostSeq)
+    {
+        if (!SessionJournal.TryParseHostSeq(hostSeq, out var hostId, out var number)) return true;
+        var cursor = HostCursor(hostId);
+        lock (clientsGate)
+        {
+            if (number <= cursor) return false;
+            hostSeen[hostId] = number;
+            return true;
+        }
     }
 
     /// <summary>
@@ -776,5 +883,14 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         }
     }
 
-    JsonObject Notification(JsonNode update) => new() { ["sessionId"] = SessionId, ["update"] = update };
+    /// <summary>
+    /// What a client gets: the update, without its place in a host's stream (<c>gorynych/hostSeq</c>),
+    /// which is for the journal. <paramref name="update"/> is a copy of the service's own.
+    /// </summary>
+    JsonObject Notification(JsonNode update)
+    {
+        if (update["_meta"] is JsonObject meta && meta.Remove(Gorynych.Acp.Hosting.GorynychProtocol.MetaHostSeq) && meta.Count == 0)
+            ((JsonObject)update).Remove("_meta");
+        return new() { ["sessionId"] = SessionId, ["update"] = update };
+    }
 }
