@@ -22,6 +22,8 @@ Status words used below: **done** (in the code and tested), **in progress** (on 
 - [Sessions that talk to each other](#sessions-that-talk-to-each-other)
 - [Waking and idle unload](#waking-and-idle-unload)
 - [Agents outside Gorynych](#agents-outside-gorynych)
+- [Several machines](#several-machines)
+- [Updating without losing work](#updating-without-losing-work)
 - [The GUI](#the-gui)
 - [Stage one and what comes next](#stage-one-and-what-comes-next)
 - [Probe results](#probe-results)
@@ -55,6 +57,9 @@ approval card, one session list, without reading terminals.
   `-p`. Switching needs no migration; both use Claude's own transcripts.
 - **Service and GUI are separate from day one.** A per-user background service on each
   machine owns the agent processes; a GUI connects to it, and later to several services.
+- **Several machines meet in a service, not in the GUI** (decided 10 November 2026). A service
+  brings in the sessions of other machines' services as one more adapter; a GUI may still
+  connect to any service directly ([Several machines](#several-machines)).
 - **ACP v1 between them**, with own additions only through ACP's extension points. The
   service is an ACP conductor (the proxy-chains RFD); adapters are ACP agents.
 - **Adapters are build-time assemblies** (or external ACP executables). Loading assemblies at
@@ -114,7 +119,8 @@ flowchart LR
 - **Transport.** Locally, a named pipe (`gorynych-acp-<user>`) carrying ACP's stdio framing,
   open only to the current user. Plain ACP clients start agents over stdio, so the **bridge**
   (`Gorynych.Service acp --agent <name>`) passes ACP between its stdio and the pipe and scopes
-  the connection to one agent. Remote machines: planned, over `ssh -T`.
+  the connection to one agent. Remote machines: over `ssh -T` to the bridge there
+  ([Several machines](#several-machines), **planned**).
 - **The conductor** keeps what is common: process supervision, a bounded journal per session
   (replayed by `session/load`), the overlay (archive flags, names given at spawn, tombstones,
   parent links), the router for questions between sessions, and the idle unload. Everything
@@ -420,6 +426,133 @@ its tools from sessions running inside Gorynych. **Done**; setup in
 It is a separate executable because hosts keep MCP servers running for hours, and Windows
 cannot overwrite a running exe: the service could not be updated while an outside agent was open.
 
+## Several machines
+
+The person works on several machines, for example a home PC and a powerful work PC that is on
+around the clock, and sometimes on a laptop while the home PC sleeps. Each machine runs its own
+service with its own agents and logins. All of this is **planned**.
+
+**A service is the hub, not the GUI.** A service connects to the services of other machines as
+one more adapter. A remote Gorynych is an ACP agent, and a conductor can stand behind another
+conductor, as the proxy-chains RFD has it.
+- **One list.** The GUI and the outside server see one list, with `claude@R-PC-167` and the
+  like next to the local agents. Each remote session carries its machine in `_meta`; the
+  persistent service ID tells services apart.
+- **Asking and spawning from the hub's machine.** `ask_agent` and `spawn_session` reach a
+  remote session through the hub, as ordinary requests to the remote service. A coordinator
+  at home can so start coders on the work PC.
+- **Asking from the remote machine.** A remote session that asks one on the hub's machine goes
+  through its service, which sends a `_gorynych/…` request to its client, the hub. ACP lets an
+  agent send requests to its client; permission requests already travel that way.
+- **The remote service keeps its journals.** The hub keeps no copy: it passes `session/load`
+  and its replay through.
+- **Why not the GUI.** The GUI was the earlier plan: the GUI connected to each service and
+  forwarded questions between them, so the services did not know each other. In Zed that
+  meant a separate entry for every agent on every machine, no combined list, forwarding
+  written in the fork in Rust, and questions between machines only while Zed is open. The
+  outside server would also have seen only its own machine. The hub means fewer points of
+  failure, and Zed needs no change.
+
+**Rules.**
+- **No ownership.** A remote service never depends on a hub, which is only one more of its
+  clients. Its sessions, journals and approvals stay its own. A hub going to sleep is a client
+  leaving; the agents work on, and an approval goes to whichever client is attached.
+- **A GUI may connect to any service directly.** For example, from a laptop to the work PC
+  while the home PC sleeps: everything on the work PC works, and the home sessions are simply
+  out of reach until the home PC wakes and its hub reconnects.
+- **Hub is a role, not a machine.** Any service may list remotes, even one with no agents of
+  its own. Then a laptop with Gorynych and no agents shows whatever machines it can reach.
+- **One hop.** A hub shows and forwards only the sessions a remote service hosts itself, never
+  what that service gathers from others. So any graph of connections is safe: the home PC and
+  the work PC may list each other, and the laptop both, without duplicates or loops.
+- **A hub attaches to a remote session only while one of its own clients has it open.** So a
+  hub with nobody at it never takes an approval that a person on another client is waiting
+  for.
+- **An unreachable machine is an error at once, not a wait.** For example: "R-PC-167 is not
+  connected".
+
+**Transport: `ssh -T` to the bridge on the remote machine.**
+- ACP standardizes only stdio so far. ssh brings key authentication and needs no open port,
+  so it also reaches a machine inside a corporate network.
+- The hub starts ssh and starts it again when the connection drops. It then resumes the
+  sessions its clients have open. This is the same code as the bridge's reconnect in
+  [Updating without losing work](#updating-without-losing-work).
+- The standard OpenSSH for Windows supports only asynchronous stdio and hangs on synchronous
+  pipes.
+
+**The remote service runs on its own, not under ssh.**
+- On Windows a scheduled task starts it at logon, in the person's session and with a limited
+  token. Linux and macOS will use `systemd --user` and launchd.
+- The bridge behind ssh only connects. It never starts the service itself there: started from
+  ssh, it would run elevated, in session 0.
+- A dropped connection then ends only the bridge: the agents work on, and the hub resumes
+  their sessions when it reconnects.
+- The first probe, on 10 November 2026, found that the sshd job lets a child break away. So a
+  service started from ssh would survive the drop too, but elevated.
+
+**The pipe must let a local ssh client in.** Two rules that hold today keep it out; the
+first probe found both.
+- The token sshd gives a key login carries the NETWORK group (S-1-5-2). The pipe's deny ACE
+  for NETWORK, meant only for clients over SMB, refuses every ssh client. Remote clients are
+  to be refused with `PIPE_REJECT_REMOTE_CLIENTS` instead.
+- ssh gives an administrator an elevated token, and an elevated client reaches only an
+  elevated service. An elevated client of the same user is to be let into a plain service:
+  that direction is safe. The other direction stays shut: a plain process never drives an
+  elevated service.
+
+**Versions may differ between machines.** The hub and a remote service speak ACP and the
+extensions each announces at `initialize`, and pass on fields they do not know. A hub can
+update a remote machine: it copies the new build over ssh and starts the update there.
+
+**Code stays where its agents work.**
+- Diffs come with the tool calls in the thread.
+- For the whole picture, git: the repository is cloned on the remote machine, and its agents
+  work in their own branches. The person fetches them, with that machine as a git remote over
+  ssh.
+- Links to files point to paths on the remote machine.
+
+**Logins.** Each machine has its own: the person signs in to each agent there by hand, and
+credentials never move between machines.
+
+## Updating without losing work
+
+Stopping the service today stops every agent: they are its children on stdio. A running turn
+breaks off mid-step, and pending approvals and questions are lost. What stays is the agents'
+native history, the journals and the overlay, so an idle session loses nothing. Updates
+therefore have to wait for a moment when no agent works.
+
+**Planned: an update that waits for its moment.**
+1. The new build is installed next to the running one: Windows cannot overwrite a running exe.
+2. `gorynych update` asks the running service to drain.
+   - It starts no new turn and holds the prompts that come in.
+   - It waits for the running turns, including those of `ask_agent`, flushes the journals and
+     exits.
+   - Then the new build starts.
+3. The bridge reconnects by itself, so the GUI sees only a pause of a few seconds.
+   - It sends `initialize` again.
+   - It resumes the sessions its client has open, with no replay.
+   - It sends the prompts it held.
+4. Agents of idle sessions start again only when their next prompt comes, as after an idle
+   unload.
+
+Fine points:
+- **When to start holding prompts.** Holding from the start would make every session wait for
+  the longest turn. So the update first watches for a moment of quiet for a few minutes, and
+  holds only after that.
+- **A turn longer than a limit.** The person is asked whether to wait on, or to stop it. When
+  stopped, the new build asks the agent to continue, and only the step that was cut off is
+  lost.
+- **Bridges keep running the old code** until the GUI restarts. So the bridge stays thin, and
+  its reconnect stays compatible across versions.
+
+**Later: turns that live through an update.** A small keeper process that hardly ever changes
+would hold the agents' stdio and pseudo consoles, so a new service could take them over in the
+middle of a turn. It is expensive and has many edge cases:
+- the JSON-RPC IDs of the old service's requests;
+- the Claude adapter's state in mid-turn;
+- the port of the TUI's hooks, which is fixed at launch;
+- the Windows job objects the agents run in.
+
 ## The GUI
 
 Stage one uses [Zed](https://zed.dev), which already draws the feed, diffs, forms and selectors
@@ -465,10 +598,12 @@ Done in stage one:
 
 Next, in order (**planned**):
 
-1. One GUI over several services: a combined session list, remote services over `ssh -T`. The
-   standard OpenSSH for Windows supports only asynchronous stdio and hangs on synchronous pipes.
-2. Questions between machines: the GUI is connected to both services and forwards the
-   question itself, so the services need not know each other.
+1. A remote service reachable over `ssh -T`: the pipe lets a local ssh client in, and the
+   service starts from a scheduled task with a limited token
+   ([Several machines](#several-machines)).
+2. The hub: remote services as an adapter, one list, the bridge's reconnect, and the update that
+   waits for its moment ([Updating without losing work](#updating-without-losing-work)).
+3. Questions and child sessions between machines, through the hub.
 
 ## Probe results
 
@@ -506,8 +641,9 @@ Open:
   Sonnet.
 - Renaming Claude sessions from the GUI. Listing those started outside Gorynych is left out
   ([Sessions](#sessions-catalog-titles-archive)).
-- A session keeper on remote machines: a headless agent behind `ssh -T` dies when the
-  connection drops.
+- Sessions on remote machines across a dropped connection. Planned answer: the service there
+  starts from a scheduled task, not under ssh, so a drop ends only the bridge
+  ([Several machines](#several-machines)). Not yet checked live.
 
 Risks:
 
