@@ -148,39 +148,42 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public bool BeginAgentTurn() => Interlocked.Exchange(ref agentTurn, 1) == 0;
 
     /// <summary>Marks the end of the agent's own turn; false when none was marked.</summary>
-    public bool EndAgentTurn() => Interlocked.Exchange(ref agentTurn, 0) == 1;
+    public bool EndAgentTurn()
+    {
+        if (Interlocked.Exchange(ref agentTurn, 0) != 1) return false;
+        Quieted();
+        return true;
+    }
 
     /// <summary>A turn of the agent's own runs (<see cref="BeginAgentTurn"/>).</summary>
     public bool AgentTurnRunning => Volatile.Read(ref agentTurn) != 0;
 
     int asking;
 
-    /// <summary>How many of the agent's requests (approvals, forms) wait for an answer: the session does not move meanwhile.</summary>
+    /// <summary>
+    /// How many of the agent's requests (approvals, forms) wait for an answer: the session does not
+    /// move meanwhile. One counts from the moment its connection read it (<see cref="Conductor.OnAgentRequestArrived"/>).
+    /// </summary>
     public int Asking => Volatile.Read(ref asking);
 
     public void BeginAsking() => Interlocked.Increment(ref asking);
 
-    int expectedAsks;
+    public void EndAsking()
+    {
+        Interlocked.Decrement(ref asking);
+        Quieted();
+    }
+
+    TaskCompletionSource quieter = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>
-    /// A host that came back reported questions of its agent's in the session, which it asks again
-    /// (<c>host_state</c>): they count as asking from now on, before they arrive.
+    /// Completes the next time the agent's own turn ends or one of its questions is answered: what a
+    /// prompt for a session in a stale host waits for before the session moves. Taken before the
+    /// state is looked at, so an end in between is not missed.
     /// </summary>
-    public void ExpectAsk()
-    {
-        Interlocked.Increment(ref expectedAsks);
-        Interlocked.Increment(ref asking);
-    }
+    public Task Quieter => Volatile.Read(ref quieter).Task;
 
-    /// <summary>A question that arrives: one expected already counts (<see cref="ExpectAsk"/>), else it begins to.</summary>
-    public void BeginOrTakeAsking()
-    {
-        while (Volatile.Read(ref expectedAsks) is var expected && expected > 0)
-            if (Interlocked.CompareExchange(ref expectedAsks, expected - 1, expected) == expected) return;
-        BeginAsking();
-    }
-
-    public void EndAsking() => Interlocked.Decrement(ref asking);
+    void Quieted() => Interlocked.Exchange(ref quieter, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
 
     long lastActivity = DateTimeOffset.MinValue.UtcTicks;
 

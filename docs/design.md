@@ -588,9 +588,13 @@ a restart onto a new executable, or with other adapter options, makes the runnin
   and its agent asks nothing. It is closed there (Codex lets go of the thread's lock first) and
   opens in the new host at its next use, with the journal caught up from its mark.
 - A prompt for a session in a stale host moves it first, so a stale host runs only the turns it
-  had, and exits once they end and its sessions moved. That is waiting for one adapter, not for
-  the whole machine, and Claude's host per session makes it one session at a time.
-- No drain: a stale host takes no new turn, so a drain would wait for the same turns.
+  had, and exits once they end and its sessions moved. A prompt that finds the agent running a
+  turn of its own there, or asking something, waits for that to end, then moves the session. That
+  is waiting for one adapter, not for the whole machine, and Claude's host per session makes it one
+  session at a time.
+- No drain: a stale host takes no new turn, so a drain would wait for the same turns. The
+  exceptions are named: a Codex draft's first turn (only that app-server has the thread), and a
+  session whose close failed there.
 - How it came out:
   - A host says its generation in its hello: the version and a SHA-256 of what it runs, read at
     its start, and its adapter's options.
@@ -600,6 +604,21 @@ a restart onto a new executable, or with other adapter options, makes the runnin
     the overlay across a restart, so the next one waits for that host rather than open the
     session twice.
   - The Claude adapter's files are safe for several of its processes on one data folder.
+- After its review (10 November 2026):
+  - A move counts only when the close is answered. A close that fails leaves the session to its
+    old host, where it opens again, until a close succeeds or that host's process has gone.
+    Codex's close fails when its app-server keeps the thread.
+  - An agent's question counts from when the conductor reads it until its answer is written back,
+    so neither a move that waits for the session nor a host that dies leaves it miscounted. No
+    host report is needed for it.
+  - Drafts move as any idle session, except Codex's, which stay until their first turn.
+  - A stale host that goes as a whole (an adapter without close) is stopped under every session's
+    gates.
+  - A host that fails to start holds back only hosts of its kind.
+
+  The review also found a race left from 3b. A host that came back settled its turns, and so let
+  go of the overlay's name for it, before requests could see it. A resume in between opened the
+  session in a second host, and the old one was stopped mid-turn.
 
 **One resumable link, three uses.** The same mechanism serves:
 - the hub and a remote service over ssh;

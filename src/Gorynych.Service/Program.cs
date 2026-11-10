@@ -49,6 +49,8 @@ var pipeName = line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName;
 var dataDirectory = DataDirectory(line);
 Directory.CreateDirectory(dataDirectory);
 ServiceLog.Init(Path.Combine(dataDirectory, "logs"), console: line.Flag("--console"));
+// What it runs is read now, before an update can rename its executable aside and copy another in its place.
+var (serviceBuild, buildTook) = Gorynych.Service.Hosts.HostGeneration.ReadAtStart(m => ServiceLog.Warn($"service: {m}"));
 // Started by the logon task, it has a console window of its own: let it go, so that closing it cannot stop the service.
 if (!line.Flag("--console") && Gorynych.Outside.DetachedProcess.ReleaseOwnConsole())
     ServiceLog.Info("service: let go of its own console window");
@@ -76,7 +78,7 @@ if (!owned)
 }
 
 var state = LoadState(Path.Combine(dataDirectory, "service.json"));
-ServiceLog.Info($"service {state.ServiceId} starting, pid {Environment.ProcessId}, pipe {pipeName}, data {dataDirectory}");
+ServiceLog.Info($"service {state.ServiceId} starting, pid {Environment.ProcessId}, pipe {pipeName}, data {dataDirectory}, build {serviceBuild} (read in {buildTook.TotalMilliseconds:0} ms)");
 // Started without breaking away from a host's job (the stdio bridge, the outside server): say so.
 if (Gorynych.Outside.DetachedProcess.KillOnCloseJob() is { } job) ServiceLog.Warn($"service: {job}");
 
@@ -102,7 +104,7 @@ await using var conductor = new Conductor(new ConductorOptions
     Hosts = hosts,
     HostToken = hostToken,
     // A host of another build, or with other options for its adapter, is stale: its sessions move once idle.
-    HostGeneration = hosted ? a => new Gorynych.Service.Hosts.HostGeneration(Gorynych.Service.Hosts.HostGeneration.ThisBuild, AdapterArguments(line, a)) : null,
+    HostGeneration = hosted ? a => new Gorynych.Service.Hosts.HostGeneration(serviceBuild, AdapterArguments(line, a)) : null,
     SessionHosts = new HashSet<string>(["claude"], StringComparer.Ordinal),
 }, adapters);
 
@@ -187,8 +189,11 @@ static async Task<int> HostCommand(CommandLine line)
     ServiceLog.Init(Path.Combine(data, "logs"), console: line.Flag("--console"), name: "host-" + adapterName);
     if (!line.Flag("--console")) Gorynych.Outside.DetachedProcess.ReleaseOwnConsole();
     var slot = line.Value("--slot") ?? "";
-    // What it runs is read now, before an update can rename its executable aside.
-    var generation = new Gorynych.Service.Hosts.HostGeneration(Gorynych.Service.Hosts.HostGeneration.ThisBuild, AdapterArguments(line, adapterName));
+    // What it runs is read now, before an update can rename its executable aside. It reads its own
+    // files rather than take the build from the service: a service on its way out of an update starts
+    // the executable now in place, which is the new one (about 25 ms for the 27 MB Native AOT build).
+    var (build, buildTook) = Gorynych.Service.Hosts.HostGeneration.ReadAtStart(m => ServiceLog.Warn($"host {adapterName}: {m}"));
+    var generation = new Gorynych.Service.Hosts.HostGeneration(build, AdapterArguments(line, adapterName));
     using var instance = new Mutex(initiallyOwned: false, Gorynych.Service.Hosts.HostNames.Mutex(pipe, adapterName, slot), Gorynych.Service.Hosts.HostNames.MutexOptions);
     try
     {
@@ -223,7 +228,8 @@ static async Task<int> HostCommand(CommandLine line)
             ?? throw new IOException("no conductor on the host pipe");
         return (stream, stream);
     }, new Gorynych.Service.Hosts.AdapterHostOptions { Adapter = adapterName, Token = token, Slot = slot, Generation = generation, Log = ServiceLog.Info });
-    ServiceLog.Info($"host {adapterName} {host.HostId} starting, pid {Environment.ProcessId}, pipe {pipe}, data {data}");
+    ServiceLog.Info($"host {adapterName} {host.HostId} starting, pid {Environment.ProcessId}, pipe {pipe}, data {data}, slot {(slot.Length == 0 ? "(none)" : slot)}, " +
+        $"build {build} (read in {buildTook.TotalMilliseconds:0} ms)");
     var code = await host.RunAsync();
     ServiceLog.Info($"host {adapterName} {host.HostId} exits ({code})");
     return code;

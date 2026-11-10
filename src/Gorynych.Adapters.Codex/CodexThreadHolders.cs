@@ -56,6 +56,13 @@ internal sealed partial class CodexThreadHolders(string? locksDirectory, Func<IR
                     if (Windows.Read(pid) is not { Image: { } image } process) continue;
                     // A wrapper's child (a .cmd, a shim) holds the lock for the adapter's own app-server.
                     if (Windows.DescendsFrom(pid, process, own)) continue;
+                    // The app-server of another adapter host of Gorynych's: another service's, or the one an
+                    // update leaves running while its sessions move.
+                    if (Windows.Ancestor(process, a => IsGorynychImage(a.Image)) is { } host)
+                    {
+                        held[id] = GorynychHost(host.Pid);
+                        break;
+                    }
                     var parentImage = Windows.Parent(process)?.Image;
                     if (Classify(pid, image, parentImage, localAppData) is not { } holder) continue;
                     held[id] = holder;
@@ -72,6 +79,19 @@ internal sealed partial class CodexThreadHolders(string? locksDirectory, Func<IR
 
     /// <summary>The one thread's holder, or null when it is free or not known.</summary>
     public string? Find(string threadId) => Find([threadId]).GetValueOrDefault(threadId);
+
+    const string GorynychHostWords = "another Gorynych host of Codex";
+
+    /// <summary>The holder named for the app-server of another Gorynych adapter host (<paramref name="hostPid"/>: that host's process).</summary>
+    internal static string GorynychHost(int hostPid) => $"{GorynychHostWords} (pid {hostPid})";
+
+    /// <summary>Whether a holder (<see cref="Find(IEnumerable{string})"/>) is another Gorynych adapter host, which lets go of a thread as its session moves.</summary>
+    public static bool IsGorynychHost(string holder) => holder.StartsWith(GorynychHostWords, StringComparison.Ordinal);
+
+    /// <summary>A Gorynych service or adapter host: <c>Gorynych.Service.exe</c>, or one renamed aside by an update (<c>Gorynych.Service.*.old.exe</c>).</summary>
+    internal static bool IsGorynychImage(string? image) =>
+        image is not null && FileName(Slashed(image)) is var name
+        && name.StartsWith("Gorynych.Service", StringComparison.OrdinalIgnoreCase) && name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>A thread ID as a file name may hold it: letters, digits and dashes (Codex's are UUIDs).</summary>
     static bool IsThreadId(string id) => id.Length is > 0 and <= 64 && id.All(c => char.IsAsciiLetterOrDigit(c) || c == '-');
@@ -173,6 +193,19 @@ internal sealed partial class CodexThreadHolders(string? locksDirectory, Func<IR
         /// <summary>The process's parent, unless it is gone or its ID now names a younger process.</summary>
         public static ProcessInfo? Parent(ProcessInfo child) =>
             child.ParentPid > 0 && Read(child.ParentPid) is { } parent && parent.Created <= child.Created ? parent : null;
+
+        /// <summary>The nearest process above this one that <paramref name="match"/> picks, its parents' chain followed while it holds.</summary>
+        public static ProcessInfo? Ancestor(ProcessInfo process, Func<ProcessInfo, bool> match)
+        {
+            var current = process;
+            for (var depth = 0; depth < 16; depth++)
+            {
+                if (Parent(current) is not { } parent || parent.Pid == process.Pid) return null;
+                if (match(parent)) return parent;
+                current = parent;
+            }
+            return null;
+        }
 
         /// <summary>Whether one of <paramref name="ancestors"/> is above the process, its parents' chain followed while it holds.</summary>
         public static bool DescendsFrom(int pid, ProcessInfo process, IReadOnlyCollection<int> ancestors)

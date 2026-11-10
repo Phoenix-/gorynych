@@ -273,9 +273,12 @@ answer arrives whole ([service-protocol.md](service-protocol.md#adapter-hosts)).
    ```powershell
    & "$dir\Gorynych.Service.exe" status
    ```
-   It lists each host with its build, sessions and running turns, and says how many sessions still
-   wait in hosts of an earlier build. A restart with other adapter options (`--claude-model`, …)
-   moves the sessions the same way.
+   It lists each host with its build, sessions and running turns, and under a host of an earlier
+   build what keeps each of its sessions there: a turn that runs, a question of the agent's that
+   waits for an answer, an empty Codex draft (Zed makes one whenever its agent panel opens: it
+   moves after its first prompt, or goes when the panel closes), or a close that failed (it moves
+   at a later idle moment). A restart with other adapter options (`--claude-model`, …) moves the
+   sessions the same way.
    An agent that was waiting for another session's answer (`ask_agent`) during the restart is told
    to ask again.
 4. **Without hosts** (`--hosts off`, the default on Linux and macOS) a restart still stops the
@@ -295,9 +298,10 @@ service to exit instead, which cancels its running turns, and the bridges Zed ru
 so they end with it. Quit Zed before it and start it again after.
 
 **The old copies.** A renamed `Gorynych.Service.<stamp>.old.exe` can be deleted once no process
-runs it: no old bridge (Zed restarted them), and no old host (`status` shows no stale host, as
-every session moved off them and they exited). A host that still runs a long turn keeps its copy
-until the turn ends. Gorynych never deletes them itself. To see which ones still run:
+runs it: no old bridge (Zed restarted them), and no old host (`status` says nothing waits to move,
+as every session moved off them and they exited). What `status` lists under an old host keeps its
+copy: a long turn until it ends, an empty Codex draft until it is prompted or its Zed panel closes.
+Gorynych never deletes them itself. To see which ones still run:
 ```powershell
 Get-Process Gorynych.Service, Gorynych.Outside | Select-Object Id, Path
 ```

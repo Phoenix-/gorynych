@@ -27,11 +27,13 @@ public sealed class CodexAdapterTests
         Time = (TimeProvider?)time ?? TimeProvider.System,
     }, [new CodexAdapter(codex ?? Options(fake)), .. more ?? []]);
 
-    static CodexAdapterOptions Options(FakeAppServer fake, List<string>? log = null, Func<IEnumerable<string>, IReadOnlyDictionary<string, string>>? holders = null) => new()
+    static CodexAdapterOptions Options(FakeAppServer fake, List<string>? log = null, Func<IEnumerable<string>, IReadOnlyDictionary<string, string>>? holders = null,
+        TimeSpan? unloadWait = null) => new()
     {
         Launch = fake.StartAsync,
         ClientVersion = "test",
         TurnEndWait = TimeSpan.FromMilliseconds(200),
+        UnloadWait = unloadWait ?? new CodexAdapterOptions().UnloadWait,
         Log = log is null ? null : m => { lock (log) log.Add(m); },
         // No other Codex app holds a fake thread; the user's own Codex folder is never read.
         FindHolders = holders ?? (_ => new Dictionary<string, string>()),
@@ -368,6 +370,48 @@ public sealed class CodexAdapterTests
         Assert.IsNull(open.ErrorData, "no data: Zed would show it as raw JSON");
         var archived = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-archived")));
         Assert.AreEqual("This Codex thread is archived in Codex. Unarchive it there (codex unarchive t-archived), then try again.", archived.Message);
+    }
+
+    [TestMethod]
+    public async Task AThreadAnotherGorynychHostLetsGoOf_IsWaitedFor_ThenOpens_AndOneItKeeps_IsRefused()
+    {
+        // After an update a session moves off an earlier host of Codex, whose app-server lets go of
+        // the thread's writer lock as its close answers, which may lag a moment behind.
+        var fake = new FakeAppServer();
+        fake.Existing("t-moving", Cwd, name: "Moving");
+        fake.Existing("t-kept", Cwd, name: "Kept");
+        var looks = 0;
+        await using var conductor = Conductor(fake, codex: Options(fake, holders: ids =>
+        {
+            var list = ids.ToArray();
+            var held = new Dictionary<string, string>();
+            if (list.Contains("t-moving") && Interlocked.Increment(ref looks) <= 3) held["t-moving"] = CodexThreadHolders.GorynychHost(4242);
+            if (list.Contains("t-kept")) held["t-kept"] = CodexThreadHolders.GorynychHost(4343);
+            return held;
+        }, unloadWait: TimeSpan.FromSeconds(2)));
+        await using var zed = await ZedAsync(conductor);
+        JsonObject Resume(string id) => new() { ["sessionId"] = id, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() };
+
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-moving")).WaitAsync(Wait);
+        Assert.AreEqual("t-moving", (string?)fake.Last("thread/resume")["threadId"]);
+        Assert.IsTrue(looks > 3, "it looked again until the other host let go");
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var kept = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-kept")).WaitAsync(Wait));
+        Assert.AreEqual("This Codex thread is open in another Gorynych host of Codex (pid 4343); close it there, then try again.", kept.Message);
+        Assert.IsTrue(watch.Elapsed >= TimeSpan.FromSeconds(1.5), "it waited for it about as long as a close waits for app-server");
+    }
+
+    [TestMethod]
+    public void TheImageOfAGorynychServiceOrHost_IsKnown_AlsoRenamedAsideByAnUpdate()
+    {
+        Assert.IsTrue(CodexThreadHolders.IsGorynychImage(@"C:\Users\u\AppData\Local\Programs\Gorynych\Gorynych.Service.exe"));
+        Assert.IsTrue(CodexThreadHolders.IsGorynychImage(@"C:\Users\u\AppData\Local\Programs\Gorynych\Gorynych.Service.20261110203103.old.exe"));
+        Assert.IsTrue(CodexThreadHolders.IsGorynychImage("/home/u/.local/bin/Gorynych.Service.exe"));
+        Assert.IsFalse(CodexThreadHolders.IsGorynychImage(@"C:\Program Files\nodejs\node.exe"));
+        Assert.IsFalse(CodexThreadHolders.IsGorynychImage(null));
+        Assert.IsTrue(CodexThreadHolders.IsGorynychHost(CodexThreadHolders.GorynychHost(1)));
+        Assert.IsFalse(CodexThreadHolders.IsGorynychHost("a terminal codex (pid 1)"));
     }
 
     [TestMethod]
@@ -872,7 +916,7 @@ public sealed class CodexAdapterTests
     }
 
     [TestMethod]
-    public async Task Closing_AThreadAppServerNeverSaysItUnloaded_GivesUpAfterAWhile()
+    public async Task Closing_AThreadAppServerNeverSaysItUnloaded_FailsAfterAWhile_AndTheThreadOpensHereAgain()
     {
         var fake = new FakeAppServer { TellsUnload = false };
         var log = new List<string>();
@@ -892,9 +936,15 @@ public sealed class CodexAdapterTests
         var id = await NewDirectAsync(acp);
         await PromptDirectAsync(acp, id, "hello");
 
-        await acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id }).WaitAsync(Wait);
-
+        // The service must not take it for closed: the writer lock may still be held, so it would fail in another host.
+        var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() =>
+            acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id }).WaitAsync(Wait));
+        StringAssert.Contains(failed.Message, "writer lock");
         Assert.IsTrue(Logged(log, "has not unloaded it"), string.Join(" | ", log));
+
+        // Where it was, it opens again (the service sends it back there), and takes a turn.
+        await acp.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = id, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() }).WaitAsync(Wait);
+        await PromptDirectAsync(acp, id, "again").WaitAsync(Wait);
     }
 
     [TestMethod]

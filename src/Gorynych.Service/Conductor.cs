@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
@@ -234,8 +235,6 @@ public sealed class Conductor : IAsyncDisposable
     /// </summary>
     internal async Task AdoptAsync(AgentHost host, HostLink link, JsonObject report, CancellationToken ct)
     {
-        foreach (var asking in report["asking"] as JsonArray ?? [])
-            if (asking is JsonValue v && v.TryGetValue<string>(out var sessionId) && !removed.ContainsKey(sessionId)) Feed(sessionId).ExpectAsk();
         foreach (var turn in (report["turns"] as JsonArray ?? []).OfType<JsonObject>())
         {
             if ((string?)turn["sessionId"] is not { } sessionId || removed.ContainsKey(sessionId)) continue;
@@ -300,14 +299,34 @@ public sealed class Conductor : IAsyncDisposable
             // A record of an earlier version names no host: its prompts were left to the one adapter-wide host.
             var its = record.HostOf == link.HostId || (record.HostOf is null && link.Slot.Length == 0);
             if (!its && host.HostIsAround(record)) continue;
-            await SettlePromptsAsync(host, record, its ? running : []);
+            // One of this host's keeps its host named until the host is taken (HostTaken): until then
+            // requests do not see it (AgentHost.AttachAsync), and a resume of the session waits for it by
+            // that name, rather than open it in a second host.
+            await SettlePromptsAsync(host, record, its ? running : [], keepHost: its && record.HostOf is not null);
         }
     }
 
-    /// <summary>A session's host from before is gone for good (<see cref="AgentHost.AwaitHostOfAsync"/>): its turns there ended nowhere.</summary>
-    internal Task SettleGoneAsync(AgentHost host, SessionRecord record) => SettlePromptsAsync(host, record, []);
+    /// <summary>
+    /// A host that came back is taken: its sessions are routed to it now, so their records no longer
+    /// name it (SettleAsync kept it named until now). The exit names again where each one is open.
+    /// </summary>
+    internal void HostTaken(AgentHost host, HostLink link)
+    {
+        if (link.HostId is not { } hostId) return;
+        foreach (var record in store.All())
+            if (record.Agent == host.Name && record.HostOf == hostId && record.HostPrompts is null && !removed.ContainsKey(record.SessionId))
+                store.Update(record.SessionId, record.Agent, r =>
+                {
+                    if (r.HostOf != hostId) return;
+                    r.HostOf = null;
+                    r.HostSlot = null;
+                });
+    }
 
-    async Task SettlePromptsAsync(AgentHost host, SessionRecord record, HashSet<string> running)
+    /// <summary>A session's host from before is gone for good (<see cref="AgentHost.AwaitHostOfAsync"/>): its turns there ended nowhere.</summary>
+    internal Task SettleGoneAsync(AgentHost host, SessionRecord record) => SettlePromptsAsync(host, record, [], keepHost: false);
+
+    async Task SettlePromptsAsync(AgentHost host, SessionRecord record, HashSet<string> running, bool keepHost)
     {
         var feed = Feed(record.SessionId);
         foreach (var promptId in record.HostPrompts ?? [])
@@ -316,7 +335,14 @@ public sealed class Conductor : IAsyncDisposable
             ServiceLog.Warn($"{host.Name} {record.SessionId}: prompt {promptId} went on in a host that is gone; it ends cancelled");
             await MarkPromptEndAsync(feed, promptId, null, new IOException("its host went"));
         }
-        store.Update(record.SessionId, record.Agent, r => { r.HostPrompts = null; r.HostOf = null; r.HostSlot = null; });
+        if (keepHost && record.HostPrompts is null) return;
+        store.Update(record.SessionId, record.Agent, r =>
+        {
+            r.HostPrompts = null;
+            if (keepHost) return;
+            r.HostOf = null;
+            r.HostSlot = null;
+        });
     }
 
     // ---------------------------------------------------------------- moving sessions off stale hosts
@@ -349,15 +375,9 @@ public sealed class Conductor : IAsyncDisposable
     async Task MoveIdleAsync(AgentHost host)
     {
         foreach (var link in host.Links.Where(l => !l.Current))
-        {
-            var sessions = host.SessionsOf(link);
-            foreach (var sessionId in sessions)
+            foreach (var sessionId in host.SessionsOf(link))
                 try { await TryMoveAsync(sessionId, holdingTurn: false, cleanupStop.Token); }
                 catch (Exception e) when (e is not OperationCanceledException) { ServiceLog.Warn($"{host.Name} {sessionId}: not moved: {e.Message}"); }
-            // An agent that cannot close one session: its host goes once nothing runs in any of its sessions.
-            if (!link.CanClose && sessions.All(s => !Feed(s).TurnRunning && Feed(s).Asking == 0))
-                await host.StopAsync(link, "nothing runs in its sessions, which its agent cannot close one by one");
-        }
         host.Reap();
     }
 
@@ -372,43 +392,74 @@ public sealed class Conductor : IAsyncDisposable
         });
     }
 
+    /// <summary>What became of a session that a move was tried for (<see cref="TryMoveAsync"/>).</summary>
+    internal enum Move
+    {
+        /// <summary>It is open in no stale host now: nowhere (its next use opens it in a current one), or already in a current one.</summary>
+        Done,
+        /// <summary>Its agent runs a turn of its own in it, asks something in it, or a turn of a client's runs or waits: it moves once that ends.</summary>
+        Wait,
+        /// <summary>It stays where it is for now: a draft its agent cannot open elsewhere, or a host that goes only as a whole while another session of it is busy.</summary>
+        Stay,
+    }
+
+    /// <summary>How long the close of a session that moves may take before the move counts as failed.</summary>
+    internal static TimeSpan MoveCloseTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>How often a turn that waits for its session to move tries again, besides when its agent's turn or question ends.</summary>
+    internal static TimeSpan MoveRetry { get; set; } = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// Whether the session could open in another instance of its agent: it had a turn, or its agent
+    /// keeps a draft (Kimi, DSH) or opens one afresh under its ID (the Claude adapter, <c>gorynych/draft</c>).
+    /// Codex keeps nothing of a thread before its first turn (<c>gorynych/draftsNotDurable</c>): its
+    /// draft can be had only in the app-server that made it.
+    /// </summary>
+    static bool OpensElsewhere(HostLink on, SessionFeed feed) => !on.DraftsNotDurable || feed.Journal.HasTurns;
+
     /// <summary>
     /// Moves a session open in a host of an earlier generation to one of the current, if it is idle
     /// there: no turn runs or waits in it (or this caller holds its turn, to run one in the new host),
-    /// its agent asks nothing in it, and it is no draft (an agent may keep nothing of a draft, and Codex
-    /// fails one opened again). It is closed in the old host (Codex lets go of the thread's writer lock
-    /// before the close answers), and the next use opens it in a host of the current generation, which
-    /// catches its journal up from its mark (<see cref="OpenAsync"/>): what the journal has is not sent
-    /// again, and what it lacks is added. A prompt that comes meanwhile waits for the session's gates and
-    /// goes to the new host. True when it is open nowhere now.
+    /// its agent asks nothing in it, and it could open elsewhere (<see cref="OpensElsewhere"/>). It is
+    /// closed in the old host (Codex lets go of the thread's writer lock before the close answers), and
+    /// the next use opens it in a host of the current generation, which catches its journal up from its
+    /// mark (<see cref="OpenAsync"/>): what the journal has is not sent again, and what it lacks is
+    /// added. A prompt that comes meanwhile waits for the session's gates and goes to the new host. A
+    /// close that fails leaves it to its old host (<see cref="AgentHost.Pin"/>). An agent that cannot
+    /// close one session has its stale host stopped as a whole instead (<see cref="TryStopWholeAsync"/>).
     /// </summary>
-    internal async Task<bool> TryMoveAsync(string sessionId, bool holdingTurn, CancellationToken ct)
+    internal async Task<Move> TryMoveAsync(string sessionId, bool holdingTurn, CancellationToken ct)
     {
-        if (removed.ContainsKey(sessionId) || store.Get(sessionId) is not { Draft: false, Deleted: false } record
-            || !agents.TryGetValue(record.Agent, out var host)) return false;
-        if (host.RouteOf(sessionId) is not { Current: false }) return !host.IsLive(sessionId);
+        if (removed.ContainsKey(sessionId) || store.Get(sessionId) is not { Deleted: false } record
+            || !agents.TryGetValue(record.Agent, out var host)) return Move.Stay;
+        if (host.RouteOf(sessionId) is not { Current: false } stale) return Move.Done;
         var feed = Feed(sessionId);
-        // No turn yet: a draft, though its first prompt has already ended it as one (Promote).
-        if (!feed.Journal.HasTurns) return false;
+        if (!OpensElsewhere(stale, feed)) return Move.Stay;
+        if (!stale.CanClose) return await TryStopWholeAsync(host, stale, holdingTurn ? sessionId : null);
         await feed.LifeGate.WaitAsync(ct);
         var turnTaken = false;
         try
         {
             if (!holdingTurn)
             {
-                if (!feed.TurnGate.Wait(0)) return false;
+                if (!feed.TurnGate.Wait(0)) return Move.Wait;
                 turnTaken = true;
             }
-            if (feed.AgentTurnRunning || feed.Asking > 0) return false;
+            if (feed.AgentTurnRunning || feed.Asking > 0) return Move.Wait;
             await feed.OpenGate.WaitAsync(ct);
             try
             {
-                if (host.RouteOf(sessionId) is not { Current: false } on) return !host.IsLive(sessionId);
-                if (!on.CanClose) return false; // its host goes as a whole (MoveIdleAsync)
-                await CloseInAgentAsync(host, on.Rpc, sessionId, ct);
-                ServiceLog.Info($"{host.Name} {sessionId}: moved off host {on.HostId} ({on.Generation?.ToString() ?? "an earlier version"}); " +
-                    "it opens in a host of the current generation at its next use");
-                return !host.IsLive(sessionId);
+                if (host.RouteOf(sessionId) is not { Current: false } on) return Move.Done;
+                if (!OpensElsewhere(on, feed)) return Move.Stay;
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(MoveCloseTimeout);
+                if (await CloseInAgentAsync(host, on.Rpc, sessionId, ct, timeout.Token))
+                    ServiceLog.Info($"{host.Name} {sessionId}: moved off host {on.HostId} ({on.Generation?.ToString() ?? "an earlier version"}); " +
+                        "it opens in a host of the current generation at its next use");
+                else
+                    ServiceLog.Warn($"{host.Name} {sessionId}: not moved off host {on.HostId}: its close failed there; it opens there again at its next use, " +
+                        "and moves once a close succeeds or that host has exited");
+                return Move.Done;
             }
             finally
             {
@@ -423,9 +474,82 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
+    /// An agent that cannot close one session (none today): its stale host goes as a whole, once none
+    /// of its sessions has a turn running or waiting or its agent asking something, and each could open
+    /// elsewhere. The host is marked stopping first, so nothing new goes to it; then each session's gates
+    /// are taken without waiting (one that is busy calls the stop off, and a later idle moment tries
+    /// again); then the host is stopped, and its sessions are open nowhere before the gates let go, so a
+    /// prompt that waited for them opens its session in a host of the current generation. Drafts there go
+    /// with it as any session does: each opens again where its agent keeps it or opens it afresh.
+    /// </summary>
+    /// <param name="turnHeldFor">The session whose turn the caller holds, for a prompt in it.</param>
+    internal async Task<Move> TryStopWholeAsync(AgentHost host, HostLink link, string? turnHeldFor)
+    {
+        // Another stop of it is on its way, or it is gone: the session stays where it is open now.
+        if (!host.BeginStop(link)) return turnHeldFor is not null && host.RouteOf(turnHeldFor) != link ? Move.Done : Move.Stay;
+        var held = new List<(SessionFeed Feed, bool Turn)>();
+        var stopped = false;
+        try
+        {
+            foreach (var sessionId in host.SessionsOf(link))
+            {
+                var feed = Feed(sessionId);
+                var mine = sessionId == turnHeldFor;
+                // The session the caller holds the turn of waits for its own agent; another one that is busy keeps the host for now.
+                var busy = mine ? Move.Wait : Move.Stay;
+                if (!feed.LifeGate.Wait(0)) return busy;
+                if (!mine && !feed.TurnGate.Wait(0))
+                {
+                    feed.LifeGate.Release();
+                    return busy;
+                }
+                if (!feed.OpenGate.Wait(0))
+                {
+                    if (!mine) feed.TurnGate.Release();
+                    feed.LifeGate.Release();
+                    return busy;
+                }
+                held.Add((feed, !mine));
+                if (feed.AgentTurnRunning || feed.Asking > 0) return busy;
+                if (!OpensElsewhere(link, feed)) return Move.Stay;
+            }
+            await host.StopAndForgetAsync(link, "none of its sessions is busy, and its agent cannot close them one by one");
+            stopped = true;
+            return Move.Done;
+        }
+        finally
+        {
+            if (!stopped) host.CancelStop(link);
+            foreach (var (feed, turn) in held)
+            {
+                feed.OpenGate.Release();
+                if (turn) feed.TurnGate.Release();
+                feed.LifeGate.Release();
+            }
+        }
+    }
+
+    /// <summary>
+    /// What keeps a session in a stale host, for <c>_gorynych/status</c>: what it waits for before it
+    /// moves (<see cref="TryMoveAsync"/>).
+    /// </summary>
+    string WhyNotMoved(HostLink link, string sessionId)
+    {
+        var feed = Feed(sessionId);
+        if (feed.TurnRunning || feed.AgentTurnRunning) return "a turn runs in it: it moves once the turn ends";
+        if (feed.Asking > 0) return "its agent asks something in it: it moves once that is answered";
+        if (!OpensElsewhere(link, feed))
+            return "a draft its agent cannot open in another host: it moves after its first turn there, or goes when its client lets go of it";
+        if (!link.CanClose) return "its agent cannot close one session: the host goes as a whole once none of its sessions is busy";
+        return "it moves at the next look";
+    }
+
+    /// <summary>
     /// With the session's turn held: the connection the turn goes to. A session open in a host of an
     /// earlier generation moves now to one of the current, so a stale host takes no new turn and
-    /// empties; one that moved while this waited for the turn is followed.
+    /// empties; one whose agent runs a turn of its own or asks something is waited for, then moves; one
+    /// that moved while this waited for the turn is followed. What stays in a stale host
+    /// (<see cref="Move.Stay"/>) takes the turn there.
     /// </summary>
     async Task<JsonRpcConnection> RpcForTurnAsync(SessionRecord record, JsonRpcConnection rpc, CancellationToken ct)
     {
@@ -844,6 +968,36 @@ public sealed class Conductor : IAsyncDisposable
         if (store.Get(sessionId) is { TitleSource: SpawnTitle, Title: { } name }) update["title"] = name;
     }
 
+    readonly ConditionalWeakTable<JsonRpcRequest, SessionFeed> askedIn = new(); // the questions counted as they arrived, until they are over
+
+    /// <summary>
+    /// An agent's request was read off its connection (<see cref="JsonRpcConnection.RequestArrived"/>),
+    /// before it is handled on the thread pool: a question in a session counts as asking from now, so a
+    /// move that looks at the session after this sees it (<see cref="TryMoveAsync"/>). A host that comes
+    /// back asks its questions again before it answers its replay, so they count before its sessions
+    /// can move at all; one that goes before it asked them counts none.
+    /// </summary>
+    internal void OnAgentRequestArrived(JsonRpcRequest request)
+    {
+        if (request.Params is not JsonObject p || p["sessionId"] is not JsonValue v || !v.TryGetValue<string>(out var sessionId)
+            || removed.ContainsKey(sessionId)) return;
+        var feed = Feed(sessionId);
+        feed.BeginAsking();
+        askedIn.AddOrUpdate(request, feed);
+    }
+
+    /// <summary>
+    /// A question counted as it arrived is over: its answer is written to the agent's connection (or
+    /// could not be). Only now is the session idle: a move closes it in its host after the answer, on
+    /// the same connection, so the agent has the answer before the close (<see cref="JsonRpcConnection.RequestDone"/>).
+    /// </summary>
+    internal void OnAgentRequestDone(JsonRpcRequest request)
+    {
+        if (!askedIn.TryGetValue(request, out var feed) || !askedIn.Remove(request)) return;
+        feed.EndAsking();
+        IdleFromNow(feed.SessionId);
+    }
+
     /// <summary>
     /// Relays a request from an agent (an approval, an elicitation) to a client attached to
     /// its session. With no client attached it waits for one; if the client goes away before
@@ -875,7 +1029,6 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             feed.EnterUse();
-            feed.BeginOrTakeAsking(); // its agent waits for the answer where it runs: the session does not move meanwhile
         }
         finally { feed.LifeGate.Release(); }
         try
@@ -897,9 +1050,9 @@ public sealed class Conductor : IAsyncDisposable
         }
         finally
         {
-            feed.EndAsking();
             feed.ExitUse();
-            IdleFromNow(sessionId);
+            // A question counted as it arrived goes idle once its answer is written (OnAgentRequestDone).
+            if (!askedIn.TryGetValue(request, out var counted)) IdleFromNow(sessionId);
         }
     }
 
@@ -984,7 +1137,7 @@ public sealed class Conductor : IAsyncDisposable
         // An explicit choice in the request wins; otherwise the agent the connection is scoped to.
         RefuseSystemPrompt(request.SystemPrompt);
         var host = Agent((string?)request.Meta?[GorynychProtocol.MetaAgent] ?? client.AgentScope);
-        var rpc = await host.OpenTargetAsync(ct);
+        var rpc = await host.OpenTargetAsync(null, ct);
         var token = NewToken();
         request.McpServers = WithPeers(request.McpServers, token);
         request.SystemPrompt = SystemPromptFor(host);
@@ -1032,18 +1185,27 @@ public sealed class Conductor : IAsyncDisposable
     internal async Task<(JsonRpcConnection Rpc, JsonObject? Opened)> EnsureLiveAsync(SessionRecord record, CancellationToken ct, bool holdingTurn = false)
     {
         var host = HostOf(record);
-        if (host.RouteOf(record.SessionId) is { } on)
+        var feed = Feed(record.SessionId);
+        var wasOpen = host.IsLive(record.SessionId);
+        // In a stale host: moved first when it is idle, so the new host takes the turn. A turn about to
+        // start waits for the agent's own turn and its questions there, and then moves.
+        while (host.RouteOf(record.SessionId) is { Current: false } stale)
         {
-            // In a stale host: moved first when it is idle, so the new host takes the turn.
-            if (on.Current || !await TryMoveAsync(record.SessionId, holdingTurn, ct)) return (on.Rpc, null);
+            var quieter = feed.Quieter;
+            var move = await TryMoveAsync(record.SessionId, holdingTurn, ct);
+            if (move == Move.Done) break;
+            if (move == Move.Stay || !holdingTurn) return (stale.Rpc, null);
+            await Task.WhenAny(quieter, Task.Delay(MoveRetry, ct));
+            ct.ThrowIfCancellationRequested();
         }
-        else await host.AwaitHostOfAsync(record, ct);
-        var gate = Feed(record.SessionId).OpenGate;
+        if (host.RouteOf(record.SessionId) is { } on) return (on.Rpc, null);
+        if (!wasOpen) await host.AwaitHostOfAsync(record, ct);
+        var gate = feed.OpenGate;
         await gate.WaitAsync(ct);
         try
         {
             if (host.RouteOf(record.SessionId) is { } open) return (open.Rpc, null);
-            var rpc = await host.OpenTargetAsync(ct);
+            var rpc = await host.OpenTargetAsync(record.SessionId, ct);
             // A host that came back with it open while this waited for a host: it is open there.
             if (host.RouteOf(record.SessionId) is { } came)
             {
@@ -1093,8 +1255,10 @@ public sealed class Conductor : IAsyncDisposable
                 meta[GorynychProtocol.MetaReplayFrom] = mark is null
                     ? new JsonObject { ["type"] = GorynychProtocol.ReplayFromStart }
                     : new JsonObject { ["type"] = GorynychProtocol.ReplayAfterMark, ["mark"] = mark };
-            // Kept across a restart for a client on the resumable link: an agent that wrote nothing of it opens it afresh.
-            if (record.Draft) meta[GorynychProtocol.MetaDraft] = true;
+            // No turn yet: a draft kept across a restart for a client on the resumable link, or one that
+            // moved off a stale host, whose first prompt may already have ended it as one (Promote). An
+            // agent that wrote nothing of it opens it afresh; one that knows it opens it as it is.
+            if (record.Draft || !feed.Journal.HasTurns) meta[GorynychProtocol.MetaDraft] = true;
             var resume = new ResumeSessionRequest
             {
                 SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId), SystemPrompt = SystemPromptFor(host),
@@ -1811,21 +1975,42 @@ public sealed class Conductor : IAsyncDisposable
         return null;
     }
 
-    /// <summary>Closes the session in its agent if it is open there, which stops its turn; an agent without close gets a cancel.</summary>
-    static async Task CloseInAgentAsync(AgentHost host, JsonRpcConnection rpc, string sessionId, CancellationToken ct)
+    /// <summary>
+    /// Closes the session in its agent if it is open there, which stops its turn; an agent without
+    /// close gets a cancel. True when it is open nowhere now: the agent answered the close, or said it
+    /// has no such session. A close that fails otherwise (an error, or no answer before
+    /// <paramref name="deadline"/>) may have left it open there, or Codex's writer lock held: the
+    /// session is left to that host, where it opens again, and elsewhere only once that host has gone
+    /// (<see cref="AgentHost.Pin"/>).
+    /// </summary>
+    static async Task<bool> CloseInAgentAsync(AgentHost host, JsonRpcConnection rpc, string sessionId, CancellationToken ct, CancellationToken deadline = default)
     {
-        if (host.RouteOf(sessionId) is not { } on) return;
+        if (host.RouteOf(sessionId) is not { } on) return true;
         rpc = on.Rpc;
         try
         {
-            if (on.CanClose) await rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = sessionId }, ct);
+            if (on.CanClose)
+            {
+                using var both = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline);
+                await rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = sessionId }, both.Token);
+            }
             else await rpc.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId });
         }
-        catch (JsonRpcException e)
+        catch (JsonRpcException e) when (e.Code != JsonRpcException.ResourceNotFound)
         {
-            ServiceLog.Warn($"{host.Name}: closing {sessionId}: {e.Message}");
+            ServiceLog.Warn($"{host.Name} {sessionId}: its close failed in host {on.HostId?.ToString() ?? "(in this process)"}: {e.Message}");
+            host.Pin(sessionId, on);
+            return false;
+        }
+        catch (JsonRpcException) { } // it has no such session: it is open nowhere
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            ServiceLog.Warn($"{host.Name} {sessionId}: its close got no answer in host {on.HostId?.ToString() ?? "(in this process)"} within {MoveCloseTimeout.TotalSeconds:0} s");
+            host.Pin(sessionId, on);
+            return false;
         }
         host.MarkClosed(sessionId);
+        return true;
     }
 
     /// <summary>
@@ -2205,7 +2390,7 @@ public sealed class Conductor : IAsyncDisposable
     async Task<string> CreateChildAsync(SessionRecord parent, AgentHost host, string cwd, string prompt, string? title, bool report, bool approved,
         CancellationToken ct)
     {
-        var rpc = await host.OpenTargetAsync(ct);
+        var rpc = await host.OpenTargetAsync(null, ct);
         var token = NewToken();
         // Not cancelled with the spawn: the agent may create the session anyway, and only its answer names it.
         // No mode is passed: the child starts in its agent's default, never in the caller's full access.
@@ -2880,7 +3065,7 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             if (host.IsLive(record.SessionId) || use.Feed.Journal.HasTurns) return;
-            var rpc = await host.OpenTargetAsync(ct);
+            var rpc = await host.OpenTargetAsync(record.SessionId, ct);
             try
             {
                 var opened = await rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, AcpJson.ToNode(new LoadSessionRequest
@@ -3502,7 +3687,7 @@ public sealed class Conductor : IAsyncDisposable
         ["restarting"] = draining,
         ["hosts"] = options.Hosts is not null,
         ["build"] = options.Hosts is null ? null : HostGeneration.ThisBuild,
-        ["agents"] = new JsonArray(agents.Values.Select(a => (JsonNode)a.Describe(s => !removed.ContainsKey(s) && Feed(s).TurnRunning)).ToArray()),
+        ["agents"] = new JsonArray(agents.Values.Select(a => (JsonNode)a.Describe(s => !removed.ContainsKey(s) && Feed(s).TurnRunning, WhyNotMoved)).ToArray()),
     };
 
     static string? FirstText(IEnumerable<ContentBlock> blocks) =>

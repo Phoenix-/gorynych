@@ -602,7 +602,7 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 | `session/list` | `thread/list {cwd, cursor, limit 50, archived: false, sortKey: updated_at, useStateDbOnly: true}`; `title` is the thread's `name` (none until a name is set or generated: the service shows its provisional title), `updatedAt` from unix seconds |
 | `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}`; with `gorynych/replayFrom`, then the thread's turns after the mark (below). `gorynych/draft` changes nothing: the app-server names a thread, so a thread never prompted is not there after the adapter restarts |
 | `session/load` | the same, then the history from `thread/items/list`, page by page, as the updates below. The service no longer uses it: a thread the journal has not seen is imported through the replay from the start |
-| `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), up to 5 s for the turn to end, then `thread/unsubscribe`. App-server is started with `-c thread_unload_delay_secs=0`, so it unloads the thread at once, and the close returns once `thread/closed` came (at most 10 s): the thread's writer lock is then free for another Codex app. A turn that has not ended by then ends `cancelled`: Codex sends nothing more of an unsubscribed thread |
+| `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), up to 5 s for the turn to end, then `thread/unsubscribe`. App-server is started with `-c thread_unload_delay_secs=0`, so it unloads the thread at once, and the close returns once `thread/closed` came (at most 10 s, else it fails, and the service counts the thread as still held there): the thread's writer lock is then free for another Codex app. A turn that has not ended by then ends `cancelled`: Codex sends nothing more of an unsubscribed thread |
 | `session/delete` | stops a running turn as `session/close` does, then `thread/delete`; a thread Codex no longer has answers `-32002` |
 | `_gorynych/set_title` | `thread/name/set` (works before the first turn too) |
 
@@ -637,7 +637,9 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     can be read is a holder, named by its image and its parent: `Codex Desktop` (any image
     under `%LOCALAPPDATA%\OpenAI\Codex\` or in the `OpenAI.Codex` package, or a `codex*.exe`
     started by `ChatGPT.exe`), `VS Code` (a `codex*.exe` in a VS Code extensions folder or
-    started by `Code.exe`), otherwise a `codex*.exe` is `a terminal codex (pid N)`. Anything else
+    started by `Code.exe`), otherwise a `codex*.exe` is `a terminal codex (pid N)`. A process with a
+    `Gorynych.Service*.exe` above it (also one an update renamed aside) is `another Gorynych host of
+    Codex (pid N)`: another service's, or the host an update leaves running. Anything else
     that has the file open (an antivirus, an indexer, a backup, Explorer's preview), and a
     process that cannot be read (gone, its ID reused, elevated), is ignored: an early refusal is
     final, so a false one would lock a free thread out. (A codex that runs as `node` would be
@@ -645,7 +647,9 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     `CODEX_HOME` comes from the service's environment, else `~/.codex`.
   - **What it does with it.** `session/load` and `session/resume` of a held thread fail at once
     with `This Codex thread is open in <holder>; close it there, then try again.`, before
-    `thread/resume` (so the other app is left alone). The error has no `data`: Zed appends it
+    `thread/resume` (so the other app is left alone). Held by another Gorynych host, it is looked at
+    again every 250 ms for up to 10 s first: after an update a session moves off an earlier host,
+    whose app-server lets go of the thread as its close answers. The error has no `data`: Zed appends it
     to the message as raw JSON, and the message names the holder already. `session/list` marks each held thread with
     `_meta["gorynych/openElsewhere"]`, the folder read once per page, and the adapter answers
     `_gorynych/open_elsewhere` for the service's session lists

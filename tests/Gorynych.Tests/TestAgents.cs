@@ -80,11 +80,12 @@ sealed class ScriptedAgent(JsonRpcConnection rpc)
 
     public Task Update(string sessionId, SessionUpdate update) => Rpc.SendUpdateAsync(sessionId, update);
 
-    public static JsonNode? Init(bool list = true, bool resume = true, bool load = false, bool close = false) => AcpJson.ToNode(new InitializeResponse
+    public static JsonNode? Init(bool list = true, bool resume = true, bool load = false, bool close = false, bool draftsNotDurable = false) => AcpJson.ToNode(new InitializeResponse
     {
         ProtocolVersion = 1,
         AgentCapabilities = new AgentCapabilities
         {
+            Meta = draftsNotDurable ? new JsonObject { [GorynychProtocol.CapDraftsNotDurable] = true } : null,
             LoadSession = load,
             SessionCapabilities = new SessionCapabilities
             {

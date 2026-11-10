@@ -44,6 +44,7 @@ internal sealed class ChannelConsentStore
     readonly Action<string>? log;
     readonly Lock gate = new();
     ChannelConsentRecord? record;
+    ChannelConsentRecord? unsaved; // an answer whose write failed: it holds until the file has a later one
     FileStamp? readStamp;
     bool read;
 
@@ -69,20 +70,31 @@ internal sealed class ChannelConsentStore
         }
     }
 
-    /// <summary>Reads the file when it has not been read yet or another process changed it.</summary>
+    /// <summary>
+    /// Reads the file when it has not been read yet or another process changed it. An answer of this
+    /// process's that could not be saved stays, unless the file holds a later one.
+    /// </summary>
     void Refresh()
     {
         var stamp = FileStamp.Of(path);
         if (read && stamp == readStamp) return;
         read = true;
         readStamp = stamp;
-        if (stamp is null) { record = null; return; }
-        try { record = JsonSerializer.Deserialize(File.ReadAllText(path), ClaudeJsonContext.Default.ChannelConsentRecord); }
-        catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
+        ChannelConsentRecord? fromFile = null;
+        if (stamp is not null)
+            try { fromFile = JsonSerializer.Deserialize(File.ReadAllText(path), ClaudeJsonContext.Default.ChannelConsentRecord); }
+            catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
+            {
+                // Treated as not asked yet, like an answer that could not be saved.
+                log?.Invoke($"claude adapter: {path} is not readable, the person is asked again: {e.Message}");
+            }
+        if (unsaved is { } mine && (fromFile is null || fromFile.AnsweredAt <= mine.AnsweredAt))
         {
-            // Treated as not asked yet, like an answer that could not be saved.
-            log?.Invoke($"claude adapter: {path} is not readable, the person is asked again: {e.Message}");
+            record = mine;
+            return;
         }
+        unsaved = null;
+        record = fromFile;
     }
 
     public void Save(bool accepted, string sessionId)
@@ -97,10 +109,13 @@ internal sealed class ChannelConsentStore
                 AtomicFile.WriteAllText(path, JsonSerializer.Serialize(record, ClaudeJsonContext.Default.ChannelConsentRecord));
                 readStamp = FileStamp.Of(path);
                 read = true;
+                unsaved = null;
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
-                // The answer holds for this run; after a restart the person is asked again.
+                // The answer holds for this process, also when another one changes the file, unless it
+                // saves a later answer; after a restart the person is asked again.
+                unsaved = record;
                 log?.Invoke($"claude adapter: the development-channels answer was not saved to {path}: {e.Message}");
             }
         }

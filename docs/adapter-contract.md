@@ -63,7 +63,11 @@ fallback when the adapter does not provide it.
   when another process changed it, so no instance drops what another wrote.
 - `session/close` MUST let go of the session in the agent before it answers, so that another
   instance can open it at once: Codex answers once its app-server let go of the thread's writer
-  lock. A session moves between hosts so.
+  lock. A session moves between hosts so. A close that could not let go (it gave up waiting) MUST
+  fail rather than answer: the service then counts the session as still held there, opens it there
+  again at its next use, and moves it only once a close succeeds or that host has exited. (Codex
+  fails a close whose app-server did not unload the thread within 10 seconds.) An error that says
+  the agent has no such session (`-32002`) counts as closed.
 - An adapter MUST run the unmodified agent binary or API client under the user's own login on
   that machine, MUST NOT copy credentials between machines, and MUST NOT edit the agent's own
   configuration (`~/.claude`, `~/.codex`, `~/.kimi-code`, `~/.dsh`). Everything it needs goes through
@@ -124,14 +128,18 @@ the agent the `mcpServers` it gets ([§6.2](#62-the-gorynych-mcp-server)).
 - An adapter that can delete but whose agent keeps nothing durable before the first prompt
   SHOULD say so with `agentCapabilities._meta["gorynych/draftsNotDurable"]: true`; the service
   then closes an unused draft and drops it, with no delete and no tombstone. (Codex, which
-  writes a thread at its first turn)
-- **A draft across a restart.** The service keeps a draft while a client on the resumable link
-  may come back for it ([service-protocol.md](service-protocol.md#the-resumable-link)), and
-  then opens it with `session/resume` and `_meta["gorynych/draft"]: true`. An adapter whose
-  agent kept nothing of it and that chooses its own IDs SHOULD open it afresh under that ID
-  (Claude: a new session with `--session-id`). Fallback: the resume fails as for any unknown
-  session, and the client's next prompt there fails with it. (Codex: its app-server names a
-  thread, so a draft does not outlive the adapter)
+  writes a thread at its first turn) It also means a draft opens in no other instance: after an
+  update the draft stays in its stale host until its first turn has run there.
+- **A draft across a restart or a move.** The service keeps a draft while a client on the
+  resumable link may come back for it ([service-protocol.md](service-protocol.md#the-resumable-link)),
+  and moves one off a stale host as any idle session
+  ([service-protocol.md](service-protocol.md#updating-adapters)); then it opens it with
+  `session/resume` and `_meta["gorynych/draft"]: true`, which it sends for any session with no turn
+  yet, also one whose first prompt is on its way. An adapter whose agent kept nothing of it and
+  that chooses its own IDs SHOULD open it afresh under that ID (Claude: a new session with
+  `--session-id`); one that knows the session opens it as it is. Fallback: the resume fails as for
+  any unknown session, and the client's next prompt there fails with it. (Codex: its app-server
+  names a thread, so a draft does not outlive the adapter, and says `gorynych/draftsNotDurable`)
 
 **List.** The adapter SHOULD implement `session/list` (`sessionCapabilities.list`) with the
 `cwd` filter, `title` and `updatedAt`, and MUST NOT list a session it deleted.
@@ -519,7 +527,7 @@ DSH speaks ACP, and its adapter is a thin proxy.
 | Approvals ([§8](#8-approvals-and-forms)) | `can_use_tool` control requests; Allow / Deny only; the gorynych tools allowed by a per-launch rule and pre-allowed; in Full access nothing asks; `bypassPermissions` marked `gorynych/fullAccess` | the PermissionRequest hook; Allow / Deny only; the gorynych tools allowed by a per-launch rule and pre-allowed | Kimi's own `session/request_permission`; the service pre-allows the gorynych tools | command, file change, permissions and MCP tool approvals; no option that writes `~/.codex`; the gorynych tools run unasked (`default_tools_approval_mode: "approve"`); `full-access` marked | sandbox escalations only: a shell escalation refused by the proxy, a file write asks the person; in full access nothing asks; MCP tools unasked; `full-access` marked |
 | Forms | `AskUserQuestion` as `elicitation/create`, through `can_use_tool`; MCP elicitations declined | `AskUserQuestion` as `elicitation/create`; MCP elicitations shown only in the terminal | none seen | `item/tool/requestUserInput` and MCP form elicitations as `elicitation/create`; URL elicitations declined | none (no ask tool, no elicitation in the acp profile) |
 | Titles ([§9](#9-titles)) | `custom-title` from the transcript; `_gorynych/set_title` → `rename_session`, which writes `custom-title` | `ai-title` / `custom-title` from the transcript; no way to set one | the first prompt, cut at 200 characters; no way to set one | `thread/name/updated`; `_gorynych/set_title` → `thread/name/set` for spawn names | none over ACP: the provisional title |
-| Close ([§7](#7-closing-and-unloading)) | ends the process | ends the process | `session/close`, still listed | `turn/interrupt`, up to 5 s for the turn to end, then `thread/unsubscribe`; app-server, started with `thread_unload_delay_secs=0`, unloads it at once and the close waits for `thread/closed` (at most 10 s), so the thread is free for another Codex app | `session/close`: cancels a running prompt, drains DSH's subagents |
+| Close ([§7](#7-closing-and-unloading)) | ends the process | ends the process | `session/close`, still listed | `turn/interrupt`, up to 5 s for the turn to end, then `thread/unsubscribe`; app-server, started with `thread_unload_delay_secs=0`, unloads it at once and the close waits for `thread/closed` (at most 10 s, else it fails), so the thread is free for another Codex app | `session/close`: cancels a running prompt, drains DSH's subagents |
 | Delete ([§10](#10-delete)) | none: a tombstone | none: a tombstone | `session/delete` (`-32602` for an unknown one) | `thread/delete` (also deletes Codex's own sub-agent threads); a thread Codex lacks: `-32002` | none: a tombstone (`dsh web` can delete) |
 | Archive ([§11](#11-archive)) | none: the overlay | none: the overlay | native in Kimi's UI, not in `kimi acp`: the overlay | native, but an archived thread cannot be resumed: the overlay; Codex-archived threads left out | none: the overlay |
 

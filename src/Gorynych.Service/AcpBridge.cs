@@ -199,16 +199,22 @@ public static class AcpBridge
         foreach (var row in HostRows(status)) Console.WriteLine("  " + row);
         if (hosted)
         {
-            var waiting = (status?["agents"] as JsonArray ?? []).OfType<JsonObject>()
+            var stale = (status?["agents"] as JsonArray ?? []).OfType<JsonObject>()
                 .SelectMany(a => (a["hosts"] as JsonArray ?? []).OfType<JsonObject>().Where(x => x["current"] is JsonValue c && c.TryGetValue<bool>(out var current) && !current))
-                .Sum(x => (x["sessions"] as JsonArray)?.Count ?? 0);
-            Console.WriteLine(waiting == 0 ? "nothing waits to move: every host runs the current build"
-                : $"{waiting} session{(waiting == 1 ? "" : "s")} wait{(waiting == 1 ? "s" : "")} in hosts of an earlier build, and move once idle");
+                .ToList();
+            var waiting = stale.Sum(x => (x["waiting"] as JsonObject)?.Count ?? (x["sessions"] as JsonArray)?.Count ?? 0);
+            // The executable renamed aside by an update (Gorynych.Service.*.old.exe) is free once no host of an earlier build runs.
+            Console.WriteLine(stale.Count == 0 ? "nothing waits to move: every host runs the current build, and no process runs an earlier executable"
+                : waiting == 0 ? $"{stale.Count} host{(stale.Count == 1 ? "" : "s")} of an earlier build {(stale.Count == 1 ? "is" : "are")} on {(stale.Count == 1 ? "its" : "their")} way out"
+                : $"{waiting} session{(waiting == 1 ? "" : "s")} wait{(waiting == 1 ? "s" : "")} in hosts of an earlier build, each for what is said above");
         }
         return 0;
     }
 
-    /// <summary>A line per adapter host of a <c>_gorynych/status</c>: its adapter, build, whether stale, options, sessions and running turns.</summary>
+    /// <summary>
+    /// A line per adapter host of a <c>_gorynych/status</c>: its adapter, build, whether stale, options,
+    /// sessions and running turns; under a stale one, a line per session for what keeps it there.
+    /// </summary>
     static IEnumerable<string> HostRows(JsonNode? status)
     {
         foreach (var agent in (status?["agents"] as JsonArray ?? []).OfType<JsonObject>())
@@ -218,10 +224,13 @@ public static class AcpBridge
                 var sessions = (x["sessions"] as JsonArray ?? []).Select(s => (string?)s).OfType<string>().ToList();
                 var options = string.Join(' ', (x["options"] as JsonArray ?? []).Select(o => (string?)o));
                 var turns = (int?)x["turns"] ?? 0;
+                var stopping = x["stopping"] is JsonValue s && s.TryGetValue<bool>(out var going) && going;
                 yield return $"{(string?)agent["name"],-7} host {(string?)x["hostId"]} (process {(int?)x["processId"]}): " +
-                    $"{(current ? "current" : "stale")}, build {(string?)x["build"] ?? "(an earlier version)"}{(options.Length > 0 ? $" {options}" : "")}, " +
+                    $"{(current ? "current" : "stale")}{(stopping ? ", stopping" : "")}, build {(string?)x["build"] ?? "(an earlier version)"}{(options.Length > 0 ? $" {options}" : "")}, " +
                     $"{sessions.Count} session{(sessions.Count == 1 ? "" : "s")}{(sessions.Count > 0 ? $" ({string.Join(", ", sessions)})" : "")}, " +
                     $"{turns} turn{(turns == 1 ? "" : "s")} running";
+                foreach (var (session, why) in x["waiting"] as JsonObject ?? [])
+                    yield return $"          {session}: {(string?)why}";
             }
     }
 

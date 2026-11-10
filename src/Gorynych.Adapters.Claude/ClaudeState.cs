@@ -36,7 +36,9 @@ public sealed class ClaudeStateStore
     readonly string path;
     readonly Lock gate = new();
     readonly Dictionary<string, ClaudeSessionRecord> records = new(StringComparer.Ordinal);
-    readonly Dictionary<string, ClaudeSessionRecord> unsaved = new(StringComparer.Ordinal); // changes whose write failed
+    // Changes whose write failed, in order: applied again to what each reload reads, so another
+    // process's newer change to the same session is kept, and only this one's fields go over it.
+    readonly List<(string Id, string Cwd, DateTimeOffset At, Action<ClaudeSessionRecord> Change)> unsaved = [];
     FileStamp? readStamp;
     bool read;
 
@@ -86,13 +88,9 @@ public sealed class ClaudeStateStore
                     fileLock = null;
                     log?.Invoke($"claude sessions file not locked or read, the change is kept in memory: {e.Message}");
                 }
-                if (!records.TryGetValue(id, out var r))
-                {
-                    var now = DateTimeOffset.UtcNow;
-                    records[id] = r = new ClaudeSessionRecord { SessionId = id, Cwd = cwd, CreatedAt = now, UpdatedAt = now };
-                }
-                change(r);
-                unsaved[id] = r;
+                var now = DateTimeOffset.UtcNow;
+                Apply(id, cwd, now, change);
+                unsaved.Add((id, cwd, now, change));
                 if (fileLock is null) return;
                 try
                 {
@@ -119,7 +117,11 @@ public sealed class ClaudeStateStore
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { /* read again next time */ }
     }
 
-    /// <summary>Replaces the records with the file's (a missing or unreadable file reads as empty), keeping unsaved changes.</summary>
+    /// <summary>
+    /// Replaces the records with the file's (a missing or unreadable file reads as empty), then applies
+    /// the unsaved changes to them again. A change that reads the clock (<c>UpdatedAt</c>) gets the
+    /// time of the reload; it is written with the next change that is saved.
+    /// </summary>
     void Reload()
     {
         var stamp = FileStamp.Of(path);
@@ -131,8 +133,16 @@ public sealed class ClaudeStateStore
         }
         records.Clear();
         foreach (var r in fromFile) records[r.SessionId] = r;
-        foreach (var (id, r) in unsaved) records[id] = r;
+        foreach (var (id, cwd, at, change) in unsaved) Apply(id, cwd, at, change);
         readStamp = stamp;
         read = true;
+    }
+
+    /// <summary>Applies a change to the session's record, made first if there is none.</summary>
+    void Apply(string id, string cwd, DateTimeOffset at, Action<ClaudeSessionRecord> change)
+    {
+        if (!records.TryGetValue(id, out var r))
+            records[id] = r = new ClaudeSessionRecord { SessionId = id, Cwd = cwd, CreatedAt = at, UpdatedAt = at };
+        change(r);
     }
 }

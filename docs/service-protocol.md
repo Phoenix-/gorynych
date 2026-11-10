@@ -205,7 +205,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/error` | the `_meta` of the mark that ends a prompt's turn | `{code, message}`: the prompt failed so |
 | `gorynych/restarting` | the `data` of an error | `true`: the service did not carry the request out because it is restarting; it may go again, as it is, to the next service, or to this one once the restart is called off |
 | `gorynych/restart` | the `data` of a `gorynych/restarting` error | the number of the restart that refused it, as in `_gorynych/restarting` and `_gorynych/restart_aborted` |
-| `gorynych/draft` | `session/resume` params `_meta`, service → adapter | `true` for a draft: an adapter that keeps nothing before the first prompt and no longer knows the session opens it afresh under its ID ([adapter-contract.md](adapter-contract.md#3-new-sessions-the-list-and-discovery)) |
+| `gorynych/draft` | `session/resume` params `_meta`, service → adapter | `true` for a session with no turn yet: a draft, also one that moved to another host and whose first prompt is on its way ([Updating adapters](#updating-adapters)). An adapter that keeps nothing before the first prompt and no longer knows the session opens it afresh under its ID; one that knows it opens it as it is ([adapter-contract.md](adapter-contract.md#3-new-sessions-the-list-and-discovery)) |
 | `gorynych/replay` | `session/resume` result `_meta`, adapter → service | what was replayed: `{"from": "mark" \| "start", "mark": "<new mark>"}` |
 | `gorynych/historyMark` | `session/prompt` result `_meta`; the `_meta` of the update that ends a turn of the agent's own (`gorynych/agentTurn: "ended"`) | the adapter's opaque mark of how far into its own history the journal now goes |
 | `gorynych/sender` | `user_message_chunk._meta` | who asked, for example `peer_claude`, `parent_claude` for a spawn, `child_kimi` for a report, `outside_claude-code` for an agent outside Gorynych (`outside_<client name>`): a label for GUIs only; the text the agent gets names the session by its ID instead (see [What agents are told](#what-agents-are-told)) |
@@ -237,7 +237,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply`, `_gorynych/spawn` and `_gorynych/archive` | which session's `gorynych` MCP server is calling |
 | `_gorynych/host_hello` | notification, host → conductor, the first message on the host pipe, `{token, hostId, adapter, link, pid, version, slot?, build?, options?}` | an [adapter host](#adapter-hosts) proves itself and says what it runs: which host of its adapter it is (`slot`), and its generation (`build`, `options`; [Updating adapters](#updating-adapters)) |
 | `gorynych/host` | `initialize` result `_meta`, host → conductor | `{hostId, link, reattached}`: the host, its link version, and whether it answers from its agent's first `initialize` (it came back) |
-| `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, turns: [{sessionId, turn, promptId?}], buffered, requests, asking, seq}` | what a host that came back has: open sessions, running prompts, the sessions it keeps updates for, open questions (`asking`: the session of each), its last number |
+| `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, turns: [{sessionId, turn, promptId?}], buffered, requests, seq}` | what a host that came back has: open sessions, running prompts, the sessions it keeps updates for, how many questions it asks again, its last number |
 | `_gorynych/host_replay` | method, conductor → host, `{after: {"<sessionId>": n}}` → `{replayed, trimmed}` | sends what the host kept after each session's cursor and its open questions, then makes this conductor its own |
 | `_gorynych/host_stop` | method, conductor → host, `{}` → `{}` | the service shuts down: the host stops its agents and exits |
 | `_gorynych/turn_ended` | notification, host → conductor, `{sessionId, turn, promptId?, result \| error}` | how a prompt ended, sent before its answer, numbered like an update; the conductor marks the turn's end from it |
@@ -1556,7 +1556,14 @@ The rest is on the **host pipe**, `<pipe>.hosts`, made like the service's
    notifications, 32 MB at most): their journal is marked trimmed, as one over its bound is.
 
 Then requests for the adapter go to the host, and the conductor serves it as it served the
-adapter in its own process.
+adapter in its own process. Until then nothing sees the host: a client that resumes one of its
+sessions meanwhile waits for it, by the host the overlay names for the session (`hostOf`), which
+stays named until the host is taken.
+
+A question of an agent's counts from the moment the conductor reads it off the connection, before
+it is handled, and until its answer is written back: the questions a host asks again come before the
+answer to its replay, so they count before any of its sessions can move, and one that went with its
+host counts no more.
 
 **Numbers.** The host numbers what its agent sends for a session, each `session/update` and each
 `_gorynych/turn_ended`, with `gorynych/hostSeq` `"<hostId>/<n>"`: in the update's own `_meta`, and
@@ -1706,9 +1713,8 @@ generation: the adapter-wide one, or for Claude a new host of the session's own.
 no new session and, below, no new turn.
 
 **Moving a session.** A session open in a stale host moves when it is idle there: no turn runs or
-waits in it, its agent asks nothing in it (an approval, a form), and it had a turn already (a draft
-stays where it was made until its first turn ends: an agent may keep nothing of it, and Codex fails
-a thread opened again before its first turn).
+waits in it, and its agent asks nothing in it (an approval, a form; a question counts from the
+moment the conductor reads it until its answer is written back, so a move never overtakes it).
 
 1. Under the session's gates, the conductor closes it in the stale host (`session/close`). Codex
    answers once its app-server let go of the thread (`thread/closed`), so its writer lock is free.
@@ -1719,27 +1725,65 @@ a thread opened again before its first turn).
 3. A prompt, or anything else, that comes meanwhile waits for the session's gates, and then goes
    to the new host.
 
+**A draft** (a session with no turn yet) moves as any idle session does: Kimi keeps a draft, DSH
+writes one at once, and the Claude adapter opens one afresh under its ID (`gorynych/draft` on the
+resume, also for a draft whose first prompt is on its way). Codex cannot: a thread with no turn
+lives only in the app-server that made it (`gorynych/draftsNotDurable`). A Codex draft stays in its
+stale host until its first turn has run there, then moves; or it goes when its client lets go of it
+(the draft is dropped, [Drafts and deletion](#drafts-and-deletion)). Zed makes a draft whenever its
+agent panel opens, so an open, empty Codex panel keeps its stale host, and `status` says so.
+
+**A close that fails** (an error, or no answer within 30 seconds; Codex fails one whose app-server
+did not unload the thread within 10 seconds) does not count as a move: the agent there may still
+have the session open, and Codex's app-server its writer lock. The session opens in that host again
+at its next use, and moves once a close succeeds; if that host exits meanwhile (it is stopped once it
+has no other session), the session opens elsewhere only once its process has gone. In the new host,
+Codex waits up to 10 seconds for an earlier Gorynych host of Codex to let go of a thread before it
+refuses it as open elsewhere.
+
 It moves:
 
 - when a stale host connects, every idle session of it;
 - when a session goes idle (its turn ends, its agent's question is answered, a use of it ends);
 - when a prompt comes for it, before its turn starts: also a prompt that waited behind a turn, so
-  that a stale host runs only the turns it had when it went stale;
+  that a stale host runs only the turns it had when it went stale. A prompt that finds the agent
+  running a turn of its own in the session, or asking something in it, waits for that to end, and
+  then the session moves;
 - and every 30 seconds, every idle session of a stale host, should a moment have been missed.
 
 A stale host left with no session is stopped (`_gorynych/host_stop`) and exits. So is a Claude
-session's host when its session closes. An adapter that could not close one session would have
-its stale host stopped as a whole once nothing runs in any of its sessions; every adapter today
-can.
+session's host when its session closes. An adapter that could not close one session (none today)
+has its stale host stopped as a whole once none of its sessions is busy: the host is marked
+stopping, so nothing new goes to it; each session's gates are taken, without waiting (a busy one
+calls the stop off until a later idle moment); the host is stopped, and its sessions are open
+nowhere before the gates let go, so a prompt that came meanwhile opens its session in a host of the
+current generation. Its drafts go with it as any draft moves.
 
-**No drain.** A stale host takes no new turn, so it empties as soon as the turns it runs end, which
-a drain would wait for too. A turn that never ends keeps its host, and the old executable, until
-it is cancelled from the client; `restart` with hosts never cancels a turn.
+**A stale host takes no new turn**, but for these: a Codex draft's first turn (above); a session
+whose close failed there, until a close succeeds; and, for an adapter that cannot close one
+session, a prompt that comes while another session of the host is busy.
+
+**No drain.** A stale host takes no new turn otherwise, so it empties as soon as the turns it runs
+end, which a drain would wait for too. A turn that never ends keeps its host, and the old
+executable, until it is cancelled from the client; `restart` with hosts never cancels a turn.
 
 **Across a restart.** At its exit the service keeps in the overlay the host each session is open in
 (`hostOf`, `hostSlot`). The next one waits up to 30 seconds for that host to come back before it
 opens the session anywhere else, and for a host of an earlier version that ran the whole adapter,
-so a session is never open in two hosts. One whose host does not run any more is opened afresh.
+so a session is never open in two hosts. The host stays named until it is taken, past the settling
+of its turns. One whose host does not run any more is opened afresh.
+
+**Builds and their cost.** The service and each host read their build first thing at their start
+(about 25 ms for the 27 MB Native AOT executable), before an update can rename the executable aside.
+A host reads its own files rather than take the build from the service: a service on its way out of
+an update starts the executable now in place, which is the new one. A file that cannot be read is
+tried again a few times; one that still cannot makes the build one of that process's own, which no
+other host or service has (logged), so sessions move rather than two builds look alike.
+
+**Starting hosts that fail.** A host that cannot be had (it exits before it connects, or does not
+connect in time) makes the requests for that kind of host fail at once for a while (10 seconds,
+doubling up to 5 minutes): the host of that slot, and for Claude every session's host of that
+generation. The adapter-wide host, and the hosts of another generation, start as before.
 
 **Updates in a row.** Hosts of several earlier generations may run at once; each empties and exits
 on its own, the same way.
@@ -1753,8 +1797,11 @@ and Claude always runs one per session, all on the same data folder: the adapter
 there safe for several processes ([adapter-contract.md](adapter-contract.md#1-building-and-starting-an-adapter)).
 
 **Seeing it.** `_gorynych/status` lists each adapter's hosts with their generation, sessions and
-running turns. `Gorynych.Service status` prints them, and how many sessions still wait in stale
-hosts; `restart` prints the hosts that keep running.
+running turns, and for a stale host what keeps each of its sessions there (`waiting`: session →
+reason: a turn runs, the agent asks something, a draft its agent cannot open elsewhere, a close that
+failed). `Gorynych.Service status` prints them, a line per waiting session, and whether anything
+still waits; `restart` prints the hosts that keep running. The executable an update renamed aside
+(`Gorynych.Service.*.old.exe`) is free once `status` says nothing waits.
 
 ## Overlay
 

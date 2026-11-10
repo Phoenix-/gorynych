@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Gorynych.Acp.Hosting;
 using Gorynych.Adapters.Claude;
@@ -135,6 +136,48 @@ public sealed class ClaudeStoresTests
         b.Save(false, "s2");
         Assert.AreEqual(false, a.Answer);
         Assert.AreEqual(false, new ChannelConsentStore(path).Answer);
+    }
+
+    [TestMethod]
+    public void State_AChangeThatCouldNotBeSaved_GoesOverAnotherInstancesNewerRecord_FieldByField()
+    {
+        var path = Path.Combine(TestDirs.New(), "sessions.json");
+        var a = new ClaudeStateStore(path);
+        var b = new ClaudeStateStore(path);
+        a.Update("s1", "/w", r => r.Title = "first");
+        Assert.AreEqual("first", b.Get("s1")!.Title);
+
+        using (SharedFileLock.Acquire(path)) // another process holds the file: a's change stays in memory
+            a.Update("s1", "/w", r => r.Model = "opus");
+        b.Update("s1", "/w", r => r.Title = "renamed"); // then another process renames it
+
+        var seen = a.Get("s1")!;
+        Assert.AreEqual(("renamed", "opus"), (seen.Title, seen.Model), "the newer title is kept, and only a's own change goes over it");
+        a.Update("s2", "/w", _ => { }); // the next change that is saved writes the one kept in memory too
+        var fresh = new ClaudeStateStore(path).Get("s1")!;
+        Assert.AreEqual(("renamed", "opus"), (fresh.Title, fresh.Model));
+    }
+
+    [TestMethod]
+    public void Consent_AnAnswerThatCouldNotBeSaved_HoldsUntilTheFileHasALaterOne()
+    {
+        var path = Path.Combine(TestDirs.New(), "claude", "channels.json");
+        var a = new ChannelConsentStore(path);
+        var b = new ChannelConsentStore(path);
+        b.Save(false, "s0");
+        Assert.AreEqual(false, a.Answer);
+        using (SharedFileLock.Acquire(path))
+            a.Save(true, "s1"); // not saved
+        Assert.AreEqual(true, a.Answer);
+
+        // Another process writes an answer given before this one: it does not replace it.
+        void Write(bool accepted, DateTimeOffset at) =>
+            File.WriteAllText(path, JsonSerializer.Serialize(new ChannelConsentRecord { Accepted = accepted, AnsweredAt = at, SessionId = "other" },
+                ClaudeJsonContext.Default.ChannelConsentRecord));
+        Write(false, DateTimeOffset.UtcNow.AddMinutes(-1));
+        Assert.AreEqual(true, a.Answer, "an earlier answer on disk does not replace the later one in memory");
+        Write(false, DateTimeOffset.UtcNow.AddMinutes(1));
+        Assert.AreEqual(false, a.Answer, "a later one does");
     }
 
     [TestMethod]

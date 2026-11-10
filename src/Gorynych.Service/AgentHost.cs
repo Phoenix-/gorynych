@@ -49,6 +49,10 @@ public sealed class HostLink
     internal bool Stopping; // under linksGate
 
     public bool CanClose => Info.AgentCapabilities?.SessionCapabilities?.Close is not null;
+
+    /// <summary>Its agent keeps nothing of a session before its first prompt, so a draft cannot open in another instance (Codex).</summary>
+    public bool DraftsNotDurable =>
+        Info.AgentCapabilities?.Meta?[GorynychProtocol.CapDraftsNotDurable] is JsonValue v && v.TryGetValue<bool>(out var on) && on;
 }
 
 /// <summary>What a host said in its hello (<see cref="Conductor.ServeHostAsync"/>).</summary>
@@ -71,6 +75,8 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     readonly Dictionary<string, TaskCompletionSource<HostLink>> arriving = new(StringComparer.Ordinal); // slot -> its attach; under linksGate
     readonly HashSet<string> goneHosts = new(StringComparer.Ordinal);                             // under linksGate
     readonly HashSet<string> claimed = new(StringComparer.Ordinal);                                // slots started for an open; under linksGate
+    readonly Dictionary<string, HostLink> pinned = new(StringComparer.Ordinal);                    // session -> the host whose close of it failed; under linksGate
+    readonly Dictionary<string, HostFailure> failures = new(StringComparer.Ordinal);               // FailureKey(slot) -> its last failure; under linksGate
     AgentInstance? instance;
 
     public string Name => adapter.Name;
@@ -160,6 +166,8 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         var started = await adapter.StartAsync(ct);
         var rpc = new JsonRpcConnection(started.Input, started.Output, Name)
         {
+            RequestArrived = conductor.OnAgentRequestArrived,
+            RequestDone = conductor.OnAgentRequestDone,
             RequestHandler = (req, token) => conductor.OnAgentRequestAsync(this, req, token),
             NotificationHandler = (method, p) => conductor.OnAgentNotificationAsync(this, method, p),
             Log = m => ServiceLog.Warn(m),
@@ -196,11 +204,14 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
 
     /// <summary>
     /// Where a session is opened or created: the adapter-wide instance, or with a host per session a
-    /// new host of its own. It counts as an open on its way, so the host is not stopped as empty, until
-    /// <see cref="DoneOpening"/>.
+    /// new host of its own; a session whose close failed in a host (<see cref="Pin"/>) opens there
+    /// again while that host runs, and elsewhere only once it has gone. It counts as an open on its
+    /// way, so the host is not stopped as empty, until <see cref="DoneOpening"/>.
     /// </summary>
-    internal async Task<JsonRpcConnection> OpenTargetAsync(CancellationToken ct)
+    /// <param name="sessionId">The session that opens; null for a new one.</param>
+    internal async Task<JsonRpcConnection> OpenTargetAsync(string? sessionId, CancellationToken ct)
     {
+        if (sessionId is not null && await PinnedTargetAsync(sessionId, ct) is { } again) return again.Rpc;
         HostLink link;
         if (PerSession)
         {
@@ -221,6 +232,80 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             lock (linksGate) link.Opening++;
         }
         return link.Rpc;
+    }
+
+    /// <summary>
+    /// The host a session's failed close left it with (<see cref="Pin"/>), counted as an open on its
+    /// way, while it runs and is not stopping. One that is on its way out may still hold the session:
+    /// it is waited for (up to <see cref="AttachTimeout"/>) and the session opens elsewhere after.
+    /// </summary>
+    async Task<HostLink?> PinnedTargetAsync(string sessionId, CancellationToken ct)
+    {
+        HostLink? link;
+        lock (linksGate)
+        {
+            if (!pinned.TryGetValue(sessionId, out link)) return null;
+            if (!link.Stopping && !link.Rpc.IsClosed && links.Contains(link))
+            {
+                link.Opening++;
+                return link;
+            }
+        }
+        // Its connection closes first; the host answers its stop before it stops its agent, so the
+        // process's exit is what tells that it let go.
+        var waited = Stopwatch.StartNew();
+        await Task.WhenAny(link.Rpc.Completion, Task.Delay(AttachTimeout, ct));
+        ct.ThrowIfCancellationRequested();
+        if (!link.Rpc.IsClosed || !await ExitedAsync(link.ProcessId, AttachTimeout - waited.Elapsed, ct))
+            ServiceLog.Warn($"{Name} {sessionId}: host {link.HostId}, whose close of it failed, has not exited within {AttachTimeout.TotalSeconds:0} s; it opens elsewhere all the same");
+        lock (linksGate)
+            if (pinned.TryGetValue(sessionId, out var still) && still == link) pinned.Remove(sessionId);
+        return null;
+    }
+
+    /// <summary>Whether the process has exited within <paramref name="wait"/>; one not known (no ID, or not to be opened) counts as exited.</summary>
+    static async Task<bool> ExitedAsync(int processId, TimeSpan wait, CancellationToken ct)
+    {
+        if (processId <= 0 || processId == Environment.ProcessId) return true;
+        Process process;
+        try { process = Process.GetProcessById(processId); }
+        catch (ArgumentException) { return true; }
+        catch (InvalidOperationException) { return true; }
+        using (process)
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(wait > TimeSpan.Zero ? wait : TimeSpan.Zero);
+            try
+            {
+                await process.WaitForExitAsync(timeout.Token);
+                return true;
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { return false; }
+            catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception) { return true; }
+        }
+    }
+
+    /// <summary>
+    /// A close of the session failed in <paramref name="link"/> (an error, or no answer in time): the
+    /// agent there may still have it open, Codex's app-server its writer lock. It is open nowhere as
+    /// far as requests go, but opens in that host again while it runs, and elsewhere only once that
+    /// host has gone (<see cref="OpenTargetAsync"/>). A host left with no session is stopped as usual,
+    /// which lets go of everything.
+    /// </summary>
+    internal void Pin(string sessionId, HostLink link)
+    {
+        lock (linksGate)
+        {
+            if (route.Remove(sessionId, out var on)) on.Sessions.Remove(sessionId);
+            if (links.Contains(link)) pinned[sessionId] = link;
+        }
+        Reap();
+    }
+
+    /// <summary>The sessions whose close failed in a host, and which open there again: they have not moved yet.</summary>
+    internal string[] PinnedTo(HostLink link)
+    {
+        lock (linksGate) return [.. pinned.Where(p => p.Value == link).Select(p => p.Key)];
     }
 
     /// <summary>An open on <paramref name="rpc"/> (<see cref="OpenTargetAsync"/>) is over: marked live there, or failed.</summary>
@@ -255,10 +340,10 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             {
                 if (links.FirstOrDefault(l => l.Slot == slot && !l.Stopping && !l.Rpc.IsClosed) is { } ready)
                 {
-                    hostFailure = null;
+                    failures.Remove(FailureKey(slot));
                     return ready;
                 }
-                if (hostFailure is { } failed && Environment.TickCount64 < failed.RetryAt)
+                if (failures.GetValueOrDefault(FailureKey(slot)) is { } failed && Environment.TickCount64 < failed.RetryAt)
                     throw HostFailed($"{failed.Why} Gorynych starts it again in {(failed.RetryAt - Environment.TickCount64 + 999) / 1000} seconds.");
                 if (!arriving.TryGetValue(slot, out var waiting))
                     arriving[slot] = waiting = new TaskCompletionSource<HostLink>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -286,7 +371,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             }
             if (!gone && arrival.IsCompletedSuccessfully && arrival.Result is { Stopping: false } got && !got.Rpc.IsClosed)
             {
-                lock (linksGate) hostFailure = null;
+                lock (linksGate) failures.Remove(FailureKey(slot));
                 return got;
             }
             // It went as it connected (it died, or its link broke): the next one, in the same wait.
@@ -297,27 +382,34 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     }
 
     /// <summary>
-    /// The host could not be had: the requests that come in the next while fail at once with the same
-    /// words, rather than each wait for a host that fails again; the while doubles up to 5 minutes.
+    /// The host could not be had: the requests for the same kind of host that come in the next while
+    /// fail at once with the same words, rather than each wait for a host that fails again; the while
+    /// doubles up to 5 minutes. Other hosts of the adapter start as before (<see cref="FailureKey"/>).
     /// </summary>
     [System.Diagnostics.CodeAnalysis.DoesNotReturn]
     void Fail(string slot, string why)
     {
         lock (linksGate)
         {
-            var backoff = hostFailure is { } before ? TimeSpan.FromTicks(Math.Min(before.Backoff.Ticks * 2, MaxHostBackoff.Ticks)) : HostBackoff;
-            hostFailure = new HostFailure(why, Environment.TickCount64 + (long)backoff.TotalMilliseconds, backoff);
+            var key = FailureKey(slot);
+            var backoff = failures.GetValueOrDefault(key) is { } before ? TimeSpan.FromTicks(Math.Min(before.Backoff.Ticks * 2, MaxHostBackoff.Ticks)) : HostBackoff;
+            failures[key] = new HostFailure(why, Environment.TickCount64 + (long)backoff.TotalMilliseconds, backoff);
             arriving.Remove(slot); // a host that comes after all is no one's open on its way
         }
         ServiceLog.Warn($"{Name}: {why}");
         throw HostFailed(why);
     }
 
+    /// <summary>
+    /// What a failure holds back: the host of its slot, and for a session's host (Claude) every
+    /// session's host of that generation, since each is started anew with a slot of its own and would
+    /// fail the same way; not the adapter-wide host, nor the hosts of another generation.
+    /// </summary>
+    static string FailureKey(string slot) => slot.IndexOf('.') is var dot and >= 0 ? slot[..dot] + ".*" : slot;
+
     static JsonRpcException HostFailed(string why) => new(JsonRpcException.InternalError, why);
 
     sealed record HostFailure(string Why, long RetryAt, TimeSpan Backoff);
-
-    HostFailure? hostFailure; // under linksGate
 
     /// <summary>How often a request that waits for the host looks whether it still runs.</summary>
     internal static TimeSpan HostCheckInterval { get; set; } = TimeSpan.FromMilliseconds(250);
@@ -360,6 +452,10 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             catch (Exception e) when (e is IOException or JsonRpcException or TimeoutException) { }
             return false;
         }
+        // A question counts from the moment it is read: the ones a host that comes back asks again come
+        // before the answer to its replay, so before its sessions can move (Conductor.OnAgentRequestArrived).
+        rpc.RequestArrived = conductor.OnAgentRequestArrived;
+        rpc.RequestDone = conductor.OnAgentRequestDone;
         rpc.RequestHandler = (req, token) => conductor.OnAgentRequestAsync(this, req, token);
         rpc.NotificationHandler = (method, p) => conductor.OnAgentNotificationAsync(this, method, p);
         var init = await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, InitializeParams(), ct);
@@ -410,6 +506,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             arriving.Remove(link.Slot, out arrival);
         }
         _ = rpc.Completion.ContinueWith(_ => OnClosed(link), TaskScheduler.Default);
+        conductor.HostTaken(this, link);
         ServiceLog.Info($"{Name}: host {hello.HostId} ({SlotName(link.Slot)}, {(link.Current ? "current" : "stale")}, {hello.Generation?.ToString() ?? "no generation"}) " +
             $"{(reattached ? "came back" : "started")}: {init.AgentInfo?.Name} {init.AgentInfo?.Version}, {sessions.Count} sessions open, " +
             $"{(report?["turns"] as JsonArray)?.Count ?? 0} turns running, {(int?)replayed?["replayed"] ?? 0} updates sent again");
@@ -429,6 +526,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         lock (linksGate)
         {
             if (link.HostId is { } id && Hosts is not null) goneHosts.Add(id); // also one that went before it was taken
+            foreach (var p in pinned.Where(p => p.Value == link).Select(p => p.Key).ToList()) pinned.Remove(p); // it holds nothing now
             if (!links.Remove(link)) return [];
             var lost = link.Sessions.ToList();
             foreach (var s in lost)
@@ -485,6 +583,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             if (route.TryGetValue(sessionId, out var was) && was != link) was.Sessions.Remove(sessionId);
             route[sessionId] = link;
             link.Sessions.Add(sessionId);
+            pinned.Remove(sessionId);
         }
     }
 
@@ -510,6 +609,34 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             foreach (var l in idle) l.Stopping = true;
         }
         foreach (var link in idle) _ = StopAsync(link, link.Current ? "its session closed" : "its sessions moved to a host of the current generation");
+    }
+
+    /// <summary>
+    /// Marks a stale host as stopping, so no new session or open goes to it, when nothing is on its
+    /// way to it: the first step of stopping it as a whole (<see cref="Conductor.TryStopWholeAsync"/>).
+    /// False when it is current, already stopping, gone, or an open is on its way to it.
+    /// </summary>
+    internal bool BeginStop(HostLink link)
+    {
+        lock (linksGate)
+        {
+            if (link.Current || link.Stopping || link.Rpc.IsClosed || link.Opening > 0 || !links.Contains(link)) return false;
+            link.Stopping = true;
+            return true;
+        }
+    }
+
+    /// <summary>A stop begun (<see cref="BeginStop"/>) is called off: one of its sessions was busy.</summary>
+    internal void CancelStop(HostLink link)
+    {
+        lock (linksGate) link.Stopping = false;
+    }
+
+    /// <summary>Stops a host begun to stop (<see cref="BeginStop"/>), and forgets it at once: its sessions are open nowhere when this returns.</summary>
+    internal async Task StopAndForgetAsync(HostLink link, string why)
+    {
+        await StopAsync(link, why);
+        OnClosed(link);
     }
 
     /// <summary>Stops a host the conductor has no more use for: it stops its agent and exits.</summary>
@@ -599,8 +726,12 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
 
     bool Flag(string key) => Info?.AgentCapabilities?.Meta?[key] is JsonValue v && v.TryGetValue<bool>(out var on) && on;
 
-    /// <summary>Its instances for <c>_gorynych/status</c>: generation, sessions and, as the conductor sees them, running turns.</summary>
-    public JsonObject Describe(Func<string, bool>? turnRuns = null)
+    /// <summary>
+    /// Its instances for <c>_gorynych/status</c>: generation, sessions and, as the conductor sees them,
+    /// running turns; for a stale one, what keeps each of its sessions there (<paramref name="why"/>),
+    /// and the sessions whose close failed in it, which open there again (<see cref="Pin"/>).
+    /// </summary>
+    internal JsonObject Describe(Func<string, bool>? turnRuns = null, Func<HostLink, string, string>? why = null)
     {
         turnRuns ??= _ => false;
         var hosts = new JsonArray();
@@ -608,13 +739,21 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         {
             string[] sessions;
             lock (linksGate) sessions = [.. link.Sessions];
-            hosts.Add((JsonNode)new JsonObject
+            var row = new JsonObject
             {
                 ["hostId"] = link.HostId, ["slot"] = link.Slot, ["current"] = link.Current, ["forSession"] = link.ForSession,
                 ["build"] = link.Generation?.Build, ["options"] = new JsonArray((link.Generation?.Options ?? []).Select(o => (JsonNode)o).ToArray()),
                 ["processId"] = link.ProcessId, ["sessions"] = new JsonArray(sessions.Select(s => (JsonNode)s).ToArray()),
                 ["turns"] = sessions.Count(turnRuns), ["stopping"] = link.Stopping,
-            });
+            };
+            if (!link.Current)
+            {
+                var held = new JsonObject();
+                foreach (var s in sessions) held[s] = why?.Invoke(link, s) ?? "it moves at the next look";
+                foreach (var s in PinnedTo(link)) held[s] = "its close failed there: it opens there again at its next use, and moves once a close succeeds or that host has exited";
+                row["waiting"] = held;
+            }
+            hosts.Add((JsonNode)row);
         }
         return new JsonObject
         {

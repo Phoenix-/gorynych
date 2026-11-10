@@ -54,11 +54,16 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
 
     public bool IsAlive(string adapter, string slot) => hosts.TryGetValue(adapter + "/" + slot, out var running) && !running.Run.IsCompleted;
 
+    /// <summary>While set, a launch of a slot it picks starts nothing, as a host that exits before it connects.</summary>
+    public Func<string, bool>? FailLaunch { get; set; }
+
     public void Launch(string adapter, string slot)
     {
         Interlocked.Increment(ref launches);
+        if (FailLaunch?.Invoke(slot) == true) return;
+        var key = adapter + "/" + slot;
         var agent = adapters(adapter).StartAsync(CancellationToken.None).GetAwaiter().GetResult();
-        var host = new AdapterHost(agent, ConnectAsync, new AdapterHostOptions
+        var host = new AdapterHost(agent, ct => ConnectAsync(key, ct), new AdapterHostOptions
         {
             Adapter = adapter, Token = Token, RetryDelays = [TimeSpan.FromMilliseconds(50)], Slot = slot,
             Generation = new HostGeneration(Build, Options(adapter)),
@@ -90,13 +95,19 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
         foreach (var wire in all) await wire.LetGoToServiceAsync();
     }
 
-    async Task<(Stream, Stream)> ConnectAsync(CancellationToken ct)
+    readonly ConcurrentDictionary<string, Wire> lastWireOf = new(StringComparer.Ordinal); // adapter/slot -> its connection now
+
+    /// <summary>The connection the host made last, to the conductor it reaches now.</summary>
+    public Wire WireOf(Running host) => lastWireOf[host.Adapter + "/" + host.Slot];
+
+    async Task<(Stream, Stream)> ConnectAsync(string key, CancellationToken ct)
     {
         if (ConnectGate is { } gate) await gate.Task.WaitAsync(ct);
         var to = Service ?? throw new IOException("no conductor on the host pipe");
         var wire = new Wire(to, "host", host: true);
         if (HoldBack is { } which) wire.HoldBackFromService(which);
         lock (wires) wires.Add(wire);
+        lastWireOf[key] = wire;
         return wire.LinkEnd;
     }
 

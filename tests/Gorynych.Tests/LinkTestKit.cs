@@ -52,6 +52,15 @@ sealed class TurnAgent(string name) : IAgentAdapter
     /// <summary>How long a close takes (Codex answers once the app-server has let go of the thread).</summary>
     public TimeSpan CloseDelay { get; set; }
 
+    /// <summary>While set, a close fails (as Codex's does when its app-server did not let go of the thread in time).</summary>
+    public bool CloseFails { get; set; }
+
+    /// <summary>It keeps nothing of a session before its first prompt, so a draft opens in no other instance (Codex).</summary>
+    public bool DraftsNotDurable { get; set; }
+
+    /// <summary>Put in the IDs of its sessions (<c>turns-&lt;tag&gt;1</c>), so the service log of tests that run at once tells them apart.</summary>
+    public string Tag { get; init; } = "";
+
     /// <summary>What each instance was asked, in order: <c>verb:instance:sessionId</c>, the instance its number among <see cref="Instances"/>.</summary>
     public ConcurrentQueue<string> Events { get; } = new();
 
@@ -105,11 +114,11 @@ sealed class TurnAgent(string name) : IAgentAdapter
         switch (req.Method)
         {
             case AcpMethods.Agent.Initialize:
-                return ScriptedAgent.Init(close: Closes);
+                return ScriptedAgent.Init(close: Closes, draftsNotDurable: DraftsNotDurable);
             case AcpMethods.Agent.SessionNew:
                 Interlocked.Increment(ref News);
                 if (SlowGate is { } slowNew) await slowNew.Task;
-                var created = $"{name}-{Interlocked.Increment(ref sessions)}";
+                var created = $"{name}-{Tag}{Interlocked.Increment(ref sessions)}";
                 openIn[created] = agent;
                 Note(agent, "new", created);
                 return AcpJson.ToNode(new NewSessionResponse { SessionId = created });
@@ -133,6 +142,11 @@ sealed class TurnAgent(string name) : IAgentAdapter
                 var closing = (string?)req.Params?["sessionId"] ?? "";
                 Note(agent, "close", closing);
                 if (CloseDelay > TimeSpan.Zero) await Task.Delay(CloseDelay);
+                if (CloseFails)
+                {
+                    Note(agent, "close-failed", closing);
+                    throw new JsonRpcException(JsonRpcException.InternalError, "it did not let go of the session in time");
+                }
                 Note(agent, "closed", closing);
                 return new JsonObject();
             case AcpMethods.Agent.SessionLoad:

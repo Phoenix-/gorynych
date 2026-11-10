@@ -92,6 +92,20 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     /// <summary>Handles requests from the peer. Return the result, or throw <see cref="JsonRpcException"/>.</summary>
     public Func<JsonRpcRequest, CancellationToken, Task<JsonNode?>>? RequestHandler { get; set; }
 
+    /// <summary>
+    /// Called on the read loop as each request arrives, before the next message is read and before
+    /// <see cref="RequestHandler"/> runs on the thread pool (with the same request object): what must
+    /// hold from the moment the peer asked, in the order of the stream. It must not block; what it
+    /// throws is logged.
+    /// </summary>
+    public Action<JsonRpcRequest>? RequestArrived { get; set; }
+
+    /// <summary>
+    /// Called once a request's answer (its result or its error) has been written to the peer, or
+    /// could not be: the end of what <see cref="RequestArrived"/> began. What it throws is logged.
+    /// </summary>
+    public Action<JsonRpcRequest>? RequestDone { get; set; }
+
     /// <summary>Handles notifications from the peer, one at a time in arrival order.</summary>
     public Func<string, JsonNode?, Task>? NotificationHandler { get; set; }
 
@@ -256,6 +270,9 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         var requestKey = id.ToJsonString();
         var requestCts = CancellationTokenSource.CreateLinkedTokenSource(stopping);
         incoming[requestKey] = requestCts;
+        if (RequestArrived is { } arrived)
+            try { arrived(request); }
+            catch (Exception e) { Log?.Invoke($"{Name}: request {method} on arrival: {e}"); }
         _ = Task.Run(() => HandleRequestAsync(request, requestKey, requestCts));
     }
 
@@ -312,9 +329,13 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         {
             incoming.TryRemove(key, out _);
         }
+        var written = true;
         try { await WriteAsync(response).ConfigureAwait(false); }
-        catch (Exception e) when (e is IOException or OperationCanceledException) { return; }
-        if (!succeeded) return;
+        catch (Exception e) when (e is IOException or OperationCanceledException) { written = false; }
+        if (RequestDone is { } done)
+            try { done(request); }
+            catch (Exception e) { Log?.Invoke($"{Name}: request {request.Method} when done: {e}"); }
+        if (!written || !succeeded) return;
         foreach (var action in request.TakeAfterResult())
             try { await action().ConfigureAwait(false); }
             catch (Exception e) { Log?.Invoke($"{Name}: after the result of {request.Method}: {e}"); }

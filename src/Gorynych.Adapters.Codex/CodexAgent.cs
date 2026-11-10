@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
@@ -518,6 +519,14 @@ sealed class CodexAgent : IAsyncDisposable
         if (threads.TryGetValue(id, out var known) && known.Loaded) return known;
         // App-server would refuse it anyway (one writer); said at once, naming the app that has it.
         var held = holders([id]);
+        // A session that moves off another Gorynych host of Codex after an update: that host's
+        // app-server lets go of the thread as its close answers, which may lag a moment behind.
+        for (var waited = Stopwatch.StartNew();
+             held.GetValueOrDefault(id) is { } other && CodexThreadHolders.IsGorynychHost(other) && waited.Elapsed < options.UnloadWait;)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(250), ct);
+            held = holders([id]);
+        }
         lockWatcher?.Saw([id], held);
         if (held.GetValueOrDefault(id) is { } holder) throw OpenElsewhere(holder);
         ThreadResumeResponse resumed;
@@ -700,7 +709,8 @@ sealed class CodexAgent : IAsyncDisposable
     /// no <c>turn/completed</c> comes for it. It returns once app-server has unloaded the thread
     /// (<c>thread/closed</c>, at once with the launch's <c>thread_unload_delay_secs=0</c>), so the
     /// thread's writer lock is free for another Codex app; it waits for that at most
-    /// <see cref="CodexAdapterOptions.UnloadWait"/>.
+    /// <see cref="CodexAdapterOptions.UnloadWait"/>, and fails when it did not come: the service
+    /// then counts the thread as still held here (it opens here again, not in another host).
     /// </summary>
     async Task CloseAsync(string id, CancellationToken ct)
     {
@@ -721,9 +731,12 @@ sealed class CodexAgent : IAsyncDisposable
             Abandon(t);
             if (!unsubscribed) unloading.TryRemove(id, out _);
         }
-        if (await Task.WhenAny(closed.Task, Task.Delay(options.UnloadWait, ct)) != closed.Task)
-            Log($"codex: thread {id}: app-server has not unloaded it {options.UnloadWait.TotalSeconds:0} s after the unsubscribe; its writer lock may still be held");
+        var unloaded = await Task.WhenAny(closed.Task, Task.Delay(options.UnloadWait, ct)) == closed.Task;
         unloading.TryRemove(id, out _);
+        if (unloaded) return;
+        Log($"codex: thread {id}: app-server has not unloaded it {options.UnloadWait.TotalSeconds:0} s after the unsubscribe; its writer lock may still be held");
+        throw new JsonRpcException(JsonRpcException.InternalError,
+            $"Codex's app-server has not let go of thread {id} {options.UnloadWait.TotalSeconds:0} s after it was closed; its writer lock may still be held.");
     }
 
     async Task DeleteAsync(string id, CancellationToken ct)
