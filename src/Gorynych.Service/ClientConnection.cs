@@ -77,8 +77,8 @@ internal sealed class ClientConnection
                 if (AgentScope is { } scope && !conductor.Agents.ContainsKey(scope))
                     throw new JsonRpcException(JsonRpcException.InvalidParams, $"Unknown agent '{scope}'. Known: {string.Join(", ", conductor.Agents.Keys)}");
                 // A client that comes during a restart learns of it as the others did.
-                if (conductor.Draining)
-                    request.AfterResult(() => { Notify(GorynychProtocol.MethodRestarting, new JsonObject()); return Task.CompletedTask; });
+                if (conductor.RestartingNotice() is { } restarting)
+                    request.AfterResult(() => { Notify(GorynychProtocol.MethodRestarting, restarting); return Task.CompletedTask; });
                 return AcpJson.ToNode(Initialize());
             case AcpMethods.Agent.Authenticate:
             case AcpMethods.Agent.Logout:

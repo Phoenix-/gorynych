@@ -551,8 +551,9 @@ between the conductor and the adapters.**
      hands them over now, so the journal misses nothing.
   3. The bridge reconnects too. It keeps the client's `session/prompt` open and answers it
      when the turn ends, so the GUI sees a pause in the stream, not a break (the bridge's part
-     is **done**; until the hosts exist, the turn ends with the old conductor, so the bridge
-     answers `cancelled`, and `restart` waits for running turns first).
+     is **done**; until the hosts exist, a turn ends with the old conductor, so `restart` waits
+     for running turns and is called off when they outlast the wait, unless `--force` cancels
+     them, and then the bridge answers `cancelled`).
 - How many hosts depends on the agent:
   - Claude runs a process per session, so it gets a host per session.
   - Codex runs one app-server for all threads, Kimi one process, and DSH a process per mode.
@@ -690,7 +691,8 @@ Next, in order (**planned**):
    service starts from a scheduled task with a limited token
    ([Several machines](#several-machines)). **Done**, and checked live on 10 November 2026.
 2. The resumable link, and the bridge's reconnect over it
-   ([Updating without losing work](#updating-without-losing-work)).
+   ([Updating without losing work](#updating-without-losing-work)). **Done** on 10 November
+   2026, with `Gorynych.Service restart`, and checked live through the bridge on one machine.
 3. Adapter hosts, and a conductor that restarts without breaking a turn.
 4. The hub: remote services as an adapter over the same link, and one list.
 5. Questions and child sessions between machines, through the hub.

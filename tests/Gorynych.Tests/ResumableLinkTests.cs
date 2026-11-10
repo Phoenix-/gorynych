@@ -234,7 +234,7 @@ public sealed class ResumableLinkTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task ARestartThatDoesNotWait_EndsThePromptCancelled_AndTheSessionGoesOnInTheNextService()
+    public async Task AForcedRestart_EndsThePromptCancelled_AndTheSessionGoesOnInTheNextService()
     {
         var data = TestDirs.New();
         var first = new TurnAgent("turns") { Hold = true };
@@ -246,7 +246,8 @@ public sealed class ResumableLinkTests
         await LinkHarness.Until(() => zed.Text().Contains("started:one"), "the turn");
 
         await using (var admin = await TestClient.ConnectAsync(service, "admin"))
-            Assert.AreEqual(1, (int)(await admin.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = false }).WaitAsync(Wait))!["cancelledTurns"]!);
+            Assert.AreEqual(1, (int)(await admin.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart,
+                new JsonObject { ["wait"] = false, ["force"] = true }).WaitAsync(Wait))!["cancelledTurns"]!);
         Assert.AreEqual("cancelled", (string?)(await running.WaitAsync(Wait))!["stopReason"]);
         zed.Service = null;
         await service.DisposeAsync();
@@ -256,6 +257,72 @@ public sealed class ResumableLinkTests
 
         Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "two").WaitAsync(Wait))!["stopReason"]);
         StringAssert.EndsWith(zed.Text(), "started:two done:two ");
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ACalledOffRestart_SendsWhatTheLinkHeld_ToTheSameService_AndOnlyHeldSessionsWaited()
+    {
+        var agent = new TurnAgent("turns") { Hold = true };
+        await using var service = Service(TestDirs.New(), agent);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var busy = await zed.NewSessionAsync().WaitAsync(Wait);
+        var other = await zed.NewSessionAsync().WaitAsync(Wait);
+        var running = zed.PromptAsync(busy, "one");
+        await LinkHarness.Until(() => zed.Text().Contains("started:one"), "the turn");
+
+        await using var admin = await TestClient.ConnectAsync(service, "admin");
+        var restart = admin.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = true, ["timeoutSeconds"] = 1.5 });
+        await LinkHarness.Until(() => zed.Log().Contains("restarting"), "the link to hear of it");
+        var held = zed.PromptAsync(other, "two");
+        var behind = zed.Zed.SendRequestAsync(GorynychProtocol.MethodRead, new JsonObject { ["sessionId"] = other });
+        // The rest the draining service still serves: a new thread opens, the list comes.
+        Assert.IsNotNull(await zed.Zed.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject()).WaitAsync(TimeSpan.FromSeconds(1)));
+        await zed.NewSessionAsync().WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.IsFalse(held.IsCompleted);
+        Assert.IsFalse(behind.IsCompleted, "what follows a held prompt in its session waits behind it");
+
+        Assert.IsFalse((bool)(await restart.WaitAsync(Wait))!["restarted"]!, "the turn outlasted the wait");
+        await LinkHarness.Until(() => zed.Log().Contains("called its restart off"), "the link to hear of it");
+        await behind.WaitAsync(Wait);
+        agent.Release();
+
+        Assert.AreEqual("end_turn", (string?)(await running.WaitAsync(Wait))!["stopReason"]);
+        Assert.AreEqual("end_turn", (string?)(await held.WaitAsync(Wait))!["stopReason"], "the held prompt ran in the service that stayed");
+        CollectionAssert.AreEquivalent(new[] { "one", "two" }, agent.Prompts.ToArray());
+        Assert.AreEqual(1, zed.Connects, "it never went");
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task APromptARestartRefused_GoesAgainToTheSameService_WhenTheRestartIsCalledOff()
+    {
+        var agent = new TurnAgent("turns") { Hold = true };
+        await using var service = Service(TestDirs.New(), agent);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var busy = await zed.NewSessionAsync().WaitAsync(Wait);
+        var other = await zed.NewSessionAsync().WaitAsync(Wait);
+        var running = zed.PromptAsync(busy, "one");
+        await LinkHarness.Until(() => zed.Text().Contains("started:one"), "the turn");
+        zed.Current.PauseLink(); // it hears nothing of the restart in time
+
+        await using var admin = await TestClient.ConnectAsync(service, "admin");
+        var restart = admin.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = true, ["timeoutSeconds"] = 0.5 });
+        await LinkHarness.Until(() => service.Draining, "the drain");
+        var refused = zed.PromptAsync(other, "two");
+        await LinkHarness.Until(() => zed.Heard().Contains("\"gorynych/restarting\":true"), "the refusal");
+        Assert.IsFalse((bool)(await restart.WaitAsync(Wait))!["restarted"]!);
+        zed.Current.Go(); // the notice, the refusal and the call-off reach it now, in whatever order
+
+        agent.Release();
+        Assert.AreEqual("end_turn", (string?)(await refused.WaitAsync(Wait))!["stopReason"], "sent again to the service that stayed, without waiting for another");
+        Assert.AreEqual("end_turn", (string?)(await running.WaitAsync(Wait))!["stopReason"]);
+        CollectionAssert.AreEquivalent(new[] { "one", "two" }, agent.Prompts.ToArray());
+        Assert.AreEqual(1, zed.Connects);
         NoBreakSeen(zed);
     }
 
@@ -643,10 +710,11 @@ public sealed class ResumableLinkTests
     [TestMethod]
     public void TheRestartCommand_TakesATimeoutInMinutes_AndNoWait()
     {
-        var line = CommandLine.Parse(["restart", "--pipe", "p", "--timeout", "2.5", "--no-wait"]);
+        var line = CommandLine.Parse(["restart", "--pipe", "p", "--timeout", "2.5", "--no-wait", "--force"]);
         Assert.AreEqual("restart", line.Command);
         Assert.AreEqual(TimeSpan.FromMinutes(2.5), CommandLine.MinutesOf(line.Value("--timeout")));
         Assert.IsTrue(line.Flag("--no-wait"));
+        Assert.IsTrue(line.Flag("--force"));
         StringAssert.Contains(Assert.ThrowsExactly<UsageException>(() => CommandLine.Parse(["restart", "--timeout", "-1"])).Message, "--timeout takes a number of minutes");
         StringAssert.Contains(Assert.ThrowsExactly<UsageException>(() => CommandLine.Parse(["restart", "--console"])).Message, "restart does not take '--console'");
         StringAssert.Contains(CommandLine.Usage, "Gorynych.Service restart");

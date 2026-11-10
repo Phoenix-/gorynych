@@ -274,18 +274,29 @@ public static class GorynychProtocol
 
     /// <summary>
     /// Asks the service to exit for an update without breaking its clients' work:
-    /// <c>{wait?, timeoutSeconds?}</c> → <c>{processId, waitedSeconds, cancelledTurns}</c>. It starts
-    /// no new turn, waits for the running ones (unless <c>wait</c> is false) up to the timeout,
-    /// cancels what still runs, and exits; a client on the resumable link reconnects to the next
-    /// service (docs/service-protocol.md, "The resumable link").
+    /// <c>{wait?, timeoutSeconds?, force?}</c> → <c>{restarted, processId, waitedSeconds, cancelledTurns}</c>,
+    /// or <c>{restarted: false, running: [{sessionId, agent, title}]}</c>. It starts no new turn, waits
+    /// for the running ones (unless <c>wait</c> is false) up to the timeout, and exits; with turns
+    /// still running it calls the restart off, unless <c>force</c> says to cancel them. A client on
+    /// the resumable link reconnects to the next service (docs/service-protocol.md, "The resumable link").
     /// </summary>
     public const string MethodRestart = "_gorynych/restart";
 
     /// <summary>
-    /// A notification to clients, <c>{}</c>: the service is restarting. A client on the resumable
-    /// link holds its new prompts from now on and sends them to the next service.
+    /// A notification to clients, <c>{restart}</c>: the service is restarting (the number of the
+    /// restart, in this run). A client on the resumable link holds its new prompts from now on and
+    /// sends them to the next service, or to this one when the restart is called off.
     /// </summary>
     public const string MethodRestarting = "_gorynych/restarting";
+
+    /// <summary>
+    /// A notification to clients, <c>{restart}</c>: the restart is called off (turns still ran, or it
+    /// failed), and new turns start again. A client on the link sends this service what it held.
+    /// </summary>
+    public const string MethodRestartAborted = "_gorynych/restart_aborted";
+
+    /// <summary>In the <c>data</c> of a <see cref="MetaRestarting"/> error: the number of the restart that refused the request.</summary>
+    public const string MetaRestart = "gorynych/restart";
 
     /// <summary>
     /// In <c>agentCapabilities._meta</c> of the service's <c>initialize</c> result: the version of the

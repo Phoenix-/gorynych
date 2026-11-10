@@ -71,8 +71,9 @@ also the `gorynych` MCP server agents start over stdio:
 for external ACP clients: `acp --agent claude|kimi|codex|dsh` (see [external-clients.md](external-clients.md)),
 `shutdown [--pipe …]`, which sends the running service `_gorynych/shutdown` and waits up
 to 30 seconds for its process to end (exit code 0; 1 when no service runs on the pipe; 2 when
-it still runs), `restart [--pipe …] [--timeout <minutes>] [--no-wait]`, which sends
-`_gorynych/restart` and waits the same way, with the same exit codes
+it still runs), `restart [--pipe …] [--timeout <minutes>] [--no-wait] [--force]`, which sends
+`_gorynych/restart` and waits the same way, with the same exit codes and 4 when turns still
+ran after the wait, so the restart was called off and the service goes on
 ([The resumable link](#the-resumable-link)), and `task install [--pipe …] [service options]` / `task uninstall [--pipe …]`.
 `task install` registers the logon task `Gorynych.Service.<pipe>` for the current user, or
 replaces it, with `schtasks /Create /XML`. How a remote machine is set up with it is in
@@ -196,7 +197,8 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/promptId` | `session/prompt` params `_meta`, client → service; the `_meta` of the prompt's `user_message_chunk`; the mark of its end | the ID a client on the link gives its prompt |
 | `gorynych/stopReason` | the `_meta` of the mark that ends a prompt's turn (`gorynych/agentTurn: "ended"` with `gorynych/promptId`) | the turn's ACP stop reason |
 | `gorynych/error` | the `_meta` of the mark that ends a prompt's turn | `{code, message}`: the prompt failed so |
-| `gorynych/restarting` | the `data` of an error | `true`: the service did not carry the request out because it is restarting; it may go again, as it is, to the next service |
+| `gorynych/restarting` | the `data` of an error | `true`: the service did not carry the request out because it is restarting; it may go again, as it is, to the next service, or to this one once the restart is called off |
+| `gorynych/restart` | the `data` of a `gorynych/restarting` error | the number of the restart that refused it, as in `_gorynych/restarting` and `_gorynych/restart_aborted` |
 | `gorynych/draft` | `session/resume` params `_meta`, service → adapter | `true` for a draft: an adapter that keeps nothing before the first prompt and no longer knows the session opens it afresh under its ID ([adapter-contract.md](adapter-contract.md#3-new-sessions-the-list-and-discovery)) |
 | `gorynych/replay` | `session/resume` result `_meta`, adapter → service | what was replayed: `{"from": "mark" \| "start", "mark": "<new mark>"}` |
 | `gorynych/historyMark` | `session/prompt` result `_meta`; the `_meta` of the update that ends a turn of the agent's own (`gorynych/agentTurn: "ended"`) | the adapter's opaque mark of how far into its own history the journal now goes |
@@ -213,8 +215,9 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
 | `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, `restarting`, adapters |
 | `_gorynych/shutdown` | method | asks the service to exit |
-| `_gorynych/restart` | method, `{wait?, timeoutSeconds?}` → `{processId, waitedSeconds, cancelledTurns}` | asks the service to exit for an update without breaking its clients' work ([The resumable link](#the-resumable-link)) |
-| `_gorynych/restarting` | notification to clients, `{}` | the service has begun a restart: a client on the link holds its new prompts for the next service |
+| `_gorynych/restart` | method, `{wait?, timeoutSeconds?, force?}` → `{restarted: true, processId, waitedSeconds, cancelledTurns}` or `{restarted: false, processId, waitedSeconds, running: [{sessionId, agent, title}]}` | asks the service to exit for an update without breaking its clients' work; called off when turns outlast the wait, unless `force` ([The resumable link](#the-resumable-link)) |
+| `_gorynych/restarting` | notification to clients, `{restart}` | the service has begun restart number `restart`: a client on the link holds its new prompts |
+| `_gorynych/restart_aborted` | notification to clients, `{restart}` | that restart is called off and new turns start again: a client on the link sends this service what it held |
 | `_gorynych/opinion` | method, `{sessionId, text, sender?}` → `{text}` | asks the agent of `sessionId` for an opinion; for Claude it goes in on its input (headless) or through its channel (TUI), and the result is Claude's `reply`. From the peers server it carries `_meta["gorynych/peerToken"]`, and the service names the sender (`peer_kimi`) and passes `fromSessionId`. The service puts a first line naming the asking session in front of the text it forwards, and to the agent adds `_meta` with `gorynych/sender`, `gorynych/fromSessionId` and `gorynych/outside` as the journal keeps them on a request in a turn, for the user message the agent reports for it. An agent that answers method not found, or `-32600` because it is not running, is asked in a turn instead ([adapter-contract.md](adapter-contract.md#64-the-live-note-path)) |
 | `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `status` (`open` when its agent has it loaded now, `saved` when not, the words of ACP's draft session-status RFD), `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")`, and `callerParent` the session that started it with `spawn_session`, when there is one. Without `includeArchived`, `hiddenArchived` counts the archived sessions left out (never the caller) |
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
@@ -1338,7 +1341,10 @@ and on `session/load` ([The resumable link](#the-resumable-link)). An import tha
 journal gives its entries new positions past the old ones. Compaction never merges the newest
 quarter of the limit (at most 256 entries), so a client resuming after one of them finds it
 there; a merged message stands at the position of its last part, so a client further behind may
-get a merged message again in full. A journal written before
+get a merged message again in full. An import that replaces the journal
+([History made outside Gorynych](#history-made-outside-gorynych)) sends its clients the new
+journal whole, behind its notice; a client that resumes after a position from before it gets
+the same, so a link that was away during the import shows that history again too. A journal written before
 there were positions gets them when it is read back, once. `_gorynych/read` leaves them out.
 
 ## The resumable link
@@ -1378,18 +1384,34 @@ draft.
   that attaches ([Standard methods](#standard-methods)), so a client that resumes the session is
   asked again, under a new request ID.
 
-**Restart.** `_gorynych/restart {wait?, timeoutSeconds?}`, which the `restart` command sends:
+**Restart.** `_gorynych/restart {wait?, timeoutSeconds?, force?}`, which the `restart` command
+sends. An update must not break a turn, so a restart that turns outlast is called off, unless it
+is forced:
 
 1. No new turn starts from then on. `session/prompt`, `_gorynych/opinion` and `_gorynych/spawn`
-   are refused with `-32603` and `data: {"gorynych/restarting": true}`: not carried out, so they
-   may go again to the next service. Everything else is served.
-2. Every client gets `_gorynych/restarting`, and so does a client that connects later.
+   are refused with `-32603` and `data: {"gorynych/restarting": true, "gorynych/restart": <n>}`,
+   the number of the restart in this run: not carried out, so they may go again. A client's
+   prompt already on its way is refused too, when it gets to its turn: one that waited for the
+   turn before it, or for its session to open, starts no turn that the exit could cut off.
+   Everything else is served.
+2. Every client gets `_gorynych/restarting {restart: <n>}`, and so does a client that connects
+   later.
 3. The service waits for the running turns: a client's, a service turn, one of the agent's own,
-   and a prompt waiting for one. It waits five minutes at most; `--timeout <minutes>` sets
-   another limit, and `--no-wait` (`wait: false`) waits for none.
-4. It cancels what still runs (`session/cancel` to the agent) and gives it 5 seconds to end.
-5. It answers `{processId, waitedSeconds, cancelledTurns}` and exits. The journals are written
-   as each update comes; the overlay is written at the exit.
+   and a prompt on its way to one. It waits five minutes at most; `--timeout <minutes>` sets
+   another limit, and `--no-wait` (`wait: false`) is a limit of 0.
+4. When none is left, it answers `{restarted: true, processId, waitedSeconds, cancelledTurns: 0}`
+   and exits. The journals are written as each update comes; the overlay is written at the exit.
+5. When some are left, the restart is **called off**: new turns start again, every client gets
+   `_gorynych/restart_aborted {restart: <n>}`, and the answer is `{restarted: false, processId,
+   waitedSeconds, running: [{sessionId, agent, title}]}`. The command lists them and exits with
+   4. The service runs on as before, and a later restart drains afresh. So `--no-wait` alone
+   restarts only a service with nothing running.
+6. With `--force` (`force: true`) it cancels what still runs instead (`session/cancel` to the
+   agent), gives it 5 seconds to end, answers `{restarted: true, …, cancelledTurns}`, and exits.
+   A cancel that fails is logged and keeps nothing back. `--no-wait --force` restarts at once.
+
+A drain that fails on its way ends as one called off: the service is never left refusing turns.
+A second restart while one drains waits for the same drain and gets its answer.
 
 The next service is started by the next bridge that needs it, or by the logon task. An update
 of a running install therefore goes so ([getting-started.md](getting-started.md#update)):
@@ -1420,10 +1442,17 @@ answers method not found, and the command asks it to exit instead.
   `_gorynych/archive` go again. A `session/load` or `session/resume` goes again as a resume
   from where its replay had got to. A `session/prompt` stays open (below). Anything else
   (`session/new`, `_gorynych/opinion`, …) ends with an error that says it may or may not have
-  been carried out. A request refused with `gorynych/restarting` goes again as it is.
-- What the client sends while there is no connection waits, in order, and so does a new prompt
-  after `_gorynych/restarting`, with everything after it. A `session/cancel` ends a prompt that
-  waits to go out with `cancelled` there, and goes at once to the service for a running turn.
+  been carried out.
+- A request refused with `gorynych/restarting` goes again as it is: to the next service, or at
+  once to the same one if it has called that restart off (`_gorynych/restart_aborted` with the
+  same number), whether its notice came before the refusal or after.
+- What the client sends while there is no connection waits, in order. After
+  `_gorynych/restarting` a new prompt waits, and so does what follows it in its session; anything
+  else goes on to the draining service, which serves it (order matters only within a session),
+  so a new thread opens and lists come during a drain. When the restart is called off, what
+  waited goes to the same service. A `session/cancel` ends a prompt that waits to go out with
+  `cancelled` there, and goes at once to the service for a running turn, or to the next service
+  after the resume when there is no connection.
 - A prompt that was on its way stays open. If the mark of its end came before the connection
   went, it is answered so at once. Otherwise, when its session is resumed, the link waits for the
   mark if `gorynych/prompts` lists its ID, and answers with its stop reason or error; it answers
@@ -1438,18 +1467,19 @@ answers method not found, and the command asks it to exit instead.
   whether Zed handles that for an agent's request is not confirmed.
 - A session's position only moves on: a resume's answer read after a live update that followed
   it does not take the link back.
-- The link's own traffic stays with it: `_gorynych/restarting`, the marks of prompts' ends, and
+- The link's own traffic stays with it: `_gorynych/restarting`, `_gorynych/restart_aborted`, the marks of prompts' ends, and
   the text of its client's own prompts where the client never had it live: in the replay of the
   link's own resume, and from a held prompt that runs only now. A `session/load` the client asks
   for shows its prompts, as any history.
 - When no service is back within 60 seconds, it fails what waits with an error, says so on
-  stderr, and exits with 1.
+  stderr, and exits with 1. A failure of the link itself ends it the same way.
 
 **Not covered yet.** A draft opened before a restart resumes only where its agent can take it:
 Kimi keeps its drafts, and the Claude adapter opens one afresh under its ID (`gorynych/draft`,
 [adapter-contract.md](adapter-contract.md#3-new-sessions-the-list-and-discovery)); a Codex
 thread never prompted fails at its first prompt after a restart. Until the adapter hosts exist,
-a restart still stops the agents with their running turns, which is why it waits for them first.
+a restart still stops the agents with their running turns, which is why it waits for them and is
+called off when they outlast the wait.
 
 ## Overlay
 

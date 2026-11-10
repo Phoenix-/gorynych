@@ -60,6 +60,12 @@ public sealed class ConductorOptions
 
     /// <summary>For tests: awaited in <c>session/new</c> once its client is attached, before the answer is written.</summary>
     internal Func<string, Task>? Answering { get; init; }
+
+    /// <summary>For tests: awaited when a restart has waited for the running turns.</summary>
+    internal Func<Task>? Drained { get; init; }
+
+    /// <summary>For tests: awaited before a forced restart cancels a session's turn.</summary>
+    internal Func<string, Task>? Cancelling { get; init; }
 }
 
 /// <summary>
@@ -142,76 +148,142 @@ public sealed class Conductor : IAsyncDisposable
     readonly Lock restartGate = new();
     Task<JsonObject>? restart;
     volatile bool draining;
+    long restartNumber;
 
     /// <summary>How long a restart waits for the running turns by default.</summary>
     public static readonly TimeSpan DefaultRestartTimeout = TimeSpan.FromMinutes(5);
 
-    /// <summary>How long the turns a restart cancels get to end before it exits all the same.</summary>
+    /// <summary>How long the turns a forced restart cancels get to end before it exits all the same.</summary>
     internal static readonly TimeSpan CancelGrace = TimeSpan.FromSeconds(5);
 
-    /// <summary>True once a restart began: no new turn starts (<see cref="Restarting"/>).</summary>
+    /// <summary>True while a restart drains: no new turn starts (<see cref="Restarting"/>).</summary>
     public bool Draining => draining;
 
     /// <summary>
     /// The error for a request that would start a turn while the service restarts: not carried out,
-    /// so a client on the resumable link sends it again to the next service (<c>data["gorynych/restarting"]</c>).
+    /// so a client on the resumable link sends it again, to the next service, or to this one should
+    /// the restart be called off (<c>data["gorynych/restarting"]</c>, and <c>data["gorynych/restart"]</c>,
+    /// the number of the restart, as in <c>_gorynych/restarting</c> and <c>_gorynych/restart_aborted</c>).
     /// </summary>
-    internal static JsonRpcException Restarting() => new(JsonRpcException.InternalError,
-        "The Gorynych service is restarting; send it again in a moment.", new JsonObject { [GorynychProtocol.MetaRestarting] = true });
+    internal JsonRpcException Restarting() => new(JsonRpcException.InternalError,
+        "The Gorynych service is restarting; send it again in a moment.",
+        new JsonObject { [GorynychProtocol.MetaRestarting] = true, [GorynychProtocol.MetaRestart] = Interlocked.Read(ref restartNumber) });
+
+    /// <summary>The params of <c>_gorynych/restarting</c> and <c>_gorynych/restart_aborted</c>.</summary>
+    JsonObject RestartNotice() => new() { ["restart"] = Interlocked.Read(ref restartNumber) };
+
+    /// <summary>For a client that connects while a restart drains.</summary>
+    internal JsonObject? RestartingNotice() => draining ? RestartNotice() : null;
 
     /// <summary>
-    /// <c>_gorynych/restart {wait?, timeoutSeconds?}</c>: the service starts no new turn and tells its
-    /// clients (<c>_gorynych/restarting</c>), waits for the running turns (<see cref="DrainAsync"/>),
-    /// answers, and exits. A second request while one runs waits for the same drain.
+    /// <c>_gorynych/restart {wait?, timeoutSeconds?, force?}</c>: the service starts no new turn and
+    /// tells its clients (<c>_gorynych/restarting</c>), waits for the running turns
+    /// (<see cref="DrainAsync"/>), answers, and exits. When turns still run after the wait, it
+    /// calls the restart off and serves on, unless <c>force</c> says to cancel them and exit. A
+    /// second request while one drains waits for the same drain.
     /// </summary>
     internal async Task<JsonNode?> RestartAsync(JsonRpcRequest request)
     {
-        var wait = request.Params?["wait"] is not JsonValue w || !w.TryGetValue<bool>(out var waits) || waits;
+        static bool Flag(JsonNode? node, bool otherwise) => node is JsonValue v && v.TryGetValue<bool>(out var b) ? b : otherwise;
+        var wait = Flag(request.Params?["wait"], true);
+        var force = Flag(request.Params?["force"], false);
         var timeout = request.Params?["timeoutSeconds"] is JsonValue t && t.TryGetValue<double>(out var seconds) && double.IsFinite(seconds) && seconds >= 0
             ? TimeSpan.FromSeconds(Math.Min(seconds, TimeSpan.FromDays(1).TotalSeconds))
             : DefaultRestartTimeout;
         Task<JsonObject> drain;
-        lock (restartGate) drain = restart ??= Task.Run(() => DrainAsync(wait ? timeout : TimeSpan.Zero));
+        lock (restartGate) drain = restart ??= Task.Run(() => DrainAsync(wait ? timeout : TimeSpan.Zero, force));
         var result = await drain;
-        // Exit once the answer is out; and in any case soon, should the asking client be gone.
-        request.AfterResult(() => { RequestShutdown(); return Task.CompletedTask; });
-        _ = Task.Delay(TimeSpan.FromSeconds(2)).ContinueWith(_ => RequestShutdown(), TaskScheduler.Default);
+        if (result["restarted"] is JsonValue r && r.TryGetValue<bool>(out var restarted) && restarted)
+        {
+            // Exit once the answer is out; and in any case soon, should the asking client be gone.
+            request.AfterResult(() => { RequestShutdown(); return Task.CompletedTask; });
+            _ = Task.Delay(TimeSpan.FromSeconds(2)).ContinueWith(_ => RequestShutdown(), TaskScheduler.Default);
+        }
         return result.DeepClone();
     }
 
     /// <summary>
-    /// Starts no new turn from now on, tells the clients, waits up to <paramref name="timeout"/> for
-    /// the turns that run (a client's, a service turn, one of the agent's own, a prompt waiting for
-    /// one), then cancels what still runs and gives it <see cref="CancelGrace"/> to end. The journals
-    /// are written as each update comes, so nothing is left to flush but the overlay, which the
-    /// exit writes.
+    /// Starts no new turn from now on, tells the clients, and waits up to <paramref name="timeout"/>
+    /// for the turns that run (a client's, a service turn, one of the agent's own, a prompt waiting
+    /// for one). If none is left it exits: the journals are written as each update comes, so nothing
+    /// is left to flush but the overlay, which the exit writes. If some are left, it calls the
+    /// restart off (<see cref="CallOff"/>), which an update must not break; with
+    /// <paramref name="force"/> it cancels them, gives them <see cref="CancelGrace"/> to end, and
+    /// exits all the same. Whatever goes wrong on the way, the service is left serving, not draining.
     /// </summary>
-    async Task<JsonObject> DrainAsync(TimeSpan timeout)
+    async Task<JsonObject> DrainAsync(TimeSpan timeout, bool force)
     {
+        var number = Interlocked.Increment(ref restartNumber);
         draining = true;
-        ServiceLog.Info($"restart: no new turn starts; waiting up to {timeout.TotalSeconds:0.#} s for the running ones");
-        foreach (var c in clients.Keys) c.Notify(GorynychProtocol.MethodRestarting, new JsonObject());
-        var waited = System.Diagnostics.Stopwatch.StartNew();
-        while (Running().Any() && waited.Elapsed < timeout) await Task.Delay(100);
-        var seconds = Math.Round(waited.Elapsed.TotalSeconds, 1);
-        var left = Running().ToList();
-        foreach (var feed in left)
+        var exiting = false;
+        try
         {
-            ServiceLog.Info($"restart: cancelling the turn of {feed.SessionId}");
-            try
+            ServiceLog.Info($"restart {number}: no new turn starts; waiting up to {timeout.TotalSeconds:0.#} s for the running ones");
+            foreach (var c in clients.Keys) c.Notify(GorynychProtocol.MethodRestarting, RestartNotice());
+            var waited = System.Diagnostics.Stopwatch.StartNew();
+            while (Running().Any() && waited.Elapsed < timeout) await Task.Delay(100);
+            var seconds = Math.Round(waited.Elapsed.TotalSeconds, 1);
+            if (options.Drained is { } drained) await drained();
+            var left = Running().ToList();
+            if (left.Count > 0 && !force)
             {
-                await ForwardNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = feed.SessionId }, feed.SessionId)
-                    .WaitAsync(CancelGrace);
+                ServiceLog.Info($"restart {number}: {left.Count} turns still run after {seconds} s; called off");
+                return new JsonObject
+                {
+                    ["restarted"] = false, ["processId"] = Environment.ProcessId, ["waitedSeconds"] = seconds,
+                    ["running"] = new JsonArray(left.Select(f => (JsonNode)RunningEntry(f.SessionId)).ToArray()),
+                };
             }
-            catch (Exception e) when (e is IOException or JsonRpcException or ObjectDisposedException or TimeoutException)
+            foreach (var feed in left)
             {
-                ServiceLog.Warn($"restart: the cancel of {feed.SessionId} did not reach its agent: {e.Message}");
+                ServiceLog.Info($"restart {number}: cancelling the turn of {feed.SessionId}");
+                try
+                {
+                    if (options.Cancelling is { } cancelling) await cancelling(feed.SessionId);
+                    await ForwardNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = feed.SessionId }, feed.SessionId)
+                        .WaitAsync(CancelGrace);
+                }
+                catch (Exception e)
+                {
+                    // One turn that cannot be cancelled does not keep the others, or the exit.
+                    ServiceLog.Warn($"restart {number}: the cancel of {feed.SessionId} did not reach its agent: {e.Message}");
+                }
             }
+            var grace = System.Diagnostics.Stopwatch.StartNew();
+            while (left.Count > 0 && Running().Any() && grace.Elapsed < CancelGrace) await Task.Delay(100);
+            ServiceLog.Info($"restart {number}: waited {seconds} s, cancelled {left.Count} turns; exiting");
+            exiting = true;
+            return new JsonObject
+            {
+                ["restarted"] = true, ["processId"] = Environment.ProcessId, ["waitedSeconds"] = seconds, ["cancelledTurns"] = left.Count,
+            };
         }
-        var grace = System.Diagnostics.Stopwatch.StartNew();
-        while (left.Count > 0 && Running().Any() && grace.Elapsed < CancelGrace) await Task.Delay(100);
-        ServiceLog.Info($"restart: waited {seconds} s, cancelled {left.Count} turns; exiting");
-        return new JsonObject { ["processId"] = Environment.ProcessId, ["waitedSeconds"] = seconds, ["cancelledTurns"] = left.Count };
+        finally
+        {
+            if (!exiting) CallOff(number);
+        }
+    }
+
+    /// <summary>
+    /// The restart is called off (turns still run, or the drain failed): new turns start again, and
+    /// the clients hear it (<c>_gorynych/restart_aborted</c>), so a client on the link sends this
+    /// service what it held for the next one. A later restart drains afresh.
+    /// </summary>
+    void CallOff(long number)
+    {
+        lock (restartGate)
+        {
+            draining = false;
+            restart = null;
+        }
+        foreach (var c in clients.Keys) c.Notify(GorynychProtocol.MethodRestartAborted, new JsonObject { ["restart"] = number });
+    }
+
+    /// <summary>A session a restart did not wait out: <c>{sessionId, agent, title}</c>.</summary>
+    JsonObject RunningEntry(string sessionId)
+    {
+        var record = store.Get(sessionId);
+        return new JsonObject { ["sessionId"] = sessionId, ["agent"] = record?.Agent, ["title"] = record?.Title };
     }
 
     IEnumerable<SessionFeed> Running() => feeds.Values.Where(f => !f.Retired && f.TurnRunning);
@@ -781,11 +853,15 @@ public sealed class Conductor : IAsyncDisposable
         {
             // The mark first: a client resuming meanwhile finds the prompt in progress or its end in the
             // journal. Marked whether or not its client still seems there: a connection may be gone
-            // before the service notices, and then the answer is lost.
-            if (promptId is not null) await MarkPromptEndAsync(use.Feed, promptId, result, failure);
+            // before the service notices, and then the answer is lost. A prompt a restart refused
+            // ended nowhere: it goes again, as it is.
+            if (promptId is not null && !IsRestartingRefusal(failure)) await MarkPromptEndAsync(use.Feed, promptId, result, failure);
             use.Feed.EndPrompt(key);
         }
     }
+
+    static bool IsRestartingRefusal(Exception? failure) =>
+        failure is JsonRpcException j && j.ErrorData?[GorynychProtocol.MetaRestarting] is JsonValue v && v.TryGetValue<bool>(out var restarting) && restarting;
 
     static string? PromptIdOf(PromptRequest prompt) =>
         prompt.Meta?[GorynychProtocol.MetaPromptId] is JsonValue v && v.TryGetValue<string>(out var id) && id.Length > 0 ? id : null;
@@ -829,6 +905,13 @@ public sealed class Conductor : IAsyncDisposable
         // One turn at a time: an opinion request delivered as a turn waits for this one, and
         // this one for it.
         await feed.TurnGate.WaitAsync(CancellationToken.None);
+        // A restart that began while this prompt waited for the turn before it: it starts no turn
+        // here, which the exit might cut off, but goes whole to the next service.
+        if (Draining)
+        {
+            feed.TurnGate.Release();
+            throw Restarting();
+        }
         feed.ClientTurn = true; // what a client's session/close cancels
         try
         {

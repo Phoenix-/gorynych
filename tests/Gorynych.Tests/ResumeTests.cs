@@ -193,7 +193,7 @@ public sealed class ResumeTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task ARestart_WaitsForAPromptStillOpeningItsSession()
+    public async Task ARestart_WaitsForAPromptStillOpeningItsSession_AndRefusesItItsTurn()
     {
         var data = TestDirs.New();
         string sid;
@@ -216,15 +216,20 @@ public sealed class ResumeTests
         Assert.IsFalse(restart.IsCompleted, "it waits for that prompt too");
 
         agent.ResumeGate.SetResult();
-        Assert.AreEqual("end_turn", (string?)(await prompt.WaitAsync(Wait))!["stopReason"]);
-        Assert.AreEqual(0, (int)(await restart.WaitAsync(Wait))!["cancelledTurns"]!);
+        // It started no turn the exit could cut off: whole, for the next service.
+        var refused = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => prompt.WaitAsync(Wait));
+        Assert.IsTrue((bool?)refused.ErrorData?[GorynychProtocol.MetaRestarting] == true);
+        var done = await restart.WaitAsync(Wait);
+        Assert.IsTrue((bool)done!["restarted"]!);
+        Assert.AreEqual(0, (int)done["cancelledTurns"]!);
+        Assert.AreEqual(0, agent.Prompts.Count, "the refused prompt never reached the agent");
     }
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
     [DataRow(false, 30.0, DisplayName = "no wait")]
     [DataRow(true, 0.3, DisplayName = "the wait runs out")]
-    public async Task ARestartThatDoesNotWaitForTheTurn_CancelsIt(bool wait, double seconds)
+    public async Task AForcedRestart_CancelsTheTurnItDidNotWaitFor_AndExits(bool wait, double seconds)
     {
         var agent = new TurnAgent("turns") { Hold = true };
         await using var conductor = TestDirs.Conductor(TestDirs.New(), agent);
@@ -233,11 +238,124 @@ public sealed class ResumeTests
         var running = a.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, PromptParams(sid, "one"));
         await LinkHarness.Until(() => a.Text().Contains("started:one"), "the turn");
 
-        var done = await a.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = wait, ["timeoutSeconds"] = seconds }).WaitAsync(Wait);
+        var done = await a.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart,
+            new JsonObject { ["wait"] = wait, ["timeoutSeconds"] = seconds, ["force"] = true }).WaitAsync(Wait);
 
-        Assert.AreEqual(1, (int)done!["cancelledTurns"]!);
+        Assert.IsTrue((bool)done!["restarted"]!);
+        Assert.AreEqual(1, (int)done["cancelledTurns"]!);
         Assert.AreEqual("cancelled", (string?)(await running.WaitAsync(Wait))!["stopReason"], "the agent was asked to cancel, and its turn ended so");
         await LinkHarness.Until(() => conductor.ShutdownRequested.IsCancellationRequested, "the exit");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    [DataRow(false, 30.0, DisplayName = "no wait")]
+    [DataRow(true, 0.3, DisplayName = "the wait runs out")]
+    public async Task ARestartThatTurnsOutlast_IsCalledOff_AndTheServiceGoesOn(bool wait, double seconds)
+    {
+        var agent = new TurnAgent("turns") { Hold = true };
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), agent);
+        await using var a = await TestClient.ConnectAsync(conductor, "a");
+        var sid = (await a.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest { Cwd = Path.GetTempPath() })).SessionId;
+        var running = a.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, PromptParams(sid, "one"));
+        await LinkHarness.Until(() => a.Text().Contains("started:one"), "the turn");
+        // Another prompt waits behind it: it stays in its place, not refused.
+        await using var b = await TestClient.ConnectAsync(conductor, "b");
+        var queued = b.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, PromptParams(sid, "two", promptId: "p2"));
+        await LinkHarness.Until(() => conductor.Feed(sid).PromptsInProgress().Contains("p2"), "the second prompt to wait for the turn");
+
+        var done = await a.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = wait, ["timeoutSeconds"] = seconds }).WaitAsync(Wait);
+
+        Assert.IsFalse((bool)done!["restarted"]!, "an update breaks no turn");
+        var left = done["running"]!.AsArray().Single()!;
+        Assert.AreEqual(sid, (string?)left["sessionId"]);
+        Assert.AreEqual("turns", (string?)left["agent"]);
+        Assert.AreEqual("one", (string?)left["title"]);
+        Assert.IsFalse(conductor.Draining);
+        await LinkHarness.Until(() => { lock (a.Notices) return a.Notices.Contains(GorynychProtocol.MethodRestartAborted); }, "the clients to hear it");
+        await Task.Delay(300);
+        Assert.IsFalse(conductor.ShutdownRequested.IsCancellationRequested, "it serves on");
+        Assert.IsFalse(running.IsCompleted, "nothing was cancelled");
+
+        agent.Release();
+        Assert.AreEqual("end_turn", (string?)(await running.WaitAsync(Wait))!["stopReason"]);
+        Assert.AreEqual("end_turn", (string?)(await queued.WaitAsync(Wait))!["stopReason"], "the one behind it ran here, in its turn");
+        await Prompt(a, sid, "three");
+        CollectionAssert.AreEqual(new[] { "one", "two", "three" }, agent.Prompts.ToArray());
+
+        // Once nothing runs, the same request restarts it.
+        var again = await a.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = wait, ["timeoutSeconds"] = seconds }).WaitAsync(Wait);
+        Assert.IsTrue((bool)again!["restarted"]!);
+        await LinkHarness.Until(() => conductor.ShutdownRequested.IsCancellationRequested, "the exit");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AForcedRestart_RefusesAPromptThatWaitedBehindTheCancelledTurn()
+    {
+        var agent = new TurnAgent("turns") { Hold = true };
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), agent);
+        await using var a = await TestClient.ConnectAsync(conductor, "a");
+        var sid = (await a.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest { Cwd = Path.GetTempPath() })).SessionId;
+        var running = a.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, PromptParams(sid, "one"));
+        await LinkHarness.Until(() => a.Text().Contains("started:one"), "the turn");
+        var queued = a.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, PromptParams(sid, "two", promptId: "p2"));
+        await LinkHarness.Until(() => conductor.Feed(sid).PromptsInProgress().Contains("p2"), "the second prompt to wait for the turn");
+
+        var done = await a.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = false, ["force"] = true }).WaitAsync(Wait);
+
+        Assert.IsTrue((bool)done!["restarted"]!);
+        Assert.AreEqual("cancelled", (string?)(await running.WaitAsync(Wait))!["stopReason"]);
+        var refused = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => queued.WaitAsync(Wait));
+        Assert.IsTrue((bool?)refused.ErrorData?[GorynychProtocol.MetaRestarting] == true, "it got the gate as the service went: it starts no turn to be cut off");
+        CollectionAssert.AreEqual(new[] { "one" }, agent.Prompts.ToArray());
+        Assert.IsFalse(conductor.Feed(sid).Journal.ReadAll().Any(e => (string?)e["_meta"]?[GorynychProtocol.MetaPromptId] == "p2"), "nor its text, nor a mark: it goes again whole");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AForcedRestart_ExitsEvenWhenACancelFails()
+    {
+        var agent = new TurnAgent("turns") { Hold = true };
+        await using var conductor = new Conductor(new ConductorOptions
+        {
+            DataDirectory = TestDirs.New(), ServiceId = "test-service",
+            Cancelling = _ => throw new InvalidOperationException("the adapter fell over"),
+        }, [agent]);
+        await using var a = await TestClient.ConnectAsync(conductor, "a");
+        var sid = (await a.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest { Cwd = Path.GetTempPath() })).SessionId;
+        _ = a.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, PromptParams(sid, "one"));
+        await LinkHarness.Until(() => a.Text().Contains("started:one"), "the turn");
+
+        var done = await a.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = false, ["force"] = true }).WaitAsync(Wait);
+
+        Assert.IsTrue((bool)done!["restarted"]!, "one cancel that fails keeps nothing back");
+        await LinkHarness.Until(() => conductor.ShutdownRequested.IsCancellationRequested, "the exit");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ARestartThatFails_LeavesTheServiceServing_AndTheNextOneDrainsAfresh()
+    {
+        var fail = true;
+        var agent = new TurnAgent("turns");
+        await using var conductor = new Conductor(new ConductorOptions
+        {
+            DataDirectory = TestDirs.New(), ServiceId = "test-service",
+            Drained = () => fail ? throw new InvalidOperationException("the drain fell over") : Task.CompletedTask,
+        }, [agent]);
+        await using var a = await TestClient.ConnectAsync(conductor, "a");
+        var sid = (await a.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest { Cwd = Path.GetTempPath() })).SessionId;
+
+        var e = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => a.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject()).WaitAsync(Wait));
+
+        StringAssert.Contains(e.Message, "the drain fell over");
+        Assert.IsFalse(conductor.Draining, "not stuck refusing every prompt");
+        await LinkHarness.Until(() => { lock (a.Notices) return a.Notices.Contains(GorynychProtocol.MethodRestartAborted); }, "the clients to hear it");
+        await Prompt(a, sid, "one");
+        Assert.IsFalse(conductor.ShutdownRequested.IsCancellationRequested);
+        fail = false;
+        Assert.IsTrue((bool)(await a.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject()).WaitAsync(Wait))!["restarted"]!);
     }
 
     static JsonObject After(long position) => new() { ["type"] = GorynychProtocol.ReplayAfterMark, ["mark"] = SessionJournal.FormatPosition(position) };

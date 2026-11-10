@@ -30,7 +30,7 @@ switch (line.Command)
     // Asks it to exit for an update without breaking its clients' work; its bridges start the new one.
     case "restart":
         return await AcpBridge.RestartAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName, !line.Flag("--no-wait"),
-            CommandLine.MinutesOf(line.Value("--timeout")) ?? Conductor.DefaultRestartTimeout);
+            CommandLine.MinutesOf(line.Value("--timeout")) ?? Conductor.DefaultRestartTimeout, line.Flag("--force"));
     // The stdio entry point for external ACP clients (Zed); starts the service when needed.
     case "acp":
         return await AcpBridge.RunAsync(line.Value("--agent")!, line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName, line.ServiceArguments("--pipe"));

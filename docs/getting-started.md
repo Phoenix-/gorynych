@@ -257,14 +257,19 @@ Zed can stay open: its threads go on with the new service
    Rename-Item "$dir\outside\Gorynych.Outside.exe" "Gorynych.Outside.$stamp.old.exe"
    ```
 2. Install the new build as above. `Expand-Archive -Force` writes the new files in place.
-3. Restart the service. It starts no new turn, waits up to five minutes for the running ones
-   (`--timeout <minutes>` changes that, `--no-wait` waits for none), cancels what still runs,
-   and exits; Zed's bridges hold the prompts sent meanwhile, start the new service and carry on:
+3. Restart the service. It starts no new turn and waits up to five minutes for the running ones
+   (`--timeout <minutes>` changes that); then it exits, and Zed's bridges, which held the
+   prompts sent meanwhile, start the new service and carry on:
    ```powershell
    & "$dir\Gorynych.Service.exe" restart
    ```
    The bridges themselves keep running the old copy until Zed restarts them, and an agent outside
    Gorynych keeps its outside server until it restarts its MCP servers.
+4. **If a turn still runs after the wait**, the restart is called off: the command lists the
+   sessions still at work and exits with 4, and the service goes on as before, the held prompts
+   included. Run `restart` again once they end, give it a longer `--timeout`, or add `--force`,
+   which cancels them and restarts all the same. `--no-wait` restarts only if nothing runs at
+   that moment; `--no-wait --force` restarts at once.
 
 **The first update onto this scheme**, from a build without `restart`: the command asks the old
 service to exit instead, which cancels its running turns, and the bridges Zed runs are old too,

@@ -140,7 +140,14 @@ public sealed class ResumableLink
                 await FromClientAsync(message);
             }
         }
-        catch (Exception e) when (e is OperationCanceledException or IOException or ObjectDisposedException or InvalidOperationException) { }
+        catch (Exception e) when (e is OperationCanceledException or IOException or ObjectDisposedException) { }
+        catch (Exception e)
+        {
+            // The link itself failed: it ends, says why, and fails what waits, rather than leave the
+            // client with nobody reading what it sends.
+            await GiveUpAsync($"the link failed: {e.GetType().Name}: {e.Message}", linkFailed: true);
+            return;
+        }
         ended.TrySetResult(0);
     }
 
@@ -223,7 +230,7 @@ public sealed class ResumableLink
             }
             lock (state)
             {
-                foreach (var r in dropped) upstream.Remove(r.Id);
+                foreach (var r in dropped) Forget(r);
                 // One that went out (held now, or about to be if its connection is going) is
                 // cancelled again in the agent that comes back, if it runs there.
                 foreach (var r in upstream.Values)
@@ -231,7 +238,7 @@ public sealed class ResumableLink
                 foreach (var r in again.Where(r => r.Method == AcpMethods.Agent.SessionPrompt && r.SessionId == sessionId).ToList())
                 {
                     again.Remove(r);
-                    upstream.Remove(r.Id);
+                    Forget(r);
                     dropped.Add(r);
                 }
             }
@@ -281,7 +288,7 @@ public sealed class ResumableLink
             if (again.Remove(request)) waiting = true;
         if (waiting)
         {
-            lock (state) upstream.Remove(request.Id);
+            lock (state) Forget(request);
             await AnswerAsync(request, Error(JsonRpcException.RequestCancelled, "Request cancelled"));
             return;
         }
@@ -315,15 +322,23 @@ public sealed class ResumableLink
         await TryWriteAsync(target, Response(serviceId, answer));
     }
 
-    /// <summary>Sends a client's message to the agent in order, or keeps it for the next connection.</summary>
+    /// <summary>
+    /// Sends a client's message to the agent in order, or keeps it for the next connection. While a
+    /// restart drains, a prompt waits, and so does what follows it in its session; the service that
+    /// drains serves anything else, since order matters only within a session. With no connection,
+    /// everything waits, in order.
+    /// </summary>
     async Task SendAsync(JsonObject message, Upstream? request)
     {
         await sendGate.WaitAsync();
         try
         {
+            var sessionId = request?.SessionId ?? Text(message["params"]?["sessionId"]);
             bool hold;
             lock (state) hold = restarting && request?.Method == AcpMethods.Agent.SessionPrompt;
-            if (current is { IsLost: false } connection && outbox.Count == 0 && !hold)
+            // With a connection, the outbox holds only what a restart holds.
+            var behind = sessionId is not null && outbox.Any(q => SessionOf(q) == sessionId);
+            if (current is { IsLost: false } connection && !behind && !hold)
             {
                 if (request is not null) lock (state) request.Generation = connection.Generation;
                 if (await TryWriteAsync(connection, message)) return;
@@ -336,6 +351,9 @@ public sealed class ResumableLink
             sendGate.Release();
         }
     }
+
+    static string? SessionOf((JsonObject Message, Upstream? Request) waiting) =>
+        waiting.Request?.SessionId ?? Text(waiting.Message["params"]?["sessionId"]);
 
     async Task<Connection?> CurrentAsync()
     {
@@ -373,6 +391,12 @@ public sealed class ResumableLink
             }
         }
         catch (Exception e) when (e is OperationCanceledException or IOException or ObjectDisposedException or InvalidOperationException) { }
+        catch (Exception e)
+        {
+            Fail(connection);
+            await GiveUpAsync($"the link failed: {e.GetType().Name}: {e.Message}", linkFailed: true);
+            return;
+        }
         Fail(connection);
     }
 
@@ -385,22 +409,34 @@ public sealed class ResumableLink
         }
         if (!TryId(id, out var key)) return;
         Upstream? request;
+        bool refused, retryNow = false;
         lock (state)
         {
             if (!upstream.TryGetValue(key, out request) || request.Generation != connection.Generation) return;
-            if (IsRestarting(message))
+            refused = IsRestarting(message);
+            if (refused)
             {
-                // Not carried out: the next agent gets it as it is.
-                restarting = true;
+                // Not carried out: it goes again as it is, to the next service, or at once to this one
+                // if it has already called that restart off (its notice may come before this answer).
                 request.Generation = 0;
                 again.Add(request);
-                return;
+                if (RestartOf(message) is { } number && connection.CalledOff.Contains(number)) retryNow = true;
+                else restarting = true;
             }
-            upstream.Remove(key);
-            // The turn is over: the answers kept for its questions go.
-            if (request.Method == AcpMethods.Agent.SessionPrompt && request.SessionId is { } turnOver)
-                foreach (var q in downstream.Values.Where(q => q.SessionId == turnOver && q.Answer is not null).ToList())
-                    downstream.Remove(q.ClientFacingId);
+            else
+            {
+                Forget(request);
+                // The turn is over: the answers kept for its questions go.
+                if (request.Method == AcpMethods.Agent.SessionPrompt && request.SessionId is { } turnOver)
+                    foreach (var q in downstream.Values.Where(q => q.SessionId == turnOver && q.Answer is not null).ToList())
+                        downstream.Remove(q.ClientFacingId);
+            }
+        }
+        if (refused)
+        {
+            // Not awaited here: this loop must go on reading while the release writes.
+            if (retryNow) _ = Task.Run(() => ReleaseAsync(connection));
+            return;
         }
         Track(request, message);
         message["id"] = request.ClientId.DeepClone();
@@ -454,6 +490,15 @@ public sealed class ResumableLink
         {
             lock (state) restarting = true;
             Log("the service is restarting; new prompts wait for the next one");
+            return;
+        }
+        if (method == GorynychProtocol.MethodRestartAborted)
+        {
+            // Turns still ran, so the service stays: what waited for the next one goes to it now.
+            lock (state)
+                if (Number(message["params"]?["restart"]) is { } number) connection.CalledOff.Add(number);
+            Log("the service called its restart off; what waited goes to it now");
+            _ = Task.Run(() => ReleaseAsync(connection));
             return;
         }
         if (method == AcpMethods.Protocol.CancelRequest)
@@ -582,7 +627,7 @@ public sealed class ResumableLink
                 {
                     case Policy.Hold when request.Ended is not null:
                         // The mark of its end came, its answer did not: answered as the mark says.
-                        upstream.Remove(request.Id);
+                        Forget(request);
                         over.Add(request);
                         break;
                     case Policy.Hold:
@@ -593,7 +638,7 @@ public sealed class ResumableLink
                         again.Add(request);
                         break;
                     default:
-                        upstream.Remove(request.Id);
+                        Forget(request);
                         failed.Add(request);
                         break;
                 }
@@ -645,6 +690,8 @@ public sealed class ResumableLink
             }
             catch (OperationCanceledException) when (stopping.IsCancellationRequested)
             {
+                // The client went while this connection was being made: it goes too.
+                if (connection is not null) Drop(connection);
                 return;
             }
             catch (NotResumableException e)
@@ -684,7 +731,7 @@ public sealed class ResumableLink
         lock (state)
         {
             orphans = upstream.Values.Where(r => r.Held && (r.SessionId is null || !live.ContainsKey(r.SessionId))).ToList();
-            foreach (var r in orphans) upstream.Remove(r.Id);
+            foreach (var r in orphans) Forget(r);
         }
         foreach (var r in orphans) await AnswerAsync(r, Result(StopReason.Cancelled));
         return sessions.Count;
@@ -710,7 +757,7 @@ public sealed class ResumableLink
             {
                 live.Remove(sessionId);
                 ending = upstream.Values.Where(r => r.Held && r.SessionId == sessionId).ToList();
-                foreach (var r in ending) upstream.Remove(r.Id);
+                foreach (var r in ending) Forget(r);
             }
             foreach (var r in ending) await AnswerAsync(r, Error(e.Code, e.Message));
             await WithdrawStaleQuestionsAsync(sessionId);
@@ -731,7 +778,7 @@ public sealed class ResumableLink
             // Not in progress there: it never got there, or it went with the agent that ran it.
             over = held.Where(r => r.PromptId is null || !inProgress.Contains(r.PromptId)).ToList();
             cancel = held.Except(over).Where(r => r.CancelAsked).ToList();
-            foreach (var r in over) upstream.Remove(r.Id);
+            foreach (var r in over) Forget(r);
         }
         foreach (var r in over) await AnswerAsync(r, Result(StopReason.Cancelled));
         if (cancel.Count > 0) await TryWriteAsync(connection, Notification(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId }));
@@ -761,6 +808,8 @@ public sealed class ResumableLink
                 restarting = false;
                 // First what went out before the connection was lost, then what came since.
                 waiting = again.OrderBy(r => r.Id).Where(r => upstream.ContainsKey(r.Id)).Select(r => (Again(r), (Upstream?)r)).ToList();
+                // A mark from where it was refused says nothing of where it goes now.
+                foreach (var r in again) r.Ended = null;
                 again.Clear();
             }
             waiting.AddRange(outbox);
@@ -818,7 +867,7 @@ public sealed class ResumableLink
                 request.Ended = (JsonObject)meta.DeepClone();
                 return;
             }
-            upstream.Remove(request.Id);
+            Forget(request);
         }
         await AnswerAsync(request, Outcome(meta));
         if (request.SessionId is { } sessionId) await WithdrawStaleQuestionsAsync(sessionId);
@@ -845,9 +894,11 @@ public sealed class ResumableLink
             await ToClientAsync(Notification(AcpMethods.Protocol.CancelRequest, new JsonObject { ["requestId"] = q.ClientFacingId }));
     }
 
-    async Task GiveUpAsync(string why)
+    /// <param name="linkFailed">The link itself failed, not the connection to the service.</param>
+    async Task GiveUpAsync(string why, bool linkFailed = false)
     {
-        Log($"gave up on the service: {why}");
+        if (ended.Task.IsCompleted) return;
+        Log(linkFailed ? why : $"gave up on the service: {why}");
         List<Upstream> waiting;
         await sendGate.WaitAsync();
         try
@@ -863,9 +914,12 @@ public sealed class ResumableLink
             waiting = upstream.Values.OrderBy(r => r.Id).ToList();
             upstream.Clear();
             again.Clear();
+            promptIds.Clear();
         }
         foreach (var request in waiting)
-            await AnswerAsync(request, Error(JsonRpcException.InternalError, $"The connection to the Gorynych service was lost: {why}"));
+            await AnswerAsync(request, Error(JsonRpcException.InternalError, linkFailed
+                ? $"The Gorynych bridge failed: {why}"
+                : $"The connection to the Gorynych service was lost: {why}"));
         ended.TrySetResult(1);
     }
 
@@ -974,6 +1028,36 @@ public sealed class ResumableLink
         return @params;
     }
 
+    /// <summary>A request answered, or given up: it is no longer waited for. Under <see cref="state"/>.</summary>
+    void Forget(Upstream request)
+    {
+        upstream.Remove(request.Id);
+        if (request.PromptId is { } promptId) promptIds.Remove(promptId);
+    }
+
+    /// <summary>
+    /// The service called its restart off: it gets what was held for the next one. A connection still
+    /// in its handshake gets it from that handshake's flush.
+    /// </summary>
+    async Task ReleaseAsync(Connection connection)
+    {
+        bool isCurrent;
+        await sendGate.WaitAsync();
+        try { isCurrent = current == connection; }
+        finally { sendGate.Release(); }
+        if (!isCurrent)
+        {
+            lock (state) restarting = false;
+            return;
+        }
+        try { await FlushAsync(connection); }
+        catch (IOException) { } // lost meanwhile: LostAsync takes it from here
+    }
+
+    static long? RestartOf(JsonObject response) => Number(response["error"]?["data"]?[GorynychProtocol.MetaRestart]);
+
+    static long? Number(JsonNode? node) => node is JsonValue v && v.TryGetValue<long>(out var n) ? n : null;
+
     static bool IsRestarting(JsonObject response) =>
         response["error"]?["data"]?[GorynychProtocol.MetaRestarting] is JsonValue v && v.TryGetValue<bool>(out var restarting) && restarting;
 
@@ -1036,6 +1120,9 @@ public sealed class ResumableLink
         public CancellationTokenSource Lost { get; } = new();
         public ConcurrentDictionary<string, TaskCompletionSource<JsonObject>> Internal { get; } = new(StringComparer.Ordinal);
         public int Failed;
+
+        /// <summary>The restarts this connection's service called off (<c>_gorynych/restart_aborted</c>). Under <c>state</c>.</summary>
+        public HashSet<long> CalledOff { get; } = [];
         public bool IsLost => Lost.IsCancellationRequested;
     }
 }

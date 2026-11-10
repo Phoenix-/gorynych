@@ -81,27 +81,46 @@ public static class AcpBridge
     {
         await rpc.SendRequestAsync(GorynychProtocol.MethodShutdown, new JsonObject());
         Console.Error.WriteLine($"gorynych shutdown: asked the service (process {processId}) to exit; turns still running are cancelled");
+        return null;
     });
 
+    /// <summary>The exit code of <c>restart</c> when turns still ran after the wait and the restart was called off.</summary>
+    public const int RestartCalledOffExitCode = 4;
+
     /// <summary>
-    /// <c>Gorynych.Service restart [--pipe P] [--timeout M] [--no-wait]</c>: asks the running service to
-    /// restart (<c>_gorynych/restart</c>): it starts no new turn, waits up to <paramref name="timeout"/> for
-    /// the running ones unless <paramref name="wait"/> is false, cancels the rest, and exits; then this
-    /// waits for its process to end. The bridges connected to it start the next service, with the
-    /// executable now at the path they were started from, or its logon task: so an update renames the
-    /// running executable aside, copies the new one in its place, and runs this. Exit codes as for
-    /// <see cref="ShutdownAsync"/>. A service without restart (an older version) is asked to exit instead.
+    /// <c>Gorynych.Service restart [--pipe P] [--timeout M] [--no-wait] [--force]</c>: asks the running
+    /// service to restart (<c>_gorynych/restart</c>): it starts no new turn and waits up to
+    /// <paramref name="timeout"/> for the running ones (none with <c>--no-wait</c>). If none is left
+    /// it exits, and this waits for its process to end. If some are left, the restart is called off
+    /// and the service serves on: this lists them and exits with <see cref="RestartCalledOffExitCode"/>;
+    /// with <paramref name="force"/> they are cancelled and the service exits all the same. The bridges
+    /// connected to it start the next service, with the executable now at the path they were started
+    /// from, or its logon task: so an update renames the running executable aside, copies the new one
+    /// in its place, and runs this. Other exit codes as for <see cref="ShutdownAsync"/>. A service
+    /// without restart (an older version) is asked to exit instead.
     /// </summary>
-    public static Task<int> RestartAsync(string pipe, bool wait, TimeSpan timeout, int waitSeconds = 30) => StopAsync("restart", pipe, waitSeconds, async (rpc, processId) =>
+    public static Task<int> RestartAsync(string pipe, bool wait, TimeSpan timeout, bool force, int waitSeconds = 30) => StopAsync("restart", pipe, waitSeconds, async (rpc, processId) =>
     {
-        Console.Error.WriteLine(wait
-            ? $"gorynych restart: asked the service (process {processId}) to restart; it starts no new turn and waits up to {timeout.TotalMinutes:0.#} min for the running ones"
-            : $"gorynych restart: asked the service (process {processId}) to restart without waiting for its turns");
+        var waiting = wait && timeout > TimeSpan.Zero ? $"waits up to {timeout.TotalMinutes:0.#} min for the running ones" : "does not wait for the running ones";
+        Console.Error.WriteLine($"gorynych restart: asked the service (process {processId}) to restart; it starts no new turn and {waiting}, " +
+            (force ? "then cancels what still runs" : "and stays if any still runs"));
         try
         {
-            var reply = await rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = wait, ["timeoutSeconds"] = timeout.TotalSeconds });
+            var reply = await rpc.SendRequestAsync(GorynychProtocol.MethodRestart,
+                new JsonObject { ["wait"] = wait, ["timeoutSeconds"] = timeout.TotalSeconds, ["force"] = force });
+            var seconds = (double?)reply?["waitedSeconds"] ?? 0;
+            if (reply?["restarted"] is JsonValue r && r.TryGetValue<bool>(out var restarted) && !restarted)
+            {
+                var running = reply["running"] as JsonArray ?? [];
+                Console.Error.WriteLine($"gorynych restart: {running.Count} turn{(running.Count == 1 ? "" : "s")} still ran after {seconds:0.#} s, " +
+                    "so the restart was called off and the service goes on:");
+                foreach (var s in running.OfType<JsonObject>())
+                    Console.Error.WriteLine($"  {(string?)s["agent"] ?? "?",-7} {(string?)s["sessionId"]}  {(string?)s["title"] ?? "(untitled)"}");
+                Console.Error.WriteLine("gorynych restart: run it again once they end, with a longer --timeout, or with --force, which cancels them");
+                return RestartCalledOffExitCode;
+            }
             var cancelled = (int?)reply?["cancelledTurns"] ?? 0;
-            Console.Error.WriteLine($"gorynych restart: it waited {(double?)reply?["waitedSeconds"] ?? 0:0.#} s" +
+            Console.Error.WriteLine($"gorynych restart: it waited {seconds:0.#} s" +
                 (cancelled > 0 ? $" and cancelled {cancelled} turn{(cancelled == 1 ? "" : "s")} that still ran" : "") + "; it is exiting");
         }
         catch (JsonRpcException e) when (e.Code == JsonRpcException.MethodNotFound)
@@ -109,14 +128,16 @@ public static class AcpBridge
             await rpc.SendRequestAsync(GorynychProtocol.MethodShutdown, new JsonObject());
             Console.Error.WriteLine("gorynych restart: the service is an older version without restart, so it was asked to exit; its running turns are cancelled");
         }
+        return null;
     }, stopped: "; the next bridge or the logon task starts the new one");
 
     /// <summary>
     /// Connects to the running service, asks it with <paramref name="ask"/>, and waits up to
     /// <paramref name="waitSeconds"/> for its process to end: 0 when it stopped, 1 when no service runs
-    /// on the pipe or it could not be asked, 2 when it was asked but still runs.
+    /// on the pipe or it could not be asked, 2 when it was asked but still runs. An exit code from
+    /// <paramref name="ask"/> ends it at once: the service was not asked to stop after all.
     /// </summary>
-    static async Task<int> StopAsync(string command, string pipe, int waitSeconds, Func<JsonRpcConnection, int, Task> ask, string stopped = "")
+    static async Task<int> StopAsync(string command, string pipe, int waitSeconds, Func<JsonRpcConnection, int, Task<int?>> ask, string stopped = "")
     {
         NamedPipeClientStream? stream;
         try
@@ -145,7 +166,7 @@ public static class AcpBridge
                     ClientInfo = new Implementation { Name = "gorynych-" + command, Version = AgentHost.Version },
                 });
                 processId = (int?)(await rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()))?["processId"] ?? 0;
-                await ask(rpc, processId);
+                if (await ask(rpc, processId) is { } code) return code;
             }
             catch (Exception e) when (e is IOException or JsonRpcException)
             {

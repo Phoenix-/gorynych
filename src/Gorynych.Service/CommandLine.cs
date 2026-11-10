@@ -26,9 +26,10 @@ internal sealed class CommandLine
               the stdio bridge for ACP clients such as Zed; starts the service when its pipe is missing
           Gorynych.Service shutdown [--pipe <name>]
               asks the running service to exit and waits for it
-          Gorynych.Service restart [--pipe <name>] [--timeout <minutes>] [--no-wait]
+          Gorynych.Service restart [--pipe <name>] [--timeout <minutes>] [--no-wait] [--force]
               asks the running service to exit for an update: it starts no new turn, waits for the
-              running ones (5 minutes at most by default), and its bridges start the new one
+              running ones (5 minutes at most by default; none with --no-wait), and its bridges start
+              the new one; if turns still run then, it stays (exit code 4), unless --force cancels them
           Gorynych.Service task install [--pipe <name>] [service options]
           Gorynych.Service task uninstall [--pipe <name>]
               registers or removes the Windows logon task that starts the service in this user's session
@@ -106,7 +107,7 @@ internal sealed class CommandLine
                 known = (["--pipe"], []);
                 break;
             case "restart":
-                known = (["--pipe", "--timeout"], ["--no-wait"]);
+                known = (["--pipe", "--timeout"], ["--no-wait", "--force"]);
                 break;
             case "peers":
                 known = (["--pipe", "--token", "--channel-url", "--reply-url"], []);
