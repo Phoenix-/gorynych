@@ -88,6 +88,12 @@ public sealed class HostTests
         var prompt = zed.PromptAsync(sid, "one");
         await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
 
+        await using (var admin = await TestClient.ConnectAsync(service, "admin"))
+        {
+            var status = await admin.Rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject());
+            Assert.IsTrue((bool)status!["hosts"]!, "it says its adapters run in hosts");
+            Assert.AreEqual(hosts["turns"].Host.HostId, (string?)status["agents"]![0]!["host"]);
+        }
         var restart = await RestartAsync(service);
         Assert.IsTrue((bool)restart["restarted"]!);
         Assert.AreEqual(0, (int)restart["cancelledTurns"]!);
@@ -671,19 +677,17 @@ public sealed class HostTests
         await using (var gui = await TestClient.ConnectAsync(service, "gui"))
         {
             Assert.AreEqual("s1", await NewSession(gui));
-            Task Title(int seq) => first.Rpc.SendNotificationAsync(AcpMethods.Client.SessionUpdate, new JsonObject
+            Task Update(int seq, JsonObject update)
             {
-                ["sessionId"] = "s1",
-                ["update"] = new JsonObject
-                {
-                    ["sessionUpdate"] = "session_info_update", ["title"] = "Tests",
-                    ["_meta"] = new JsonObject { [GorynychProtocol.MetaHostSeq] = $"old-host/{seq}" },
-                },
-            });
-            await Title(6);
-            await Title(7); // the same title again: taken, and not journaled
+                update["_meta"] = new JsonObject { [GorynychProtocol.MetaHostSeq] = $"old-host/{seq}" };
+                return first.Rpc.SendNotificationAsync(AcpMethods.Client.SessionUpdate, new JsonObject { ["sessionId"] = "s1", ["update"] = update });
+            }
+            await Update(6, new JsonObject { ["sessionUpdate"] = "session_info_update", ["title"] = "Tests" });
+            // The list of commands is the session's state, not its history: taken, and not journaled.
+            await Update(7, new JsonObject { ["sessionUpdate"] = "available_commands_update", ["availableCommands"] = new JsonArray() });
             await LinkHarness.Until(() => service.Store.Get("s1")?.Title == "Tests", "the title");
             await Task.Delay(200);
+            Assert.AreEqual(6, service.Feed("s1").Journal.LastHostSeq("old-host"), "the journal ends at the title");
             await Prompt(gui, "s1", "keep it").WaitAsync(Wait); // no draft, which goes with its client
         }
         await RestartAsync(service);

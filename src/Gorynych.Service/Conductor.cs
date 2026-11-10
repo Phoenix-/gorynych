@@ -3269,6 +3269,7 @@ public sealed class Conductor : IAsyncDisposable
         ["sessions"] = store.All().Count,
         ["pendingRequests"] = feeds.Values.Sum(f => f.PendingRequests),
         ["restarting"] = draining,
+        ["hosts"] = options.Hosts is not null,
         ["agents"] = new JsonArray(agents.Values.Select(a => (JsonNode)a.Describe()).ToArray()),
     };
 

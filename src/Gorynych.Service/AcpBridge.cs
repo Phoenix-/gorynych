@@ -101,10 +101,15 @@ public static class AcpBridge
     /// </summary>
     public static Task<int> RestartAsync(string pipe, bool wait, TimeSpan timeout, bool force, int waitSeconds = 30) => StopAsync("restart", pipe, waitSeconds, async (rpc, processId) =>
     {
+        // A service whose adapters run in hosts waits for no turn: they go on in the hosts (docs/service-protocol.md, "Adapter hosts").
+        var hosted = (await rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()))?["hosts"] is JsonValue h && h.TryGetValue<bool>(out var on) && on;
         var waiting = !wait || timeout <= TimeSpan.Zero ? "does not wait for the running ones"
             : $"waits up to {(timeout < TimeSpan.FromMinutes(1) ? $"{timeout.TotalSeconds:0.#} s" : $"{timeout.TotalMinutes:0.#} min")} for the running ones";
-        Console.Error.WriteLine($"gorynych restart: asked the service (process {processId}) to restart; it starts no new turn and {waiting}, " +
-            (force ? "then cancels what still runs" : "and stays if any still runs"));
+        Console.Error.WriteLine(hosted
+            ? $"gorynych restart: asked the service (process {processId}) to restart; its adapters run in hosts, which keep the running turns " +
+              "for the next service, so it waits for none"
+            : $"gorynych restart: asked the service (process {processId}) to restart; it starts no new turn and {waiting}, " +
+              (force ? "then cancels what still runs" : "and stays if any still runs"));
         try
         {
             var reply = await rpc.SendRequestAsync(GorynychProtocol.MethodRestart,
@@ -121,8 +126,11 @@ public static class AcpBridge
                 return RestartCalledOffExitCode;
             }
             var cancelled = (int?)reply?["cancelledTurns"] ?? 0;
-            Console.Error.WriteLine($"gorynych restart: it waited {seconds:0.#} s" +
-                (cancelled > 0 ? $" and cancelled {cancelled} turn{(cancelled == 1 ? "" : "s")} that still ran" : "") + "; it is exiting");
+            if (reply?["turnsInHosts"] is JsonValue t && t.TryGetValue<int>(out var inHosts))
+                Console.Error.WriteLine($"gorynych restart: it is exiting; {inHosts} running turn{(inHosts == 1 ? " goes" : "s go")} on in {(inHosts == 1 ? "its host" : "their hosts")}");
+            else
+                Console.Error.WriteLine($"gorynych restart: it waited {seconds:0.#} s" +
+                    (cancelled > 0 ? $" and cancelled {cancelled} turn{(cancelled == 1 ? "" : "s")} that still ran" : "") + "; it is exiting");
         }
         catch (JsonRpcException e) when (e.Code == JsonRpcException.MethodNotFound)
         {
