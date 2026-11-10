@@ -365,7 +365,8 @@ public sealed class HostTests
             var first = hosts["turns"];
             await hosts.KillAsync("turns", agentToo: dies);
             // One whose link broke comes back, but this service ended its turns as it saw it go: it is stopped.
-            Assert.AreEqual(0, await first.Run.WaitAsync(Wait));
+            try { Assert.AreEqual(0, await first.Run.WaitAsync(Wait)); }
+            catch (TimeoutException) { Assert.Fail("the host still runs:\n" + hosts.Log()); }
             Assert.AreEqual("cancelled", (string?)(await prompt.WaitAsync(Wait))!["stopReason"], "its turn died with it");
             Assert.AreEqual(1, EndMarks(current, sid));
             await LinkHarness.Until(() => !current.Feed(sid).TurnRunning, "the session free again");
@@ -380,6 +381,90 @@ public sealed class HostTests
         {
             await current.DisposeAsync();
         }
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHostThatDiesWhileNoServiceRuns_LeavesItsTurnToBeEndedCancelled_ByTheNext()
+    {
+        var data = TestDirs.New();
+        var agent = new TurnAgent("turns") { Hold = true };
+        var hosts = new InProcessHosts(_ => agent);
+        var service = hosts.Conductor(data, agent);
+        hosts.Service = service;
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+        await RestartAsync(service);
+        await GoneAsync(service, zed, hosts);
+        var first = hosts["turns"];
+        await hosts.KillAsync("turns");
+        await first.Run.WaitAsync(Wait);
+
+        agent.Release();
+        await using var next = Next(data, hosts, zed, agent);
+        Assert.AreEqual("cancelled", (string?)(await prompt.WaitAsync(Wait))!["stopReason"], "its turn went with its host");
+        Assert.AreEqual(1, EndMarks(next, sid));
+        Assert.AreEqual(2, hosts.Launches, "a new host");
+        Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "two").WaitAsync(Wait))!["stopReason"]);
+        Assert.AreEqual(2, EndMarks(next, sid));
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHostThatGoesInTheMiddleOfItsHandshake_EndsTheTurnsItBroughtBack()
+    {
+        var agent = new TurnAgent("turns");
+        var hosts = new InProcessHosts(_ => agent);
+        await using var service = hosts.Conductor(TestDirs.New(), agent);
+        JsonObject Init(bool back) => new()
+        {
+            ["protocolVersion"] = 1, ["agentCapabilities"] = new JsonObject(),
+            ["_meta"] = new JsonObject { [GorynychProtocol.MetaHost] = new JsonObject { ["hostId"] = "h", ["link"] = 1, ["reattached"] = back } },
+        };
+        var first = new RawHost(service, Hello(hostId: "h1"), req => req.Method switch
+        {
+            AcpMethods.Agent.Initialize => Init(false),
+            AcpMethods.Agent.SessionNew => new JsonObject { ["sessionId"] = "s1" },
+            _ => new JsonObject(),
+        });
+        await LinkHarness.Until(() => service.Agents["turns"].HostId == "h1", "the first host");
+        await using var gui = await TestClient.ConnectAsync(service, "gui");
+        Assert.AreEqual("s1", await NewSession(gui));
+        await first.DisposeAsync();
+        await LinkHarness.Until(() => !service.Agents["turns"].IsRunning, "the first host gone");
+
+        // One that comes back with a turn, and goes before it is taken.
+        RawHost? second = null;
+        second = new RawHost(service, Hello(hostId: "h2"), req =>
+        {
+            switch (req.Method)
+            {
+                case AcpMethods.Agent.Initialize:
+                    return Init(true);
+                case GorynychProtocol.MethodHostState:
+                    return new JsonObject
+                    {
+                        ["sessions"] = new JsonArray("s1"),
+                        ["turns"] = new JsonArray(new JsonObject { ["sessionId"] = "s1", ["turn"] = 3, ["promptId"] = "p1" }),
+                    };
+                default:
+                    _ = Task.Run(() => second!.DisposeAsync().AsTask()); // host_replay: the host is gone
+                    return null;
+            }
+        });
+        await LinkHarness.Until(() => EndMarks(service, "s1") == 1, "the turn's end");
+        var mark = Journal(service, "s1").Last(u => (string?)u["_meta"]?[GorynychProtocol.MetaPromptId] == "p1");
+        Assert.AreEqual("cancelled", (string?)mark["_meta"]![GorynychProtocol.MetaStopReason]);
+        await LinkHarness.Until(() => !service.Feed("s1").TurnRunning && service.Feed("s1").Adopted is null, "the session free again");
+        await second.DisposeAsync();
+
+        await using var third = new RawHost(service, Hello(hostId: "h2"), req => req.Method == AcpMethods.Agent.Initialize ? Init(true) : new JsonObject());
+        await LinkHarness.Until(() => { lock (third.Asked) return third.Asked.Contains(GorynychProtocol.MethodHostStop); }, "the host stopped as it came back");
+        lock (third.Asked) CollectionAssert.DoesNotContain(third.Asked, AcpMethods.Agent.Initialize);
     }
 
     [TestMethod]
@@ -479,7 +564,9 @@ public sealed class HostTests
     {
         var agent = new TurnAgent("turns");
         var hosts = new InProcessHosts(_ => agent);
-        await using var service = fault == "unhosted" ? TestDirs.Conductor(TestDirs.New(), agent) : hosts.Conductor(TestDirs.New(), agent);
+        await using var service = fault == "unhosted"
+            ? new Conductor(new ConductorOptions { DataDirectory = TestDirs.New(), ServiceId = "test-service", HostToken = InProcessHosts.Token }, [agent])
+            : hosts.Conductor(TestDirs.New(), agent);
         var hello = fault switch
         {
             "token" => Hello(token: "a-guess"),
@@ -563,6 +650,70 @@ public sealed class HostTests
         await Task.Delay(200);
         Assert.AreEqual("a c ", JournalText(service, "s1"));
         Assert.AreEqual(1, EndMarks(service, "s1"));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task WhatAServiceTookWithoutJournalingIt_IsNotSentToTheNextOneAgain()
+    {
+        var agent = new TurnAgent("turns");
+        var hosts = new InProcessHosts(_ => agent);
+        var data = TestDirs.New();
+        var service = hosts.Conductor(data, agent);
+        hosts.Service = service;
+        var first = new RawHost(service, Hello(), req => req.Method switch
+        {
+            AcpMethods.Agent.Initialize => new JsonObject { ["protocolVersion"] = 1, ["agentCapabilities"] = new JsonObject() },
+            AcpMethods.Agent.SessionNew => new JsonObject { ["sessionId"] = "s1" },
+            _ => new JsonObject(),
+        });
+        await LinkHarness.Until(() => service.Agents["turns"].HostId == "old-host", "the host taken");
+        await using (var gui = await TestClient.ConnectAsync(service, "gui"))
+        {
+            Assert.AreEqual("s1", await NewSession(gui));
+            Task Title(int seq) => first.Rpc.SendNotificationAsync(AcpMethods.Client.SessionUpdate, new JsonObject
+            {
+                ["sessionId"] = "s1",
+                ["update"] = new JsonObject
+                {
+                    ["sessionUpdate"] = "session_info_update", ["title"] = "Tests",
+                    ["_meta"] = new JsonObject { [GorynychProtocol.MetaHostSeq] = $"old-host/{seq}" },
+                },
+            });
+            await Title(6);
+            await Title(7); // the same title again: taken, and not journaled
+            await LinkHarness.Until(() => service.Store.Get("s1")?.Title == "Tests", "the title");
+            await Task.Delay(200);
+            await Prompt(gui, "s1", "keep it").WaitAsync(Wait); // no draft, which goes with its client
+        }
+        await RestartAsync(service);
+        hosts.Service = null;
+        await service.DisposeAsync();
+        await first.DisposeAsync();
+
+        await using var next = hosts.Conductor(data, agent);
+        JsonNode? after = null;
+        await using var back = new RawHost(next, Hello(), req =>
+        {
+            switch (req.Method)
+            {
+                case AcpMethods.Agent.Initialize:
+                    return new JsonObject
+                    {
+                        ["protocolVersion"] = 1, ["agentCapabilities"] = new JsonObject(),
+                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaHost] = new JsonObject { ["hostId"] = "old-host", ["link"] = 1, ["reattached"] = true } },
+                    };
+                case GorynychProtocol.MethodHostState:
+                    return new JsonObject { ["sessions"] = new JsonArray("s1"), ["buffered"] = new JsonArray("s1") };
+                case GorynychProtocol.MethodHostReplay:
+                    after = req.Params?["after"]?.DeepClone();
+                    return new JsonObject();
+                default:
+                    return new JsonObject();
+            }
+        });
+        await LinkHarness.Until(() => after is not null, "the replay asked for");
+        Assert.AreEqual(7, (long)after!["s1"]!, "after what the old service took, though its journal ends at 6");
     }
 
     [TestMethod]

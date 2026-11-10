@@ -135,6 +135,10 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// </summary>
     internal async Task<bool> AttachAsync(JsonRpcConnection rpc, string hostId, CancellationToken ct)
     {
+        // The host before closed, and that is not handled yet: it is now, so a host that comes back
+        // after its link broke is known as gone.
+        if (connection is { IsClosed: true } closed) OnClosed(closed);
+        bool gone;
         lock (attachGate)
         {
             if (connection is { IsClosed: false })
@@ -142,13 +146,15 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
                 ServiceLog.Warn($"{Name}: a second host ({hostId}) connected while {HostId} serves; refused");
                 return false;
             }
-            if (goneHosts.Contains(hostId))
-            {
-                // This conductor ended its turns when it went: they cannot be taken back now.
-                ServiceLog.Warn($"{Name}: host {hostId} came back after this service saw it go; stopped");
-                _ = rpc.SendRequestAsync(GorynychProtocol.MethodHostStop, new JsonObject());
-                return false;
-            }
+            gone = goneHosts.Contains(hostId);
+        }
+        if (gone)
+        {
+            // This conductor ended its turns when it went: they cannot be taken back now.
+            ServiceLog.Warn($"{Name}: host {hostId} came back after this service saw it go; stopped");
+            try { await rpc.SendRequestAsync(GorynychProtocol.MethodHostStop, new JsonObject(), ct).WaitAsync(TimeSpan.FromSeconds(5), ct); }
+            catch (Exception e) when (e is IOException or JsonRpcException or TimeoutException) { }
+            return false;
         }
         rpc.RequestHandler = (req, token) => conductor.OnAgentRequestAsync(this, req, token);
         rpc.NotificationHandler = (method, p) => conductor.OnAgentNotificationAsync(this, method, p);
@@ -164,10 +170,27 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         }
         Info = init;
         HostId = hostId;
-        if (report is not null) await conductor.AdoptAsync(this, report);
-        var after = conductor.HostCursors(hostId, sessions.Concat(Strings(report?["buffered"])).Distinct(StringComparer.Ordinal));
-        var replayed = await rpc.SendRequestAsync(GorynychProtocol.MethodHostReplay, new JsonObject { ["after"] = after }, ct);
+        JsonNode? replayed;
+        try
+        {
+            if (report is not null) await conductor.AdoptAsync(this, report);
+            var after = conductor.HostCursors(hostId, sessions.Concat(Strings(report?["buffered"])).Distinct(StringComparer.Ordinal));
+            replayed = await rpc.SendRequestAsync(GorynychProtocol.MethodHostReplay, new JsonObject { ["after"] = after }, ct);
+        }
+        catch
+        {
+            // It went in the middle of its handshake, with the turns it brought back: they end as a
+            // host's that dies do, and the host is stopped if it comes again.
+            ServiceLog.Warn($"{Name}: host {hostId} went before it was taken back; its turns end");
+            lock (attachGate) goneHosts.Add(hostId);
+            lock (liveGate) live.Clear();
+            conductor.OnAgentStopped(this);
+            throw;
+        }
         foreach (var trimmed in Strings(replayed?["trimmed"])) conductor.HostTrimmed(this, trimmed);
+        // The turns a service before left to a host that no longer has them (it died, or exited
+        // alone) never ended anywhere: they end here, cancelled.
+        await conductor.SettleHostPromptsAsync(this, reattached ? report : null);
         TaskCompletionSource signal;
         lock (attachGate)
         {
@@ -184,11 +207,11 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     static List<string> Strings(JsonNode? array) =>
         (array as JsonArray ?? []).Select(n => n is JsonValue v && v.TryGetValue<string>(out var s) ? s : null).OfType<string>().ToList();
 
+    /// <summary>The agent's connection closed: handled once, by whichever of its callers comes first.</summary>
     void OnClosed(JsonRpcConnection rpc)
     {
-        if (!ReferenceEquals(connection, rpc)) return;
+        if (!ReferenceEquals(Interlocked.CompareExchange(ref connection, null, rpc), rpc)) return;
         ServiceLog.Warn($"{Name}: connection closed");
-        connection = null;
         lock (attachGate)
         {
             if (HostId is { } gone && conductor.Hosts is not null) goneHosts.Add(gone);

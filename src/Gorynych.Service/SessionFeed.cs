@@ -745,6 +745,12 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         lock (clientsGate) prompts.Remove(key);
     }
 
+    /// <summary>The IDs of the client prompts in progress that reached their agent (<see cref="Handed"/>).</summary>
+    public string[] HandedPromptIds()
+    {
+        lock (clientsGate) return prompts.Values.Where(p => p.Handed).Select(p => p.PromptId).OfType<string>().ToArray();
+    }
+
     /// <summary>The IDs of the client prompts in progress that have one.</summary>
     public string[] PromptsInProgress()
     {
@@ -813,19 +819,32 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     }
 
     readonly Dictionary<string, long> hostSeen = new(StringComparer.Ordinal); // under clientsGate: per host, the last of its updates taken
+    string? lastTaken; // under clientsGate
+
+    /// <summary>What the service that ran before took from a host for this session (<see cref="SessionRecord.HostSeen"/>).</summary>
+    public string? KeptHostSeen { get; init; }
+
+    /// <summary>The newest place taken from a host in this run, <c>"&lt;hostId&gt;/&lt;n&gt;"</c>, which the record keeps at exit.</summary>
+    public string? LastTakenFromHost
+    {
+        get { lock (clientsGate) return lastTaken; }
+    }
 
     /// <summary>
     /// The last place in a host's stream this session has (<c>gorynych/hostSeq</c>), from what it took
-    /// in this run, else from the journal: what the host sends again must follow it.
+    /// in this run, else the newer of the journal's and what the service before kept: what the host
+    /// sends again must follow it.
     /// </summary>
     public long HostCursor(string hostId)
     {
         lock (clientsGate)
         {
             if (hostSeen.TryGetValue(hostId, out var seen)) return seen;
-            var fromJournal = Journal.LastHostSeq(hostId);
-            hostSeen[hostId] = fromJournal;
-            return fromJournal;
+            var cursor = Journal.LastHostSeq(hostId);
+            if (KeptHostSeen is { } kept && SessionJournal.TryParseHostSeq(kept, out var keptHost, out var keptNumber) && keptHost == hostId)
+                cursor = Math.Max(cursor, keptNumber);
+            hostSeen[hostId] = cursor;
+            return cursor;
         }
     }
 
@@ -841,6 +860,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         {
             if (number <= cursor) return false;
             hostSeen[hostId] = number;
+            lastTaken = hostSeq;
             return true;
         }
     }

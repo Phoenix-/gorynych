@@ -246,7 +246,9 @@ timeouts and how to try it without registering:
 ## Update
 
 Zed can stay open: its threads go on with the new service
-([service-protocol.md](service-protocol.md#the-resumable-link)).
+([service-protocol.md](service-protocol.md#the-resumable-link)). On Windows the agents run in
+*adapter hosts* of their own, which a restart leaves running, so a turn that runs goes on and its
+answer arrives whole ([service-protocol.md](service-protocol.md#adapter-hosts)).
 
 1. Windows will not overwrite an exe that runs (the service, Zed's bridges, an outside server),
    but it allows a rename. The stamp keeps the name free while a copy from an earlier update
@@ -257,26 +259,37 @@ Zed can stay open: its threads go on with the new service
    Rename-Item "$dir\outside\Gorynych.Outside.exe" "Gorynych.Outside.$stamp.old.exe"
    ```
 2. Install the new build as above. `Expand-Archive -Force` writes the new files in place.
-3. Restart the service. It starts no new turn and waits up to five minutes for the running ones
-   (`--timeout <minutes>` changes that); then it exits, and Zed's bridges, which held the
-   prompts sent meanwhile, start the new service and carry on:
+3. Restart the service. It exits within seconds, and Zed's bridges, which held the prompts sent
+   meanwhile, start the new service and carry on. The running turns go on in their hosts, and the
+   new service takes them back:
    ```powershell
    & "$dir\Gorynych.Service.exe" restart
    ```
    The bridges themselves keep running the old copy until Zed restarts them, and an agent outside
-   Gorynych keeps its outside server until it restarts its MCP servers.
-4. **If a turn still runs after the wait**, the restart is called off: the command lists the
-   sessions still at work and exits with 4, and the service goes on as before, the held prompts
-   included. Run `restart` again once they end, give it a longer `--timeout`, or add `--force`,
-   which cancels them and restarts all the same. `--no-wait` restarts only if nothing runs at
-   that moment; `--no-wait --force` restarts at once.
+   Gorynych keeps its outside server until it restarts its MCP servers. The hosts keep running the
+   old copy too, until the service shuts down (`Gorynych.Service.exe shutdown`) or they are idle
+   with no service for two minutes: until then the `*.old.exe` they run cannot be deleted.
+   An agent that was waiting for another session's answer (`ask_agent`) during the restart is told
+   to ask again.
+4. **Without hosts** (`--hosts off`, the default on Linux and macOS) a restart still stops the
+   agents, so it starts no new turn and waits up to five minutes for the running ones
+   (`--timeout <minutes>` changes that). **If a turn still runs after the wait**, the restart is
+   called off: the command lists the sessions still at work and exits with 4, and the service goes
+   on as before, the held prompts included. Run `restart` again once they end, give it a longer
+   `--timeout`, or add `--force`, which cancels them and restarts all the same. `--no-wait`
+   restarts only if nothing runs at that moment; `--no-wait --force` restarts at once.
+
+**The first update onto hosts** still stops the agents: the service it replaces runs them in its
+own process. So that restart waits for the running turns, as in step 4; the restarts after it
+leave them running.
 
 **The first update onto this scheme**, from a build without `restart`: the command asks the old
 service to exit instead, which cancels its running turns, and the bridges Zed runs are old too,
 so they end with it. Quit Zed before it and start it again after.
 
 If a file is still in use, look for processes that are left over:
-`Get-Process Gorynych.Service, Gorynych.Outside`.
+`Get-Process Gorynych.Service, Gorynych.Outside`. The adapter hosts are `Gorynych.Service`
+processes too (`host --adapter …` on their command line).
 
 ## Where things are
 
@@ -289,7 +302,9 @@ If a file is still in use, look for processes that are left over:
     the launch files and `stderr.log` (headless) or `terminal.log` (TUI).
   - `dsh\`: `gorynych.patch.yml` and `gorynych.full-access.patch.yml`, the overlays Gorynych gives
     its two DSH processes, rewritten at every start; `modes.json`, the threads in full access.
-  - `logs\`: `service-<date>.log` and `outside-<date>.log`.
+  - `host.token`: what proves an adapter host to the service; the service writes it.
+  - `logs\`: `service-<date>.log`, `host-<adapter>-<date>.log` for each adapter host, and
+    `outside-<date>.log`.
 - **The agents' own state** stays in their folders (`~/.claude`, `~/.codex`, `~/.kimi-code`,
   `~/.dsh`).
 - **Elevation.** A service started by Zed in a plain session serves the user's plain and

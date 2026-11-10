@@ -130,8 +130,9 @@ flowchart LR
   particular to an agent sits behind the [adapter contract](adapter-contract.md).
 - **Adapters are ACP agents.** An external one is an executable that speaks ACP over stdio
   (`kimi acp`); an own one (Claude and Codex) is an assembly with an ACP interface over an
-  in-memory link, so moving it into its own process later means only wrapping it in JSON-RPC.
-  That move is planned: adapter hosts, so the conductor can restart without breaking a turn
+  in-memory link, so moving it into its own process means only wrapping it in JSON-RPC.
+  That move is **done** on Windows (10 November 2026): each adapter runs in an *adapter host*, so
+  the conductor restarts without breaking a turn
   ([Updating without losing work](#updating-without-losing-work)).
   DeepSeek Harness speaks ACP itself; its adapter is a thin in-process proxy in front of
   `dsh --profile acp`.
@@ -531,15 +532,18 @@ credentials never move between machines.
 
 ## Updating without losing work
 
-Stopping the service today stops every agent. The adapters live in the service's process,
-and the agents are their children on stdio. So a running turn breaks off mid-step, and
-pending approvals and questions are lost. What stays is the agents' native history, the
-journals and the overlay, so an idle session loses nothing.
+Without adapter hosts, stopping the service stops every agent. The adapters live in the
+service's process, and the agents are their children on stdio. So a running turn breaks off
+mid-step, and pending approvals and questions are lost. What stays is the agents' native
+history, the journals and the overlay, so an idle session loses nothing.
 
-**Planned, agreed on 10 November 2026: the process boundary moves to where ACP already is,
-between the conductor and the adapters.**
+**Agreed on 10 November 2026: the process boundary moves to where ACP already is, between the
+conductor and the adapters.** Step 3a, the hosts and a conductor that restarts lightly, is
+**done** on 10 November 2026 and on by default on Windows
+([service-protocol.md](service-protocol.md#adapter-hosts)); step 3b, updating the adapters
+themselves, is next.
 
-**Adapter hosts and a light conductor.**
+**Adapter hosts and a light conductor** (3a, **done**).
 - An adapter runs in a small process of its own, an *adapter host*. It is the same executable
   in another mode, and it owns its agents and all their state.
 - The conductor keeps the journals, the catalog, the routing, the approval policy and the
@@ -550,16 +554,37 @@ between the conductor and the adapters.**
      not yet answered. It buffered the updates that came while no conductor was there, and
      hands them over now, so the journal misses nothing.
   3. The bridge reconnects too. It keeps the client's `session/prompt` open and answers it
-     when the turn ends, so the GUI sees a pause in the stream, not a break (the bridge's part
-     is **done**; until the hosts exist, a turn ends with the old conductor, so `restart` waits
-     for running turns and is called off when they outlast the wait, unless `--force` cancels
-     them, and then the bridge answers `cancelled`).
+     when the turn ends, so the GUI sees a pause in the stream, not a break. Without hosts
+     (`--hosts off`, the default elsewhere than Windows), a turn ends with the old conductor, so
+     `restart` waits for running turns and is called off when they outlast the wait, unless
+     `--force` cancels them, and then the bridge answers `cancelled`.
+- How it came out:
+  - The host is the same executable (`Gorynych.Service host --adapter <name>`), started detached
+    by the service on an adapter's first use. It dials the conductor on a pipe of its own
+    (`<pipe>.hosts`) and proves itself with a token from the data folder, which a plain client
+    does not have.
+  - The host numbers each update it passes on (`gorynych/hostSeq`), and the journal keeps the
+    number. The next conductor gives each session's newest number as a cursor, and the host sends
+    what it kept after it. So the journal misses nothing and doubles nothing, without acks.
+  - The host reports each prompt's end before its answer (`_gorynych/turn_ended`), numbered the
+    same way, and the conductor marks the end from that report. So an end that came while no
+    conductor was there, or that a dying conductor never read, is marked by the next one, once.
+  - The next conductor takes the running turns back: they hold their sessions, so a new prompt
+    waits for them, and a resuming bridge is told they run.
+  - A restart waits for no turn. A prompt waiting behind a running turn is refused and goes to the
+    next service. What still lives in the conductor is cut: an `ask_agent` waiting for its answer
+    gets an error that says to ask again, with the session ID.
 - How many hosts depends on the agent:
-  - Claude runs a process per session, so it gets a host per session.
+  - Claude runs a process per session, so it is to get a host per session. In 3a it has one host
+    for the adapter, as the others do: a host per session needs the conductor to route each
+    session's requests to its own host, and it pays off only with 3b, where it lets an update of
+    the Claude adapter move one session at a time. The link is per host already (numbers,
+    cursors, hello), so 3b changes the routing, not the link.
   - Codex runs one app-server for all threads, Kimi one process, and DSH a process per mode.
     Each of them gets one host for the adapter.
 
-**Updating an adapter.**
+**Updating an adapter** (3b, **planned**). Until then a host runs the code it was started with
+until it exits: a restart onto a new executable keeps the old hosts and their adapters.
 - New sessions start on the new host at once.
 - A live session moves over when it is unloaded idle, or when its host has no running turn.
   That is waiting for one adapter, not for the whole machine, and Claude's host per session
@@ -572,7 +597,8 @@ between the conductor and the adapters.**
 - the bridge and the service across a restart (**done** on 10 November 2026:
   `ResumableLink` and `Gorynych.Service restart`,
   [service-protocol.md](service-protocol.md#the-resumable-link));
-- the conductor and its hosts.
+- the conductor and its hosts (**done** in 3a with its own small protocol on the same ideas:
+  the host keeps what the conductor lacks, numbered, and sends it after a cursor).
 
 Each time one side lives on while the other restarts or loses the connection. After
 reconnecting they shake hands again, list the live sessions, hand over the updates after the
@@ -608,17 +634,26 @@ last acknowledged one, and send the pending requests again. So it is built once.
   - v2 of the transport RFD;
   - a proposed `session/attach` with delta sync after a message ID (not yet checked).
 
-**Edge cases.**
-- **Versions.** A new conductor talks to older hosts: the link's version is announced at
-  `initialize`, and at least the previous one is supported. Bridges keep running the old code
-  until the GUI restarts, so the bridge stays thin.
-- **Orphans.** A host whose conductor does not come back, after a crash or an uninstall,
-  finishes its running turns and exits after a timeout.
-- **The peers server inside an agent** reconnects by itself. An `ask_agent` that was waiting
-  during the restart returns an error that says to ask again.
+**Edge cases** (as decided in 3a).
+- **Versions.** A new conductor talks to older hosts: the host link's version is in the host's
+  hello and its `initialize` answer (`gorynych/host`), and a conductor takes a range of them that
+  keeps at least the previous one. Bridges keep running the old code until the GUI restarts, so
+  the bridge stays thin.
+- **Orphans.** A host whose conductor does not come back, after a crash or an uninstall, lets its
+  turns run for up to 10 minutes and exits once nothing runs (2 minutes after it lost the
+  conductor at the earliest, also when it is idle); at 10 minutes it cancels what still runs and
+  exits. What it did meanwhile is in the agents' own history, not in a journal.
+- **A host that dies** ends its turns `cancelled`, with their marks, and the next request starts
+  another.
+- **The peers server inside an agent** connects for each call, and waits up to 30 seconds for a
+  service that restarts. An `ask_agent` that was waiting during the restart returns an error
+  that says to ask again.
 - **Job objects.** Hosts are detached from the service's process, as `DetachedProcess` already
   does for the service.
-- **The first update** onto this scheme still stops the agents.
+- **Platforms.** Hosts are on by default on Windows only, where they are tested; on Linux and
+  macOS they build, but are off unless `--hosts on`.
+- **The first update** onto this scheme still stops the agents: the service it replaces has no
+  hosts.
 
 This replaces the two levels considered first. One was a drain of the whole machine before
 every update. The other was a keeper of the agents' raw stdio, which needs the adapters' state
@@ -731,9 +766,11 @@ Next, in order (**planned**):
 2. The resumable link, and the bridge's reconnect over it
    ([Updating without losing work](#updating-without-losing-work)). **Done** on 10 November
    2026, with `Gorynych.Service restart`, and checked live through the bridge on one machine.
-3. Adapter hosts, and a conductor that restarts without breaking a turn (**in progress**).
-4. Updating an adapter on the fly: new sessions start on the new host, and a live one moves
-   over once it is idle.
+3. Adapter hosts, and a conductor that restarts without breaking a turn. **3a done** on 10
+   November 2026: the hosts, one per adapter, and a restart that waits for no turn, on by
+   default on Windows ([service-protocol.md](service-protocol.md#adapter-hosts)).
+4. Updating an adapter on the fly (3b): new sessions start on the new host, and a live one moves
+   over once it is idle; with it a host per Claude session.
 5. Read-only sessions, first for a Codex thread open in another app (agreed on 10 November
    2026). Today opening such a thread shows the journal, which may be stale, when Gorynych has
    one, and fails when it has none. Instead:

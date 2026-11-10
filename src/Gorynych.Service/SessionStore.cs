@@ -42,6 +42,23 @@ public sealed class SessionRecord
     /// </summary>
     public string? PeerToken { get; set; }
 
+    /// <summary>
+    /// The newest place in its adapter host's stream the service took for this session
+    /// (<c>gorynych/hostSeq</c>), kept when the service exits: it took some without journaling them
+    /// with their place (a catch-up of the agent's own history), and the host must not send those to
+    /// the next service again.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? HostSeen { get; set; }
+
+    /// <summary>
+    /// The <c>gorynych/promptId</c>s of the turns that went on in the adapter's host when the service
+    /// exited for a restart. The next service ends those its host no longer has (it died, or exited
+    /// alone) as cancelled, and the host reports the end of the others.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? HostPrompts { get; set; }
+
     /// <summary>A spawned session reports the end of each of its turns to its parent.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool ReportToParent { get; set; }
@@ -253,5 +270,6 @@ public sealed class SessionStore
         SessionId = r.SessionId, Agent = r.Agent, Cwd = r.Cwd, Title = r.Title, TitleSource = r.TitleSource,
         CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt, Draft = r.Draft, Deleted = r.Deleted,
         ParentSessionId = r.ParentSessionId, ReportToParent = r.ReportToParent, Archived = r.Archived, PeerToken = r.PeerToken,
+        HostSeen = r.HostSeen, HostPrompts = r.HostPrompts is null ? null : [.. r.HostPrompts],
     };
 }

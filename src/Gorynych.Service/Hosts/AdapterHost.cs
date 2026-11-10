@@ -222,11 +222,15 @@ public sealed class AdapterHost
     async Task AgentAsksAsync(JsonNode id, string method, JsonObject message)
     {
         var question = new Asked { AgentId = id.DeepClone(), Message = message };
-        lock (state) asked[id.ToJsonString()] = question;
+        var key = id.ToJsonString();
+        lock (state) asked[key] = question;
         await sendGate.WaitAsync();
         try
         {
-            if (current is { IsLost: false } connection) await AskAsync(connection, question);
+            // A conductor that took the host meanwhile asked it already (ActivateAsync); one the agent withdrew is asked no more.
+            bool open;
+            lock (state) open = asked.TryGetValue(key, out var still) && ReferenceEquals(still, question) && question.Connection is null;
+            if (open && current is { IsLost: false } connection) await AskAsync(connection, question);
         }
         finally
         {
@@ -344,7 +348,21 @@ public sealed class AdapterHost
         finally
         {
             lock (state) reconnecting = false;
+            await AgainIfLostAsync();
         }
+    }
+
+    /// <summary>
+    /// The connection the loop got was lost before the loop saw it was taken: LostAsync found the
+    /// loop still running, and left it to it.
+    /// </summary>
+    async Task AgainIfLostAsync()
+    {
+        bool again;
+        await sendGate.WaitAsync();
+        try { again = current is null && !ended.Task.IsCompleted && !stopping.IsCancellationRequested; }
+        finally { sendGate.Release(); }
+        if (again) StartReconnecting();
     }
 
     /// <summary>

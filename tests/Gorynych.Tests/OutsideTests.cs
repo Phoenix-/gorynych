@@ -718,6 +718,49 @@ public sealed class OutsideTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AnAskCutOffByARestart_SaysToAskAgain_WithTheSession()
+    {
+        // A service that goes as it is asked, as one that restarts while the asked session answers.
+        var pipe = Pipe();
+        using var stop = new CancellationTokenSource();
+        var serving = Task.Run(async () =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                var server = PipeListener.Create(pipe);
+                try { await server.WaitForConnectionAsync(stop.Token); }
+                catch (OperationCanceledException) { await server.DisposeAsync(); break; }
+                var rpc = new JsonRpcConnection(server, server, "going-service");
+                rpc.RequestHandler = async (req, ct) =>
+                {
+                    if (req.Method == AcpMethods.Agent.Initialize) return new JsonObject { ["protocolVersion"] = 1, ["agentCapabilities"] = new JsonObject() };
+                    _ = Task.Run(() => rpc.DisposeAsync().AsTask());
+                    await Task.Delay(Timeout.Infinite, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30));
+                    return null;
+                };
+                rpc.Start();
+            }
+        });
+        try
+        {
+            await using var shim = new Shim(pipe);
+            var cut = await shim.Host.SendRequestAsync("tools/call", ModernCall("ask_agent", new JsonObject { ["session_id"] = "s-42", ["question"] = "SQLite?" }));
+            Assert.AreEqual(true, (bool?)cut!["isError"]);
+            Assert.AreEqual("Gorynych restarted while session_id s-42 was answering, so its answer was lost. Ask again in a moment: " +
+                "ask_agent with session_id s-42 and the same question.", (string?)cut["content"]![0]!["text"]);
+            var listed = await shim.Host.SendRequestAsync("tools/call", ModernCall("list_sessions", []));
+            Assert.AreEqual("Gorynych restarted while it handled this call, so its answer was lost. Call the tool again in a moment.",
+                (string?)listed!["content"]![0]!["text"]);
+        }
+        finally
+        {
+            stop.Cancel();
+            await serving.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
     public async Task WhileTheServiceIsDown_TheToolsComeFromTheServersCopy_AndTheServiceWinsOnceItIsBack()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);

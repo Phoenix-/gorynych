@@ -60,6 +60,17 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
         {
             return Local(request.Method, @params, inside: false, serviceDown: e.Message);
         }
+        catch (ServiceLostException)
+        {
+            // The service went once the call was on its way (a restart): it may have been done, or not.
+            var target = (string?)@params?["arguments"]?["session_id"];
+            var text = (string?)@params?["name"] == "ask_agent"
+                ? $"Gorynych restarted while session_id {target} was answering, so its answer was lost. Ask again in a moment: " +
+                  $"ask_agent with session_id {target} and the same question."
+                : "Gorynych restarted while it handled this call, so its answer was lost. Call the tool again in a moment.";
+            if (request.Method == "tools/call") return OutsideTools.ToolResult(text, isError: true, modern);
+            throw new JsonRpcException(JsonRpcException.InternalError, text);
+        }
     }
 
     /// <summary>The answers from the server's own copy: inside Gorynych, and while the service cannot be reached.</summary>
@@ -102,11 +113,23 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
         JsonNode? answer;
         try
         {
-            answer = await service.SendRequestAsync(GorynychProtocol.MethodMcpMessage, envelope, ct);
-        }
-        catch (IOException e)
-        {
-            throw new ServiceUnreachableException($"the connection to it broke ({e.Message})");
+            Task<JsonNode?> sent;
+            try
+            {
+                sent = await service.StartRequestAsync(GorynychProtocol.MethodMcpMessage, envelope, ct);
+            }
+            catch (IOException e)
+            {
+                throw new ServiceUnreachableException($"the connection to it broke ({e.Message})");
+            }
+            try
+            {
+                answer = await sent;
+            }
+            catch (IOException e)
+            {
+                throw new ServiceLostException(e.Message);
+            }
         }
         finally
         {
@@ -213,4 +236,7 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
     Task<NamedPipeClientStream?> TryConnectAsync(TimeSpan timeout, CancellationToken ct) => ServicePipe.ConnectAsync(pipe, timeout, ct);
 
     sealed class ServiceUnreachableException(string reason) : Exception(reason);
+
+    /// <summary>The connection to the service went once the request was on its way: a restart, most likely.</summary>
+    sealed class ServiceLostException(string reason) : Exception(reason);
 }

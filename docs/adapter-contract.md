@@ -51,6 +51,11 @@ fallback when the adapter does not provide it.
   stdio (Kimi), or a `DuplexLink` to an in-process agent (Claude). The service starts the
   adapter on first use and again after its connection closes; every session is then not
   loaded ([§4](#4-opening-a-session-that-is-not-loaded)).
+- The adapter MAY run in an *adapter host*, a process of its own that outlives a restart of the
+  service ([service-protocol.md](service-protocol.md#adapter-hosts)), and MUST work the same
+  there: it talks to the service only through its ACP connection, keeps everything it needs in
+  its own instance, and builds from the same command-line options in either process. Listeners
+  it opens for its agent (hooks, a channel) live with it in the host.
 - An adapter MUST run the unmodified agent binary or API client under the user's own login on
   that machine, MUST NOT copy credentials between machines, and MUST NOT edit the agent's own
   configuration (`~/.claude`, `~/.codex`, `~/.kimi-code`, `~/.dsh`). Everything it needs goes through
@@ -60,7 +65,8 @@ fallback when the adapter does not provide it.
 - An adapter MUST start its agent in a folder of its own, never in a session's folder: an agent
   may read its launch folder's configuration (DSH loads its `.env` into its environment), which
   would then hold for every session. (DSH)
-- An adapter MUST start its agent as a descendant of the service process, so that the MCP
+- An adapter MUST start its agent as a descendant of the process it runs in, the service or
+  its adapter host (the same executable), so that the MCP
   servers the agent starts from the user's own configuration are recognised as inside
   Gorynych: the `gorynych-outside` server, which the user registers for agents outside
   Gorynych, hides its tools when a Gorynych service is among its ancestors

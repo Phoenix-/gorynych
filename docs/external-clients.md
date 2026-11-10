@@ -56,9 +56,11 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
   sessions after the last update the client got, keeps a prompt in flight open until its turn
   ends there (or answers `cancelled` when it went with the old service), and shows a pending
   approval once. The client sees a pause, not a break
-  ([service-protocol.md](service-protocol.md#the-resumable-link)). A restart that running
-  turns outlast is called off (unless `--force`), and the prompts the bridge held go to the
-  service that stayed.
+  ([service-protocol.md](service-protocol.md#the-resumable-link)). On Windows the service runs
+  its adapters in adapter hosts, which a restart leaves running: a turn goes on, and the bridge
+  gets its answer from the next service ([service-protocol.md](service-protocol.md#adapter-hosts)).
+  Without them (`--hosts off`), a restart that running turns outlast is called off (unless
+  `--force`), and the prompts the bridge held go to the service that stayed.
 - A session an agent spawned is an ordinary session in `session/list`, with its parent in
   `_meta["gorynych/parentSessionId"]`. The service asks the person to approve a spawn with
   a `session/request_permission` on the parent session, unless the user asked for it in their

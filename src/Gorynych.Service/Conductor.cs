@@ -241,6 +241,33 @@ public sealed class Conductor : IAsyncDisposable
         IdleFromNow(feed.SessionId);
     }
 
+    static bool SameList(List<string>? a, List<string>? b) => (a ?? []).SequenceEqual(b ?? [], StringComparer.Ordinal);
+
+    /// <summary>
+    /// After a host is taken: the turns the service before left running in the adapter's host
+    /// (<see cref="SessionRecord.HostPrompts"/>) that this host does not run and whose end is not in
+    /// the journal ended nowhere, as their host died or exited alone: each ends cancelled, with its
+    /// mark. A host that came back has reported and sent the ends it had by now.
+    /// </summary>
+    /// <param name="report">What a host that came back reported; null for a new host, which runs none of them.</param>
+    internal async Task SettleHostPromptsAsync(AgentHost host, JsonObject? report)
+    {
+        var running = (report?["turns"] as JsonArray ?? []).OfType<JsonObject>()
+            .Select(t => (string?)t["promptId"]).OfType<string>().ToHashSet(StringComparer.Ordinal);
+        foreach (var record in store.All())
+        {
+            if (record.Agent != host.Name || record.HostPrompts is not { Count: > 0 } left || removed.ContainsKey(record.SessionId)) continue;
+            var feed = Feed(record.SessionId);
+            foreach (var promptId in left)
+            {
+                if (running.Contains(promptId) || feed.Journal.HasEndMark(promptId)) continue;
+                ServiceLog.Warn($"{host.Name} {record.SessionId}: prompt {promptId} went on in a host that is gone; it ends cancelled");
+                await MarkPromptEndAsync(feed, promptId, null, new IOException("its host went"));
+            }
+            store.Update(record.SessionId, record.Agent, r => r.HostPrompts = null);
+        }
+    }
+
     /// <summary>For each session, its place in the host's stream: what the host sends again must follow it.</summary>
     internal JsonObject HostCursors(string hostId, IEnumerable<string> sessions)
     {
@@ -503,6 +530,7 @@ public sealed class Conductor : IAsyncDisposable
             return feeds.GetOrAdd(sessionId, id => new SessionFeed(id, new SessionJournal(JournalPath(id), options.JournalMaxEntries))
             {
                 LastClientLeft = () => IdleFromNow(id),
+                KeptHostSeen = store.Get(id)?.HostSeen,
             });
         var retired = new SessionFeed(sessionId, new SessionJournal(JournalPath(sessionId), options.JournalMaxEntries));
         retired.Retire();
@@ -610,9 +638,6 @@ public sealed class Conductor : IAsyncDisposable
                 feed.TurnEnded();
                 feed.ExitUse();
             }
-            // This service exits for a restart and leaves its hosts running: the turn goes on there,
-            // and the next service takes it back.
-            if (Hosts is not null && !StopHostsOnExit) continue;
             if (feed.EndAdopted(any: true) is { } turn)
             {
                 ServiceLog.Warn($"{host.Name} {feed.SessionId}: its host went in the middle of a turn it had brought back");
@@ -3293,6 +3318,20 @@ public sealed class Conductor : IAsyncDisposable
         foreach (var host in agents.Values)
             try { await host.DisposeAsync(); }
             catch (Exception e) { ServiceLog.Warn($"{host.Name}: stop failed: {e.Message}"); }
+        // What each session took from its host, journaled or not, for the next service: the hosts'
+        // connections are closed, so nothing more comes (SessionFeed.HostCursor).
+        // For a restart, the turns that go on in the hosts too, so the next one can end those that no
+        // host brings back (SettleHostPromptsAsync).
+        if (options.Hosts is not null)
+            foreach (var feed in feeds.Values)
+            {
+                if (feed.Retired || store.Get(feed.SessionId) is not { } record) continue;
+                var seen = feed.LastTakenFromHost ?? record.HostSeen;
+                List<string>? left = StopHostsOnExit ? record.HostPrompts : [.. feed.HandedPromptIds()];
+                if (left is { Count: 0 }) left = null;
+                if (record.HostSeen != seen || !SameList(record.HostPrompts, left))
+                    store.Update(feed.SessionId, record.Agent, r => { r.HostSeen = seen; r.HostPrompts = left; });
+            }
         store.Flush();
         shutdown.Dispose();
         cleanupStop.Dispose();
