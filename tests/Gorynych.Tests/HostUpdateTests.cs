@@ -279,6 +279,30 @@ public sealed class HostUpdateTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AQuestionWhoseHostDies_CountsNoMore_AndTheSessionOpensElsewhere()
+    {
+        // Its answer can no longer be written: the question is over all the same.
+        await using var rig = new Rig();
+        rig.Zed.Approve = async (_, ct) =>
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            return "allow";
+        };
+        await rig.Zed.InitializeAsync().WaitAsync(Wait);
+        var b = await rig.SessionAsync();
+        await Prompt(rig, b, "b1");
+        var feed = rig.Service.Feed(b);
+        _ = rig.Agent.AgentOf(b).Rpc.SendRequestAsync(AcpMethods.Client.SessionRequestPermission, Question(b));
+        await LinkHarness.Until(() => feed.Asking == 1, "the question");
+
+        await rig.Hosts.KillAsync("turns");
+        await LinkHarness.Until(() => feed.Asking == 0, "the question to be over with its host");
+        await Prompt(rig, b, "b2");
+        Assert.AreEqual(1, rig.Agent.InstanceOf(b), "it opened in the next host");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
     public async Task AHostThatGoesBeforeItAsksItsQuestionsAgain_LeavesNoQuestionCounted()
     {
         // The old host has a question open, and goes after it told its state but before the next
