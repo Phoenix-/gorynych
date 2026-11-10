@@ -731,7 +731,9 @@ public sealed class OutsideTests
         CollectionAssert.AreEqual(new[] { "list_sessions", "read_session", "ask_agent" }, tools!["tools"]!.AsArray().Select(t => (string?)t!["name"]).ToArray());
         var down = await shim.Host.SendRequestAsync("tools/call", ModernCall("list_sessions", []));
         Assert.AreEqual(true, (bool?)down!["isError"]);
-        Assert.AreEqual($"Gorynych is not running and could not be started: {Nowhere} does not exist. Start Gorynych, then call the tool again.",
+        // From an ssh login or session 0 (a CI runner may run there) it starts nothing, and says why.
+        var reason = ServiceLaunch.IsRemoteLogon() ? ServiceLaunch.Refusal(pipe, defaultPipe: false) : $"{Nowhere} does not exist";
+        Assert.AreEqual($"Gorynych is not running and could not be started: {reason}. Start Gorynych, then call the tool again.",
             (string?)down["content"]![0]!["text"]);
         var discover = await shim.Host.SendRequestAsync("server/discover", new JsonObject { ["_meta"] = Modern() });
         Assert.AreEqual(OutsideTools.Instructions, (string?)discover!["instructions"]);
@@ -828,6 +830,7 @@ public sealed class OutsideTests
     [Timeout(60_000, CooperativeCancellation = true)]
     public async Task ARequestCancelledWhileTheServiceStarts_LetsTheNextRequestStartItAgain()
     {
+        if (ServiceLaunch.IsRemoteLogon()) Assert.Inconclusive("an ssh login or session 0 starts no service without the logon task");
         var logs = TestDirs.New();
         int Starts() => Directory.EnumerateFiles(logs, "outside-*.log").SelectMany(SharedLines).Count(l => l.Contains("starting the service", StringComparison.Ordinal));
         // A "service" that never opens the pipe, so the server waits for it.

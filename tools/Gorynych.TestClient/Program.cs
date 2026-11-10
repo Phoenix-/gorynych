@@ -235,24 +235,8 @@ sealed class Client : IAsyncDisposable
         return new Client(new JsonRpcConnection(stream, stream, "service"));
     }
 
-    static async Task<NamedPipeClientStream?> TryConnectAsync(string pipe, int timeoutMs)
-    {
-        var deadline = Environment.TickCount64 + timeoutMs;
-        while (true)
-        {
-            var stream = new NamedPipeClientStream(".", pipe, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-            try
-            {
-                await stream.ConnectAsync(200);
-                return stream;
-            }
-            catch (TimeoutException)
-            {
-                await stream.DisposeAsync();
-                if (Environment.TickCount64 > deadline) return null;
-            }
-        }
-    }
+    static Task<NamedPipeClientStream?> TryConnectAsync(string pipe, int timeoutMs) =>
+        ServicePipe.ConnectAsync(pipe, TimeSpan.FromMilliseconds(timeoutMs));
 
     static string? FindService()
     {

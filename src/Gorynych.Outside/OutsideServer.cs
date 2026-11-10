@@ -152,9 +152,9 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
     }
 
     /// <summary>
-    /// Starts the service as the stdio bridge does, at most once a minute, and waits for its pipe.
-    /// A start that cannot break away from the host's job is logged: closing the host may then stop
-    /// the service with every session.
+    /// Starts the service as the stdio bridge does (<see cref="ServiceLaunch.Decide"/>), at most once
+    /// a minute, and waits for its pipe. A start that cannot break away from the host's job is
+    /// logged: closing the host may then stop the service with every session.
     /// </summary>
     async Task<NamedPipeClientStream> StartServiceAsync(CancellationToken ct)
     {
@@ -167,12 +167,26 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
             lastStart = Environment.TickCount64;
             try
             {
-                if (!File.Exists(serviceExe)) throw new FileNotFoundException($"{serviceExe} does not exist");
-                OutsideLog.Info($"starting the service: {serviceExe} --pipe {pipe}");
-                if (!DetachedProcess.Start(serviceExe, ["--pipe", pipe]))
-                    OutsideLog.Warn("the host's job object forbids breaking away, so the service started inside it: " +
-                        "closing the host may stop the service and every session");
-                var stream = await TryConnectAsync(TimeSpan.FromSeconds(20), ct) ?? throw new TimeoutException("it did not open its pipe within 20 seconds");
+                NamedPipeClientStream stream;
+                switch (ServiceLaunch.Decide(LogonTask.Exists(pipe), ServiceLaunch.IsRemoteLogon()))
+                {
+                    case ServiceLaunch.Way.Refuse:
+                        throw new InvalidOperationException(ServiceLaunch.Refusal(pipe, pipe == GorynychProtocol.DefaultPipeName));
+                    case ServiceLaunch.Way.RunTask:
+                        OutsideLog.Info($"starting the service with the logon task {LogonTask.Name(pipe)}");
+                        if (LogonTask.Run(pipe) is { } failure)
+                            throw new InvalidOperationException($"the logon task {LogonTask.Name(pipe)} did not start: {failure}");
+                        stream = await TryConnectAsync(TimeSpan.FromSeconds(20), ct) ?? throw new TimeoutException(ServiceLaunch.TaskTimeout(pipe, 20));
+                        break;
+                    default:
+                        if (!File.Exists(serviceExe)) throw new FileNotFoundException($"{serviceExe} does not exist");
+                        OutsideLog.Info($"starting the service: {serviceExe} --pipe {pipe}");
+                        if (!DetachedProcess.Start(serviceExe, ["--pipe", pipe]))
+                            OutsideLog.Warn("the host's job object forbids breaking away, so the service started inside it: " +
+                                "closing the host may stop the service and every session");
+                        stream = await TryConnectAsync(TimeSpan.FromSeconds(20), ct) ?? throw new TimeoutException("it did not open its pipe within 20 seconds");
+                        break;
+                }
                 lastStartFailure = null;
                 return stream;
             }
@@ -196,29 +210,7 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
         }
     }
 
-    async Task<NamedPipeClientStream?> TryConnectAsync(TimeSpan timeout, CancellationToken ct)
-    {
-        var deadline = Environment.TickCount64 + (long)timeout.TotalMilliseconds;
-        while (true)
-        {
-            var stream = new NamedPipeClientStream(".", pipe, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-            try
-            {
-                await stream.ConnectAsync(200, ct);
-                return stream;
-            }
-            catch (TimeoutException)
-            {
-                await stream.DisposeAsync();
-                if (Environment.TickCount64 > deadline) return null;
-            }
-            catch
-            {
-                await stream.DisposeAsync();
-                throw;
-            }
-        }
-    }
+    Task<NamedPipeClientStream?> TryConnectAsync(TimeSpan timeout, CancellationToken ct) => ServicePipe.ConnectAsync(pipe, timeout, ct);
 
     sealed class ServiceUnreachableException(string reason) : Exception(reason);
 }

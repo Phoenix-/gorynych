@@ -147,6 +147,18 @@ public sealed class BridgeTests
     {
         var pipe = "gorynych-bridge-" + Guid.NewGuid().ToString("N")[..8];
         var data = TestDirs.New();
+        if (Outside.ServiceLaunch.IsRemoteLogon())
+        {
+            // An ssh login or session 0 (a CI runner may run there), and no logon task for this pipe:
+            // the bridge starts no service, which would run elevated there, and says what to do.
+            await using var refused = new PlainClient("acp", "--agent", "claude", "--pipe", pipe, "--data", data);
+            Assert.IsTrue(await refused.ExitsAsync());
+            for (var i = 0; i < 50 && !refused.Stderr.ToString().Contains("task install --pipe " + pipe, StringComparison.Ordinal); i++)
+                await Task.Delay(100);
+            StringAssert.Contains(refused.Stderr.ToString(), "task install --pipe " + pipe, "the refusal");
+            Assert.IsNull(await ServicePipe.ConnectAsync(pipe, TimeSpan.FromMilliseconds(500)), "no service was started");
+            return;
+        }
         string serviceId;
         await using (var first = new PlainClient("acp", "--agent", "claude", "--pipe", pipe, "--data", data))
         {

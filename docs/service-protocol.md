@@ -12,17 +12,39 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
 - One service per user and endpoint, enforced by a named mutex
   (`Gorynych.Service.<pipe>`, current user, all logon sessions).
 - Transport: a named pipe, default `gorynych-acp-<user name>`, carrying the ACP stdio
-  framing (JSON-RPC 2.0, one message per line). Clients connect with
-  `PipeOptions.CurrentUserOnly`, which checks the server's owner. On Windows the pipe's
-  owner and the only principal its ACL allows is the default owner of the service's
-  token, the SID that this check compares with; the ACL also denies the NETWORK group.
-  That owner is the user, or BUILTIN\Administrators when the service runs elevated, so
-  an elevated service and its clients are kept apart from the user's plain processes:
-  both run elevated or neither does. A plain process can never drive an elevated service,
-  which starts agents. Elsewhere the pipe is a Unix socket, open only to the user.
+  framing (JSON-RPC 2.0, one message per line). Elsewhere than Windows the pipe is a Unix
+  socket, open only to the user, and clients connect with `PipeOptions.CurrentUserOnly`.
+- **Who may open the pipe** (Windows). The rules let a local ssh client in, so that another
+  machine can reach the service through `ssh -T` and the bridge
+  ([design.md](design.md#several-machines)).
+  - Its owner, and the only principal its ACL allows, is the default owner of the service's
+    token: the user, or BUILTIN\Administrators when the service runs elevated.
+  - It is created with `PIPE_REJECT_REMOTE_CLIENTS`, so a client over the network (SMB) is
+    refused. A local process that an ssh server started gets in, although its token has the
+    NETWORK group. .NET 10 never sets this flag, so the service creates the pipe with
+    `CreateNamedPipeW` itself.
+  - A client checks the pipe's owner before it sends anything. The owner must be the client's
+    user or its token's default owner, so a pipe of another user's with the same name is
+    refused. The clients do this check themselves: `PipeOptions.CurrentUserOnly` takes only
+    the default owner, and for an elevated client that is BUILTIN\Administrators.
+  - The server may only identify a client (`SecurityIdentification`), never act as it.
+- **Elevation.**
+  - An elevated client of the same user opens a plain service: its token has the user's SID,
+    which the ACL allows. Every ssh login of an administrator is elevated.
+  - A plain process never opens an elevated service, which starts agents. The ACL allows only
+    BUILTIN\Administrators, which a plain token holds only for deny.
+  - The bridge never starts a service from an ssh login, where it would run elevated
+    (below).
 - The service is not a Windows service (session 0 could not start agents under the
-  user's login). The GUI, the test client or a logon task starts it; it keeps running
-  after clients disconnect.
+  user's login). It keeps running after clients disconnect. The GUI, the test client, the
+  bridge, the outside server, or the logon task starts it.
+- **Starting the service.** When the pipe is missing, the bridge and the outside server:
+  1. Run the logon task `Gorynych.Service.<pipe>` if it is registered (`task install`, below),
+     and wait 20 seconds for the pipe. The task's own options apply, not the bridge's.
+  2. Without the task, start nothing from outside the user's Windows session, that is in
+     session 0 or with the NETWORK group in the token, as under ssh. They say that
+     `task install` is needed.
+  3. Otherwise start the service as a detached process, with the bridge's options.
 - Data: `%LOCALAPPDATA%\Gorynych` (`--data` overrides): `service.json` (the persistent
   service ID), `sessions.json` (the overlay), `journal/`, `claude/` (the Claude adapter's
   session list and `channels.json`, the person's answer about development channels), `logs/`.
@@ -43,9 +65,22 @@ The same executable is
 also the `gorynych` MCP server agents start over stdio:
 `peers [--pipe … --token …] [--channel-url … | --reply-url …]` (see Opinions below), the stdio bridge
 for external ACP clients: `acp --agent claude|kimi|codex` (see [external-clients.md](external-clients.md)),
-and `shutdown [--pipe …]`, which sends the running service `_gorynych/shutdown` and waits up
+`shutdown [--pipe …]`, which sends the running service `_gorynych/shutdown` and waits up
 to 30 seconds for its process to end (exit code 0; 1 when no service runs on the pipe; 2 when
-it still runs).
+it still runs), and `task install [--pipe …] [service options]` / `task uninstall [--pipe …]`.
+`task install` registers the logon task `Gorynych.Service.<pipe>` for the current user, or
+replaces it, with `schtasks /Create /XML`. How a remote machine is set up with it is in
+[external-clients.md](external-clients.md#a-remote-machine).
+- It runs this executable with these service options at the user's logon.
+- It runs in the user's interactive session (`InteractiveToken`) with the limited token
+  (`LeastPrivilege`), from an elevated ssh login too.
+- It ignores a second start while it runs (`IgnoreNew`).
+- It has no time limit and no battery rules, and runs at normal priority (`Priority` 4).
+
+Every command takes only its own options, and every option that takes a value needs one. A
+wrong command line, `--help`, `-h` or `/?` prints the usage and exits with 2 without running
+anything. No arguments at all run the service, as before.
+
 Agents outside Gorynych use a separate small executable, `Gorynych.Outside.exe`, as their MCP
 server ([Agents outside Gorynych](#agents-outside-gorynych)).
 

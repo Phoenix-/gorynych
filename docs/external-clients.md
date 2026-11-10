@@ -6,18 +6,19 @@ Any ACP client that starts an agent over stdio can use Gorynych through the brid
 Gorynych.Service acp --agent claude|kimi|codex [--pipe <name>] [service options]
 ```
 
-The bridge connects to the service's pipe (starting the service if it is not running) and
-passes ACP between its stdin/stdout and the pipe. It changes one thing: it adds
+The bridge connects to the service's pipe and passes ACP between its stdin/stdout and the pipe.
+When the service is not running, the bridge starts it: with the logon task when there is one,
+and never from an ssh login without it ([A remote machine](#a-remote-machine)). It changes one thing: it adds
 `_meta["gorynych/agent"]` to the client's `initialize`, which scopes that connection to one
 agent. New sessions then go to that agent and `session/list` shows only its sessions, so the
 client needs no Gorynych extensions. `codex app-server proxy` follows the same idea.
 
 Service options after `--agent` (`--data`, `--claude-model`, `--default-agent`,
 `--unload-after <minutes>`, `--claude-transport headless|tui`, `--claude-channels ask|accept|decline`, `--no-channel`,
-`--no-peers`) apply only when the bridge has to start the service; a running
-service keeps its own. The service outlives the bridge and the client: it is started
-without inherited handles, without a console and, when the client's job object allows it,
-outside that job.
+`--no-peers`) apply only when the bridge has to start the service as a process. A running
+service keeps its own options, and the logon task has its own. The service outlives the bridge
+and the client: it is started without inherited handles, without a console and, when the
+client's job object allows it, outside that job.
 
 ## What a plain client gets
 
@@ -121,6 +122,70 @@ publishing the build they point to, and the fork's `auto_import_sessions` are in
 
 For debugging: Zed's `dev: open acp logs` shows the messages between Zed and the bridge; the
 service writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
+
+## A remote machine
+
+Zed reaches the agents of another Windows machine through ssh. It starts `ssh -T` to that
+machine and runs the bridge there, and the bridge talks to that machine's service. This is the
+first step of [Several machines](design.md#several-machines). The hub, which shows every
+machine in one list, is planned.
+
+### Setting up the remote machine
+
+Do this once, as the person who works there.
+
+1. Install Gorynych there and sign in to its agents, as in [getting-started.md](getting-started.md).
+   Logins never move between machines.
+2. Register the logon task, from a terminal or from an ssh login:
+
+   ```
+   %LOCALAPPDATA%\Programs\Gorynych\Gorynych.Service.exe task install
+   ```
+
+   - Service options go after it (for example `--claude-model sonnet`) and become the task's
+     arguments. A relative `--data` is made absolute.
+   - `task uninstall` removes the task, and leaves a running service running.
+   - Run `task install` again after you move the installation: the task runs the executable
+     that registered it.
+
+What the task does:
+
+- **Where the service runs.** The task `Gorynych.Service.<pipe>` starts the service at the
+  person's logon, in their own session and with the limited token. So the service never runs
+  elevated or in session 0, although an administrator's ssh login is elevated. The pipe lets
+  such an elevated client of the same user in ([service-protocol.md](service-protocol.md#endpoint)).
+- **When it runs.** The bridge and the outside server run the task whenever the service's
+  pipe is missing. It can run only while the person is signed in to Windows on that machine; a
+  locked session will do, and after a reboot they sign in once.
+- **Without the task**, a bridge started from ssh starts no service and says to run
+  `task install`. A service started from ssh would run elevated, in session 0.
+
+### The Zed entry
+
+On the machine with Zed, add an entry to `agent_servers` for each remote agent. `work-pc` is a
+host from your `~/.ssh/config` that logs in with a key:
+
+```json
+"Gorynych: Claude on the work PC": {
+  "type": "custom",
+  "command": "ssh",
+  "args": ["-T", "-o", "BatchMode=yes", "work-pc",
+           "%LOCALAPPDATA%\\Programs\\Gorynych\\Gorynych.Service.exe", "acp", "--agent", "claude"]
+}
+```
+
+*Unverified:* this entry has not been tried with Zed yet.
+
+- **The options.**
+  - `-T`: no pseudo terminal, so ACP passes through as it is.
+  - `-o BatchMode=yes`: ssh fails at once instead of waiting for a password that Zed cannot
+    type.
+- **The remote command** runs in the remote user's shell. OpenSSH for Windows uses `cmd.exe`
+  by default, which expands `%LOCALAPPDATA%`; with another default shell, give the full path.
+- **Service options** given to this bridge do not apply: the task's do.
+- **Paths** in such a thread, such as folders and links to files, are the remote machine's.
+- **A dropped connection** ends only the bridge. The remote service and its agents work on, and
+  Zed can open the session again.
 
 ## Agents outside Gorynych
 

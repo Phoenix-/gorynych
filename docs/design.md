@@ -495,8 +495,9 @@ conductor, as the proxy-chains RFD has it.
 - The first probe, on 10 November 2026, found that the sshd job lets a child break away. So a
   service started from ssh would survive the drop too, but elevated.
 
-**The pipe must let a local ssh client in.** Two rules that hold today keep it out; the
-first probe found both.
+**The pipe must let a local ssh client in.** Done on 10 November 2026
+([service-protocol.md](service-protocol.md#endpoint)). Two rules kept it out; the first probe
+found both.
 - The token sshd gives a key login carries the NETWORK group (S-1-5-2). The pipe's deny ACE
   for NETWORK, meant only for clients over SMB, refuses every ssh client. Remote clients are
   to be refused with `PIPE_REJECT_REMOTE_CLIENTS` instead.

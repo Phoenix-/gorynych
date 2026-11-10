@@ -277,16 +277,18 @@ If a file is still in use, look for processes that are left over:
   - `logs\`: `service-<date>.log` and `outside-<date>.log`.
 - **The agents' own state** stays in their folders (`~/.claude`, `~/.codex`, `~/.kimi-code`,
   `~/.dsh`).
-- **Elevation.** The service serves only clients at its own elevation. A service started from
-  an elevated (administrator) terminal, which includes an SSH session, serves only elevated
-  clients. One started by Zed in a plain session serves only plain clients. So a plain process
-  can never drive an elevated service, which runs agents
-  ([service-protocol.md](service-protocol.md#endpoint)).
+- **Elevation.** A service started by Zed in a plain session serves the user's plain and
+  elevated clients alike, an SSH login included. A service started from an elevated
+  (administrator) terminal serves only elevated clients, so a plain process can never drive an
+  elevated service, which runs agents. A bridge started over SSH never starts a service
+  itself: the logon task does ([external-clients.md](external-clients.md#a-remote-machine),
+  [service-protocol.md](service-protocol.md#endpoint)).
 
 ## Uninstall
 
 1. Undo any outside registrations (`claude mcp remove …`, `codex mcp remove …`, the Kimi entry).
-2. Quit Zed and run `Gorynych.Service.exe shutdown`.
+2. Quit Zed and run `Gorynych.Service.exe shutdown`, and `Gorynych.Service.exe task uninstall`
+   if you registered the logon task.
 3. Remove the `Gorynych: …` entries from Zed's `agent_servers`.
 4. Delete `%LOCALAPPDATA%\Programs\Gorynych`, and `%LOCALAPPDATA%\Gorynych` if you do not want
    its journals and logs. The agents' own transcripts stay where they are.
@@ -300,9 +302,13 @@ writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
   on the `PATH` it inherited from whoever started it, usually Zed through the bridge. Install the
   agent, then restart the service so it picks up the new `PATH`: quit Zed, run
   `Gorynych.Service.exe shutdown`, and start Zed again from a fresh shell or the Start menu.
-- **"gorynych acp: cannot reach the service on pipe …"**, with a note about elevation. A service
-  at the other elevation already runs. Stop it from a terminal at its elevation with
-  `Gorynych.Service.exe shutdown`, or use clients at its elevation.
+- **"gorynych acp: cannot reach the service on pipe …"**, with a note about elevation. An
+  elevated service runs, and Zed is not elevated. Stop it from an elevated terminal with
+  `Gorynych.Service.exe shutdown`, and let Zed start a plain one.
+- **"gorynych acp: no service runs on pipe …, and this process runs outside the user's Windows
+  session"**. A bridge over SSH found no service and no logon task. Run
+  `Gorynych.Service.exe task install` on that machine once
+  ([external-clients.md](external-clients.md#a-remote-machine)).
 - **"Claude Code started without your login …"**. Run `claude` in a terminal and sign in. If you
   are signed in, `claude -p` may have started to run bare by default, which ignores the login:
   start the service with `--claude-transport tui`.

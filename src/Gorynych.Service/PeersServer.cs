@@ -232,8 +232,8 @@ public static class PeersServer
 
     static async Task<JsonRpcConnection> ConnectAsync(string pipe, CancellationToken ct)
     {
-        var stream = new NamedPipeClientStream(".", pipe, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-        await stream.ConnectAsync(5000, ct);
+        var stream = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(5), ct)
+            ?? throw new TimeoutException($"the service did not answer on pipe {pipe}");
         var rpc = new JsonRpcConnection(stream, stream, "peers->service");
         rpc.Start();
         await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest

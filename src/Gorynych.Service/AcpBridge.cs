@@ -6,6 +6,7 @@ using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
+using Gorynych.Outside;
 
 namespace Gorynych.Service;
 
@@ -26,7 +27,12 @@ public static class AcpBridge
         NamedPipeClientStream service;
         try
         {
-            service = await ConnectAsync(pipe, 300) ?? await StartAndConnectAsync(pipe, serviceArgs);
+            service = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromMilliseconds(300)) ?? await StartAndConnectAsync(pipe, serviceArgs);
+        }
+        catch (NotStartedException e)
+        {
+            Console.Error.WriteLine($"gorynych acp: {e.Message}");
+            return 1;
         }
         catch (Exception e) when (e is TimeoutException or IOException or Win32Exception or InvalidOperationException)
         {
@@ -49,8 +55,8 @@ public static class AcpBridge
 
     /// <summary>What a refused connection to the pipe usually means (docs/service-protocol.md, Endpoint).</summary>
     internal const string ElevationHint =
-        "The service serves only processes at its own elevation: one started from an elevated (administrator) " +
-        "terminal serves only elevated clients, and a plain one only plain clients.";
+        "A service started elevated (from an administrator terminal) serves only elevated clients; a plain service " +
+        "serves the user's plain and elevated clients alike.";
 
     /// <summary>
     /// <c>Gorynych.Service shutdown [--pipe P]</c>: asks the running service to exit, as a client's
@@ -63,7 +69,7 @@ public static class AcpBridge
         NamedPipeClientStream? stream;
         try
         {
-            stream = await ConnectAsync(pipe, 1000);
+            stream = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(1));
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
@@ -140,35 +146,36 @@ public static class AcpBridge
         return message.ToJsonString(Wire);
     }
 
-    static async Task<NamedPipeClientStream?> ConnectAsync(string pipe, int timeoutMs)
+    /// <summary>
+    /// Starts the service, as <see cref="ServiceLaunch.Decide"/> says, and waits for its pipe: with
+    /// the logon task when there is one, else as a detached process, but never from an ssh login.
+    /// </summary>
+    static async Task<NamedPipeClientStream> StartAndConnectAsync(string pipe, IReadOnlyList<string> serviceArgs)
     {
-        var deadline = Environment.TickCount64 + timeoutMs;
-        while (true)
+        const int wait = 20;
+        switch (ServiceLaunch.Decide(LogonTask.Exists(pipe), ServiceLaunch.IsRemoteLogon()))
         {
-            var stream = new NamedPipeClientStream(".", pipe, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
-            try
-            {
-                await stream.ConnectAsync(200);
-                return stream;
-            }
-            catch (TimeoutException)
-            {
-                await stream.DisposeAsync();
-                if (Environment.TickCount64 > deadline) return null;
-            }
+            case ServiceLaunch.Way.Refuse:
+                throw new NotStartedException(ServiceLaunch.Refusal(pipe, pipe == GorynychProtocol.DefaultPipeName));
+            case ServiceLaunch.Way.RunTask:
+                Console.Error.WriteLine($"gorynych acp: starting the service with the logon task {LogonTask.Name(pipe)}" +
+                    (serviceArgs.Count > 0 ? "; the task's options apply, not these" : ""));
+                if (LogonTask.Run(pipe) is { } failure)
+                    throw new InvalidOperationException($"the logon task {LogonTask.Name(pipe)} did not start: {failure}");
+                return await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(wait)) ?? throw new TimeoutException(ServiceLaunch.TaskTimeout(pipe, wait));
+            default:
+                var exe = Environment.ProcessPath ?? throw new InvalidOperationException("no process path");
+                List<string> args = ["--pipe", pipe, .. serviceArgs];
+                Console.Error.WriteLine($"gorynych acp: starting the service ({exe} {string.Join(' ', args)})");
+                if (!DetachedProcess.Start(exe, args))
+                    Console.Error.WriteLine("gorynych acp: the client's job object forbids breaking away, so the service stays in it; " +
+                        "closing the client may stop the service and every session");
+                return await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(wait)) ?? throw new TimeoutException("the service did not open its pipe");
         }
     }
 
-    static async Task<NamedPipeClientStream> StartAndConnectAsync(string pipe, IReadOnlyList<string> serviceArgs)
-    {
-        var exe = Environment.ProcessPath ?? throw new InvalidOperationException("no process path");
-        List<string> args = ["--pipe", pipe, .. serviceArgs];
-        Console.Error.WriteLine($"gorynych acp: starting the service ({exe} {string.Join(' ', args)})");
-        if (!Outside.DetachedProcess.Start(exe, args))
-            Console.Error.WriteLine("gorynych acp: the client's job object forbids breaking away, so the service stays in it; " +
-                "closing the client may stop the service and every session");
-        return await ConnectAsync(pipe, 20000) ?? throw new TimeoutException("the service did not open its pipe");
-    }
+    /// <summary>The bridge started no service, on purpose; the message says why.</summary>
+    sealed class NotStartedException(string message) : Exception(message);
 
     /// <summary>Writes through to stdout and flushes every write, so each message leaves at once.</summary>
     sealed class FlushingStream(Stream inner) : Stream

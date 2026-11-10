@@ -3,4 +3,7 @@
     <IsAotCompatible>true</IsAotCompatible>
     <RootNamespace>Gorynych.Acp</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Gorynych.Tests" />
+  </ItemGroup>
 </Project>

@@ -6,36 +6,42 @@ using Gorynych.Adapters.Dsh;
 using Gorynych.Adapters.Kimi;
 using Gorynych.Service;
 
-// Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex|dsh] [--claude-model <m>] [--unload-after <minutes>]
-//   [--claude-transport headless|tui] [--claude-channels ask|accept|decline] [--no-channel] [--no-peers] [--console]
-// Gorynych.Service peers [--pipe <name> --token <t>] [--channel-url <url> | --reply-url <url>]
-//   the gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel (TUI) or reply route (headless)
-if (args.Length > 0 && args[0] == "peers")
-    return await PeersServer.RunAsync(Arg(args, "--pipe"), Arg(args, "--token"), Arg(args, "--channel-url"), Arg(args, "--reply-url"));
-// Gorynych.Service shutdown [--pipe <name>]
-//   asks the running service to exit and waits for it; exit code 1 when none runs on the pipe
-if (args.Length > 0 && args[0] == "shutdown")
-    return await AcpBridge.ShutdownAsync(Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName);
-// Gorynych.Service acp --agent claude|kimi|codex|dsh [--pipe <name>] [service options]
-//   the stdio entry point for external ACP clients (Zed); starts the service when needed
-if (args.Length > 0 && args[0] == "acp")
+// The commands and their options: CommandLine.Usage. A wrong command line, or --help, prints the
+// usage and exits with 2; it never runs the service.
+CommandLine line;
+try
 {
-    var agent = Arg(args, "--agent") ?? throw new ArgumentException("--agent is required");
-    var forwarded = new List<string>();
-    foreach (var option in new[] { "--data", "--claude-model", "--default-agent", "--unload-after", "--claude-transport", "--claude-channels" })
-        if (Arg(args, option) is { } value) forwarded.AddRange([option, value]);
-    foreach (var flag in new[] { "--no-channel", "--no-peers" })
-        if (args.Contains(flag)) forwarded.Add(flag);
-    return await AcpBridge.RunAsync(agent, Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName, forwarded);
+    line = CommandLine.Parse(args);
+}
+catch (UsageException e)
+{
+    if (e.Problem is { } problem) Console.Error.WriteLine($"Gorynych.Service: {problem}");
+    Console.Error.Write(CommandLine.Usage);
+    return CommandLine.UsageExitCode;
+}
+switch (line.Command)
+{
+    // The gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel (TUI) or reply route (headless).
+    case "peers":
+        return await PeersServer.RunAsync(line.Value("--pipe"), line.Value("--token"), line.Value("--channel-url"), line.Value("--reply-url"));
+    // Asks the running service to exit and waits for it; exit code 1 when none runs on the pipe.
+    case "shutdown":
+        return await AcpBridge.ShutdownAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName);
+    // The stdio entry point for external ACP clients (Zed); starts the service when needed.
+    case "acp":
+        return await AcpBridge.RunAsync(line.Value("--agent")!, line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName, line.ServiceArguments("--pipe"));
+    // The Windows logon task that starts the service in this user's session (docs/external-clients.md).
+    case "task":
+        return TaskCommand(line);
 }
 
-var pipeName = Arg(args, "--pipe") ?? GorynychProtocol.DefaultPipeName;
-var channels = Channels(Arg(args, "--claude-channels"));
-var claudeTransport = Transport(Arg(args, "--claude-transport"));
-var dataDirectory = Path.GetFullPath(Arg(args, "--data")
+var pipeName = line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName;
+var channels = Channels(line.Value("--claude-channels"));
+var claudeTransport = Transport(line.Value("--claude-transport"));
+var dataDirectory = Path.GetFullPath(line.Value("--data")
     ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gorynych"));
 Directory.CreateDirectory(dataDirectory);
-ServiceLog.Init(Path.Combine(dataDirectory, "logs"), console: args.Contains("--console"));
+ServiceLog.Init(Path.Combine(dataDirectory, "logs"), console: line.Flag("--console"));
 
 // One service per user and endpoint, across logon sessions (RDP included).
 using var instance = new Mutex(initiallyOwned: false, "Gorynych.Service." + pipeName,
@@ -60,8 +66,8 @@ var adapters = new List<IAgentAdapter>
     {
         DataDirectory = Path.Combine(dataDirectory, "claude"),
         Transport = claudeTransport,
-        Model = Arg(args, "--claude-model"),
-        ChannelServerCommand = args.Contains("--no-channel") ? null : [Environment.ProcessPath!, "peers"],
+        Model = line.Value("--claude-model"),
+        ChannelServerCommand = line.Flag("--no-channel") ? null : [Environment.ProcessPath!, "peers"],
         Channels = channels,
         Log = ServiceLog.Info,
     }),
@@ -70,7 +76,7 @@ var adapters = new List<IAgentAdapter>
     new DshAdapter(new DshAdapterOptions
     {
         DataDirectory = Path.Combine(dataDirectory, "dsh"),
-        Instructions = args.Contains("--no-peers") ? null : PeersServer.SystemPrompt,
+        Instructions = line.Flag("--no-peers") ? null : PeersServer.SystemPrompt,
         Log = ServiceLog.Info,
     }),
 };
@@ -79,9 +85,9 @@ await using var conductor = new Conductor(new ConductorOptions
 {
     DataDirectory = dataDirectory,
     ServiceId = state.ServiceId,
-    DefaultAgent = Arg(args, "--default-agent"),
-    UnloadAfter = UnloadAfter(Arg(args, "--unload-after")),
-    PeerServerCommand = args.Contains("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
+    DefaultAgent = line.Value("--default-agent"),
+    UnloadAfter = UnloadAfter(line.Value("--unload-after")),
+    PeerServerCommand = line.Flag("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
 }, adapters);
 
 // Drafts a client left behind in an earlier run (Zed quits without closing them).
@@ -114,10 +120,41 @@ static void Stop(CancellationTokenSource cts)
     try { cts.Cancel(); } catch (ObjectDisposedException) { }
 }
 
-static string? Arg(string[] args, string name)
+// task install|uninstall [--pipe <name>] [service options]: registers or removes the logon task that starts
+// this executable with these options in the user's session, with a limited token; it works from an elevated
+// ssh login too, and the bridge and the outside server run it when the pipe is missing.
+static int TaskCommand(CommandLine line)
 {
-    var i = Array.IndexOf(args, name);
-    return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
+    var pipe = line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName;
+    var name = Gorynych.Outside.LogonTask.Name(pipe);
+    if (line.Action == "uninstall")
+    {
+        var (removed, said) = Gorynych.Outside.LogonTask.Uninstall(pipe);
+        if (removed != 0)
+        {
+            Console.Error.WriteLine($"gorynych task: cannot remove the logon task {name}: {said}");
+            return removed;
+        }
+        Console.WriteLine($"gorynych task: removed the logon task {name}. A running service keeps running; " +
+            $"Gorynych.Service shutdown{(line.Value("--pipe") is null ? "" : $" --pipe {pipe}")} stops it.");
+        return 0;
+    }
+    var exe = Environment.ProcessPath!;
+    var serviceArgs = line.ServiceArguments();
+    // The task starts in the executable's folder, so a relative data folder is made absolute here.
+    var data = serviceArgs.IndexOf("--data");
+    if (data >= 0) serviceArgs[data + 1] = Path.GetFullPath(serviceArgs[data + 1]);
+    var (code, output) = Gorynych.Outside.LogonTask.Install(pipe, exe, serviceArgs);
+    if (code != 0)
+    {
+        Console.Error.WriteLine($"gorynych task: cannot register the logon task {name}: {output}");
+        return code;
+    }
+    Console.WriteLine($"gorynych task: registered the logon task {name}. At this user's logon it runs " +
+        $"{string.Join(' ', new[] { exe }.Concat(serviceArgs).Select(Gorynych.Outside.DetachedProcess.Quote))} " +
+        "in their session with a limited token. The bridge and the outside server run it whenever the service's pipe is " +
+        $"missing; to start it now: schtasks /Run /TN {name}");
+    return 0;
 }
 
 // --claude-channels ask|accept|decline: whether Claude may be started with development channels, a Claude Code
