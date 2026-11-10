@@ -911,6 +911,48 @@ public sealed class HostTests
         await run.WaitAsync(Wait);
     }
 
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AConductorAfterOneWhoseInitializeTheAgentNeverAnswered_GetsAnErrorInTime()
+    {
+        // An agent that never answers its initialize.
+        var link = new DuplexLink();
+        var agent = new JsonRpcConnection(link.AgentEnd.Input, link.AgentEnd.Output, "silent-agent");
+        agent.RequestHandler = async (_, ct) => { await Task.Delay(Timeout.Infinite, ct); return null; };
+        agent.Start();
+        var instance = new AgentInstance(link.ClientEnd.Input, link.ClientEnd.Output, agent.Completion, () => agent.DisposeAsync());
+
+        // Each connection of the host is a conductor of the test's: the first asks and goes, the second asks.
+        var conductors = new System.Collections.Concurrent.ConcurrentQueue<JsonRpcConnection>();
+        var host = new AdapterHost(instance, _ =>
+        {
+            var wire = new DuplexLink();
+            var conductor = new JsonRpcConnection(wire.AgentEnd.Input, wire.AgentEnd.Output, $"conductor-{conductors.Count + 1}");
+            conductor.Start();
+            conductors.Enqueue(conductor);
+            return Task.FromResult<(Stream, Stream)>((wire.ClientEnd.Input, wire.ClientEnd.Output));
+        }, new AdapterHostOptions
+        {
+            Adapter = "turns", Token = InProcessHosts.Token, RetryDelays = [TimeSpan.FromMilliseconds(50)], InitializeWait = TimeSpan.FromSeconds(1),
+        });
+        var run = host.RunAsync();
+        await LinkHarness.Until(() => !conductors.IsEmpty, "the first conductor");
+        conductors.TryPeek(out var first);
+        _ = first!.SendRequestAsync(AcpMethods.Agent.Initialize, new JsonObject { ["protocolVersion"] = 1 });
+        await Task.Delay(200);
+        await first.DisposeAsync(); // it goes, its initialize on its way to the agent
+
+        await LinkHarness.Until(() => conductors.Count >= 2, "the second conductor");
+        var second = conductors.ToArray()[1];
+        var took = System.Diagnostics.Stopwatch.StartNew();
+        var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() =>
+            second.SendRequestAsync(AcpMethods.Agent.Initialize, new JsonObject { ["protocolVersion"] = 1 }).WaitAsync(Wait));
+        StringAssert.Contains(failed.Message, "has not answered its first initialize");
+        Assert.IsLessThan(10, took.Elapsed.TotalSeconds);
+        await instance.DisposeAsync();
+        await run.WaitAsync(Wait);
+    }
+
     /// <summary>A host the test starts by hand: it may never connect, or exit before it does.</summary>
     sealed class HandLauncher : IHostLauncher
     {
