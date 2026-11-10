@@ -809,7 +809,9 @@ Next, in order (**planned**):
    - the service shows the thread's current history, read without taking the thread
      (`thread/turns/list`, which takes no writer lock: probed), also when it had no journal;
    - it says so with an ACP session notice (`notice`, which Zed shows), and refuses a prompt
-     in words while the thread is held, but sends it once the thread is free;
+     in words while the thread is held (the session's ID, the holder, what to do; no `data`,
+     which Zed would show raw: the client has the flag from the session's state), but sends it
+     once the thread is free;
    - the flag reaches the client: `_meta["gorynych/interactivity"]`, `full` or `read-only`
      (absent means `full`, as AHP's `ChatInteractivity` has it), with the reason for a person
      (`gorynych/interactivityReason`) and the holder (`gorynych/openElsewhere`), on

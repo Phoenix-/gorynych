@@ -592,14 +592,14 @@ public sealed class Conductor : IAsyncDisposable
 
     /// <summary>
     /// The refusal of a turn in a read-only session: its ID, why, and what to do, for the person or
-    /// the asking agent; its <c>data</c> says the interactivity, for a client that reads it.
+    /// the asking agent. No <c>data</c>, which Zed would append to the message as raw JSON: the
+    /// client has the flag from the session's state (load, resume and updates).
     /// </summary>
     static JsonRpcException ReadOnlyRefusal(SessionRecord record, SessionFeed.ReadOnlyState state, bool forAgent) => new(
         JsonRpcException.InvalidRequest,
         forAgent
             ? $"Session {record.SessionId} is read-only for now, so it takes no message: {state.Reason} Ask again once it is free, or ask another session."
-            : $"Session {record.SessionId} is read-only for now: {state.Reason} Then send the prompt again.",
-        new JsonObject { [GorynychProtocol.MetaInteractivity] = GorynychProtocol.InteractivityReadOnly });
+            : $"Session {record.SessionId} is read-only for now: {state.Reason} Then send the prompt again.");
 
     /// <summary>The read-only state a <c>_meta</c> says (<c>gorynych/interactivity</c>); null for full, also when it says nothing.</summary>
     static SessionFeed.ReadOnlyState? ReadOnlyOf(JsonNode? meta)

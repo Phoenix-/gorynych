@@ -1205,9 +1205,10 @@ can (Codex takes the thread once the other app let it go), and the journal gets 
 made meanwhile.
 
 - Taken: the flag clears (an update with `"full"`, a notice), and the turn runs.
-- Still read-only: the prompt fails with the session's ID, the reason and what to do: `Session
-  <id> is read-only for now: This Codex thread is open in Codex Desktop. Close it there to write
-  here. Then send the prompt again.` Its `data` is `{"gorynych/interactivity": "read-only"}`.
+- Still read-only: the prompt fails (`-32600`) with the session's ID, the reason and what to do:
+  `Session <id> is read-only for now: This Codex thread is open in Codex Desktop. Close it there
+  to write here. Then send the prompt again.` It has no `data`, which Zed appends to the message as
+  raw JSON: the client has the flag from the session's state (the answers and updates above).
 - A question from another session is refused at once, before it waits for the turn, in the
   words for an agent ([Opinions between agents](#opinions-between-agents)): `session_id <id> (…)
   is open in Codex Desktop, which holds it, so it cannot be asked until it is closed there. Ask
@@ -1221,8 +1222,13 @@ first prompt, so another app that takes it back meanwhile makes it read-only onc
 the service's own agent holds is `"full"`: the flag is only about another holder.
 
 **The list's order** follows the agent's own time (`updatedAt` of its `session/list`) wherever the
-agent gives one, so a catch-up of the journal, a mark that changes, or a turn that streams does
-not move a row; the service's own time orders only what the agent does not list.
+agent gives one, as its title wins over the service's ("Native state wins", [Overlay](#overlay)): a
+catch-up of the journal, a mark that changes, or a turn that streams does not move a row; the
+service's own time orders only what the agent does not list (a draft, DSH, which lists no time).
+The agents' own times move at the end of a turn, not with each update: Codex's `thread/list`
+(`useStateDbOnly`) when a turn ends, the Claude adapter's when a turn ends (the service's prompt, or
+a turn of Claude's own) and when its title changes. So a session goes to the top when its turn
+ends, and a long turn that runs in an older session keeps that session's place until then.
 
 ## List changes
 

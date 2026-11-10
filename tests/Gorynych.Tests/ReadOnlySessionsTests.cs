@@ -33,9 +33,15 @@ public sealed class ReadOnlySessionsTests
 
         readonly IAgentAdapter[] more;
 
-        public Rig(bool heldAtStart = true, params IAgentAdapter[] more)
+        readonly TimeSpan lockRecheck;
+
+        public Rig(bool heldAtStart = true, params IAgentAdapter[] more) : this(heldAtStart, TimeSpan.FromMilliseconds(200), more) { }
+
+        /// <param name="lockRecheck">How often the adapter's lock watcher looks again at the threads it saw held.</param>
+        public Rig(bool heldAtStart, TimeSpan lockRecheck, params IAgentAdapter[] more)
         {
             this.more = more;
+            this.lockRecheck = lockRecheck;
             Fake.Existing(Thread, Cwd, name: "Open in Codex Desktop");
             if (heldAtStart) Hold();
             Service = NewService();
@@ -57,7 +63,7 @@ public sealed class ReadOnlySessionsTests
             },
             LocksDirectory = Locks,
             LockSettle = TimeSpan.FromMilliseconds(50),
-            LockRecheck = TimeSpan.FromMilliseconds(200),
+            LockRecheck = lockRecheck,
         }), .. more]);
 
         /// <summary>Codex Desktop takes the thread: app-server refuses it to anyone else, and its lock file appears.</summary>
@@ -71,9 +77,15 @@ public sealed class ReadOnlySessionsTests
         /// <summary>Codex Desktop lets the thread go.</summary>
         public void LetGo(string id = Thread)
         {
+            LetGoUnseen(id);
+            File.Delete(Path.Combine(Locks, id + ".lock"));
+        }
+
+        /// <summary>Codex Desktop lets the thread go, and its lock file stays (it went without deleting it): the watcher sees nothing until it looks again.</summary>
+        public void LetGoUnseen(string id = Thread)
+        {
             lock (held) held.Remove(id);
             if (Fake.Threads.TryGetValue(id, out var t)) t.OpenElsewhere = false;
-            File.Delete(Path.Combine(Locks, id + ".lock"));
         }
 
         public Task<TestClient> ZedAsync(bool notices = true, string name = "zed") => TestClient.ConnectAsync(Service, name, agent: "codex", notices: notices);
@@ -209,7 +221,7 @@ public sealed class ReadOnlySessionsTests
         StringAssert.Contains(refused.Message, Thread, "the session's ID");
         StringAssert.Contains(refused.Message, Reason);
         StringAssert.Contains(refused.Message, "send the prompt again");
-        Assert.AreEqual(GorynychProtocol.InteractivityReadOnly, (string?)refused.ErrorData?[GorynychProtocol.MetaInteractivity]);
+        Assert.IsNull(refused.ErrorData, "no data, which Zed would show as raw JSON: the flag is in the session's state");
         Assert.AreEqual(0, rig.Fake.All("turn/start").Length, "no turn started");
 
         // Desktop runs a turn, then lets go; the next prompt takes the thread, with the turn made meanwhile.
@@ -222,6 +234,21 @@ public sealed class ReadOnlySessionsTests
         Assert.AreEqual(1, rig.Fake.All("turn/start").Length);
         var journal = HostTests.JournalText(rig.Service, Thread);
         Assert.AreEqual(1, journal.Split("Desktop's answer.").Length - 1, "the turn made in Desktop meanwhile reached the journal once: " + journal);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task APrompt_ToAThreadFreedBeforeTheWatcherSawIt_TakesIt_AndClearsTheFlag()
+    {
+        // The flag still says read-only; the prompt opens the session again, which finds it free.
+        await using var rig = new Rig(heldAtStart: true, lockRecheck: TimeSpan.FromHours(1));
+        await using var zed = await rig.ZedAsync();
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume()).WaitAsync(Wait);
+        rig.LetGoUnseen();
+
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, "hello").WaitAsync(Wait)).StopReason);
+        CollectionAssert.AreEqual(new[] { GorynychProtocol.InteractivityFull }, FlagUpdates(zed), "the open in full cleared it");
+        Assert.AreEqual(GorynychProtocol.InteractivityFull, Interactivity(await MetaOfAsync(zed, AcpMethods.Agent.SessionResume)));
     }
 
     [TestMethod]
