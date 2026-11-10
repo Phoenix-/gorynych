@@ -635,7 +635,8 @@ On 10 November 2026 the window drove the service through
 `Gorynych.Service.exe acp --agent claude` as an ACP agent. A prompt was answered, a file write
 asked for approval, and the session appeared in the service's list. Through the gateway,
 though, the window does not see the service's existing sessions, and Gorynych's `_meta` is
-lost. A full integration needs an AHP face on the service, next to ACP.
+lost. A full integration needs an AHP face on the service, next to ACP. Until then the gateway
+is the way in ([external-clients.md](external-clients.md#vs-codes-agents-window)).
 
 VS Code itself has no ACP. A generic ACP provider for it is an open pull request,
 [microsoft/vscode#340863](https://github.com/microsoft/vscode/pull/340863).

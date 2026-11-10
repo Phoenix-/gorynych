@@ -194,6 +194,94 @@ host from your `~/.ssh/config` that logs in with a key:
 - **A dropped connection** ends only the bridge. The remote service and its agents work on, and
   Zed can open the session again.
 
+## VS Code's Agents window
+
+VS Code's Agents window (a preview since VS Code 1.120) speaks Microsoft's Agent Host Protocol,
+not ACP ([design.md](design.md#the-gui)). Until the service has an AHP face of its own,
+[ahp-acp-gateway](https://github.com/formulahendry/ahp-acp-gateway) (MIT, Node 24 or newer)
+stands in between. To VS Code it is an AHP host; to Gorynych it is an ACP client that runs the
+bridge, one bridge per VS Code chat. Checked on 10 November 2026 with VS Code 1.145.2 and the
+gateway 0.2.2: Claude, Codex, Kimi and DeepSeek each answered and wrote a file after an
+approval, and their sessions appeared in the service's list.
+
+### Setting it up
+
+1. Install the gateway at a fixed version:
+
+   ```
+   npm install ahp-acp-gateway@0.2.2 --prefix "%LOCALAPPDATA%\Programs\ahp-acp-gateway"
+   ```
+
+2. Write its configuration to `%LOCALAPPDATA%\Gorynych\ahp-gateway\gateway.json`, and let only
+   yourself read it, since it holds the token:
+
+   ```json
+   {
+     "version": 1,
+     "listener": { "host": "127.0.0.1", "port": 8765, "path": "/ahp",
+                   "allowAnyOrigin": false, "allowedOrigins": ["vscode-file://vscode-app"] },
+     "auth": { "token": "<a long random hex string>" },
+     "database": { "path": "C:\\Users\\<you>\\AppData\\Local\\Gorynych\\ahp-gateway\\gateway.db" },
+     "providerDefaults": { "requestTimeoutMs": 86400000 },
+     "providers": [
+       { "id": "copilot", "enabled": false },
+       { "id": "gorynych-claude", "displayName": "Gorynych: Claude",
+         "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
+         "args": ["acp", "--agent", "claude"], "startupTimeoutMs": 60000 }
+     ]
+   }
+   ```
+
+   - Turn off every built-in provider the same way as `copilot`, so the gateway never fetches
+     an agent with npx: `copilot`, `claude`, `gemini`, `qwen`, `auggie`, `qoder`, `codex`,
+     `opencode`, `openclaw`, `kiro`, `hermes`, `kimi`, `pi`.
+   - Add `gorynych-codex`, `gorynych-kimi` and `gorynych-dsh` like `gorynych-claude`, with
+     `--agent codex`, `kimi` and `dsh`.
+   - `requestTimeoutMs` is how long the gateway lets a prompt run before it fails it and stops
+     its bridge. Its default, five minutes, is shorter than many turns.
+   - `--print-config` shows what the gateway makes of the file, with the token hidden.
+
+3. Start it at logon with no window. Write `run-gateway.cmd` next to the configuration; it runs
+   `"C:\Program Files\nodejs\node.exe" "%LOCALAPPDATA%\Programs\ahp-acp-gateway\node_modules\ahp-acp-gateway\dist\src\cli.js" --config gateway.json`
+   and appends the output to `gateway.log`. Then register a task, `Gorynych.AhpGateway`, for
+   your logon, with your limited token, no time limit and a restart on failure, that runs:
+
+   ```
+   %SystemRoot%\System32\conhost.exe --headless %SystemRoot%\System32\cmd.exe /d /c "%LOCALAPPDATA%\Gorynych\ahp-gateway\run-gateway.cmd"
+   ```
+
+   `conhost --headless` gives node a console that is never shown.
+
+4. Add the host to VS Code's user settings:
+
+   ```json
+   "chat.remoteAgentHosts": [
+     { "name": "Gorynych", "address": "127.0.0.1:8765/ahp?token=<the token>" }
+   ]
+   ```
+
+   Then open the Agents window (`code --agents`, or **Chat: Open Agents Window**), choose
+   **New**, the environment **Gorynych**, a folder and an agent.
+
+### What to expect
+
+- A session started in VS Code is an ordinary Gorynych session, which Zed sees too. Sessions
+  started elsewhere do not show in VS Code: the gateway keeps a list of its own.
+- The model picker starts at "Auto" for Codex and Kimi, and **Send** stays off until a model is
+  picked. The gateway sets the picked model before every prompt, so pick one the account may
+  use: on 10 November Kimi's `kimi-code/*` models failed with "Your current subscription does
+  not have access to Kimi Code", while its default, under the picker's second tab
+  (`moonshot-ai/kimi-k3.1-pro`), worked.
+- Claude asks to trust a new folder first, as it does in Zed.
+- VS Code's setting warns that a connected host receives your GitHub credentials. In the traffic
+  checked on 10 November VS Code sent the gateway no `authenticate` and no GitHub token, and
+  the gateway asks for none.
+- With `chat.agentHost.ahpJsonlLoggingEnabled` on (by default only in Insiders), VS Code
+  writes the host's address, token included, into the names of its AHP log files under
+  `%APPDATA%\Code\logs`.
+- Left out by the gateway: more than one chat in a session, forks, and Gorynych's own `_meta`
+  (archive, child sessions, questions between sessions).
+
 ## Agents outside Gorynych
 
 An agent outside Gorynych, such as Claude Code in Claude Desktop or in a terminal, Codex, or
