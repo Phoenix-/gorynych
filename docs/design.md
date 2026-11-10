@@ -623,6 +623,23 @@ a feed in WebView2 built on existing ACP components (**planned**, only if needed
 treats sessions, and what the service does about it, is in
 [external-clients.md](external-clients.md#zed).
 
+VS Code's Agents window, a preview since VS Code 1.120, may become a second GUI. **This looks
+interesting, but it is not planned yet.** The window does not speak ACP. It speaks Microsoft's
+[Agent Host Protocol](https://microsoft.github.io/agent-host-protocol/) (AHP, 1.0 since
+2 October 2026): a sessions server holds the state, several clients see it in sync over a
+WebSocket, and a client that reconnects gets what it missed. A third-party host is added
+through VS Code's `chat.remoteAgentHosts` setting.
+
+On 10 November 2026 the window drove the service through
+[ahp-acp-gateway](https://github.com/formulahendry/ahp-acp-gateway), which ran
+`Gorynych.Service.exe acp --agent claude` as an ACP agent. A prompt was answered, a file write
+asked for approval, and the session appeared in the service's list. Through the gateway,
+though, the window does not see the service's existing sessions, and Gorynych's `_meta` is
+lost. A full integration needs an AHP face on the service, next to ACP.
+
+VS Code itself has no ACP. A generic ACP provider for it is an open pull request,
+[microsoft/vscode#340863](https://github.com/microsoft/vscode/pull/340863).
+
 Model, mode and effort selectors for Claude are deferred: the Claude adapter exposes none yet.
 The Codex adapter exposes all three as ACP session config options.
 
