@@ -276,7 +276,8 @@ approval, and their sessions appeared in the service's list.
 ### What to expect
 
 - A session started in VS Code is an ordinary Gorynych session, which Zed sees too. Sessions
-  started elsewhere do not show in VS Code: the gateway keeps a list of its own.
+  started elsewhere do not show in VS Code: the gateway answers VS Code from a list of its own
+  and never asks the service for its sessions ([design.md](design.md#the-gui)).
 - The model picker starts at "Auto" for Codex and Kimi, and **Send** stays off until a model is
   picked. The gateway sets the picked model before every prompt, so pick one the account may
   use: on 10 November Kimi's `kimi-code/*` models failed with "Your current subscription does

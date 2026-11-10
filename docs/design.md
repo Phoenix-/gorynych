@@ -648,16 +648,54 @@ interesting, but it is not planned yet.** The window does not speak ACP. It spea
 WebSocket, and a client that reconnects gets what it missed. A third-party host is added
 through VS Code's `chat.remoteAgentHosts` setting.
 
+AHP leaves the session list to the host. A client asks for it with `listSessions` on
+`ahp-root://`, a page at a time, and the host reports changes with `root/sessionAdded`,
+`root/sessionRemoved` and `root/sessionSummaryChanged`. Archived and read are bits of a
+session's status; renaming has no command of its own, and there is no fork. Where the host
+keeps its sessions, and whether sessions made elsewhere show, the spec leaves to the host.
+
 On 10 November 2026 the window drove the service through
 [ahp-acp-gateway](https://github.com/formulahendry/ahp-acp-gateway), which ran
 `Gorynych.Service.exe acp --agent claude` as an ACP agent. A prompt was answered, a file write
-asked for approval, and the session appeared in the service's list. Through the gateway,
-though, the window does not see the service's existing sessions, and Gorynych's `_meta` is
-lost. A full integration needs an AHP face on the service, next to ACP. Until then the gateway
-is the way in ([external-clients.md](external-clients.md#vs-codes-agents-window)).
+asked for approval, and the session appeared in the service's list. The gateway, though,
+answers `listSessions` from a database of its own and never asks the service's `session/list`,
+so the window does not see the service's existing sessions, and Gorynych's `_meta` is lost.
+Teaching the gateway to import the list would still leave a second copy of the catalog, which
+drifts from the native one (titles, archive). A full integration needs an AHP face on the
+service, next to ACP. Until then the gateway is the way in
+([external-clients.md](external-clients.md#vs-codes-agents-window)).
 
 VS Code itself has no ACP. A generic ACP provider for it is an open pull request,
-[microsoft/vscode#340863](https://github.com/microsoft/vscode/pull/340863).
+[microsoft/vscode#340863](https://github.com/microsoft/vscode/pull/340863), awaiting review and
+unchanged since 6 November 2026. Merged, it would not show existing sessions either: VS Code's
+agent host lets a provider bring in sessions made outside (`startChatDiscovery`,
+`onDidDiscoverChats`), but that provider implements neither and never calls `session/list`.
+
+What an AHP face would take, checked on 10 November 2026:
+- **Types and reducers** come from Microsoft's .NET SDK,
+  `Microsoft.VisualStudioCode.AgentHostProtocol` (MIT). Its net8.0 assets are marked AOT
+  compatible and use source-generated System.Text.Json. It is a client SDK, though: its
+  `Abstractions` (wire types, JSON context) and its reducers serve a host too, but the
+  WebSocket listener, the JSON-RPC dispatch, the action log with `serverSeq` and the replay on
+  reconnect are ours. The fallback is generating types from AHP's JSON Schema (`schema/` in its
+  repository), as `Gorynych.AcpGen` does for ACP.
+- **The list** comes from the service's catalog, so the window sees what Zed sees. Titles and
+  the archive bit are read and written natively, as for Zed
+  ([Sessions](#sessions-catalog-titles-archive)). The client picks a new session's URI in
+  `createSession`, so the overlay keeps the map from that URI to the session's ID.
+- **Child sessions** might become chats: an AHP session holds several, including ones the agent
+  starts. Whether the window lets a person prompt such a chat is not checked.
+- **The commands.** The 21 the gateway serves were enough for the trial: `initialize`,
+  `reconnect`, `ping`; `listSessions`, `createSession`, `disposeSession`, `createChat`,
+  `disposeChat`, `subscribe`, `unsubscribe`, `dispatchAction`, `fetchTurns`;
+  `resolveSessionConfig`, `completions`; reading the host's files (`resourceList`,
+  `resourceRead`, `resourceResolve`, `createResourceWatch`); `createTerminal`,
+  `disposeTerminal`; `invokeChangesetOperation`. VS Code 1.145.2 calls more, which the window
+  did without: writing the host's files, `moveChat`, automations, `sessionConfigCompletions`
+  and `tools/*`. The trials were short, and a tool card did not stay in the transcript.
+- **The weight** is in the state, not in the commands: session and chat state built from
+  actions, a journal and a replay, close to the service's journals and the
+  [resumable link](service-protocol.md#the-resumable-link).
 
 Model, mode and effort selectors for Claude are deferred: the Claude adapter exposes none yet.
 The Codex adapter exposes all three as ACP session config options.
