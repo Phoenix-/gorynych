@@ -118,19 +118,34 @@ sealed class TurnAgent(string name) : IAgentAdapter
 sealed class Wire
 {
     readonly BrokenOnce[] ends;
+    readonly BrokenOnce linkIn;
+    readonly BrokenOnce serviceIn;
 
     /// <param name="said">Gets what the service writes to the link.</param>
-    public Wire(Conductor conductor, string name, Action<string>? said = null)
+    /// <param name="sent">Gets what the link writes to the service.</param>
+    public Wire(Conductor conductor, string name, Action<string>? said = null, Action<string>? sent = null)
     {
         var up = new System.IO.Pipelines.Pipe();
         var down = new System.IO.Pipelines.Pipe();
-        var linkIn = new BrokenOnce(down.Reader.AsStream(), reads: true);
-        var linkOut = new BrokenOnce(up.Writer.AsStream());
-        var serviceIn = new BrokenOnce(up.Reader.AsStream(), reads: true);
+        linkIn = new BrokenOnce(down.Reader.AsStream(), reads: true);
+        var linkOut = new BrokenOnce(up.Writer.AsStream()) { Tap = sent };
+        serviceIn = new BrokenOnce(up.Reader.AsStream(), reads: true);
         var serviceOut = new BrokenOnce(down.Writer.AsStream()) { Tap = said };
         ends = [linkIn, linkOut, serviceIn, serviceOut];
         LinkEnd = (linkIn, linkOut);
         Serving = conductor.ServeClientAsync(serviceIn, serviceOut, name);
+    }
+
+    /// <summary>The service reads nothing more until <see cref="Go"/>: what the link sends waits in the pipe.</summary>
+    public void PauseService() => serviceIn.Pause();
+
+    /// <summary>The link reads nothing more until <see cref="Go"/>: what the service sends waits in the pipe.</summary>
+    public void PauseLink() => linkIn.Pause();
+
+    public void Go()
+    {
+        serviceIn.Go();
+        linkIn.Go();
     }
 
     public (Stream Input, Stream Output) LinkEnd { get; }
@@ -149,6 +164,11 @@ sealed class Wire
     sealed class BrokenOnce(Stream inner, bool reads = false) : Stream
     {
         readonly CancellationTokenSource broken = new();
+        volatile TaskCompletionSource? paused;
+
+        public void Pause() => paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Go() => Interlocked.Exchange(ref paused, null)?.TrySetResult();
 
         public void Break()
         {
@@ -171,7 +191,13 @@ sealed class Wire
         {
             if (broken.IsCancellationRequested) return 0;
             using var both = CancellationTokenSource.CreateLinkedTokenSource(ct, broken.Token);
-            try { return await inner.ReadAsync(buffer, both.Token); }
+            try
+            {
+                var n = await inner.ReadAsync(buffer, both.Token);
+                // What comes while paused is held, and lost if the pipe breaks meanwhile.
+                if (paused is { } wait) await wait.Task.WaitAsync(both.Token);
+                return broken.IsCancellationRequested ? 0 : n;
+            }
             catch (OperationCanceledException) when (broken.IsCancellationRequested && !ct.IsCancellationRequested) { return 0; }
         }
 
@@ -264,13 +290,24 @@ sealed class LinkHarness : IAsyncDisposable
         lock (ServiceSaid) return ServiceSaid.ToString();
     }
 
+    /// <summary>Everything the link wrote to the services.</summary>
+    public StringBuilder LinkSent { get; } = new();
+
+    public string Sent()
+    {
+        lock (LinkSent) return LinkSent.ToString();
+    }
+
     (Stream, Stream) Connect()
     {
         var n = Interlocked.Increment(ref connects);
         var to = Service ?? throw new IOException("no service on the pipe");
-        wire = new Wire(to, $"link-{n}", s => { lock (ServiceSaid) ServiceSaid.Append(s); });
+        wire = new Wire(to, $"link-{n}", s => { lock (ServiceSaid) ServiceSaid.Append(s); }, s => { lock (LinkSent) LinkSent.Append(s); });
         return wire.LinkEnd;
     }
+
+    /// <summary>The current connection, for pausing one direction.</summary>
+    public Wire Current => wire!;
 
     async Task<(Stream, Stream)> ConnectAsync(CancellationToken ct)
     {
