@@ -3,7 +3,7 @@
 Any ACP client that starts an agent over stdio can use Gorynych through the bridge:
 
 ```
-Gorynych.Service acp --agent claude|kimi|codex [--pipe <name>] [service options]
+Gorynych.Service acp --agent claude|kimi|codex|dsh [--pipe <name>] [service options]
 ```
 
 The bridge connects to the service's pipe and passes ACP between its stdin/stdout and the pipe.
@@ -147,6 +147,9 @@ Do this once, as the person who works there.
    - `task uninstall` removes the task, and leaves a running service running.
    - Run `task install` again after you move the installation: the task runs the executable
      that registered it.
+   - *Unverified:* whether a plain (not elevated) terminal may register the task. If schtasks
+     answers "Access is denied", run it from an elevated one: the task still runs with the
+     limited token.
 
 What the task does:
 
@@ -158,7 +161,11 @@ What the task does:
   pipe is missing. It can run only while the person is signed in to Windows on that machine; a
   locked session will do, and after a reboot they sign in once.
 - **Without the task**, a bridge started from ssh starts no service and says to run
-  `task install`. A service started from ssh would run elevated, in session 0.
+  `task install`. A service started from ssh would run in session 0, and elevated for an
+  administrator.
+- **Console window.** Task Scheduler gives the service a console window of its own; the
+  service lets it go at once, so the window only flashes at logon. *Unverified* on a real
+  logon.
 
 ### The Zed entry
 
@@ -182,7 +189,7 @@ host from your `~/.ssh/config` that logs in with a key:
     type.
 - **The remote command** runs in the remote user's shell. OpenSSH for Windows uses `cmd.exe`
   by default, which expands `%LOCALAPPDATA%`; with another default shell, give the full path.
-- **Service options** given to this bridge do not apply: the task's do.
+- **Service options** given to a bridge over ssh never apply: the task's do.
 - **Paths** in such a thread, such as folders and links to files, are the remote machine's.
 - **A dropped connection** ends only the bridge. The remote service and its agents work on, and
   Zed can open the session again.

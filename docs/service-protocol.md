@@ -20,9 +20,10 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   - Its owner, and the only principal its ACL allows, is the default owner of the service's
     token: the user, or BUILTIN\Administrators when the service runs elevated.
   - It is created with `PIPE_REJECT_REMOTE_CLIENTS`, so a client over the network (SMB) is
-    refused. A local process that an ssh server started gets in, although its token has the
-    NETWORK group. .NET 10 never sets this flag, so the service creates the pipe with
-    `CreateNamedPipeW` itself.
+    refused; `PipeTests` checks it through loopback SMB. .NET 10 never sets this flag, so the
+    service creates the pipe with `CreateNamedPipeW` itself.
+  - A local process that an ssh server started is no remote client, so it gets in, although its
+    token has the NETWORK group. *Unverified* until the first live check over ssh.
   - A client checks the pipe's owner before it sends anything. The owner must be the client's
     user or its token's default owner, so a pipe of another user's with the same name is
     refused. The clients do this check themselves: `PipeOptions.CurrentUserOnly` takes only
@@ -33,8 +34,8 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
     which the ACL allows. Every ssh login of an administrator is elevated.
   - A plain process never opens an elevated service, which starts agents. The ACL allows only
     BUILTIN\Administrators, which a plain token holds only for deny.
-  - The bridge never starts a service from an ssh login, where it would run elevated
-    (below).
+  - From an ssh login, where a service would run in session 0, and elevated for an
+    administrator, the bridge never starts one itself; only the logon task does (below).
 - The service is not a Windows service (session 0 could not start agents under the
   user's login). It keeps running after clients disconnect. The GUI, the test client, the
   bridge, the outside server, or the logon task starts it.
@@ -49,7 +50,7 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   service ID), `sessions.json` (the overlay), `journal/`, `claude/` (the Claude adapter's
   session list and `channels.json`, the person's answer about development channels), `logs/`.
 
-Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex]
+Command line: `Gorynych.Service [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex|dsh]
 [--claude-model <model>] [--unload-after <minutes>] [--claude-transport headless|tui]
 [--claude-channels ask|accept|decline] [--no-channel] [--no-peers] [--console]`.
 `--unload-after` is how long a session stays loaded in its agent once it is idle with no
@@ -64,7 +65,7 @@ the TUI it is the same as `decline`.
 The same executable is
 also the `gorynych` MCP server agents start over stdio:
 `peers [--pipe … --token …] [--channel-url … | --reply-url …]` (see Opinions below), the stdio bridge
-for external ACP clients: `acp --agent claude|kimi|codex` (see [external-clients.md](external-clients.md)),
+for external ACP clients: `acp --agent claude|kimi|codex|dsh` (see [external-clients.md](external-clients.md)),
 `shutdown [--pipe …]`, which sends the running service `_gorynych/shutdown` and waits up
 to 30 seconds for its process to end (exit code 0; 1 when no service runs on the pipe; 2 when
 it still runs), and `task install [--pipe …] [service options]` / `task uninstall [--pipe …]`.
@@ -76,6 +77,8 @@ replaces it, with `schtasks /Create /XML`. How a remote machine is set up with i
   (`LeastPrivilege`), from an elevated ssh login too.
 - It ignores a second start while it runs (`IgnoreNew`).
 - It has no time limit and no battery rules, and runs at normal priority (`Priority` 4).
+- The service lets go of the console window that Task Scheduler gives it, unless it was asked to
+  log there (`--console`): a console it has to itself, closed, would stop it.
 
 Every command takes only its own options, and every option that takes a value needs one. A
 wrong command line, `--help`, `-h` or `/?` prints the usage and exits with 2 without running

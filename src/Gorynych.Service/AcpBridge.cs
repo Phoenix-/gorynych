@@ -41,7 +41,7 @@ public static class AcpBridge
         }
         catch (UnauthorizedAccessException e)
         {
-            Console.Error.WriteLine($"gorynych acp: cannot reach the service on pipe {pipe}: {e.Message} {ElevationHint}");
+            Console.Error.WriteLine($"gorynych acp: cannot reach the service on pipe {pipe}: {e.Message}{Hint(e)}");
             return 1;
         }
         await using (service)
@@ -54,6 +54,9 @@ public static class AcpBridge
     }
 
     /// <summary>What a refused connection to the pipe usually means (docs/service-protocol.md, Endpoint).</summary>
+    /// <summary>The elevation hint for a pipe whose ACL refused this process; none for a pipe someone else owns.</summary>
+    internal static string Hint(Exception e) => e is UnauthorizedAccessException and not ServicePipe.ForeignPipeException ? " " + ElevationHint : "";
+
     internal const string ElevationHint =
         "A service started elevated (from an administrator terminal) serves only elevated clients; a plain service " +
         "serves the user's plain and elevated clients alike.";
@@ -73,7 +76,7 @@ public static class AcpBridge
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            Console.Error.WriteLine($"gorynych shutdown: cannot reach the service on pipe {pipe}: {e.Message} {ElevationHint}");
+            Console.Error.WriteLine($"gorynych shutdown: cannot reach the service on pipe {pipe}: {e.Message}{Hint(e)}");
             return 1;
         }
         if (stream is null)

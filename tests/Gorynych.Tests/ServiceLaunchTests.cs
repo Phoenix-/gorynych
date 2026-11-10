@@ -77,6 +77,15 @@ public sealed class ServiceLaunchTests
     }
 
     [TestMethod]
+    public void TheBridge_BlamesElevationOnlyForAPipeWhoseAclRefusedIt()
+    {
+        StringAssert.Contains(AcpBridge.Hint(new UnauthorizedAccessException("Access to the path is denied.")), "elevated");
+        Assert.AreEqual("", AcpBridge.Hint(new ServicePipe.ForeignPipeException("the pipe p is owned by S-1-5-21-1-2-3-1002")),
+            "another user's pipe is no matter of elevation");
+        Assert.AreEqual("", AcpBridge.Hint(new IOException("the pipe broke")));
+    }
+
+    [TestMethod]
     public void TheTask_IsNamedForTheUserAndPipe_AsTheServicesMutex()
     {
         Assert.AreEqual("Gorynych.Service.gorynych-acp-x", LogonTask.Name("gorynych-acp-x"));
@@ -87,6 +96,20 @@ public sealed class ServiceLaunchTests
     public void NoTask_IsFoundForAPipeNobodyRegistered()
     {
         Assert.IsFalse(LogonTask.Exists("gorynych-test-" + Guid.NewGuid().ToString("N")));
+    }
+
+    /// <summary>
+    /// schtasks writes in the OEM code page (866 on a Russian Windows), which is not UTF-8, so its
+    /// errors are readable from an ssh login too, where this process has no console.
+    /// </summary>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "schtasks is Windows only")]
+    public void WhatSchtasksSays_IsReadInItsOemCodePage()
+    {
+        var said = LogonTask.Run("gorynych-test-" + Guid.NewGuid().ToString("N"));
+        Assert.IsNotNull(said, "no such task runs");
+        Assert.IsFalse(said.Contains('�'), said);
+        Assert.IsTrue(said.Count(char.IsLetter) > 10, said);
     }
 
     [TestMethod]
@@ -111,7 +134,7 @@ public sealed class ServiceLaunchTests
         Assert.AreEqual("uninstall", CommandLine.Parse(["task", "uninstall", "--pipe", "p"]).Action);
         Assert.AreEqual("t", CommandLine.Parse(["peers", "--pipe", "p", "--token", "t", "--reply-url", "u"]).Value("--token"));
         Assert.AreEqual("p", CommandLine.Parse(["shutdown", "--pipe", "p"]).Value("--pipe"));
-        Assert.AreEqual("--help", CommandLine.Parse(["--claude-model", "--help"]).Value("--claude-model"), "a value is a value");
+        Assert.AreEqual("-x", CommandLine.Parse(["--claude-model", "-x"]).Value("--claude-model"), "a value may start with one dash");
 
         foreach (var help in new[] { new[] { "--help" }, ["-h"], ["/?"], ["help"], ["acp", "--agent", "kimi", "-?"], ["task", "--help"], ["task", "install", "--help"] })
             Assert.IsNull(Assert.ThrowsExactly<UsageException>(() => CommandLine.Parse(help)).Problem, string.Join(' ', help));
@@ -121,6 +144,9 @@ public sealed class ServiceLaunchTests
             (new[] { "--bogus" }, "unknown option '--bogus'"),
             (["serve"], "unknown command 'serve'"),
             (["--pipe"], "--pipe needs a value"),
+            (["--pipe", "--data", "d"], "--pipe needs a value"),
+            (["--claude-model", "--no-peers"], "--claude-model needs a value"),
+            (["--pipe", ""], "--pipe needs a value"),
             (["--pipe", "a", "--pipe", "b"], "--pipe is given twice"),
             (["acp", "--pipe", "p"], "acp needs --agent"),
             (["acp", "--agent", "kimi", "--console"], "acp does not take '--console'"),
@@ -132,8 +158,45 @@ public sealed class ServiceLaunchTests
             (["--claude-transport", "pty"], "--claude-transport takes headless or tui, not 'pty'"),
             (["--claude-channels", "yes"], "--claude-channels takes ask, accept or decline, not 'yes'"),
             (["task", "install", "--unload-after", "-1"], "--unload-after takes a number of minutes, 0 or more, not '-1'"),
+            (["--unload-after", "Infinity"], "--unload-after takes a number of minutes, 0 or more, not 'Infinity'"),
+            (["--unload-after", "1e300"], "--unload-after takes a number of minutes, 0 or more, not '1e300'"),
         })
             Assert.AreEqual(problem, Assert.ThrowsExactly<UsageException>(() => CommandLine.Parse(wrong)).Problem, string.Join(' ', wrong));
+    }
+
+    /// <summary>
+    /// The logon task starts the service with a console window of its own, which would stop the
+    /// service when closed. Here <c>CREATE_NO_WINDOW</c> gives it such a console, without the window.
+    /// </summary>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "consoles are Windows only")]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AServiceWithAConsoleOfItsOwn_LetsItGo_ButNotWhenAskedToLogThere()
+    {
+        foreach (var console in new[] { false, true })
+        {
+            var pipe = "gorynych-test-" + Guid.NewGuid().ToString("N")[..8];
+            var data = TestDirs.New();
+            List<string> args = ["--pipe", pipe, "--data", data];
+            if (console) args.Add("--console");
+            using var service = Process.Start(new ProcessStartInfo(BridgeTests.ServiceExe(), args) { UseShellExecute = false, CreateNoWindow = true })!;
+            try
+            {
+                await using (var up = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(20)))
+                    Assert.IsNotNull(up, "it serves");
+                var log = string.Concat(Directory.EnumerateFiles(Path.Combine(data, "logs"), "service-*.log").Select(f =>
+                {
+                    using var reader = new StreamReader(new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+                    return reader.ReadToEnd();
+                }));
+                Assert.AreEqual(!console, log.Contains("let go of its own console window", StringComparison.Ordinal), $"--console: {console}");
+            }
+            finally
+            {
+                service.Kill();
+                await service.WaitForExitAsync();
+            }
+        }
     }
 
     /// <summary>The executable itself: a wrong command line or <c>--help</c> prints the usage and exits with 2, and never opens the pipe.</summary>
@@ -152,7 +215,7 @@ public sealed class ServiceLaunchTests
             {
                 var stderr = process.StandardError.ReadToEndAsync();
                 Assert.IsTrue(process.WaitForExit(10_000), $"{extra}: it exits instead of serving");
-                Assert.AreEqual(CommandLine.UsageExitCode, process.ExitCode, extra);
+                Assert.AreEqual(2, process.ExitCode, extra);
                 StringAssert.Contains(await stderr, "Usage:", extra);
                 if (extra == "--bogus") StringAssert.Contains(await stderr, "unknown option '--bogus'");
                 Assert.IsNull(await ServicePipe.ConnectAsync(pipe, TimeSpan.FromMilliseconds(500)), $"{extra}: no service on the pipe");

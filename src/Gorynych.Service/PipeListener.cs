@@ -92,7 +92,7 @@ public static partial class PipeListener
         {
             var error = Marshal.GetLastPInvokeError();
             var message = $"cannot create the pipe {name}: {new Win32Exception(error).Message}";
-            throw error == 5 ? new UnauthorizedAccessException(message) : new IOException(message, Marshal.GetHRForLastWin32Error());
+            throw error == 5 ? new UnauthorizedAccessException(message) : new IOException(message, new Win32Exception(error));
         }
         return new NamedPipeServerStream(PipeDirection.InOut, isAsync: true, isConnected: false, new SafePipeHandle(handle, ownsHandle: true));
     }

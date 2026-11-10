@@ -15,9 +15,9 @@ public static class ServicePipe
     /// Connects to the service's pipe, trying again until <paramref name="timeout"/> has passed.
     /// </summary>
     /// <returns>The connected pipe, or null when no service opened it in time.</returns>
-    /// <exception cref="UnauthorizedAccessException">The pipe is there but not this user's service:
-    /// its ACL refuses this process (a plain process and an elevated service), or its owner is
-    /// someone else (<see cref="TrustsOwner"/>).</exception>
+    /// <exception cref="UnauthorizedAccessException">The pipe is there but its ACL refuses this
+    /// process: a plain process and an elevated service.</exception>
+    /// <exception cref="ForeignPipeException">The pipe is there but someone else owns it.</exception>
     public static Task<NamedPipeClientStream?> ConnectAsync(string pipe, TimeSpan timeout, CancellationToken ct = default)
     {
         if (!OperatingSystem.IsWindows()) return ConnectAsync(pipe, timeout, null, ct);
@@ -71,9 +71,11 @@ public static class ServicePipe
     {
         var owner = stream.GetAccessControl().GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
         if (owner is not null && TrustsOwner(owner, identity.User, identity.DefaultOwner)) return;
-        throw new UnauthorizedAccessException(
-            $"the pipe {pipe} is owned by {owner?.Value ?? "nobody"}, so it is not this user's service");
+        throw new ForeignPipeException($"the pipe {pipe} is owned by {owner?.Value ?? "nobody"}, so it is not this user's service");
     }
+
+    /// <summary>The pipe is there, but its owner is not this user (<see cref="TrustsOwner"/>): no matter of elevation.</summary>
+    public sealed class ForeignPipeException(string message) : UnauthorizedAccessException(message);
 
     /// <summary>
     /// Whether a pipe with this owner is the user's service: owned by the user, as a plain

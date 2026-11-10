@@ -42,6 +42,9 @@ var dataDirectory = Path.GetFullPath(line.Value("--data")
     ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gorynych"));
 Directory.CreateDirectory(dataDirectory);
 ServiceLog.Init(Path.Combine(dataDirectory, "logs"), console: line.Flag("--console"));
+// Started by the logon task, it has a console window of its own: let it go, so that closing it cannot stop the service.
+if (!line.Flag("--console") && Gorynych.Outside.DetachedProcess.ReleaseOwnConsole())
+    ServiceLog.Info("service: let go of its own console window");
 
 // One service per user and endpoint, across logon sessions (RDP included).
 using var instance = new Mutex(initiallyOwned: false, "Gorynych.Service." + pipeName,

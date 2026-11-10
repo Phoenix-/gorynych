@@ -45,7 +45,8 @@ internal static class ServiceLaunch
     /// <summary>Why nothing was started, and what to do about it.</summary>
     public static string Refusal(string pipe, bool defaultPipe) =>
         $"no service runs on pipe {pipe}, and this process runs outside the user's Windows session (an ssh login or session 0), " +
-        "where a service would run elevated. Register the logon task once, which starts the service in the user's session: " +
+        "where a service would run in session 0, and elevated for an administrator. Register the logon task once, which " +
+        "starts the service in the user's session: " +
         $"Gorynych.Service.exe task install{(defaultPipe ? "" : " --pipe " + DetachedProcess.Quote(pipe))}";
 
     /// <summary>Why the task's service did not answer in time.</summary>

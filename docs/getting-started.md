@@ -304,7 +304,8 @@ writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
   `Gorynych.Service.exe shutdown`, and start Zed again from a fresh shell or the Start menu.
 - **"gorynych acp: cannot reach the service on pipe …"**, with a note about elevation. An
   elevated service runs, and Zed is not elevated. Stop it from an elevated terminal with
-  `Gorynych.Service.exe shutdown`, and let Zed start a plain one.
+  `Gorynych.Service.exe shutdown`, and let Zed start a plain one. When the message says instead
+  that the pipe "is not this user's service", another user's process holds the pipe's name.
 - **"gorynych acp: no service runs on pipe …, and this process runs outside the user's Windows
   session"**. A bridge over SSH found no service and no logon task. Run
   `Gorynych.Service.exe task install` on that machine once

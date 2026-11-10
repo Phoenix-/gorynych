@@ -127,7 +127,9 @@ internal sealed class CommandLine
             if (IsHelp(name)) throw new UsageException(null);
             if (known.Values.Contains(name))
             {
-                if (i + 1 >= args.Length) throw new UsageException($"{name} needs a value");
+                // A value is never empty and never an option: "--pipe --data d" lacks the pipe.
+                if (i + 1 >= args.Length || args[i + 1].Length == 0 || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                    throw new UsageException($"{name} needs a value");
                 value = args[++i];
                 Check(name, value);
             }
@@ -142,6 +144,20 @@ internal sealed class CommandLine
 
     static bool IsHelp(string? arg) => arg is "--help" or "-h" or "-?" or "/?";
 
+    /// <summary>Whether that many minutes make a time span: not infinite, not too long.</summary>
+    static bool Minutes(double minutes)
+    {
+        try
+        {
+            TimeSpan.FromMinutes(minutes);
+            return true;
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>The values with a fixed set, checked here so that a wrong one never reaches a started service or a task.</summary>
     static void Check(string name, string value)
     {
@@ -149,7 +165,7 @@ internal sealed class CommandLine
         {
             "--claude-transport" => value is "headless" or "tui",
             "--claude-channels" => value is "ask" or "accept" or "decline",
-            "--unload-after" => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var m) && m >= 0,
+            "--unload-after" => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var m) && m >= 0 && Minutes(m),
             _ => true,
         };
         if (ok) return;

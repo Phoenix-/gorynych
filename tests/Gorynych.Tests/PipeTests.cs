@@ -116,7 +116,8 @@ public sealed class PipeTests
         await using var server = PipeListener.Create(name);
         var accepting = server.WaitForConnectionAsync();
         var stranger = new ServicePipe.Identity(new SecurityIdentifier("S-1-5-21-1-2-3-1001"), new SecurityIdentifier("S-1-5-21-1-2-3-1001"));
-        var refused = await Assert.ThrowsExactlyAsync<UnauthorizedAccessException>(() => ServicePipe.ConnectAsync(name, Wait, stranger, CancellationToken.None));
+        var refused = await Assert.ThrowsExactlyAsync<ServicePipe.ForeignPipeException>(() => ServicePipe.ConnectAsync(name, Wait, stranger, CancellationToken.None));
+        Assert.IsInstanceOfType<UnauthorizedAccessException>(refused, "callers that catch an access error still catch it");
         StringAssert.Contains(refused.Message, "is not this user's service");
         await accepting.WaitAsync(Wait);
         var buffer = new byte[1];

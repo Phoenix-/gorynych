@@ -51,6 +51,20 @@ internal static unsafe partial class DetachedProcess
             (breakaway ? "" : " and lets none break away") + ", so closing whatever started it may stop it";
     }
 
+    /// <summary>
+    /// Lets go of a console that this process has to itself, as Task Scheduler gives a console
+    /// program it starts in the user's session (the logon task). Its window would stay open, and
+    /// closing it would stop the service with every session; a detached start has no console at
+    /// all. A console shared with the terminal the person ran the service from is kept.
+    /// </summary>
+    /// <returns>True when it let one go.</returns>
+    public static bool ReleaseOwnConsole()
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        var ids = stackalloc uint[2];
+        return GetConsoleProcessList(ids, 2) == 1 && FreeConsole();
+    }
+
     /// <summary>Quotes an argument the way the Microsoft C runtime splits a command line.</summary>
     public static string Quote(string arg)
     {
@@ -115,6 +129,13 @@ internal static unsafe partial class DetachedProcess
 
     [LibraryImport("kernel32.dll")]
     private static partial nint GetCurrentProcess();
+
+    [LibraryImport("kernel32.dll")]
+    private static partial uint GetConsoleProcessList(uint* processIds, uint count);
+
+    [LibraryImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool FreeConsole();
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

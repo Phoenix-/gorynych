@@ -1,6 +1,7 @@
 // Compiled into both Gorynych.Service (`task install|uninstall`, and the stdio bridge) and
 // Gorynych.Outside, which run the task to start the service.
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
 using System.Xml.Linq;
@@ -13,7 +14,7 @@ namespace Gorynych.Outside;
 /// the current user, so it needs no password, and the bridge and the outside server run it when
 /// the service's pipe is missing.
 /// </summary>
-internal static class LogonTask
+internal static partial class LogonTask
 {
     static readonly XNamespace Ns = "http://schemas.microsoft.com/windows/2004/02/mit/task";
 
@@ -88,7 +89,7 @@ internal static class LogonTask
         }
         finally
         {
-            try { File.Delete(file); } catch (IOException) { }
+            try { File.Delete(file); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         }
     }
 
@@ -115,18 +116,48 @@ internal static class LogonTask
         {
             using var process = Process.Start(psi)!;
             process.StandardInput.Close();
-            var stdout = process.StandardOutput.ReadToEndAsync();
-            var stderr = process.StandardError.ReadToEndAsync();
+            var stdout = ReadAllAsync(process.StandardOutput.BaseStream);
+            var stderr = ReadAllAsync(process.StandardError.BaseStream);
             if (!process.WaitForExit(30_000))
             {
                 try { process.Kill(); } catch (InvalidOperationException) { }
                 return (-1, "schtasks did not finish within 30 seconds");
             }
-            return (process.ExitCode, (stdout.Result + stderr.Result).Trim());
+            return (process.ExitCode, (Oem(stdout.Result) + Oem(stderr.Result)).Trim());
         }
         catch (System.ComponentModel.Win32Exception e)
         {
             return (-1, $"cannot run schtasks: {e.Message}");
         }
     }
+
+    static async Task<byte[]> ReadAllAsync(Stream stream)
+    {
+        using var bytes = new MemoryStream();
+        await stream.CopyToAsync(bytes);
+        return bytes.ToArray();
+    }
+
+    /// <summary>
+    /// schtasks writes in the OEM code page of the console it gets (CREATE_NO_WINDOW gives it one of
+    /// its own), whatever this process's console says; under ssh this process has none, and .NET
+    /// would read the text as UTF-8.
+    /// </summary>
+    internal static unsafe string Oem(byte[] bytes)
+    {
+        const uint oemCodePage = 1; // CP_OEMCP
+        if (bytes.Length == 0 || !OperatingSystem.IsWindows()) return Encoding.UTF8.GetString(bytes);
+        fixed (byte* source = bytes)
+        {
+            var length = MultiByteToWideChar(oemCodePage, 0, source, bytes.Length, null, 0);
+            if (length <= 0) return Encoding.UTF8.GetString(bytes);
+            var text = new char[length];
+            fixed (char* target = text)
+                length = MultiByteToWideChar(oemCodePage, 0, source, bytes.Length, target, length);
+            return new string(text, 0, Math.Max(length, 0));
+        }
+    }
+
+    [LibraryImport("kernel32.dll")]
+    private static unsafe partial int MultiByteToWideChar(uint codePage, uint flags, byte* source, int sourceLength, char* target, int targetLength);
 }
