@@ -14,7 +14,6 @@ internal sealed class ClaudeCatalogStore(string path, Action<string>? log)
 {
     readonly Lock gate = new();
     string? current; // the catalog in use, as the file's text
-    string? written; // what the file holds
 
     /// <summary>The kept catalog, or an empty one when there is none or it cannot be read.</summary>
     public List<ClaudeModel> Load()
@@ -26,7 +25,7 @@ internal sealed class ClaudeCatalogStore(string path, Action<string>? log)
                 throw new JsonException("no models list");
             var catalog = ClaudeOptions.Catalog(file);
             var text = Text(models);
-            lock (gate) current = written = text;
+            lock (gate) current = text;
             return catalog;
         }
         catch (Exception e) when (e is not OutOfMemoryException)
@@ -39,7 +38,8 @@ internal sealed class ClaudeCatalogStore(string path, Action<string>? log)
 
     /// <summary>
     /// Keeps <paramref name="models"/>. True when they differ from the catalog in use. The file is
-    /// written when it does not hold them yet; one that could not be written is tried again next time.
+    /// written, under a cross-process lock, when it does not hold them yet; one that could not be
+    /// written is tried again next time.
     /// </summary>
     public bool Save(JsonArray models)
     {
@@ -49,19 +49,28 @@ internal sealed class ClaudeCatalogStore(string path, Action<string>? log)
         {
             changed = text != current;
             current = text;
-            if (text == written) return changed;
         }
+        if (text == FileText()) return changed;
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            AtomicFile.WriteAllText(path, text);
-            lock (gate) written = text;
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+            using (SharedFileLock.Acquire(path))
+            {
+                if (text != FileText()) AtomicFile.WriteAllText(path, text);
+            }
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
             log?.Invoke($"claude: the model catalog was not saved to {path}: {e.Message}");
         }
         return changed;
+    }
+
+    /// <summary>The models the file holds, as text; null when it is missing or unreadable.</summary>
+    string? FileText()
+    {
+        try { return File.Exists(path) && JsonNode.Parse(File.ReadAllText(path)) is JsonObject file && file["models"] is JsonArray models ? Text(models) : null; }
+        catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException) { return null; }
     }
 
     static string Text(JsonArray models) => new JsonObject { ["models"] = models.DeepClone() }.ToJsonString(AcpJson.TextOptions);

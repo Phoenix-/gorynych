@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Gorynych.Acp.Hosting;
 
 namespace Gorynych.Adapters.Claude;
 
@@ -14,6 +15,8 @@ internal sealed class ClaudeTrust(string storePath, string? claudeStatePath, Act
 {
     readonly Lock gate = new();
     HashSet<string>? allowed;
+    readonly HashSet<string> unsaved = new(Comparer); // allows whose write failed
+    FileStamp? loadedStamp;
 
     /// <summary>Claude's own state file: <c>$CLAUDE_CONFIG_DIR/.claude.json</c>, else <c>~/.claude.json</c>.</summary>
     public static string DefaultClaudeStatePath() =>
@@ -26,37 +29,52 @@ internal sealed class ClaudeTrust(string storePath, string? claudeStatePath, Act
         var key = Key(cwd);
         lock (gate)
         {
-            allowed ??= Load();
-            if (Ancestors(key).Any(allowed.Contains)) return true;
+            Refresh();
+            if (Ancestors(key).Any(allowed!.Contains)) return true;
         }
         return TrustedByClaude(key);
     }
 
-    /// <summary>Keeps the person's allow for <paramref name="cwd"/>.</summary>
+    /// <summary>Keeps the person's allow for <paramref name="cwd"/>; folders other processes added on disk are kept too.</summary>
     public void Remember(string cwd)
     {
         lock (gate)
         {
-            allowed ??= Load();
-            if (!allowed.Add(Key(cwd))) return;
+            var key = Key(cwd);
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(storePath)!);
-                var tmp = storePath + ".tmp";
-                File.WriteAllText(tmp, new JsonObject { ["trusted"] = new JsonArray(allowed.Order(StringComparer.Ordinal).Select(f => (JsonNode)f).ToArray()) }
+                using var fileLock = SharedFileLock.Acquire(storePath);
+                allowed = Load();
+                if (!allowed.Add(key) && unsaved.Count == 0) return;
+                allowed.UnionWith(unsaved);
+                AtomicFile.WriteAllText(storePath, new JsonObject { ["trusted"] = new JsonArray(allowed.Order(StringComparer.Ordinal).Select(f => (JsonNode)f).ToArray()) }
                     .ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-                File.Move(tmp, storePath, overwrite: true);
+                unsaved.Clear();
+                loadedStamp = FileStamp.Of(storePath);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
+                allowed ??= new HashSet<string>(Comparer);
+                allowed.Add(key);
+                unsaved.Add(key);
                 log?.Invoke($"claude: could not keep the trusted folder in {storePath}: {e.Message}");
             }
         }
     }
 
+    /// <summary>Loads the file when it is not loaded yet or another process changed it.</summary>
+    void Refresh()
+    {
+        if (allowed is not null && FileStamp.Of(storePath) == loadedStamp) return;
+        allowed = Load();
+        allowed.UnionWith(unsaved);
+    }
+
     HashSet<string> Load()
     {
         var set = new HashSet<string>(Comparer);
+        loadedStamp = FileStamp.Of(storePath);
         try
         {
             if (File.Exists(storePath) && JsonNode.Parse(File.ReadAllText(storePath))?["trusted"] is JsonArray list)

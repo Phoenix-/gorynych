@@ -44,18 +44,14 @@ internal sealed class ChannelConsentStore
     readonly Action<string>? log;
     readonly Lock gate = new();
     ChannelConsentRecord? record;
+    FileStamp? readStamp;
+    bool read;
 
     public ChannelConsentStore(string path, Action<string>? log = null)
     {
         this.path = path;
         this.log = log;
-        if (!File.Exists(path)) return;
-        try { record = JsonSerializer.Deserialize(File.ReadAllText(path), ClaudeJsonContext.Default.ChannelConsentRecord); }
-        catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
-        {
-            // Treated as not asked yet, like an answer that could not be saved.
-            log?.Invoke($"claude adapter: {path} is not readable, the person is asked again: {e.Message}");
-        }
+        lock (gate) Refresh();
     }
 
     public string Path => path;
@@ -63,7 +59,30 @@ internal sealed class ChannelConsentStore
     /// <summary>The kept answer, or null when the person has not answered yet.</summary>
     public bool? Answer
     {
-        get { lock (gate) return record?.Accepted; }
+        get
+        {
+            lock (gate)
+            {
+                Refresh();
+                return record?.Accepted;
+            }
+        }
+    }
+
+    /// <summary>Reads the file when it has not been read yet or another process changed it.</summary>
+    void Refresh()
+    {
+        var stamp = FileStamp.Of(path);
+        if (read && stamp == readStamp) return;
+        read = true;
+        readStamp = stamp;
+        if (stamp is null) { record = null; return; }
+        try { record = JsonSerializer.Deserialize(File.ReadAllText(path), ClaudeJsonContext.Default.ChannelConsentRecord); }
+        catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
+        {
+            // Treated as not asked yet, like an answer that could not be saved.
+            log?.Invoke($"claude adapter: {path} is not readable, the person is asked again: {e.Message}");
+        }
     }
 
     public void Save(bool accepted, string sessionId)
@@ -73,7 +92,11 @@ internal sealed class ChannelConsentStore
             record = new ChannelConsentRecord { Accepted = accepted, AnsweredAt = DateTimeOffset.UtcNow, SessionId = sessionId };
             try
             {
+                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path))!);
+                using var fileLock = SharedFileLock.Acquire(path);
                 AtomicFile.WriteAllText(path, JsonSerializer.Serialize(record, ClaudeJsonContext.Default.ChannelConsentRecord));
+                readStamp = FileStamp.Of(path);
+                read = true;
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
