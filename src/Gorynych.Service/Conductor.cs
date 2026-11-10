@@ -559,7 +559,18 @@ public sealed class Conductor : IAsyncDisposable
         var feed = Feed(record.SessionId);
         if (host.RouteOf(record.SessionId) is { Current: true } on && on.Rpc == rpc && !feed.OpenedReadOnly) return rpc;
         var live = (await EnsureLiveAsync(record, ct, holdingTurn: true)).Rpc;
-        return feed.OpenedReadOnly ? await RetakeAsync(host, record, live, forAgent, ct) : live;
+        return feed.OpenedReadOnly ? await RetakeAsync(host, record, live, forAgent ? ReadOnlyUse.Message : ReadOnlyUse.Prompt, ct) : live;
+    }
+
+    /// <summary>What a read-only session was refused for, which its refusal's words follow.</summary>
+    enum ReadOnlyUse
+    {
+        /// <summary>A client's prompt.</summary>
+        Prompt,
+        /// <summary>Another session's message: a question, a report.</summary>
+        Message,
+        /// <summary>A change of its settings: <c>session/set_config_option</c>, <c>session/set_mode</c>, <c>session/set_model</c>.</summary>
+        Setting,
     }
 
     // ---------------------------------------------------------------- read-only sessions
@@ -570,7 +581,7 @@ public sealed class Conductor : IAsyncDisposable
     /// free now (Codex takes the thread once the other app let it go), and brings into the journal
     /// what was made in the other app meanwhile. Still read-only, the turn is refused in words.
     /// </summary>
-    async Task<JsonRpcConnection> RetakeAsync(AgentHost host, SessionRecord record, JsonRpcConnection rpc, bool forAgent, CancellationToken ct)
+    async Task<JsonRpcConnection> RetakeAsync(AgentHost host, SessionRecord record, JsonRpcConnection rpc, ReadOnlyUse use, CancellationToken ct)
     {
         var feed = Feed(record.SessionId);
         await feed.OpenGate.WaitAsync(ct);
@@ -586,20 +597,22 @@ public sealed class Conductor : IAsyncDisposable
         {
             feed.OpenGate.Release();
         }
-        if (feed.ReadOnly is { } state) throw ReadOnlyRefusal(record, state, forAgent);
+        if (feed.ReadOnly is { } state) throw ReadOnlyRefusal(record, state, use);
         return rpc;
     }
 
     /// <summary>
-    /// The refusal of a turn in a read-only session: its ID, why, and what to do, for the person or
-    /// the asking agent. No <c>data</c>, which Zed would append to the message as raw JSON: the
-    /// client has the flag from the session's state (load, resume and updates).
+    /// The refusal of a turn or a change in a read-only session: its ID, why, and what to do, for
+    /// the person or the asking agent. No <c>data</c>, which Zed would append to the message as raw
+    /// JSON: the client has the flag from the session's state (load, resume and updates).
     /// </summary>
-    static JsonRpcException ReadOnlyRefusal(SessionRecord record, SessionFeed.ReadOnlyState state, bool forAgent) => new(
-        JsonRpcException.InvalidRequest,
-        forAgent
-            ? $"Session {record.SessionId} is read-only for now, so it takes no message: {state.Reason} Ask again once it is free, or ask another session."
-            : $"Session {record.SessionId} is read-only for now: {state.Reason} Then send the prompt again.");
+    static JsonRpcException ReadOnlyRefusal(SessionRecord record, SessionFeed.ReadOnlyState state, ReadOnlyUse use) => new(
+        JsonRpcException.InvalidRequest, use switch
+        {
+            ReadOnlyUse.Message => $"Session {record.SessionId} is read-only for now, so it takes no message: {state.Reason} Ask again once it is free, or ask another session.",
+            ReadOnlyUse.Setting => $"Session {record.SessionId} is read-only for now, so its settings cannot change: {state.Reason} Then change them again.",
+            _ => $"Session {record.SessionId} is read-only for now: {state.Reason} Then send the prompt again.",
+        });
 
     /// <summary>The read-only state a <c>_meta</c> says (<c>gorynych/interactivity</c>); null for full, also when it says nothing.</summary>
     static SessionFeed.ReadOnlyState? ReadOnlyOf(JsonNode? meta)
@@ -634,7 +647,7 @@ public sealed class Conductor : IAsyncDisposable
         ServiceLog.Info($"{feed.SessionId}: {(state is null ? "can be written to again" : $"read-only: {state.Reason}")}");
         var update = new JsonObject { ["sessionUpdate"] = "session_info_update", ["_meta"] = PutInteractivity(new JsonObject(), state) };
         await feed.PublishAsync(update, except: null, () => { }, journal: false);
-        await feed.SendLiveAsync(NoticeOf(state), c => c.TakesNotices);
+        await feed.SendLiveAsync(NoticeOf(state), c => c.TakesNotices && c.Tell(feed.SessionId, state));
     }
 
     /// <summary>The notice that tells a person the session is read-only now, and why, or that it can be written to again.</summary>
@@ -642,9 +655,16 @@ public sealed class Conductor : IAsyncDisposable
         ? new Notice { Severity = NoticeSeverity.Info, Title = "You can write here again", Description = "Nothing else holds this session now." }
         : new Notice { Severity = NoticeSeverity.Warning, Title = "Read-only for now", Description = state.Reason })!.AsObject();
 
-    /// <summary>A client that opens a read-only session is told why it takes no prompt, if it shows notices.</summary>
-    static Task NoticeOnOpenAsync(SessionFeed feed, ClientConnection client) =>
-        feed.ReadOnly is { } state && client.TakesNotices ? feed.SendLiveAsync(NoticeOf(state), c => ReferenceEquals(c, client)) : Task.CompletedTask;
+    /// <summary>
+    /// A client that opens a read-only session is told why it takes no prompt, if it shows notices,
+    /// once: not again on the same connection, nor after a reconnect when its link says it shows it.
+    /// </summary>
+    static Task NoticeOnOpenAsync(SessionFeed feed, ClientConnection client)
+    {
+        // Also writable again, when its link said it shows the session read-only: a change it missed.
+        var state = feed.ReadOnly;
+        return client.Tell(feed.SessionId, state) && client.TakesNotices ? feed.SendLiveAsync(NoticeOf(state), c => ReferenceEquals(c, client)) : Task.CompletedTask;
+    }
 
     /// <summary>For each session, its place in the host's stream: what the host sends again must follow it.</summary>
     internal JsonObject HostCursors(string hostId, IEnumerable<string> sessions)
@@ -1206,6 +1226,17 @@ public sealed class Conductor : IAsyncDisposable
         return new ListSessionsResponse { Sessions = pageItems, NextCursor = next };
     }
 
+    /// <summary>
+    /// A session's time in the list. The agent's own time wins, as its title does: a catch-up of the
+    /// journal, or a row that changes its marks, does not move the session. But a turn the service
+    /// saw end counts, should the agent note its end a moment later than the list is read.
+    /// </summary>
+    DateTimeOffset ListTime(SessionRecord r, SessionInfo? native)
+    {
+        var at = native?.UpdatedAt is { } said && ParseTime(said) is { } agentTime ? agentTime : r.UpdatedAt;
+        return feeds.TryGetValue(r.SessionId, out var seen) && seen.LastTurnEnded is { } ended && ended > at ? ended : at;
+    }
+
     SessionInfo Describe(SessionRecord r, SessionInfo? native)
     {
         var meta = native?.Meta?.DeepClone().AsObject() ?? [];
@@ -1231,9 +1262,7 @@ public sealed class Conductor : IAsyncDisposable
             Cwd = FolderPath.Normalize(native?.Cwd ?? r.Cwd),
             AdditionalDirectories = native?.AdditionalDirectories,
             Title = r.TitleSource != SpawnTitle && native?.Title is { Length: > 0 } t ? t : r.Title,
-            // The agent's own time wins, as its title does: a catch-up of the journal, or a row that
-            // changes its marks, does not move the session in the list.
-            UpdatedAt = native?.UpdatedAt is { } at && ParseTime(at) is not null ? at : r.UpdatedAt.ToString("O", CultureInfo.InvariantCulture),
+            UpdatedAt = ListTime(r, native).ToString("O", CultureInfo.InvariantCulture),
             Meta = meta,
         };
     }
@@ -1418,7 +1447,13 @@ public sealed class Conductor : IAsyncDisposable
         feed.CaptureState(opened);
         // An agent that can show the session but not take it now says so (gorynych/interactivity): read-only until it can.
         var readOnly = ReadOnlyOf((opened as JsonObject)?["_meta"]);
+        var taken = feed.OpenedReadOnly && readOnly is null;
         feed.OpenedReadOnly = readOnly is not null;
+        // Taken now after it was open for reading only: the options its agent could not say then
+        // (Codex reports a thread's settings only once it loads it) reach the clients that have it open.
+        if (taken && (opened as JsonObject)?["configOptions"] is JsonArray { Count: > 0 } options)
+            await feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "config_option_update", ["configOptions"] = options.DeepClone() },
+                except: null, () => { }, journal: false);
         await SetInteractivityAsync(feed, readOnly);
         try
         {
@@ -1501,6 +1536,8 @@ public sealed class Conductor : IAsyncDisposable
     {
         RefuseSystemPrompt(request.SystemPrompt);
         var after = ReplayFrom(request.Meta?[GorynychProtocol.MetaReplayFrom]);
+        // A resumable link coming back says what its client shows of the session's interactivity.
+        if (request.Meta?[GorynychProtocol.MetaInteractivity] is not null) client.Knows(request.SessionId, ReadOnlyOf(request.Meta));
         using var use = await UseAsync(request.SessionId, ct);
         var (_, opened) = await EnsureLiveAsync(use.Record, ct);
         var position = await use.Feed.ResumeAndAttachAsync(client, after);
@@ -1803,6 +1840,10 @@ public sealed class Conductor : IAsyncDisposable
     {
         using var use = await UseAsync(sessionId, ct);
         var (rpc, _) = await EnsureLiveAsync(use.Record, ct);
+        // A change of a session its agent opened for reading only: opened again first, which takes it
+        // if it is free now, and refused in the same words as a prompt while it is still read-only.
+        if (use.Feed.OpenedReadOnly && request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode or "session/set_model")
+            rpc = await RetakeAsync(HostOf(use.Record), use.Record, rpc, ReadOnlyUse.Setting, ct);
         var response = await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
         switch (request.Method)
         {

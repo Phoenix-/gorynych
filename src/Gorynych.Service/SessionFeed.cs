@@ -132,11 +132,23 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         if (!markedBefore) Interlocked.Exchange(ref otherText, 0);
     }
 
-    /// <summary>A turn ended: clears <see cref="HasOtherSessionText"/> once neither a client's turn nor one of the agent's own runs.</summary>
+    /// <summary>
+    /// A turn ended: clears <see cref="HasOtherSessionText"/> once neither a client's turn nor one of
+    /// the agent's own runs, and notes when (<see cref="LastTurnEnded"/>).
+    /// </summary>
     public void TurnEnded()
     {
+        Interlocked.Exchange(ref lastTurnEnded, DateTimeOffset.UtcNow.UtcTicks);
         if (!ClientTurn && Volatile.Read(ref agentTurn) == 0) Interlocked.Exchange(ref otherText, 0);
     }
+
+    long lastTurnEnded;
+
+    /// <summary>
+    /// When the last turn this service saw end ended (null: none in this run): the session's time in
+    /// the list while its agent's own time is behind it (an agent that notes a turn's end a moment late).
+    /// </summary>
+    public DateTimeOffset? LastTurnEnded => Interlocked.Read(ref lastTurnEnded) is var ticks and > 0 ? new DateTimeOffset(ticks, TimeSpan.Zero) : null;
 
     int agentTurn;
 

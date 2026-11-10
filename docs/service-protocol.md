@@ -1191,6 +1191,9 @@ means `"full"`, as AHP's `ChatInteractivity`), and with `"read-only"` its reason
 RFD *Session Notices*, completed) gets a `notice` update: `warning`, "Read-only for now", with the
 reason, when it opens a read-only session and when one it has open becomes read-only; `info`, "You
 can write here again", when the flag clears. No other client gets one, and none is journaled.
+Each is said once to a client: not again when it opens the session again on the same connection,
+nor after its resumable link comes back, when the link says what its client shows
+([The resumable link](#the-resumable-link)) and nothing changed meanwhile.
 
 **Opening one.** The agent says it in the `_meta` of its `session/resume` or `session/load` answer
 ([adapter-contract.md](adapter-contract.md#4-loading-resuming-and-history)): read-only, with the
@@ -1204,7 +1207,9 @@ only first opens it again (`session/resume` after the journal's mark): an agent 
 can (Codex takes the thread once the other app let it go), and the journal gets what the other app
 made meanwhile.
 
-- Taken: the flag clears (an update with `"full"`, a notice), and the turn runs.
+- Taken: the flag clears (an update with `"full"`, a notice), and the turn runs. The options its
+  agent says only once it has the session (Codex: a thread's model, effort and mode) reach the
+  attached clients as a `config_option_update`.
 - Still read-only: the prompt fails (`-32600`) with the session's ID, the reason and what to do:
   `Session <id> is read-only for now: This Codex thread is open in Codex Desktop. Close it there
   to write here. Then send the prompt again.` It has no `data`, which Zed appends to the message as
@@ -1213,10 +1218,16 @@ made meanwhile.
   words for an agent ([Opinions between agents](#opinions-between-agents)): `session_id <id> (…)
   is open in Codex Desktop, which holds it, so it cannot be asked until it is closed there. Ask
   another session from list_agents, or ask the user to close it in Codex Desktop.`
+- A change of its settings (`session/set_config_option`, `session/set_mode`, `session/set_model`)
+  opens it again the same way, and while it is still read-only is refused in the same words:
+  `Session <id> is read-only for now, so its settings cannot change: <reason> Then change them
+  again.`
 
 **On the fly.** The agent tells the service when a session it opened for reading only can be
 written to again, or no longer, with a `session_info_update` carrying `gorynych/interactivity`
-(Codex: when its lock watcher sees the holder go or come back). The service passes it on to the
+(Codex: when its lock watcher sees the holder go or come back; a holder only the agent's own
+refusal tells of, which the watcher cannot see, is not taken for gone: such a session stays
+read-only until a resume takes it). The service passes it on to the
 attached clients, with a notice. Writable again does not take the session: that waits for its
 first prompt, so another app that takes it back meanwhile makes it read-only once more. A session
 the service's own agent holds is `"full"`: the flag is only about another holder.
@@ -1228,7 +1239,9 @@ service's own time orders only what the agent does not list (a draft, DSH, which
 The agents' own times move at the end of a turn, not with each update: Codex's `thread/list`
 (`useStateDbOnly`) when a turn ends, the Claude adapter's when a turn ends (the service's prompt, or
 a turn of Claude's own) and when its title changes. So a session goes to the top when its turn
-ends, and a long turn that runs in an older session keeps that session's place until then.
+ends, and a long turn that runs in an older session keeps that session's place until then. The end
+of a turn the service saw counts too, from the moment it ends, should the agent note it a moment
+later than a list is read.
 
 ## List changes
 
@@ -1546,6 +1559,12 @@ answers method not found, and the command asks it to exit instead.
   whether Zed handles that for an agent's request is not confirmed.
 - A session's position only moves on: a resume's answer read after a live update that followed
   it does not take the link back.
+- The link keeps what its client was told last of each session's interactivity (the answers of its
+  loads and resumes, and the `session_info_update`s that say it), and its resume after a
+  reconnect says it in its `_meta` (`gorynych/interactivity`, with the reason and holder while
+  read-only): the service then notices the client only of a change. When the answer says another
+  value, the link gives its client the `session_info_update` it missed
+  ([Read-only sessions](#read-only-sessions)).
 - The link's own traffic stays with it: `_gorynych/restarting`, `_gorynych/restart_aborted`, the marks of prompts' ends, and
   the text of its client's own prompts where the client never had it live: in the replay of the
   link's own resume, and from a held prompt that runs only now. A `session/load` the client asks

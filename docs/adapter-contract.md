@@ -223,6 +223,12 @@ it is; after an adapter restart, or a `session/close`, it is not.
     while read-only. Writable again it does not take it yet: the service opens it again before its
     next turn, and the adapter takes it then. A prompt for a session it holds open for reading only
     it SHOULD refuse in words, since the service does not send one there;
+  - it MUST NOT say "full" because it no longer sees a holder it never saw: a holder only the
+    agent's own refusal told of (Codex: app-server's `active writer`, its holder not known) holds
+    the session until a resume takes it. A holder it notes as it opens the session it SHOULD look
+    at once more after it noted it, so one that let go in between is not missed;
+  - it MAY leave out the session's options (`configOptions`) while it cannot take it; the service
+    sends the clients those of the open that takes it;
   - a session the agent itself holds is `"full"`.
 
   Fallback: an adapter that refuses the open names the holder and says to close it there (and no

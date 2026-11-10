@@ -672,6 +672,11 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     takes the thread at the service's next resume, before the next turn. Taken back by the other app
     meanwhile, it is read-only again (an update with `"read-only"`). A prompt for a thread open here
     for reading only is refused in words; the service resumes it first, so it never sends one.
+    A thread only app-server's refusal says is held (`active writer`, its holder not known: outside
+    Windows, or one that cannot be read) is not given to the lock watcher, which would see no
+    holder at its next look: it stays read-only until a resume takes it. A holder found as the
+    thread opens is looked at once more after it is noted, and the thread is taken if it went in
+    between. Taken, the answer has its `configOptions` again, which the service sends its clients.
   - **Changes as they happen.** While the adapter runs it watches the lock folder
     (`FileSystemWatcher`, file names only): a lock file appears when an app takes a thread and
     is usually deleted when it lets go. Once a burst of changes settles (0.75 s), it finds the

@@ -78,6 +78,10 @@ public sealed class ResumableLink
     readonly List<Upstream> again = [];
     readonly Dictionary<string, JsonObject> live = new(StringComparer.Ordinal);
     readonly Dictionary<string, string> cursors = new(StringComparer.Ordinal);
+    // What the client was told last of each session's interactivity (gorynych/interactivity and its
+    // reason, the _meta fields that say it): a reconnect's resume tells the service, which then does
+    // not notice the client again of what it shows, and the client is told of a change it missed.
+    readonly Dictionary<string, JsonObject> shown = new(StringComparer.Ordinal);
     readonly HashSet<string> promptIds = new(StringComparer.Ordinal);
     readonly HashSet<string> resuming = new(StringComparer.Ordinal); // sessions the link's handshake is resuming now
     readonly Dictionary<long, Downstream> downstream = [];
@@ -194,6 +198,7 @@ public sealed class ResumableLink
                 // Not resumed after a reconnect from now on, whatever the answer.
                 live.Remove(closed);
                 cursors.Remove(closed);
+                shown.Remove(closed);
             }
         message["id"] = request.Id;
         request.Message = message;
@@ -470,6 +475,16 @@ public sealed class ResumableLink
         open.Remove("sessionId");
         live[sessionId] = open;
         if (Text(result["_meta"]?[GorynychProtocol.MetaPosition]) is { } position) Advance(sessionId, position);
+        shown[sessionId] = InteractivityOf(result["_meta"] as JsonObject);
+    }
+
+    /// <summary>A session's interactivity as a <c>_meta</c> says it, in full: <c>full</c> when it says nothing.</summary>
+    static JsonObject InteractivityOf(JsonObject? meta)
+    {
+        var said = new JsonObject { [GorynychProtocol.MetaInteractivity] = Text(meta?[GorynychProtocol.MetaInteractivity]) ?? GorynychProtocol.InteractivityFull };
+        foreach (var key in new[] { GorynychProtocol.MetaInteractivityReason, GorynychProtocol.MetaOpenElsewhere })
+            if (Text(meta?[key]) is { } value && Text(said[GorynychProtocol.MetaInteractivity]) != GorynychProtocol.InteractivityFull) said[key] = value;
+        return said;
     }
 
     /// <summary>
@@ -519,6 +534,8 @@ public sealed class ResumableLink
         {
             var meta = update["_meta"] as JsonObject;
             if (Text(meta?[GorynychProtocol.MetaPosition]) is { } position) lock (state) Advance(sessionId, position);
+            if (Text(update["sessionUpdate"]) == "session_info_update" && meta?[GorynychProtocol.MetaInteractivity] is not null)
+                lock (state) shown[sessionId] = InteractivityOf(meta);
             if (Text(meta?[GorynychProtocol.MetaPromptId]) is { } promptId)
             {
                 bool mine, hide;
@@ -741,7 +758,12 @@ public sealed class ResumableLink
     {
         var @params = open;
         @params["sessionId"] = sessionId;
-        @params["_meta"] = new JsonObject { [GorynychProtocol.MetaReplayFrom] = ReplayFrom(sessionId) };
+        var resumeMeta = new JsonObject { [GorynychProtocol.MetaReplayFrom] = ReplayFrom(sessionId) };
+        // What the client shows of the session's interactivity: the service notices it only of a change.
+        JsonObject? before;
+        lock (state) before = shown.TryGetValue(sessionId, out var known) ? (JsonObject)known.DeepClone() : null;
+        foreach (var (key, value) in before ?? []) resumeMeta[key] = value?.DeepClone();
+        @params["_meta"] = resumeMeta;
         JsonObject result;
         lock (state) resuming.Add(sessionId); // the replay comes before the answer
         try
@@ -783,6 +805,21 @@ public sealed class ResumableLink
         foreach (var r in over) await AnswerAsync(r, Result(StopReason.Cancelled));
         if (cancel.Count > 0) await TryWriteAsync(connection, Notification(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId }));
         if (idle) await WithdrawStaleQuestionsAsync(sessionId);
+        // The answer stays with the link: a change of interactivity while the link was away reaches
+        // the client as the update it missed.
+        var now = InteractivityOf(meta);
+        bool changed;
+        lock (state)
+        {
+            changed = before is null || !JsonNode.DeepEquals(before, now);
+            shown[sessionId] = now;
+        }
+        if (changed && before is not null)
+            await ToClientAsync(Notification(AcpMethods.Client.SessionUpdate, new JsonObject
+            {
+                ["sessionId"] = sessionId,
+                ["update"] = new JsonObject { ["sessionUpdate"] = "session_info_update", ["_meta"] = now.DeepClone() },
+            }));
     }
 
     JsonObject ReplayFrom(string sessionId)

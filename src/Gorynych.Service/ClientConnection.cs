@@ -64,6 +64,25 @@ internal sealed class ClientConnection
     /// <summary>The client shows ACP's <c>notice</c> session updates (<c>clientCapabilities.session.notices</c>); none is sent to another.</summary>
     public bool TakesNotices => Init?.ClientCapabilities?.Session?.Notices is not null;
 
+    // What this client was told of each session's interactivity (null: full): on this connection, or
+    // before it, as its resumable link says when it resumes the session after a reconnect.
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, SessionFeed.ReadOnlyState?> told = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Whether the session's interactivity is news to this client: it was told another state, or
+    /// none and this one is read-only (a full session is no news). Notes it as told, so a notice of
+    /// it is sent to the client once.
+    /// </summary>
+    public bool Tell(string sessionId, SessionFeed.ReadOnlyState? state)
+    {
+        var news = told.TryGetValue(sessionId, out var before) ? !Equals(before, state) : state is not null;
+        told[sessionId] = state;
+        return news;
+    }
+
+    /// <summary>The client shows this already (its resumable link said so on a resume after a reconnect).</summary>
+    public void Knows(string sessionId, SessionFeed.ReadOnlyState? state) => told[sessionId] = state;
+
     /// <summary>Whether this client can take <paramref name="method"/> requests from an agent.</summary>
     public bool Accepts(string method) => method switch
     {

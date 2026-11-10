@@ -390,16 +390,22 @@ sealed class CodexAgent : IAsyncDisposable
     }
 
     /// <summary>
-    /// Threads opened here without being taken, because another Codex app held them: each with its
-    /// holder now (null: it let go, and the thread is taken at its next turn). Read-only while held.
+    /// A thread opened here without being taken, because another Codex app held it: its holder now
+    /// (null: it let go, and the thread is taken at its next turn), and whether only app-server's
+    /// refusal said it is held. The lock watcher cannot see such a holder (outside Windows, or one it
+    /// cannot read), so its not seeing one does not mean it went: only a resume that works frees it.
     /// </summary>
-    readonly ConcurrentDictionary<string, string?> readOnly = new(StringComparer.Ordinal);
+    sealed record ReadOnlyThread(string? Holder, bool Refused);
+
+    /// <summary>The threads open here for reading only (<see cref="ReadOnlyThread"/>).</summary>
+    readonly ConcurrentDictionary<string, ReadOnlyThread> readOnly = new(StringComparer.Ordinal);
 
     async Task ChangedHandsAsync(string id, string? holder)
     {
         await rpc.SendNotificationAsync(GorynychProtocol.MethodSessionsChanged, new JsonObject { ["sessionId"] = id, ["change"] = "updated" });
-        if (!readOnly.TryGetValue(id, out var before) || before == holder) return;
-        readOnly[id] = holder;
+        if (!readOnly.TryGetValue(id, out var before) || before.Holder == holder) return;
+        if (holder is null && before.Refused) return; // a holder it never saw is not gone because it still sees none
+        readOnly[id] = new ReadOnlyThread(holder, Refused: false);
         Log($"codex: thread {id}, open here for reading, is {(holder is null ? "free now" : $"held by {holder} now")}");
         await rpc.SendUpdateAsync(id, new SessionInfoUpdate { Meta = InteractivityMeta(new JsonObject(), holder) });
     }
@@ -548,7 +554,9 @@ sealed class CodexAgent : IAsyncDisposable
     /// open for reading only, untaken, while another Codex app holds it (null and its holder). Its
     /// history is read without taking it, and it is taken at its first turn once it is free.
     /// </summary>
-    async Task<(CodexThread? Thread, string? Holder)> OpenOrReadAsync(string id, List<McpServer> servers, SystemPrompt? systemPrompt, CancellationToken ct)
+    /// <param name="again">The holder was found gone right after it was noted (<paramref name="again"/> is the one more try).</param>
+    async Task<(CodexThread? Thread, string? Holder)> OpenOrReadAsync(string id, List<McpServer> servers, SystemPrompt? systemPrompt, CancellationToken ct,
+        bool again = false)
     {
         try
         {
@@ -558,16 +566,24 @@ sealed class CodexAgent : IAsyncDisposable
         }
         catch (HeldElsewhereException held)
         {
-            readOnly[id] = held.Holder;
+            readOnly[id] = new ReadOnlyThread(held.Holder, held.Refused);
+            // A holder that let go between its check and the line above: the lock watcher's word of it
+            // found no thread open for reading to tell. Looked at once more, and taken if it is free.
+            if (!held.Refused && !again && holders([id]).GetValueOrDefault(id) is null)
+                return await OpenOrReadAsync(id, servers, systemPrompt, ct, again: true);
             Log($"codex: thread {id} is open in {held.Holder}; it opens here for reading only, untaken");
             return (null, held.Holder);
         }
     }
 
-    /// <summary>The thread is held by another Codex app (the holder's name), so it cannot be loaded here.</summary>
-    sealed class HeldElsewhereException(string holder) : Exception($"This Codex thread is open in {holder}; close it there, then try again.")
+    /// <summary>
+    /// The thread is held by another Codex app (the holder's name), so it cannot be loaded here: as
+    /// the holders found say, or as only app-server's refusal does (<paramref name="refused"/>).
+    /// </summary>
+    sealed class HeldElsewhereException(string holder, bool refused = false) : Exception($"This Codex thread is open in {holder}; close it there, then try again.")
     {
         public string Holder { get; } = holder;
+        public bool Refused { get; } = refused;
     }
 
     /// <summary>
@@ -605,9 +621,9 @@ sealed class CodexAgent : IAsyncDisposable
         }
         catch (JsonRpcException e) when (e.Message.Contains("active writer", StringComparison.Ordinal))
         {
-            // The lock was taken after the check, or the holder could not be told (outside Windows).
-            lockWatcher?.Saw([id], new Dictionary<string, string> { [id] = AnotherCodexApp });
-            throw new HeldElsewhereException(AnotherCodexApp);
+            // The lock was taken after the check, or the holder could not be told (outside Windows, or
+            // one it cannot read). Not given to the lock watcher, which would see it go at its next look.
+            throw new HeldElsewhereException(AnotherCodexApp, refused: true);
         }
         catch (JsonRpcException e)
         {
@@ -861,8 +877,8 @@ sealed class CodexAgent : IAsyncDisposable
     {
         var p = request.ParamsAs<PromptRequest>();
         // Open here for reading only: a resume takes it once it is free (the service resumes it before a turn).
-        if (readOnly.TryGetValue(p.SessionId, out var holder))
-            throw new JsonRpcException(JsonRpcException.InvalidRequest, holder is null
+        if (readOnly.TryGetValue(p.SessionId, out var open))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, open.Holder is not { } holder
                 ? $"Codex session {p.SessionId} is open here for reading only; resume it to take it, then send the prompt again."
                 : $"Codex session {p.SessionId} is read-only here: {ReadOnlyReason(holder)}");
         if (!threads.TryGetValue(p.SessionId, out var t) || !t.Loaded)

@@ -59,7 +59,18 @@ public sealed class ReadOnlySessionsTests
             TurnEndWait = TimeSpan.FromMilliseconds(200),
             FindHolders = ids =>
             {
-                lock (held) return ids.Where(held.ContainsKey).ToDictionary(id => id, id => held[id]);
+                lock (held)
+                {
+                    var found = ids.Where(held.ContainsKey).ToDictionary(id => id, id => held[id]);
+                    foreach (var id in found.Keys.Where(lookedAtOnce.Contains).ToList())
+                    {
+                        // It lets go right after it was seen, before the adapter noted it.
+                        lookedAtOnce.Remove(id);
+                        held.Remove(id);
+                        Fake.Threads[id].OpenElsewhere = false;
+                    }
+                    return found;
+                }
             },
             LocksDirectory = Locks,
             LockSettle = TimeSpan.FromMilliseconds(50),
@@ -79,6 +90,14 @@ public sealed class ReadOnlySessionsTests
         {
             LetGoUnseen(id);
             File.Delete(Path.Combine(Locks, id + ".lock"));
+        }
+
+        readonly HashSet<string> lookedAtOnce = new(StringComparer.Ordinal);
+
+        /// <summary>Codex Desktop lets the thread go right after the next look at who holds it, with no event of its lock file.</summary>
+        public void LetGoAfterOneLook(string id = Thread)
+        {
+            lock (held) lookedAtOnce.Add(id);
         }
 
         /// <summary>Codex Desktop lets the thread go, and its lock file stays (it went without deleting it): the watcher sees nothing until it looks again.</summary>
@@ -269,6 +288,132 @@ public sealed class ReadOnlySessionsTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHolderTheWatcherCannotSee_KeepsTheSessionReadOnly_UntilAResumeTakesIt()
+    {
+        // App-server refuses the thread, but who holds it cannot be told (outside Windows, or an
+        // elevated holder): the lock watcher seeing no holder does not mean it went.
+        await using var rig = new Rig(heldAtStart: false);
+        rig.Fake.Threads[Thread].OpenElsewhere = true;
+        await using var zed = await rig.ZedAsync();
+        var meta = await MetaOfAsync(zed, AcpMethods.Agent.SessionResume);
+        Assert.AreEqual(GorynychProtocol.InteractivityReadOnly, Interactivity(meta));
+        Assert.AreEqual("another Codex app (Codex Desktop, the CLI or VS Code)", (string?)meta[GorynychProtocol.MetaOpenElsewhere]);
+
+        await Task.Delay(1000); // the watcher looks again every 200 ms, and sees no holder
+        Assert.AreEqual(0, FlagUpdates(zed).Length, "not told it can be written to: " + string.Join(", ", FlagUpdates(zed)));
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(zed, "hello").WaitAsync(Wait));
+        Assert.AreEqual(0, FlagUpdates(zed).Length, "still read-only, unchanged");
+        CollectionAssert.AreEqual(new[] { "warning" }, Notices(zed).Select(n => (string?)n["severity"]).ToArray(), "one warning, at the open");
+
+        rig.Fake.Threads[Thread].OpenElsewhere = false; // the other app lets go
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, "hello").WaitAsync(Wait)).StopReason);
+        CollectionAssert.AreEqual(new[] { GorynychProtocol.InteractivityFull }, FlagUpdates(zed), "free once a resume took it");
+        CollectionAssert.AreEqual(new[] { "warning", "info" }, Notices(zed).Select(n => (string?)n["severity"]).ToArray());
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHolderThatLetsGoAsTheOpenNotesIt_IsLookedAtAgain_AndTheThreadIsTaken()
+    {
+        // It went between the look and the note, with no event of its lock file: the open looks once more.
+        await using var rig = new Rig(heldAtStart: true, lockRecheck: TimeSpan.FromHours(1));
+        rig.LetGoAfterOneLook();
+        await using var zed = await rig.ZedAsync();
+        var meta = await MetaOfAsync(zed, AcpMethods.Agent.SessionResume);
+        Assert.AreEqual(GorynychProtocol.InteractivityFull, Interactivity(meta));
+        Assert.AreEqual(1, rig.Fake.All("thread/resume").Length, "taken");
+        Assert.AreEqual(0, Notices(zed).Length);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AThreadTakenAfterItWasReadOnly_SendsItsOptions_AndItsSettingsChangeOnlyThen()
+    {
+        await using var rig = new Rig();
+        await using var zed = await rig.ZedAsync();
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume()).WaitAsync(Wait);
+        foreach (var (method, @params) in new[]
+                 {
+                     (AcpMethods.Agent.SessionSetConfigOption, new JsonObject { ["sessionId"] = Thread, ["configId"] = "model", ["value"] = "gpt-fake" }),
+                     (AcpMethods.Agent.SessionSetMode, new JsonObject { ["sessionId"] = Thread, ["modeId"] = "read-only" }),
+                 })
+        {
+            var refused = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(method, @params).WaitAsync(Wait));
+            Assert.AreEqual($"Session {Thread} is read-only for now, so its settings cannot change: {Reason} Then change them again.", refused.Message, method);
+        }
+        Assert.AreEqual(0, CodexAdapterOptions().Length);
+
+        rig.LetGo();
+        await Until(() => FlagUpdates(zed).LastOrDefault() == GorynychProtocol.InteractivityFull, "the flag to clear");
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, "hello").WaitAsync(Wait)).StopReason);
+        var options = CodexAdapterOptions();
+        Assert.AreEqual(1, options.Length, "the options Codex reports once it took the thread reached the client");
+        var option = (JsonObject)options[0]["configOptions"]!.AsArray()[0]!;
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption, new JsonObject
+        {
+            ["sessionId"] = Thread, ["configId"] = (string?)option["id"], ["value"] = option["currentValue"]?.DeepClone(),
+        }).WaitAsync(Wait);
+
+        JsonObject[] CodexAdapterOptions() => zed.Snapshot().Where(u => (string?)u["sessionUpdate"] == "config_option_update").ToArray();
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AReadOnlyNotice_IsNotSentAgain_ToTheSameConnection_NorAfterTheLinkComesBack()
+    {
+        await using var rig = new Rig();
+        await using var zed = await rig.ZedAsync();
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume()).WaitAsync(Wait);
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, Resume()).WaitAsync(Wait);
+        Assert.AreEqual(1, Notices(zed).Length, "one warning on this connection");
+
+        // A client on the resumable link: the service restarts twice; the first time nothing changed,
+        // the second time the other app let go while the service was away.
+        var said = new System.Text.StringBuilder();
+        await using var link = new LinkHarness(rig.Service, new Gorynych.Acp.Link.ResumableLinkOptions
+        {
+            Log = m => { lock (said) said.AppendLine(m); },
+            RetryDelays = [TimeSpan.FromMilliseconds(50)],
+            GiveUpAfter = TimeSpan.FromSeconds(15),
+            InitializeMeta = new JsonObject { [GorynychProtocol.MetaAgent] = "codex" },
+        });
+        await link.Zed.SendRequestAsync(AcpMethods.Agent.Initialize, new JsonObject
+        {
+            ["protocolVersion"] = 1, ["clientCapabilities"] = new JsonObject { ["session"] = new JsonObject { ["notices"] = new JsonObject() } },
+        }).WaitAsync(Wait);
+        await link.Zed.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume()).WaitAsync(Wait);
+        string?[] LinkNotices() { lock (link.Updates) return [.. link.Updates.Where(u => (string?)u["sessionUpdate"] == "notice").Select(u => (string?)u["severity"])]; }
+        string?[] LinkFlags()
+        {
+            lock (link.Updates)
+                return [.. link.Updates.Where(u => (string?)u["sessionUpdate"] == "session_info_update" && u["_meta"]?[GorynychProtocol.MetaInteractivity] is not null)
+                    .Select(u => Interactivity(u["_meta"]))];
+        }
+        CollectionAssert.AreEqual(new[] { "warning" }, LinkNotices());
+
+        async Task RestartAsync(Action whileAway)
+        {
+            var connects = link.Connects;
+            link.Service = null;
+            await rig.Service.DisposeAsync();
+            link.Break();
+            whileAway();
+            rig.Service = rig.NewService();
+            link.Service = rig.Service;
+            await Until(() => { lock (said) return link.Connects > connects && said.ToString().Contains("connected again", StringComparison.Ordinal); }, "the link to come back");
+            lock (said) said.Clear();
+            await Task.Delay(300);
+        }
+
+        await RestartAsync(() => { });
+        CollectionAssert.AreEqual(new[] { "warning" }, LinkNotices(), "the link said its client shows it read-only already");
+        await RestartAsync(() => rig.LetGo());
+        await Until(() => LinkFlags().LastOrDefault() == GorynychProtocol.InteractivityFull, "the client to learn it can write again");
+        CollectionAssert.AreEqual(new[] { "warning", "info" }, LinkNotices(), "the change it missed, said once");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
     public async Task AQuestionFromAnotherSession_ToAReadOnlySession_IsRefusedInWordsForTheAskingAgent()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);
@@ -302,14 +447,16 @@ public sealed class ReadOnlySessionsTests
         rig.Fake.Existing("t-mid", Cwd, name: "Middle").UpdatedAt = 1_794_000_200;
         await using var zed = await rig.ZedAsync();
 
-        // Gorynych's own activity on the oldest (its journal catches up, a turn streams) moves no row:
-        // Codex's own time orders the list, and Codex moves it when a turn of its ends.
+        // Opening the oldest, which catches its journal up, moves no row: Codex's own time orders the list.
         await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume("t-old")).WaitAsync(Wait);
-        await PromptAsync(zed, "hi", "t-old").WaitAsync(Wait);
         var rows = (await zed.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest())).Sessions;
-
         CollectionAssert.AreEqual(new[] { Thread, "t-mid", "t-old" }, rows.Select(r => r.SessionId).ToArray(), "Codex's own order");
         Assert.AreEqual(GorynychProtocol.InteractivityReadOnly, Interactivity(rows[0].Meta), "marked in the first list");
         Assert.IsNull(Interactivity(rows[1].Meta));
+
+        // A turn that ends there does, though Codex notes it a moment later (here never).
+        await PromptAsync(zed, "hi", "t-old").WaitAsync(Wait);
+        rows = (await zed.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest())).Sessions;
+        CollectionAssert.AreEqual(new[] { "t-old", Thread, "t-mid" }, rows.Select(r => r.SessionId).ToArray(), "its turn's end counts");
     }
 }
