@@ -10,11 +10,14 @@ namespace Gorynych.Service.Hosts;
 /// <summary>Starts the adapter hosts of a conductor that runs its adapters in hosts.</summary>
 public interface IHostLauncher
 {
-    /// <summary>Whether a host of the adapter runs, connected or on its way to a conductor.</summary>
+    /// <summary>Whether a host of the adapter runs, connected or on its way to a conductor: from its start on.</summary>
     bool IsAlive(string adapter);
 
     /// <summary>Starts a host of the adapter, which then dials the conductor.</summary>
     void Launch(string adapter);
+
+    /// <summary>What the host this launcher started last said as it failed, if it said anything; for the error a request gets.</summary>
+    string? WhyExited(string adapter) => null;
 }
 
 /// <summary>
@@ -23,14 +26,60 @@ public interface IHostLauncher
 /// </summary>
 public sealed class ProcessHostLauncher(string exe, string pipe, string dataDirectory, IReadOnlyList<string> adapterArguments) : IHostLauncher
 {
-    public bool IsAlive(string adapter) => HostNames.IsHeld(pipe, adapter);
+    readonly Lock gate = new();
+    readonly Dictionary<string, (System.Diagnostics.Process? Process, string Log, long From)> started = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// It holds its mutex, or it is the one this launcher started and its process still runs: from
+    /// its start on, before it takes the mutex, so a host that exits at once is seen to.
+    /// </summary>
+    public bool IsAlive(string adapter)
+    {
+        if (HostNames.IsHeld(pipe, adapter)) return true;
+        lock (gate) return started.TryGetValue(adapter, out var host) && host.Process is { } process && !process.HasExited;
+    }
 
     public void Launch(string adapter)
     {
         List<string> args = ["host", "--adapter", adapter, "--pipe", pipe, "--data", dataDirectory, .. adapterArguments];
         ServiceLog.Info($"{adapter}: starting its host ({exe} {string.Join(' ', args)})");
-        if (!DetachedProcess.Start(exe, args))
+        var log = Path.Combine(dataDirectory, "logs", $"host-{adapter}-{DateTime.Now:yyyyMMdd}.log");
+        var from = File.Exists(log) ? new FileInfo(log).Length : 0;
+        if (!DetachedProcess.Start(exe, args, out var processId))
             ServiceLog.Warn($"{adapter}: the host stays in the service's job object, which forbids breaking away; a restart may stop it");
+        System.Diagnostics.Process? process = null;
+        try { process = System.Diagnostics.Process.GetProcessById(processId); }
+        catch (ArgumentException) { } // gone already
+        lock (gate)
+        {
+            if (started.TryGetValue(adapter, out var before)) before.Process?.Dispose();
+            started[adapter] = (process, log, from);
+        }
+    }
+
+    /// <summary>The last error the host wrote in its log since it was started.</summary>
+    public string? WhyExited(string adapter)
+    {
+        (System.Diagnostics.Process? Process, string Log, long From) host;
+        lock (gate)
+            if (!started.TryGetValue(adapter, out host)) return null;
+        try
+        {
+            using var file = new FileStream(host.Log, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (file.Length <= host.From) return null;
+            file.Position = host.From;
+            using var reader = new StreamReader(file, Encoding.UTF8);
+            var lines = reader.ReadToEnd().Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var error = lines.LastOrDefault(l => l.Contains(" ERR ", StringComparison.Ordinal));
+            if (error is null) return null;
+            var said = error[(error.IndexOf(" ERR ", StringComparison.Ordinal) + 5)..];
+            var own = $"host {adapter}: ";
+            return said.StartsWith(own, StringComparison.Ordinal) ? said[own.Length..] : said;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 }
 

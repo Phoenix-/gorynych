@@ -991,6 +991,36 @@ public sealed class HostTests
         Assert.AreEqual(1, launcher.Launches, "not started again meanwhile");
     }
 
+    /// <summary>
+    /// A host of an earlier run runs as the service starts (an orphan on its way out) and never
+    /// connects; once it is gone, hosts of these in-process ones start.
+    /// </summary>
+    sealed class AfterAnOrphan(InProcessHosts hosts, TimeSpan orphanFor) : IHostLauncher
+    {
+        readonly System.Diagnostics.Stopwatch since = System.Diagnostics.Stopwatch.StartNew();
+        public bool IsAlive(string adapter) => hosts.IsAlive(adapter) || since.Elapsed < orphanFor;
+        public void Launch(string adapter) => hosts.Launch(adapter);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHostThatGoesWithoutConnecting_IsFollowedByTheNext_ForTheSameRequest()
+    {
+        // As a host that went as it connected, or was stopped as it came back: the request does not
+        // fail with it, but waits for the next one, which it starts.
+        var agent = new TurnAgent("turns");
+        var hosts = new InProcessHosts(_ => agent);
+        await using var service = new Conductor(new ConductorOptions
+        {
+            DataDirectory = TestDirs.New(), ServiceId = "test-service", Hosts = new AfterAnOrphan(hosts, TimeSpan.FromMilliseconds(600)),
+            HostToken = InProcessHosts.Token,
+        }, [agent]);
+        hosts.Service = service;
+        await using var gui = await TestClient.ConnectAsync(service, "gui");
+        Assert.AreEqual("turns-1", await NewSession(gui), "through the host it started once the other was gone");
+        Assert.AreEqual(1, hosts.Launches);
+    }
+
     [TestMethod]
     public void TheHostToken_IsTheUsersAlone_AndAnOldOneIsMadeSo()
     {

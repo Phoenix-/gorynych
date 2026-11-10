@@ -17,7 +17,10 @@ internal static unsafe partial class DetachedProcess
     /// </summary>
     /// <returns>False when the process had to stay in the caller's job, because the job forbids
     /// breaking away: closing the host may then kill it.</returns>
-    public static bool Start(string exe, IReadOnlyList<string> args)
+    public static bool Start(string exe, IReadOnlyList<string> args) => Start(exe, args, out _);
+
+    /// <param name="processId">The started process's ID.</param>
+    public static bool Start(string exe, IReadOnlyList<string> args, out int processId)
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -25,12 +28,13 @@ internal static unsafe partial class DetachedProcess
             foreach (var a in args) psi.ArgumentList.Add(a);
             using var p = Process.Start(psi) ?? throw new InvalidOperationException($"{exe} did not start");
             p.StandardInput.Close();
+            processId = p.Id;
             return true;
         }
         var commandLine = Quote(exe) + " " + string.Join(' ', args.Select(Quote));
         const uint detached = 0x00000008, newGroup = 0x00000200, breakaway = 0x01000000, unicodeEnv = 0x00000400;
-        if (StartWindows(commandLine, detached | newGroup | breakaway | unicodeEnv)) return true;
-        if (StartWindows(commandLine, detached | newGroup | unicodeEnv)) return false;
+        if (StartWindows(commandLine, detached | newGroup | breakaway | unicodeEnv, out processId)) return true;
+        if (StartWindows(commandLine, detached | newGroup | unicodeEnv, out processId)) return false;
         throw new Win32Exception(Marshal.GetLastPInvokeError());
     }
 
@@ -81,17 +85,19 @@ internal static unsafe partial class DetachedProcess
         return sb.Append('"').ToString();
     }
 
-    static bool StartWindows(string commandLine, uint flags)
+    static bool StartWindows(string commandLine, uint flags, out int processId)
     {
         var si = new StartupInfo { cb = sizeof(StartupInfo) };
         var cmd = (commandLine + '\0').ToCharArray();
         ProcessInformation pi;
+        processId = 0;
         fixed (char* p = cmd)
         {
             if (!CreateProcessW(null, p, 0, 0, 0, flags, null, null, &si, &pi)) return false;
         }
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+        processId = pi.dwProcessId;
         return true;
     }
 

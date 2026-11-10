@@ -109,26 +109,50 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// </summary>
     async Task<JsonRpcConnection> HostedAsync(Gorynych.Service.Hosts.IHostLauncher hosts, CancellationToken ct)
     {
-        Task waiting;
-        lock (attachGate) waiting = attached.Task;
-        if (connection is { IsClosed: false } ready) return ready;
-        if (hostFailure is { } failed && Environment.TickCount64 < failed.RetryAt)
-            throw HostFailed($"{failed.Why} Gorynych starts it again in {(failed.RetryAt - Environment.TickCount64 + 999) / 1000} seconds.");
-        var alive = hosts.IsAlive(Name);
-        if (!alive) hosts.Launch(Name);
         var waited = System.Diagnostics.Stopwatch.StartNew();
-        while (await Task.WhenAny(waiting, Task.Delay(HostCheckInterval, ct)) != waiting)
+        for (var attempt = 1; ; attempt++)
         {
-            ct.ThrowIfCancellationRequested();
-            // One that ran and runs no more exited before it connected: its log says why.
-            if (hosts.IsAlive(Name)) alive = true;
-            else if (alive) Fail($"The {DisplayName} host exited before it connected to Gorynych; its log is in Gorynych's logs folder (host-{Name}-*.log).");
-            if (waited.Elapsed >= AttachTimeout)
-                Fail($"The {DisplayName} host did not connect to Gorynych within {AttachTimeout.TotalSeconds:0} seconds; its log is in Gorynych's logs folder " +
-                    $"(host-{Name}-*.log). If its process (Gorynych.Service host --adapter {Name}) hangs, stopping it lets Gorynych start another.");
+            // A host that closed and is not handled yet is handled now, so the next one is waited for.
+            if (connection is { IsClosed: true } closed) OnClosed(closed);
+            Task waiting;
+            lock (attachGate) waiting = attached.Task;
+            if (connection is { IsClosed: false } ready)
+            {
+                hostFailure = null;
+                return ready;
+            }
+            if (hostFailure is { } failed && Environment.TickCount64 < failed.RetryAt)
+                throw HostFailed($"{failed.Why} Gorynych starts it again in {(failed.RetryAt - Environment.TickCount64 + 999) / 1000} seconds.");
+            var startedHere = !hosts.IsAlive(Name);
+            if (startedHere) hosts.Launch(Name);
+            var gone = false;
+            while (await Task.WhenAny(waiting, Task.Delay(HostCheckInterval, ct)) != waiting)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (!hosts.IsAlive(Name))
+                {
+                    // The one started for this request exited before it connected: its log says why.
+                    // One that ran before (it went, or was stopped as it came back) makes way for the next.
+                    if (startedHere)
+                        Fail($"The {DisplayName} host exited before it connected to Gorynych{(hosts.WhyExited(Name) is { } why ? $": {why}" : "")}; " +
+                            $"its log is in Gorynych's logs folder (host-{Name}-*.log).");
+                    gone = true;
+                    break;
+                }
+                if (waited.Elapsed >= AttachTimeout)
+                    Fail($"The {DisplayName} host did not connect to Gorynych within {AttachTimeout.TotalSeconds:0} seconds; its log is in Gorynych's logs folder " +
+                        $"(host-{Name}-*.log). If its process (Gorynych.Service host --adapter {Name}) hangs, stopping it lets Gorynych start another.");
+            }
+            if (!gone && connection is { IsClosed: false } got)
+            {
+                hostFailure = null;
+                return got;
+            }
+            // It went as it connected (it died, or its link broke): the next one, in the same wait.
+            if (attempt >= 3 || waited.Elapsed >= AttachTimeout)
+                Fail($"The {DisplayName} host went each time it connected to Gorynych; its log is in Gorynych's logs folder (host-{Name}-*.log).");
+            ServiceLog.Warn($"{Name}: its host went as it connected; waiting for the next one");
         }
-        hostFailure = null;
-        return connection ?? throw new IOException($"{Name}: its host went as it connected");
     }
 
     /// <summary>
