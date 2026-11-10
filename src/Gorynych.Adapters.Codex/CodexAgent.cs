@@ -456,6 +456,8 @@ sealed class CodexAgent : IAsyncDisposable
                             [GorynychProtocol.MetaSessionsChanged] = true,
                             // It replays a thread's turns after the last one the service saw (ReplayFromAsync).
                             [GorynychProtocol.CapReplayFrom] = true,
+                            // And without taking it, for a thread another Codex app held (thread/turns/list takes no writer lock).
+                            [GorynychProtocol.CapCatchUp] = true,
                         },
                     },
                     AuthMethods = [],
@@ -500,6 +502,13 @@ sealed class CodexAgent : IAsyncDisposable
                 return await PromptAsync(request, ct);
             case AcpMethods.Agent.SessionSetConfigOption:
                 return SetConfigOption(request.ParamsAs<SetSessionConfigOptionRequest>());
+            case GorynychProtocol.MethodCatchUp:
+            {
+                // Read, not loaded: the thread's turns after the mark, as a resume replays them.
+                var from = request.Params?["_meta"]?[GorynychProtocol.MetaReplayFrom] as JsonObject ?? new JsonObject { ["type"] = GorynychProtocol.ReplayFromStart };
+                var replayed = await ReplayFromAsync(RequireId(request), from, ct);
+                return new JsonObject { ["_meta"] = replayed is null ? null : new JsonObject { [GorynychProtocol.MetaReplay] = replayed } };
+            }
             case GorynychProtocol.MethodOpenElsewhere:
             {
                 var ids = (request.Params?["sessionIds"] as JsonArray ?? []).Select(i => (string?)i).OfType<string>().ToList();

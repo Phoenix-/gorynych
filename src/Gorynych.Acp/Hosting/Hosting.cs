@@ -216,6 +216,17 @@ public static class GorynychProtocol
     public const string InteractivityReadOnly = "read-only";
 
     /// <summary>
+    /// Service → adapter, <c>{sessionId, _meta: {"gorynych/replayFrom": …}}</c> → <c>{_meta: {"gorynych/replay": …}}</c>:
+    /// replays the session's history after the mark, as a resume does (<see cref="MetaReplayFrom"/>),
+    /// without opening or taking it: for a session open for reading only, whose history another app
+    /// made meanwhile (docs/service-protocol.md, "Read-only sessions").
+    /// </summary>
+    public const string MethodCatchUp = "_gorynych/catch_up";
+
+    /// <summary>In <c>agentCapabilities._meta</c>: <c>true</c> when the adapter takes <see cref="MethodCatchUp"/>.</summary>
+    public const string CapCatchUp = "gorynych/catchUp";
+
+    /// <summary>
     /// In <c>agentCapabilities._meta</c>: <c>true</c> when the adapter takes <see cref="MetaReplayFrom"/>
     /// on <c>session/resume</c> and reports <see cref="MetaHistoryMark"/> (docs/adapter-contract.md, §4).
     /// </summary>

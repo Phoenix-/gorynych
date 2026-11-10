@@ -229,6 +229,11 @@ it is; after an adapter restart, or a `session/close`, it is not.
     at once more after it noted it, so one that let go in between is not missed;
   - it MAY leave out the session's options (`configOptions`) while it cannot take it; the service
     sends the clients those of the open that takes it;
+  - it SHOULD take `_gorynych/catch_up {sessionId, _meta: {"gorynych/replayFrom"}}` and advertise
+    `gorynych/catchUp: true`: replay the history after the mark as at a resume, before it answers
+    `_meta["gorynych/replay"]`, without opening or taking the session (Codex: `thread/turns/list`).
+    The service asks it when the session can be written to again, before it clears the flag, so the
+    other app's turns reach the client before its input comes back;
   - a session the agent itself holds is `"full"`.
 
   Fallback: an adapter that refuses the open names the holder and says to close it there (and no

@@ -184,6 +184,18 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <summary>Sets <see cref="ReadOnly"/>; true when that changed it.</summary>
     public bool SetReadOnly(ReadOnlyState? state) => !Equals(Interlocked.Exchange(ref readOnly, state), state);
 
+    ReadOnlyState? reportedReadOnly;
+
+    /// <summary>
+    /// What its agent said last of whether the session is read-only, which <see cref="ReadOnly"/>
+    /// follows once what was made meanwhile is caught up (Conductor.WritableAgainAsync).
+    /// </summary>
+    public ReadOnlyState? ReportedReadOnly
+    {
+        get => Volatile.Read(ref reportedReadOnly);
+        set => Volatile.Write(ref reportedReadOnly, value);
+    }
+
     int openedReadOnly;
 
     /// <summary>

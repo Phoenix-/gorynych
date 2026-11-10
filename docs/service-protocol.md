@@ -218,6 +218,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/openElsewhere` | `SessionInfo._meta` of `session/list`, the `_meta` of a `session/load` or `session/resume` answer and of a `session_info_update` while the session is read-only; an adapter's `agentCapabilities._meta` | a string naming another app that has the session open, so its agent cannot take it here until it is closed there (`Codex Desktop`, `VS Code`, `a terminal codex (pid 4242)`); absent: free, or not known. In capabilities, `true`: the adapter takes `_gorynych/open_elsewhere` ([Sessions open in another app](#sessions-open-in-another-app)) |
 | `gorynych/interactivity` | `SessionInfo._meta` of `session/list`; the `_meta` of a `session/load` or `session/resume` answer; the `_meta` of a `session_info_update` | `"full"`: a client may prompt the session; `"read-only"`: it may watch it, not prompt it. Absent means `"full"`, as AHP's `ChatInteractivity`; an answer and a change always say it, `"full"` too ([Read-only sessions](#read-only-sessions)) |
 | `gorynych/interactivityReason` | next to `gorynych/interactivity: "read-only"` | why, in words for a person, for any reason (`This Codex thread is open in Codex Desktop. Close it there to write here.`) |
+| `_gorynych/catch_up` | method, service → adapter, `{sessionId, _meta: {"gorynych/replayFrom": …}}` → `{_meta: {"gorynych/replay": …}}` | replays the session's history after the mark as a resume does, without opening or taking the session; for one open for reading only that can be written to again ([Read-only sessions](#read-only-sessions)). Advertised by `gorynych/catchUp: true` in the adapter's `agentCapabilities._meta` |
 | `_gorynych/open_elsewhere` | method, service → adapter, `{sessionIds}` → `{sessions: {"<id>": "<holder>"}}` | which of these sessions another app has open now, the held ones only; for the lists agents see |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
@@ -1231,6 +1232,16 @@ read-only until a resume takes it). The service passes it on to the
 attached clients, with a notice. Writable again does not take the session: that waits for its
 first prompt, so another app that takes it back meanwhile makes it read-only once more. A session
 the service's own agent holds is `"full"`: the flag is only about another holder.
+
+**Writable again, with the history whole.** Before the service clears the flag of a session
+opened for reading only, it reads what the other app made meanwhile, without taking the session:
+`_gorynych/catch_up` after the journal's mark, from an agent that advertises `gorynych/catchUp`
+(Codex). That goes into the journal and to the clients first, and only then the update with
+`"full"` and the notice. A client that shows a prompt as it sends it (Zed) then shows it after that
+history, not before. A turn's own open of the session waits for this catch-up; that open, when it
+takes the session, sends its own catch-up first, then the options and the flag, and the prompt's
+text is journaled after all of it. While the session is read-only, the other app's turns do not
+reach it: they come with this catch-up, or with the next open.
 
 **The list's order** follows the agent's own time (`updatedAt` of its `session/list`) wherever the
 agent gives one, as its title wins over the service's ("Native state wins", [Overlay](#overlay)): a

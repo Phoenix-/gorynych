@@ -812,6 +812,9 @@ Next, in order (**planned**):
      in words while the thread is held (the session's ID, the holder, what to do; no `data`,
      which Zed would show raw: the client has the flag from the session's state), but sends it
      once the thread is free;
+   - when the thread is free, what the other app made meanwhile reaches the journal and the
+     clients before the flag clears, so that a client that shows a prompt as it sends it shows it
+     after that history (found in the joint Zed check of 11 November 2026);
    - the flag reaches the client: `_meta["gorynych/interactivity"]`, `full` or `read-only`
      (absent means `full`, as AHP's `ChatInteractivity` has it), with the reason for a person
      (`gorynych/interactivityReason`) and the holder (`gorynych/openElsewhere`), on

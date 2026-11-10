@@ -415,6 +415,84 @@ public sealed class ReadOnlySessionsTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHoldersTurnWhileReadOnly_ReachesTheClientBeforeTheFlagClears_AndTheJournalKeepsItsOrder()
+    {
+        // As in Zed: it shows a prompt as soon as it is sent, so what was made meanwhile must be there before the input comes back.
+        await using var rig = new Rig();
+        await using var zed = await rig.ZedAsync();
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume()).WaitAsync(Wait);
+        rig.Fake.AddTurn(Thread, "two", "Desktop's two.");
+        rig.LetGo();
+        await Until(() => FlagUpdates(zed).LastOrDefault() == GorynychProtocol.InteractivityFull, "the flag to clear");
+
+        var seen = zed.Snapshot();
+        var two = Array.FindIndex(seen, u => (string?)u["content"]?["text"] == "Desktop's two.");
+        var full = Array.FindIndex(seen, u => Interactivity(u["_meta"]) == GorynychProtocol.InteractivityFull);
+        Assert.IsTrue(two >= 0 && two < full, $"the holder's turn came before the flag cleared ({two}, {full})");
+        Assert.AreEqual(0, rig.Fake.All("thread/resume").Length, "read, not taken");
+
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, "three").WaitAsync(Wait)).StopReason);
+        var users = HostTests.Journal(rig.Service, Thread).Where(u => (string?)u["sessionUpdate"] == "user_message_chunk")
+            .Select(u => (string?)u["content"]?["text"]).ToArray();
+        CollectionAssert.AreEqual(new[] { "Fix the flaky test", "two", "three" }, users, "one, two, three");
+        Assert.AreEqual(1, HostTests.JournalText(rig.Service, Thread).Split("Desktop's two.").Length - 1, "once");
+        var reads = rig.Fake.All("thread/items/list").Where(p => p["cursor"] is null).GroupBy(p => (string?)p["turnId"]).ToDictionary(g => g.Key ?? "", g => g.Count());
+        Assert.IsTrue(reads.Count == 2 && reads.Values.All(n => n == 1),
+            "each turn read once: the catch-up after the mark, which it kept, so the prompt's open reads nothing again: " + string.Join(", ", reads));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHoldersTurn_TheWatcherMissed_ComesWithTheRetake_BeforeTheOptions_TheFlag_AndThePrompt()
+    {
+        // The safety net: the holder went unseen, so the flag never cleared, and the prompt's own open catches up.
+        await using var rig = new Rig(heldAtStart: true, lockRecheck: TimeSpan.FromHours(1));
+        await using var zed = await rig.ZedAsync();
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume()).WaitAsync(Wait);
+        rig.Fake.AddTurn(Thread, "two", "Desktop's two.");
+        rig.LetGoUnseen();
+
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, "three").WaitAsync(Wait)).StopReason);
+        var seen = zed.Snapshot();
+        var two = Array.FindIndex(seen, u => (string?)u["content"]?["text"] == "Desktop's two.");
+        var options = Array.FindIndex(seen, u => (string?)u["sessionUpdate"] == "config_option_update");
+        var full = Array.FindIndex(seen, u => Interactivity(u["_meta"]) == GorynychProtocol.InteractivityFull);
+        Assert.IsTrue(two >= 0 && two < options && options < full, $"the holder's turn, then the options, then the flag ({two}, {options}, {full})");
+        Assert.AreEqual(1, rig.Fake.All("thread/resume").Length, "taken by the prompt");
+        var users = HostTests.Journal(rig.Service, Thread).Where(u => (string?)u["sessionUpdate"] == "user_message_chunk")
+            .Select(u => (string?)u["content"]?["text"]).ToArray();
+        CollectionAssert.AreEqual(new[] { "Fix the flaky test", "two", "three" }, users, "one, two, three");
+        Assert.AreEqual(1, HostTests.JournalText(rig.Service, Thread).Split("Desktop's two.").Length - 1, "once");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task TheOptions_OfAThreadTakenAfterItWasReadOnly_ReachAClientOnTheLink()
+    {
+        // As Zed gets them, through the bridge's resumable link.
+        await using var rig = new Rig();
+        await using var link = new LinkHarness(rig.Service, new Gorynych.Acp.Link.ResumableLinkOptions
+        {
+            RetryDelays = [TimeSpan.FromMilliseconds(50)],
+            GiveUpAfter = TimeSpan.FromSeconds(15),
+            InitializeMeta = new JsonObject { [GorynychProtocol.MetaAgent] = "codex" },
+        });
+        await link.Zed.SendRequestAsync(AcpMethods.Agent.Initialize, new JsonObject { ["protocolVersion"] = 1, ["clientCapabilities"] = new JsonObject() }).WaitAsync(Wait);
+        var opened = await link.Zed.SendRequestAsync(AcpMethods.Agent.SessionLoad, Resume()).WaitAsync(Wait);
+        Assert.IsNull(opened?["configOptions"], "none while it is read-only: Codex says a thread's settings only once it loads it");
+        rig.LetGo();
+        JsonObject[] Of(string kind) { lock (link.Updates) return [.. link.Updates.Where(u => (string?)u["sessionUpdate"] == kind)]; }
+        await Until(() => Of("session_info_update").Any(u => Interactivity(u["_meta"]) == GorynychProtocol.InteractivityFull), "the flag to clear");
+        Assert.AreEqual(0, Of("config_option_update").Length, "free is not taken yet");
+
+        await link.PromptAsync(Thread, "three").WaitAsync(Wait);
+        var options = Of("config_option_update");
+        Assert.AreEqual(1, options.Length, "the options, once a prompt took it");
+        Assert.IsTrue(options[0]["configOptions"]!.AsArray().Count > 0);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
     public async Task AQuestionFromAnotherSession_ToAReadOnlySession_IsRefusedInWordsForTheAskingAgent()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);

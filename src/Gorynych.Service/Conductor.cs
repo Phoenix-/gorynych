@@ -971,7 +971,12 @@ public sealed class Conductor : IAsyncDisposable
             // Whether the session can be prompted now: its state, not its history, so it is not journaled.
             if (TextOf(update["sessionUpdate"]) == "session_info_update" && update["_meta"] is JsonObject said && said.ContainsKey(GorynychProtocol.MetaInteractivity))
             {
-                await SetInteractivityAsync(feed, ReadOnlyOf(said));
+                var state = ReadOnlyOf(said);
+                feed.ReportedReadOnly = state;
+                // Writable again: what the other app made meanwhile first, read off this handler, which
+                // the agent's replay must get through (WritableAgainAsync).
+                if (state is null && feed.OpenedReadOnly && host.CatchesUp) RunCleanup(() => WritableAgainAsync(host, feed));
+                else await SetInteractivityAsync(feed, state);
                 return;
             }
             feed.ApplyStateUpdate(update);
@@ -1449,12 +1454,7 @@ public sealed class Conductor : IAsyncDisposable
         var readOnly = ReadOnlyOf((opened as JsonObject)?["_meta"]);
         var taken = feed.OpenedReadOnly && readOnly is null;
         feed.OpenedReadOnly = readOnly is not null;
-        // Taken now after it was open for reading only: the options its agent could not say then
-        // (Codex reports a thread's settings only once it loads it) reach the clients that have it open.
-        if (taken && (opened as JsonObject)?["configOptions"] is JsonArray { Count: > 0 } options)
-            await feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "config_option_update", ["configOptions"] = options.DeepClone() },
-                except: null, () => { }, journal: false);
-        await SetInteractivityAsync(feed, readOnly);
+        feed.ReportedReadOnly = readOnly;
         try
         {
             if (replayed is { } how && collect) await CatchUpAsync(host, feed, history.Updates, history.Dropped, how, newMark);
@@ -1464,7 +1464,72 @@ public sealed class Conductor : IAsyncDisposable
         {
             host.MarkLive(record.SessionId, rpc);
         }
+        // What the other app made meanwhile is in the journal and with the clients first; then, taken
+        // after it was open for reading only, the options its agent could not say then (Codex reports
+        // a thread's settings only once it loads it), and the flag.
+        if (taken && (opened as JsonObject)?["configOptions"] is JsonArray { Count: > 0 } options)
+            await feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "config_option_update", ["configOptions"] = options.DeepClone() },
+                except: null, () => { }, journal: false);
+        await SetInteractivityAsync(feed, readOnly);
         return opened as JsonObject;
+    }
+
+    /// <summary>
+    /// A session its agent opened for reading only can be written to again: what the other app made
+    /// meanwhile is read first, without taking the session (<c>_gorynych/catch_up</c>, after the
+    /// journal's mark), into the journal and to the clients, and only then is the flag cleared, so a
+    /// client turns its input on with the history whole, and a prompt it sends comes after it. Under
+    /// the session's open gate, which a turn's own open waits for. The flag ends as the agent said
+    /// last, should the session have been taken again meanwhile.
+    /// </summary>
+    async Task WritableAgainAsync(AgentHost host, SessionFeed feed)
+    {
+        await feed.OpenGate.WaitAsync(cleanupStop.Token);
+        try
+        {
+            if (feed.ReportedReadOnly is null && feed.OpenedReadOnly && host.RouteOf(feed.SessionId) is { } on)
+                await CatchUpByReadingAsync(host, on.Rpc, feed, cleanupStop.Token);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            ServiceLog.Warn($"{host.Name} {feed.SessionId}: what was made meanwhile could not be read; it comes with the next open: {e.Message}");
+        }
+        finally
+        {
+            feed.OpenGate.Release();
+        }
+        await SetInteractivityAsync(feed, feed.ReportedReadOnly);
+    }
+
+    /// <summary>The session's history after the journal's mark, read by its agent without taking it, caught up into the journal as at an open.</summary>
+    async Task CatchUpByReadingAsync(AgentHost host, JsonRpcConnection rpc, SessionFeed feed, CancellationToken ct)
+    {
+        var mark = feed.Journal.NativeMark;
+        var collect = feed.Journal.HasTurns;
+        var from = mark is null
+            ? new JsonObject { ["type"] = GorynychProtocol.ReplayFromStart }
+            : new JsonObject { ["type"] = GorynychProtocol.ReplayAfterMark, ["mark"] = mark };
+        if (collect) feed.BeginReplay(feed.Journal.MaxEntries);
+        (List<JsonObject> Updates, bool Dropped) history = ([], false);
+        JsonNode? reply;
+        try
+        {
+            reply = await rpc.SendRequestAsync(GorynychProtocol.MethodCatchUp,
+                new JsonObject { ["sessionId"] = feed.SessionId, ["_meta"] = new JsonObject { [GorynychProtocol.MetaReplayFrom] = from } }, ct);
+        }
+        finally
+        {
+            if (collect) history = feed.EndReplay();
+        }
+        if (reply?["_meta"]?[GorynychProtocol.MetaReplay] is not JsonObject replay)
+        {
+            ServiceLog.Warn($"{host.Name} {feed.SessionId}: its agent could not read what was made meanwhile; it comes with the next open");
+            return;
+        }
+        var how = mark is not null && TextOf(replay["from"]) == "mark" ? HistoryCatchUp.Replayed.AfterMark : HistoryCatchUp.Replayed.All;
+        var newMark = TextOf(replay["mark"]);
+        if (collect) await CatchUpAsync(host, feed, history.Updates, history.Dropped, how, newMark);
+        else if (newMark is not null) SetMark(feed, newMark);
     }
 
     /// <summary>Applies what the agent replayed of its own history to the journal, then keeps its new mark. Never fails the open.</summary>

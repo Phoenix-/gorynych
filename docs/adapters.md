@@ -668,8 +668,12 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     thread's `updatedAt` at the end of each turn, also in another app-server's list; without it,
     `updatedAt` stays at the thread's start (`updated_at_probe.py`).
   - **Writable again.** A thread open for reading only is not taken when its holder lets go: the
-    adapter tells the service (`session_info_update` with `gorynych/interactivity: "full"`), and
-    takes the thread at the service's next resume, before the next turn. Taken back by the other app
+    adapter tells the service (`session_info_update` with `gorynych/interactivity: "full"`), which
+    first reads what was made meanwhile with `_gorynych/catch_up` (`gorynych/catchUp`: the same
+    replay after the mark as at a resume, from `thread/turns/list` and `thread/items/list`, the
+    thread not loaded), and the adapter takes the thread at the service's next resume, before the
+    next turn. While it is read-only, the holder's turns reach the service only so; a thread's
+    rollout (`Thread.path`) could be watched for them, which is not done. Taken back by the other app
     meanwhile, it is read-only again (an update with `"read-only"`). A prompt for a thread open here
     for reading only is refused in words; the service resumes it first, so it never sends one.
     A thread only app-server's refusal says is held (`active writer`, its holder not known: outside
