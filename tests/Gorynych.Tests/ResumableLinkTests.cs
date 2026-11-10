@@ -271,10 +271,15 @@ public sealed class ResumableLinkTests
         var running = zed.PromptAsync(sid, "one");
         await LinkHarness.Until(() => zed.Text().Contains("started:one"), "the turn");
 
-        // Gone without a restart: its agents with it.
+        // Gone without a restart: its agents with it. Its prompt's end is journaled before the next one starts.
         zed.Service = null;
         zed.Break();
+        await LinkHarness.Until(() => service.Feed(sid).Clients().Length == 0, "the old service to see its client go");
         await service.DisposeAsync();
+        await LinkHarness.Until(() => !service.Feed(sid).TurnRunning, "the old service's prompt to end");
+        Assert.AreEqual("cancelled", (string?)service.Feed(sid).Journal.ReadAll()
+            .LastOrDefault(e => e["_meta"]?[GorynychProtocol.MetaPromptId] is not null && (string?)e["sessionUpdate"] == "session_info_update")
+            ?["_meta"]?[GorynychProtocol.MetaStopReason], "cut off with its agent: cancelled, not an error");
         await using var next = Service(data, new TurnAgent("turns"));
         zed.Service = next;
 
@@ -459,20 +464,37 @@ public sealed class ResumableLinkTests
     {
         var pipe = "gorynych-restart-" + Guid.NewGuid().ToString("N")[..8];
         if (Outside.ServiceLaunch.IsRemoteLogon()) Assert.Inconclusive("from an ssh login or session 0 the bridge starts no service without the logon task");
-        await using var zed = new PlainClient("acp", "--agent", "kimi", "--pipe", pipe, "--data", TestDirs.New());
-        var init = await zed.InitializeAsync();
-        Assert.AreEqual(GorynychProtocol.LinkVersion, (int?)init!["agentCapabilities"]!["_meta"]![GorynychProtocol.CapLink]);
-        var before = (int)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()).WaitAsync(Wait))!["processId"]!;
+        var started = new List<int>();
+        try
+        {
+            await using var zed = new PlainClient("acp", "--agent", "kimi", "--pipe", pipe, "--data", TestDirs.New());
+            var init = await zed.InitializeAsync();
+            Assert.AreEqual(GorynychProtocol.LinkVersion, (int?)init!["agentCapabilities"]!["_meta"]![GorynychProtocol.CapLink]);
+            var before = (int)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()).WaitAsync(Wait))!["processId"]!;
+            started.Add(before);
 
-        var (code, stderr) = await RunAsync("restart", "--pipe", pipe, "--no-wait");
+            var (code, stderr) = await RunAsync("restart", "--pipe", pipe, "--no-wait");
 
-        Assert.AreEqual(0, code, stderr);
-        StringAssert.Contains(stderr, "the next bridge or the logon task starts the new one");
-        var after = (int)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()).WaitAsync(Wait))!["processId"]!;
-        Assert.AreNotEqual(before, after, "the bridge started the next service and went on");
-        var sessions = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject()).WaitAsync(Wait);
-        Assert.IsNotNull(sessions!["sessions"]);
-        await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodShutdown, new JsonObject()).WaitAsync(Wait);
+            Assert.AreEqual(0, code, stderr);
+            StringAssert.Contains(stderr, "the next bridge or the logon task starts the new one");
+            var after = (int)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()).WaitAsync(Wait))!["processId"]!;
+            started.Add(after);
+            Assert.AreNotEqual(before, after, "the bridge started the next service and went on");
+            var sessions = await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject()).WaitAsync(Wait);
+            Assert.IsNotNull(sessions!["sessions"]);
+        }
+        finally
+        {
+            // Whatever failed, no service of this test outlives it (it would hold the build's files).
+            await RunAsync("shutdown", "--pipe", pipe);
+            foreach (var id in started)
+                try
+                {
+                    using var left = Process.GetProcessById(id);
+                    left.Kill();
+                }
+                catch (ArgumentException) { } // gone
+        }
     }
 
     static async Task<(int Code, string Stderr)> RunAsync(params string[] args)

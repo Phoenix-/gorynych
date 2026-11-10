@@ -185,6 +185,35 @@ public sealed class ResumeTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ARestart_WaitsForAPromptStillOpeningItsSession()
+    {
+        var data = TestDirs.New();
+        string sid;
+        await using (var first = TestDirs.Conductor(data, new TurnAgent("turns")))
+        await using (var a = await TestClient.ConnectAsync(first, "a"))
+        {
+            sid = (await a.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest { Cwd = Path.GetTempPath() })).SessionId;
+            await Prompt(a, sid, "one");
+        }
+        // The next service has to open the session in its agent first, which takes a while.
+        var agent = new TurnAgent("turns") { ResumeGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously) };
+        await using var conductor = TestDirs.Conductor(data, agent);
+        await using var b = await TestClient.ConnectAsync(conductor, "b");
+        var prompt = b.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, PromptParams(sid, "two"));
+        await LinkHarness.Until(() => agent.Resumes.Count == 1, "the session to be opening");
+        Assert.IsTrue(conductor.Feed(sid).TurnRunning, "a prompt on its way to its turn counts");
+
+        var restart = b.Rpc.SendRequestAsync(GorynychProtocol.MethodRestart, new JsonObject { ["wait"] = true, ["timeoutSeconds"] = 30 });
+        await Task.Delay(300);
+        Assert.IsFalse(restart.IsCompleted, "it waits for that prompt too");
+
+        agent.ResumeGate.SetResult();
+        Assert.AreEqual("end_turn", (string?)(await prompt.WaitAsync(Wait))!["stopReason"]);
+        Assert.AreEqual(0, (int)(await restart.WaitAsync(Wait))!["cancelledTurns"]!);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
     [DataRow(false, 30.0, DisplayName = "no wait")]
     [DataRow(true, 0.3, DisplayName = "the wait runs out")]
     public async Task ARestartThatDoesNotWaitForTheTurn_CancelsIt(bool wait, double seconds)

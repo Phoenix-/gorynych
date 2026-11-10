@@ -36,6 +36,9 @@ sealed class TurnAgent(string name) : IAgentAdapter
     /// <summary>When set, <c>session/list</c> and <c>session/new</c> wait for it.</summary>
     public TaskCompletionSource? SlowGate { get; set; }
 
+    /// <summary>When set, <c>session/resume</c> waits for it.</summary>
+    public TaskCompletionSource? ResumeGate { get; set; }
+
     /// <summary>How many <c>session/list</c> and <c>session/new</c> requests came.</summary>
     public int Lists;
     public int News;
@@ -76,6 +79,7 @@ sealed class TurnAgent(string name) : IAgentAdapter
                 return AcpJson.ToNode(new ListSessionsResponse());
             case AcpMethods.Agent.SessionResume:
                 if (req.Params is JsonObject resumed) Resumes.Enqueue((JsonObject)resumed.DeepClone());
+                if (ResumeGate is { } slowResume) await slowResume.Task;
                 return new JsonObject();
             case AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionClose:
                 return new JsonObject();
