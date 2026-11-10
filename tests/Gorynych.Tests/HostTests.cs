@@ -118,6 +118,8 @@ public sealed class HostTests
         Assert.AreEqual(1, hosts.Launches, "the same host, with the same agent");
         Assert.AreEqual("started:one between done:one ", JournalText(next, sid));
         Assert.AreEqual(1, EndMarks(next, sid), "its end marked once");
+        // Only what the old one had not journaled: the update without it, and the turn's end if it came then.
+        StringAssert.Contains(hosts.Log(), endsWhileNone ? "3 updates sent again" : "1 updates sent again");
         NoBreakSeen(zed);
 
         // The session goes on in the next service; and once more, which doubles nothing.
@@ -130,6 +132,38 @@ public sealed class HostTests
         Assert.AreEqual("started:one between done:one started:two done:two started:three done:three ", zed.Text());
         Assert.AreEqual(3, EndMarks(third, sid));
         Assert.AreEqual(1, hosts.Launches);
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ATurn_GoesOnAcrossTwoRestarts_AndEndsOnceInTheThirdService()
+    {
+        var data = TestDirs.New();
+        var agent = new TurnAgent("turns") { Hold = true };
+        var hosts = new InProcessHosts(_ => agent);
+        var service = hosts.Conductor(data, agent);
+        hosts.Service = service;
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+        await RestartAsync(service);
+        await GoneAsync(service, zed, hosts);
+        var next = Next(data, hosts, zed, agent);
+        await LinkHarness.Until(() => next.Feed(sid).Adopted is not null, "the turn taken back");
+
+        // A service that took a turn back leaves it running for the next one, too.
+        Assert.AreEqual(1, (int)(await RestartAsync(next))["turnsInHosts"]!);
+        await GoneAsync(next, zed, hosts);
+        Assert.AreEqual(0, EndMarks(next, sid));
+        await using var third = Next(data, hosts, zed, agent);
+        await LinkHarness.Until(() => third.Feed(sid).Adopted is not null, "the turn taken back again");
+        agent.Release();
+        Assert.AreEqual("end_turn", (string?)(await prompt.WaitAsync(Wait))!["stopReason"]);
+        Assert.AreEqual("started:one done:one ", zed.Text());
+        Assert.AreEqual(1, EndMarks(third, sid));
         NoBreakSeen(zed);
     }
 
@@ -297,14 +331,16 @@ public sealed class HostTests
         Assert.AreEqual(2, await run.WaitAsync(Wait), "an orphan's exit code");
         StringAssert.Contains(hosts.Log(), busy ? "cancelling 1 turns and exiting" : "cancelling 0 turns and exiting");
         if (busy) CollectionAssert.AreEqual(new[] { "one" }, agent.Prompts.ToArray());
+        Assert.AreEqual(busy ? 1 : 0, agent.Cancels, "its turn cancelled in the agent");
         Assert.IsTrue(agent.Current!.Rpc.Completion.IsCompleted, "its agent stopped with it");
     }
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    [DataRow(false, DisplayName = "a turn this conductor started")]
-    [DataRow(true, DisplayName = "a turn it took back after a restart")]
-    public async Task AHostThatGoes_EndsItsTurnsCancelled_WithTheirMarks_AndTheNextPromptStartsAnother(bool takenBack)
+    [DataRow(false, true, DisplayName = "a turn this conductor started")]
+    [DataRow(true, true, DisplayName = "a turn it took back after a restart")]
+    [DataRow(false, false, DisplayName = "the link breaks, and the host that comes back is stopped")]
+    public async Task AHostThatGoes_EndsItsTurnsCancelled_WithTheirMarks_AndTheNextPromptStartsAnother(bool takenBack, bool dies)
     {
         var data = TestDirs.New();
         var agent = new TurnAgent("turns") { Hold = true };
@@ -326,7 +362,10 @@ public sealed class HostTests
         }
         try
         {
-            await hosts.KillAsync("turns");
+            var first = hosts["turns"];
+            await hosts.KillAsync("turns", agentToo: dies);
+            // One whose link broke comes back, but this service ended its turns as it saw it go: it is stopped.
+            Assert.AreEqual(0, await first.Run.WaitAsync(Wait));
             Assert.AreEqual("cancelled", (string?)(await prompt.WaitAsync(Wait))!["stopReason"], "its turn died with it");
             Assert.AreEqual(1, EndMarks(current, sid));
             await LinkHarness.Until(() => !current.Feed(sid).TurnRunning, "the session free again");
@@ -484,6 +523,46 @@ public sealed class HostTests
         Assert.AreEqual(0, hosts.Launches, "no host of its own started");
         lock (raw.Asked) CollectionAssert.AreEqual(new[] { AcpMethods.Agent.Initialize, GorynychProtocol.MethodHostState, GorynychProtocol.MethodHostReplay, AcpMethods.Agent.SessionNew }, raw.Asked);
         Assert.AreEqual("old-agent", (string?)service.Agents["turns"].Describe()["agentInfo"]?["name"]);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task WhatAHostSendsAtOrBeforeTheJournalsPlace_IsTakenOnce()
+    {
+        var agent = new TurnAgent("turns");
+        var hosts = new InProcessHosts(_ => agent);
+        await using var service = hosts.Conductor(TestDirs.New(), agent);
+        hosts.Service = service;
+        await using var raw = new RawHost(service, Hello(), req => req.Method switch
+        {
+            AcpMethods.Agent.Initialize => new JsonObject { ["protocolVersion"] = 1, ["agentCapabilities"] = new JsonObject() },
+            _ => new JsonObject(),
+        });
+        await LinkHarness.Until(() => service.Agents["turns"].HostId == "old-host", "the host taken");
+        Task Chunk(string text, int seq) => raw.Rpc.SendNotificationAsync(AcpMethods.Client.SessionUpdate, new JsonObject
+        {
+            ["sessionId"] = "s1",
+            ["update"] = new JsonObject
+            {
+                ["sessionUpdate"] = "agent_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = text },
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaHostSeq] = $"old-host/{seq}" },
+            },
+        });
+        Task Ended(int seq) => raw.Rpc.SendNotificationAsync(GorynychProtocol.MethodTurnEnded, new JsonObject
+        {
+            ["sessionId"] = "s1", ["promptId"] = "p1", ["turn"] = 1, ["result"] = new JsonObject { ["stopReason"] = "end_turn" },
+            ["_meta"] = new JsonObject { [GorynychProtocol.MetaHostSeq] = $"old-host/{seq}" },
+        });
+        await Chunk("a ", 5);
+        await Chunk("a ", 5);
+        await Chunk("b ", 4);
+        await Chunk("c ", 6);
+        await Ended(7);
+        await Ended(7);
+        await LinkHarness.Until(() => EndMarks(service, "s1") > 0, "the end");
+        await Task.Delay(200);
+        Assert.AreEqual("a c ", JournalText(service, "s1"));
+        Assert.AreEqual(1, EndMarks(service, "s1"));
     }
 
     [TestMethod]

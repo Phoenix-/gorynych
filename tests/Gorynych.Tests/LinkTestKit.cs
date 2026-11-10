@@ -43,6 +43,9 @@ sealed class TurnAgent(string name) : IAgentAdapter
     public int Lists;
     public int News;
 
+    /// <summary>How many <c>session/cancel</c> notifications came.</summary>
+    public int Cancels;
+
     /// <summary>The prompts held now end, and later ones do not wait.</summary>
     public void Release() => release.TrySetResult();
 
@@ -54,6 +57,7 @@ sealed class TurnAgent(string name) : IAgentAdapter
         agent.Rpc.RequestHandler = (req, token) => HandleAsync(agent, req);
         agent.Rpc.NotificationHandler = (method, p) =>
         {
+            if (method == AcpMethods.Agent.SessionCancel) Interlocked.Increment(ref Cancels);
             if (method == AcpMethods.Agent.SessionCancel && (string?)p?["sessionId"] is { } sid && cancels.TryGetValue(sid, out var cancel)) cancel.Cancel();
             return Task.CompletedTask;
         };

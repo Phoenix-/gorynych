@@ -67,13 +67,15 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
             foreach (var w in wires) w.Break();
     }
 
-    /// <summary>The host dies, as its process would: its connection drops, and its agent goes with it.</summary>
-    public async Task KillAsync(string adapter)
+    /// <summary>
+    /// The host dies, as its process would: its connection drops, and its agent goes with it. Or only
+    /// its connection drops (<paramref name="agentToo"/> false), and the host lives on.
+    /// </summary>
+    public async Task KillAsync(string adapter, bool agentToo = true)
     {
         var running = hosts[adapter];
         BreakAll();
-        await running.Agent.DisposeAsync();
-        await running.Run.WaitAsync(TimeSpan.FromSeconds(20));
+        if (agentToo) await running.Agent.DisposeAsync();
     }
 
     public string Log()
