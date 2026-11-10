@@ -80,7 +80,7 @@ sealed class ScriptedAgent(JsonRpcConnection rpc)
 
     public Task Update(string sessionId, SessionUpdate update) => Rpc.SendUpdateAsync(sessionId, update);
 
-    public static JsonNode? Init(bool list = true, bool resume = true, bool load = false) => AcpJson.ToNode(new InitializeResponse
+    public static JsonNode? Init(bool list = true, bool resume = true, bool load = false, bool close = false) => AcpJson.ToNode(new InitializeResponse
     {
         ProtocolVersion = 1,
         AgentCapabilities = new AgentCapabilities
@@ -90,6 +90,7 @@ sealed class ScriptedAgent(JsonRpcConnection rpc)
             {
                 List = list ? new SessionListCapabilities() : null,
                 Resume = resume ? new SessionResumeCapabilities() : null,
+                Close = close ? new SessionCloseCapabilities() : null,
             },
         },
         AgentInfo = new Implementation { Name = "scripted", Version = "1" },

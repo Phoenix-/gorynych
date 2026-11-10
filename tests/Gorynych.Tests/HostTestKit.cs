@@ -72,12 +72,16 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
 
     readonly List<Wire> wires = [];
 
-    Task<(Stream, Stream)> ConnectAsync(CancellationToken ct)
+    /// <summary>While set, a host that dials a conductor waits for it, as a host that comes back late.</summary>
+    public TaskCompletionSource? ConnectGate { get; set; }
+
+    async Task<(Stream, Stream)> ConnectAsync(CancellationToken ct)
     {
+        if (ConnectGate is { } gate) await gate.Task.WaitAsync(ct);
         var to = Service ?? throw new IOException("no conductor on the host pipe");
         var wire = new Wire(to, "host", host: true);
         lock (wires) wires.Add(wire);
-        return Task.FromResult<(Stream, Stream)>(wire.LinkEnd);
+        return wire.LinkEnd;
     }
 
     /// <summary>The newest connection a host made, for pausing one direction.</summary>

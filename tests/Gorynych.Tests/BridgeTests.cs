@@ -138,6 +138,8 @@ public sealed class BridgeTests
         {
             stop.Cancel();
             await listening;
+            // A bridge that saw the listener go before its client may have started a service: none outlives the test.
+            await RunAsync("shutdown", "--pipe", pipe);
         }
     }
 

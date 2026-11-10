@@ -597,6 +597,8 @@ public sealed class AdapterHost
                     .Select(f => (JsonNode)new JsonObject { ["sessionId"] = f.Value.SessionId, ["turn"] = f.Key, ["promptId"] = f.Value.PromptId }).ToArray()),
                 ["buffered"] = new JsonArray(buffer.Select(b => b.SessionId).Distinct(StringComparer.Ordinal).Select(s => (JsonNode)s).ToArray()),
                 ["requests"] = asked.Count,
+                // The sessions the agent asks something in, once per question: they stay in this host until it is answered.
+                ["asking"] = new JsonArray(asked.Values.Select(q => Text(q.Message["params"]?["sessionId"])).OfType<string>().Select(s => (JsonNode)s).ToArray()),
                 ["seq"] = seq,
             };
     }

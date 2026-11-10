@@ -27,6 +27,9 @@ switch (line.Command)
     // Asks the running service to exit and waits for it; exit code 1 when none runs on the pipe.
     case "shutdown":
         return await AcpBridge.ShutdownAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName);
+    // Shows the running service and its hosts: what runs where, and what waits to move after an update.
+    case "status":
+        return await AcpBridge.StatusAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName);
     // Asks it to exit for an update without breaking its clients' work; its bridges start the new one.
     case "restart":
         return await AcpBridge.RestartAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName, !line.Flag("--no-wait"),

@@ -234,6 +234,8 @@ public sealed class Conductor : IAsyncDisposable
     /// </summary>
     internal async Task AdoptAsync(AgentHost host, HostLink link, JsonObject report, CancellationToken ct)
     {
+        foreach (var asking in report["asking"] as JsonArray ?? [])
+            if (asking is JsonValue v && v.TryGetValue<string>(out var sessionId) && !removed.ContainsKey(sessionId)) Feed(sessionId).ExpectAsk();
         foreach (var turn in (report["turns"] as JsonArray ?? []).OfType<JsonObject>())
         {
             if ((string?)turn["sessionId"] is not { } sessionId || removed.ContainsKey(sessionId)) continue;
@@ -871,7 +873,7 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             feed.EnterUse();
-            feed.BeginAsking(); // its agent waits for the answer where it runs: the session does not move meanwhile
+            feed.BeginOrTakeAsking(); // its agent waits for the answer where it runs: the session does not move meanwhile
         }
         finally { feed.LifeGate.Release(); }
         try
@@ -3491,6 +3493,7 @@ public sealed class Conductor : IAsyncDisposable
         ["pendingRequests"] = feeds.Values.Sum(f => f.PendingRequests),
         ["restarting"] = draining,
         ["hosts"] = options.Hosts is not null,
+        ["build"] = options.Hosts is null ? null : HostGeneration.ThisBuild,
         ["agents"] = new JsonArray(agents.Values.Select(a => (JsonNode)a.Describe(s => !removed.ContainsKey(s) && Feed(s).TurnRunning)).ToArray()),
     };
 

@@ -42,9 +42,10 @@ public static class AcpBridge
             Console.Error.WriteLine($"gorynych acp: cannot reach the service on pipe {pipe}: {e.Message}{Hint(e)}");
             return 1;
         }
-        var link = new ResumableLink(Console.OpenStandardInput(), Console.OpenStandardOutput(), async _ =>
+        // The client that goes cancels a reconnect: no service is started for a bridge whose client is gone.
+        var link = new ResumableLink(Console.OpenStandardInput(), Console.OpenStandardOutput(), async ct =>
         {
-            var again = await ConnectOrStartAsync(pipe, serviceArgs);
+            var again = await ConnectOrStartAsync(pipe, serviceArgs, ct);
             return (again, again);
         }, LinkOptions(agent));
         return await link.RunAsync((service, service));
@@ -61,8 +62,12 @@ public static class AcpBridge
     };
 
     /// <summary>Connects to the service's pipe; when it is missing, starts the service and waits for it.</summary>
-    static async Task<NamedPipeClientStream> ConnectOrStartAsync(string pipe, IReadOnlyList<string> serviceArgs) =>
-        await ServicePipe.ConnectAsync(pipe, TimeSpan.FromMilliseconds(300)) ?? await StartAndConnectAsync(pipe, serviceArgs);
+    static async Task<NamedPipeClientStream> ConnectOrStartAsync(string pipe, IReadOnlyList<string> serviceArgs, CancellationToken ct = default)
+    {
+        if (await ServicePipe.ConnectAsync(pipe, TimeSpan.FromMilliseconds(300), ct) is { } running) return running;
+        ct.ThrowIfCancellationRequested();
+        return await StartAndConnectAsync(pipe, serviceArgs);
+    }
 
     /// <summary>The elevation hint for a pipe whose ACL refused this process; none for a pipe someone else owns.</summary>
     internal static string Hint(Exception e) => e is UnauthorizedAccessException and not ServicePipe.ForeignPipeException ? " " + ElevationHint : "";
@@ -102,7 +107,8 @@ public static class AcpBridge
     public static Task<int> RestartAsync(string pipe, bool wait, TimeSpan timeout, bool force, int waitSeconds = 30) => StopAsync("restart", pipe, waitSeconds, async (rpc, processId) =>
     {
         // A service whose adapters run in hosts waits for no turn: they go on in the hosts (docs/service-protocol.md, "Adapter hosts").
-        var hosted = (await rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()))?["hosts"] is JsonValue h && h.TryGetValue<bool>(out var on) && on;
+        var status = await rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject());
+        var hosted = status?["hosts"] is JsonValue h && h.TryGetValue<bool>(out var on) && on;
         var waiting = !wait || timeout <= TimeSpan.Zero ? "does not wait for the running ones"
             : $"waits up to {(timeout < TimeSpan.FromMinutes(1) ? $"{timeout.TotalSeconds:0.#} s" : $"{timeout.TotalMinutes:0.#} min")} for the running ones";
         Console.Error.WriteLine(hosted
@@ -127,7 +133,14 @@ public static class AcpBridge
             }
             var cancelled = (int?)reply?["cancelledTurns"] ?? 0;
             if (reply?["turnsInHosts"] is JsonValue t && t.TryGetValue<int>(out var inHosts))
+            {
                 Console.Error.WriteLine($"gorynych restart: it is exiting; {inHosts} running turn{(inHosts == 1 ? " goes" : "s go")} on in {(inHosts == 1 ? "its host" : "their hosts")}");
+                // What keeps running: a host of another build than the next service's is stale there, and
+                // its sessions move to a host of the new build as they go idle (docs/service-protocol.md, "Updating adapters").
+                foreach (var row in HostRows(status)) Console.Error.WriteLine("  " + row);
+                Console.Error.WriteLine("gorynych restart: sessions in hosts of another build than the next service's move to its hosts as they go idle, " +
+                    "and those hosts exit when they have none; `Gorynych.Service status` shows what still waits");
+            }
             else
                 Console.Error.WriteLine($"gorynych restart: it waited {seconds:0.#} s" +
                     (cancelled > 0 ? $" and cancelled {cancelled} turn{(cancelled == 1 ? "" : "s")} that still ran" : "") + "; it is exiting");
@@ -139,6 +152,78 @@ public static class AcpBridge
         }
         return null;
     }, stopped: "; the next bridge or the logon task starts the new one");
+
+    /// <summary>
+    /// <c>Gorynych.Service status [--pipe P]</c>: the running service, its build, and per adapter its
+    /// hosts: of the current build or stale, their options, sessions and running turns, and what still
+    /// waits to move after an update. 0, or 1 when no service runs on the pipe or it could not be asked.
+    /// </summary>
+    public static async Task<int> StatusAsync(string pipe)
+    {
+        NamedPipeClientStream? stream;
+        try
+        {
+            stream = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(1));
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"gorynych status: cannot reach the service on pipe {pipe}: {e.Message}{Hint(e)}");
+            return 1;
+        }
+        if (stream is null)
+        {
+            Console.Error.WriteLine($"gorynych status: no service is running on pipe {pipe}");
+            return 1;
+        }
+        await using var rpc = new JsonRpcConnection(stream, stream, "status");
+        rpc.Start();
+        JsonNode? status;
+        try
+        {
+            await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
+            {
+                ProtocolVersion = AcpMethods.ProtocolVersion,
+                ClientInfo = new Implementation { Name = "gorynych-status", Version = AgentHost.Version },
+            });
+            status = await rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject());
+        }
+        catch (Exception e) when (e is IOException or JsonRpcException)
+        {
+            Console.Error.WriteLine($"gorynych status: the service on pipe {pipe} did not answer: {e.Message}");
+            return 1;
+        }
+        var hosted = status?["hosts"] is JsonValue h && h.TryGetValue<bool>(out var on) && on;
+        Console.WriteLine($"service: process {(int?)status?["processId"]}, version {(string?)status?["version"]}" +
+            (hosted ? $", build {(string?)status?["build"]}, adapters in hosts" : ", adapters in its own process") +
+            $", {(int?)status?["clients"] ?? 0} clients, {(int?)status?["sessions"] ?? 0} sessions");
+        foreach (var row in HostRows(status)) Console.WriteLine("  " + row);
+        if (hosted)
+        {
+            var waiting = (status?["agents"] as JsonArray ?? []).OfType<JsonObject>()
+                .SelectMany(a => (a["hosts"] as JsonArray ?? []).OfType<JsonObject>().Where(x => x["current"] is JsonValue c && c.TryGetValue<bool>(out var current) && !current))
+                .Sum(x => (x["sessions"] as JsonArray)?.Count ?? 0);
+            Console.WriteLine(waiting == 0 ? "nothing waits to move: every host runs the current build"
+                : $"{waiting} session{(waiting == 1 ? "" : "s")} wait{(waiting == 1 ? "s" : "")} in hosts of an earlier build, and move once idle");
+        }
+        return 0;
+    }
+
+    /// <summary>A line per adapter host of a <c>_gorynych/status</c>: its adapter, build, whether stale, options, sessions and running turns.</summary>
+    static IEnumerable<string> HostRows(JsonNode? status)
+    {
+        foreach (var agent in (status?["agents"] as JsonArray ?? []).OfType<JsonObject>())
+            foreach (var x in (agent["hosts"] as JsonArray ?? []).OfType<JsonObject>())
+            {
+                var current = x["current"] is JsonValue c && c.TryGetValue<bool>(out var now) && now;
+                var sessions = (x["sessions"] as JsonArray ?? []).Select(s => (string?)s).OfType<string>().ToList();
+                var options = string.Join(' ', (x["options"] as JsonArray ?? []).Select(o => (string?)o));
+                var turns = (int?)x["turns"] ?? 0;
+                yield return $"{(string?)agent["name"],-7} host {(string?)x["hostId"]} (process {(int?)x["processId"]}): " +
+                    $"{(current ? "current" : "stale")}, build {(string?)x["build"] ?? "(an earlier version)"}{(options.Length > 0 ? $" {options}" : "")}, " +
+                    $"{sessions.Count} session{(sessions.Count == 1 ? "" : "s")}{(sessions.Count > 0 ? $" ({string.Join(", ", sessions)})" : "")}, " +
+                    $"{turns} turn{(turns == 1 ? "" : "s")} running";
+            }
+    }
 
     /// <summary>
     /// Connects to the running service, asks it with <paramref name="ask"/>, and waits up to

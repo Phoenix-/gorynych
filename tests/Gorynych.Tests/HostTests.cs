@@ -18,7 +18,7 @@ public sealed class HostTests
     static readonly TimeSpan Wait = TimeSpan.FromSeconds(20);
 
     /// <summary>A restart as <c>Gorynych.Service restart</c> asks for one, which would wait up to 30 s for turns.</summary>
-    static async Task<JsonObject> RestartAsync(Conductor service)
+    internal static async Task<JsonObject> RestartAsync(Conductor service)
     {
         JsonObject reply;
         await using (var admin = await TestClient.ConnectAsync(service, "admin"))
@@ -29,7 +29,7 @@ public sealed class HostTests
     }
 
     /// <summary>The service exits, and for a while there is none: neither the link nor the hosts reach one.</summary>
-    static async Task GoneAsync(Conductor service, LinkHarness? zed, InProcessHosts hosts)
+    internal static async Task GoneAsync(Conductor service, LinkHarness? zed, InProcessHosts hosts)
     {
         if (zed is not null) zed.Service = null;
         hosts.Service = null;
@@ -37,7 +37,7 @@ public sealed class HostTests
         zed?.Break();
     }
 
-    static Conductor Next(string data, InProcessHosts hosts, LinkHarness? zed, IAgentAdapter adapter)
+    internal static Conductor Next(string data, InProcessHosts hosts, LinkHarness? zed, IAgentAdapter adapter)
     {
         var next = hosts.Conductor(data, adapter);
         hosts.Service = next;
@@ -45,29 +45,29 @@ public sealed class HostTests
         return next;
     }
 
-    static JsonObject[] Journal(Conductor service, string sid) => service.Feed(sid).Journal.ReadAll().OfType<JsonObject>().ToArray();
+    internal static JsonObject[] Journal(Conductor service, string sid) => service.Feed(sid).Journal.ReadAll().OfType<JsonObject>().ToArray();
 
-    static int EndMarks(Conductor service, string sid) => Journal(service, sid)
+    internal static int EndMarks(Conductor service, string sid) => Journal(service, sid)
         .Count(u => (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended" && u["_meta"]?[GorynychProtocol.MetaPromptId] is not null);
 
-    static string JournalText(Conductor service, string sid) => string.Concat(Journal(service, sid)
+    internal static string JournalText(Conductor service, string sid) => string.Concat(Journal(service, sid)
         .Where(u => (string?)u["sessionUpdate"] == "agent_message_chunk").Select(u => (string?)u["content"]?["text"]));
 
     static int Count(JsonNode? array) => (array as JsonArray)?.Count ?? 0;
 
-    static void NoBreakSeen(LinkHarness zed)
+    internal static void NoBreakSeen(LinkHarness zed)
     {
         StringAssert.DoesNotMatch(zed.Log(), new System.Text.RegularExpressions.Regex("zed: .*unknown id"), "Zed got no answer it did not ask for");
         lock (zed.Notices) CollectionAssert.DoesNotContain(zed.Notices, GorynychProtocol.MethodRestarting, "the link keeps its own notices");
     }
 
-    static Task<JsonNode?> Prompt(TestClient client, string sessionId, string text) => client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject
+    internal static Task<JsonNode?> Prompt(TestClient client, string sessionId, string text) => client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject
     {
         ["sessionId"] = sessionId,
         ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
     });
 
-    static async Task<string> NewSession(TestClient client) =>
+    internal static async Task<string> NewSession(TestClient client) =>
         (string)(await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew, new JsonObject { ["cwd"] = Path.GetTempPath(), ["mcpServers"] = new JsonArray() })
             .WaitAsync(Wait))!["sessionId"]!;
 

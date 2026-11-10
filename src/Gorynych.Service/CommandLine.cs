@@ -26,6 +26,9 @@ internal sealed class CommandLine
               the stdio bridge for ACP clients such as Zed; starts the service when its pipe is missing
           Gorynych.Service shutdown [--pipe <name>]
               asks the running service to exit and waits for it
+          Gorynych.Service status [--pipe <name>]
+              shows the running service and its adapter hosts: their build, sessions and running turns,
+              and which sessions still wait to move to a host of the current build after an update
           Gorynych.Service restart [--pipe <name>] [--timeout <minutes>] [--no-wait] [--force]
               asks the running service to exit for an update: it starts no new turn, waits for the
               running ones (5 minutes at most by default; none with --no-wait), and its bridges start
@@ -114,7 +117,7 @@ internal sealed class CommandLine
             case "acp":
                 known = ([.. ServiceValues, "--agent"], ServiceFlags);
                 break;
-            case "shutdown":
+            case "shutdown" or "status":
                 known = (["--pipe"], []);
                 break;
             case "restart":

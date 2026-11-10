@@ -160,6 +160,26 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
 
     public void BeginAsking() => Interlocked.Increment(ref asking);
 
+    int expectedAsks;
+
+    /// <summary>
+    /// A host that came back reported questions of its agent's in the session, which it asks again
+    /// (<c>host_state</c>): they count as asking from now on, before they arrive.
+    /// </summary>
+    public void ExpectAsk()
+    {
+        Interlocked.Increment(ref expectedAsks);
+        Interlocked.Increment(ref asking);
+    }
+
+    /// <summary>A question that arrives: one expected already counts (<see cref="ExpectAsk"/>), else it begins to.</summary>
+    public void BeginOrTakeAsking()
+    {
+        while (Volatile.Read(ref expectedAsks) is var expected && expected > 0)
+            if (Interlocked.CompareExchange(ref expectedAsks, expected - 1, expected) == expected) return;
+        BeginAsking();
+    }
+
     public void EndAsking() => Interlocked.Decrement(ref asking);
 
     long lastActivity = DateTimeOffset.MinValue.UtcTicks;

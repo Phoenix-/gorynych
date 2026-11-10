@@ -46,6 +46,38 @@ sealed class TurnAgent(string name) : IAgentAdapter
     /// <summary>How many <c>session/cancel</c> notifications came.</summary>
     public int Cancels;
 
+    /// <summary>It takes <c>session/close</c>, as every real adapter does; without it a session cannot leave a host on its own.</summary>
+    public bool Closes { get; set; }
+
+    /// <summary>How long a close takes (Codex answers once the app-server has let go of the thread).</summary>
+    public TimeSpan CloseDelay { get; set; }
+
+    /// <summary>What each instance was asked, in order: <c>verb:instance:sessionId</c>, the instance its number among <see cref="Instances"/>.</summary>
+    public ConcurrentQueue<string> Events { get; } = new();
+
+    /// <summary>Every instance started, the first first: each host runs one.</summary>
+    public List<ScriptedAgent> Instances { get; } = [];
+
+    readonly ConcurrentDictionary<string, ScriptedAgent> openIn = new(StringComparer.Ordinal);
+
+    /// <summary>The instance that opened the session last.</summary>
+    public ScriptedAgent AgentOf(string sessionId) => openIn[sessionId];
+
+    /// <summary>The number of the instance that opened the session last.</summary>
+    public int InstanceOf(string sessionId)
+    {
+        lock (Instances) return Instances.IndexOf(openIn[sessionId]);
+    }
+
+    public string[] EventsOf(string sessionId) => Events.Where(e => e.EndsWith(":" + sessionId, StringComparison.Ordinal)).ToArray();
+
+    void Note(ScriptedAgent agent, string verb, string sessionId)
+    {
+        int index;
+        lock (Instances) index = Instances.IndexOf(agent);
+        Events.Enqueue($"{verb}:{index}:{sessionId}");
+    }
+
     /// <summary>The prompts held now end, and later ones do not wait.</summary>
     public void Release() => release.TrySetResult();
 
@@ -63,6 +95,7 @@ sealed class TurnAgent(string name) : IAgentAdapter
         };
         agent.Rpc.Start();
         Current = agent;
+        lock (Instances) Instances.Add(agent);
         var (ci, co) = link.ClientEnd;
         return Task.FromResult(new AgentInstance(ci, co, agent.Rpc.Completion, () => agent.Rpc.DisposeAsync()));
     }
@@ -72,26 +105,44 @@ sealed class TurnAgent(string name) : IAgentAdapter
         switch (req.Method)
         {
             case AcpMethods.Agent.Initialize:
-                return ScriptedAgent.Init();
+                return ScriptedAgent.Init(close: Closes);
             case AcpMethods.Agent.SessionNew:
                 Interlocked.Increment(ref News);
                 if (SlowGate is { } slowNew) await slowNew.Task;
-                return AcpJson.ToNode(new NewSessionResponse { SessionId = $"{name}-{Interlocked.Increment(ref sessions)}" });
+                var created = $"{name}-{Interlocked.Increment(ref sessions)}";
+                openIn[created] = agent;
+                Note(agent, "new", created);
+                return AcpJson.ToNode(new NewSessionResponse { SessionId = created });
             case AcpMethods.Agent.SessionList:
                 Interlocked.Increment(ref Lists);
                 if (SlowGate is { } slowList) await slowList.Task;
                 return AcpJson.ToNode(new ListSessionsResponse());
             case AcpMethods.Agent.SessionResume:
-                if (req.Params is JsonObject resumed) Resumes.Enqueue((JsonObject)resumed.DeepClone());
+                if (req.Params is JsonObject resumed)
+                {
+                    Resumes.Enqueue((JsonObject)resumed.DeepClone());
+                    if ((string?)resumed["sessionId"] is { } back)
+                    {
+                        openIn[back] = agent;
+                        Note(agent, "resume", back);
+                    }
+                }
                 if (ResumeGate is { } slowResume) await slowResume.Task;
                 return new JsonObject();
-            case AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionClose:
+            case AcpMethods.Agent.SessionClose:
+                var closing = (string?)req.Params?["sessionId"] ?? "";
+                Note(agent, "close", closing);
+                if (CloseDelay > TimeSpan.Zero) await Task.Delay(CloseDelay);
+                Note(agent, "closed", closing);
+                return new JsonObject();
+            case AcpMethods.Agent.SessionLoad:
                 return new JsonObject();
             case AcpMethods.Agent.SessionPrompt:
                 var prompt = req.ParamsAs<PromptRequest>();
                 var sid = prompt.SessionId;
                 var text = prompt.Prompt.OfType<TextContent>().FirstOrDefault()?.Text ?? "";
                 Prompts.Enqueue(text);
+                Note(agent, "prompt", sid);
                 using (var cancel = new CancellationTokenSource())
                 {
                     cancels[sid] = cancel;
