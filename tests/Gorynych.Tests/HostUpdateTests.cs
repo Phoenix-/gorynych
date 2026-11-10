@@ -161,9 +161,16 @@ public sealed class HostUpdateTests
         HostTests.NoBreakSeen(rig.Zed);
     }
 
+    /// <param name="late">
+    /// The next service handles the question its host asks again only after it has taken the host and
+    /// moved its idle sessions: it handles each request apart from the stream it came on (on the thread
+    /// pool), so that can happen, and the host's report of the question (<c>asking</c>) alone holds the session.
+    /// </param>
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task ASessionWhoseAgentAsksSomething_StaysInTheOldHost_UntilItIsAnswered()
+    [DataRow(false, DisplayName = "the question asked again is handled at once")]
+    [DataRow(true, DisplayName = "the question asked again is handled late")]
+    public async Task ASessionWhoseAgentAsksSomething_StaysInTheOldHost_UntilItIsAnswered(bool late)
     {
         await using var rig = new Rig();
         var answer = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -183,11 +190,13 @@ public sealed class HostUpdateTests
         });
         await LinkHarness.Until(() => { lock (rig.Zed.Approvals) return rig.Zed.Approvals.Count == 1; }, "the question");
 
+        if (late) rig.Hosts.HoldBack = line => line.Contains(AcpMethods.Client.SessionRequestPermission, StringComparison.Ordinal);
         await rig.UpdateAsync("build-2");
         await LinkHarness.Until(() => rig.Hosts.Log().Contains("1 questions asked again"), "the old host to ask again");
         await Task.Delay(500);
         CollectionAssert.DoesNotContain(rig.Agent.EventsOf(b), "close:0:" + b, "not moved while its agent waits for an answer");
 
+        await rig.Hosts.LetGoAsync();
         answer.SetResult();
         Assert.AreEqual("allow", (string?)(await asked.WaitAsync(Wait))!["outcome"]!["optionId"], "the answer reached the agent in the old host");
         await LinkHarness.Until(() => rig.Agent.EventsOf(b).Contains("closed:0:" + b), "B to move once answered");

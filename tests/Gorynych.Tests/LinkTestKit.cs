@@ -174,6 +174,7 @@ sealed class Wire
 {
     readonly BrokenOnce[] ends;
     readonly BrokenOnce linkIn;
+    readonly BrokenOnce linkOut;
     readonly BrokenOnce serviceIn;
 
     /// <param name="said">Gets what the service writes to the link.</param>
@@ -184,7 +185,7 @@ sealed class Wire
         var up = new System.IO.Pipelines.Pipe();
         var down = new System.IO.Pipelines.Pipe();
         linkIn = new BrokenOnce(down.Reader.AsStream(), reads: true);
-        var linkOut = new BrokenOnce(up.Writer.AsStream()) { Tap = sent };
+        linkOut = new BrokenOnce(up.Writer.AsStream()) { Tap = sent };
         serviceIn = new BrokenOnce(up.Reader.AsStream(), reads: true);
         var serviceOut = new BrokenOnce(down.Writer.AsStream()) { Tap = said };
         ends = [linkIn, linkOut, serviceIn, serviceOut];
@@ -203,6 +204,16 @@ sealed class Wire
         serviceIn.Go();
         linkIn.Go();
     }
+
+    /// <summary>
+    /// What the link writes and <paramref name="which"/> picks (a whole line each, as a host writes
+    /// them) waits, while what it writes after goes on, until <see cref="LetGoToServiceAsync"/>: as
+    /// when the service handles a message only after ones that came after it.
+    /// </summary>
+    public void HoldBackFromService(Func<string, bool> which) => linkOut.HoldBack = which;
+
+    /// <summary>What <see cref="HoldBackFromService"/> held goes to the service now, and nothing more waits.</summary>
+    public Task LetGoToServiceAsync() => linkOut.LetGoAsync();
 
     public (Stream Input, Stream Output) LinkEnd { get; }
     public Task Serving { get; }
@@ -259,16 +270,56 @@ sealed class Wire
 
         public Action<string>? Tap { get; init; }
 
+        /// <summary>The writes it picks wait in <see cref="heldBack"/> until <see cref="LetGoAsync"/>.</summary>
+        public Func<string, bool>? HoldBack { get; set; }
+
+        readonly List<byte[]> heldBack = [];
+        readonly SemaphoreSlim writing = new(1, 1); // the writes that wait go in between the others, which a pipe's writer takes one at a time
+
+        public async Task LetGoAsync()
+        {
+            await writing.WaitAsync();
+            try
+            {
+                HoldBack = null;
+                foreach (var bytes in heldBack)
+                {
+                    Tap?.Invoke(Encoding.UTF8.GetString(bytes));
+                    await inner.WriteAsync(bytes);
+                }
+                heldBack.Clear();
+                await inner.FlushAsync();
+            }
+            finally { writing.Release(); }
+        }
+
         public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
         {
             if (broken.IsCancellationRequested) throw new IOException("the pipe is broken");
-            Tap?.Invoke(Encoding.UTF8.GetString(buffer.Span));
-            await inner.WriteAsync(buffer, ct);
+            var text = Encoding.UTF8.GetString(buffer.Span);
+            await writing.WaitAsync(ct);
+            try
+            {
+                if (broken.IsCancellationRequested) throw new IOException("the pipe is broken");
+                if (HoldBack?.Invoke(text) == true)
+                {
+                    heldBack.Add(buffer.ToArray());
+                    return;
+                }
+                Tap?.Invoke(text);
+                await inner.WriteAsync(buffer, ct);
+            }
+            finally { writing.Release(); }
             if (broken.IsCancellationRequested) throw new IOException("the pipe is broken");
         }
 
-        public override Task FlushAsync(CancellationToken ct) =>
-            broken.IsCancellationRequested ? Task.FromException(new IOException("the pipe is broken")) : inner.FlushAsync(ct);
+        public override async Task FlushAsync(CancellationToken ct)
+        {
+            if (broken.IsCancellationRequested) throw new IOException("the pipe is broken");
+            await writing.WaitAsync(ct);
+            try { await inner.FlushAsync(ct); }
+            finally { writing.Release(); }
+        }
 
         protected override void Dispose(bool disposing)
         {

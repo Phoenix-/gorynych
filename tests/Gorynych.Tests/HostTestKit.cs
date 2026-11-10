@@ -75,11 +75,27 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
     /// <summary>While set, a host that dials a conductor waits for it, as a host that comes back late.</summary>
     public TaskCompletionSource? ConnectGate { get; set; }
 
+    /// <summary>
+    /// While set, what a host writes to a conductor it dials from now on and this picks waits, while
+    /// what it writes after goes on, until <see cref="LetGoAsync"/> (<see cref="Wire.HoldBackFromService"/>).
+    /// </summary>
+    public Func<string, bool>? HoldBack { get; set; }
+
+    /// <summary>What <see cref="HoldBack"/> held reaches the conductors now, and nothing more waits.</summary>
+    public async Task LetGoAsync()
+    {
+        HoldBack = null;
+        Wire[] all;
+        lock (wires) all = [.. wires];
+        foreach (var wire in all) await wire.LetGoToServiceAsync();
+    }
+
     async Task<(Stream, Stream)> ConnectAsync(CancellationToken ct)
     {
         if (ConnectGate is { } gate) await gate.Task.WaitAsync(ct);
         var to = Service ?? throw new IOException("no conductor on the host pipe");
         var wire = new Wire(to, "host", host: true);
+        if (HoldBack is { } which) wire.HoldBackFromService(which);
         lock (wires) wires.Add(wire);
         return wire.LinkEnd;
     }
