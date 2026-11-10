@@ -89,7 +89,7 @@ public sealed class BridgeTests
         try
         {
             string sessionId;
-            await using (var zed = new PlainClient("acp", "--agent", "fake", "--pipe", pipe))
+            await using (var zed = new PlainClient("acp", "--agent", "fake", "--pipe", pipe, "--data", TestDirs.New()))
             {
                 var init = await zed.InitializeAsync();
                 Assert.AreEqual("Gorynych: fake", (string?)init!["agentInfo"]!["title"]);
@@ -122,7 +122,7 @@ public sealed class BridgeTests
                 Assert.IsTrue(await zed.ExitsAsync(), "the bridge exits when the client closes stdin");
             }
 
-            await using (var again = new PlainClient("acp", "--agent", "fake", "--pipe", pipe))
+            await using (var again = new PlainClient("acp", "--agent", "fake", "--pipe", pipe, "--data", TestDirs.New()))
             {
                 await again.InitializeAsync();
                 await again.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject
@@ -189,9 +189,10 @@ public sealed class BridgeTests
         })!;
         try
         {
-            // Started once it answers: the bridge's initialize needs the pipe.
-            await using (var probe = new PlainClient("acp", "--agent", "kimi", "--pipe", pipe))
-                await probe.InitializeAsync();
+            // Started once its pipe answers. Not through a bridge: one that finds no pipe yet starts a
+            // service of its own, which would serve the pipe after this one.
+            await using (var ready = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(30)))
+                Assert.IsNotNull(ready, "the service opened its pipe");
 
             var (code, stderr) = await RunAsync("shutdown", "--pipe", pipe);
             Assert.AreEqual(0, code, stderr);
