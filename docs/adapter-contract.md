@@ -56,6 +56,14 @@ fallback when the adapter does not provide it.
   there: it talks to the service only through its ACP connection, keeps everything it needs in
   its own instance, and builds from the same command-line options in either process. Listeners
   it opens for its agent (hooks, a channel) live with it in the host.
+- Several instances of an adapter MUST be able to run at once on the same data folder: during an
+  update an old and a new host run side by side, and Claude runs one host per session
+  ([service-protocol.md](service-protocol.md#updating-adapters)). A file the adapter keeps there is
+  written under a lock across processes (`SharedFileLock`) after reading it again, and read again
+  when another process changed it, so no instance drops what another wrote.
+- `session/close` MUST let go of the session in the agent before it answers, so that another
+  instance can open it at once: Codex answers once its app-server let go of the thread's writer
+  lock. A session moves between hosts so.
 - An adapter MUST run the unmodified agent binary or API client under the user's own login on
   that machine, MUST NOT copy credentials between machines, and MUST NOT edit the agent's own
   configuration (`~/.claude`, `~/.codex`, `~/.kimi-code`, `~/.dsh`). Everything it needs goes through

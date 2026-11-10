@@ -115,13 +115,16 @@ public sealed class HostUpdateTests
         Assert.AreEqual("build-2", rig.BuildOf(b));
         Assert.AreEqual(1, rig.Agent.Events.Count(e => e == "prompt:0:" + b), "no new turn in the old host: b1 ran there before the update, b2 in the new one");
 
-        // A's turn ends whole in the old host; then A moves, and the old host, empty, exits.
+        // A prompt that waits for A's turn; A's turn ends whole in the old host; then A moves, the
+        // prompt runs in the new host, and the old host, empty, exits.
+        var a2 = rig.Zed.PromptAsync(a, "a2");
+        await Task.Delay(200);
         rig.Release(a);
         Assert.AreEqual("end_turn", (string?)(await a1.WaitAsync(Wait))!["stopReason"]);
+        Assert.AreEqual("end_turn", (string?)(await a2.WaitAsync(Wait))!["stopReason"]);
+        Assert.AreEqual("build-2", rig.BuildOf(a), "the prompt that waited behind the turn ran in the new host");
         Assert.AreEqual(0, await old.Run.WaitAsync(Wait), "the old host exits once it has no session");
         CollectionAssert.Contains(rig.Agent.EventsOf(a), "closed:0:" + a);
-        await Prompt(rig, a, "a2");
-        Assert.AreEqual("build-2", rig.BuildOf(a));
         Assert.IsTrue(rig.Turns.Links.All(l => l.Current), "only hosts of the new build are left");
 
         // Nothing doubled or lost on the way, for Zed and in the journals.
@@ -193,6 +196,25 @@ public sealed class HostUpdateTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ADraft_StaysInItsHost_UntilItsFirstTurnEnds()
+    {
+        // An agent may keep nothing of a session never prompted, and Codex fails one opened again.
+        await using var rig = new Rig();
+        await rig.Zed.InitializeAsync().WaitAsync(Wait);
+        var d = await rig.SessionAsync();
+        await rig.UpdateAsync("build-2");
+        await Task.Delay(500);
+        CollectionAssert.DoesNotContain(rig.Agent.EventsOf(d), "close:0:" + d, "a draft does not move");
+        await Prompt(rig, d, "d1");
+        Assert.AreEqual("build-1", rig.BuildOf(d), "its first turn runs where it was made: " + string.Join(" ", rig.Agent.Events) + "\n" + rig.Hosts.Log());
+        await LinkHarness.Until(() => rig.Agent.EventsOf(d).Contains("closed:0:" + d), "it moves once it is no draft");
+        Assert.AreEqual(0, await rig.HostOf("build-1").Run.WaitAsync(Wait));
+        await Prompt(rig, d, "d2");
+        Assert.AreEqual("build-2", rig.BuildOf(d));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
     public async Task OtherAdapterOptions_MakeTheHostsStale_AsAnUpdateDoes()
     {
         await using var rig = new Rig();
@@ -216,6 +238,7 @@ public sealed class HostUpdateTests
         await rig.Zed.InitializeAsync().WaitAsync(Wait);
         var a = await rig.SessionAsync();
         var b = await rig.SessionAsync();
+        await Prompt(rig, b, "b0"); // no draft: a draft stays where it was made until its first turn
         rig.Hold(a);
         var a1 = rig.Zed.PromptAsync(a, "a1");
         await LinkHarness.Until(() => rig.Zed.Text().Contains("started:a1"), "A's long turn");

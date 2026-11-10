@@ -266,9 +266,16 @@ answer arrives whole ([service-protocol.md](service-protocol.md#adapter-hosts)).
    & "$dir\Gorynych.Service.exe" restart
    ```
    The bridges themselves keep running the old copy until Zed restarts them, and an agent outside
-   Gorynych keeps its outside server until it restarts its MCP servers. The hosts keep running the
-   old copy too, until the service shuts down (`Gorynych.Service.exe shutdown`) or they are idle
-   with no service for two minutes: until then the `*.old.exe` they run cannot be deleted.
+   Gorynych keeps its outside server until it restarts its MCP servers. The hosts of the old copy
+   go on with their sessions: each session moves to a host of the new build as soon as it is idle
+   (at once, or after its running turn), and an old host exits when it has none left. New sessions
+   open in hosts of the new build at once. To see what still waits:
+   ```powershell
+   & "$dir\Gorynych.Service.exe" status
+   ```
+   It lists each host with its build, sessions and running turns, and says how many sessions still
+   wait in hosts of an earlier build. A restart with other adapter options (`--claude-model`, …)
+   moves the sessions the same way.
    An agent that was waiting for another session's answer (`ask_agent`) during the restart is told
    to ask again.
 4. **Without hosts** (`--hosts off`, the default on Linux and macOS) a restart still stops the
@@ -287,9 +294,15 @@ leave them running.
 service to exit instead, which cancels its running turns, and the bridges Zed runs are old too,
 so they end with it. Quit Zed before it and start it again after.
 
-If a file is still in use, look for processes that are left over:
-`Get-Process Gorynych.Service, Gorynych.Outside`. The adapter hosts are `Gorynych.Service`
-processes too (`host --adapter …` on their command line).
+**The old copies.** A renamed `Gorynych.Service.<stamp>.old.exe` can be deleted once no process
+runs it: no old bridge (Zed restarted them), and no old host (`status` shows no stale host, as
+every session moved off them and they exited). A host that still runs a long turn keeps its copy
+until the turn ends. Gorynych never deletes them itself. To see which ones still run:
+```powershell
+Get-Process Gorynych.Service, Gorynych.Outside | Select-Object Id, Path
+```
+The adapter hosts are `Gorynych.Service` processes too (`host --adapter …` on their command line).
+A file that is still in use belongs to one of them.
 
 ## Where things are
 

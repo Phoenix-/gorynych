@@ -388,6 +388,8 @@ public sealed class Conductor : IAsyncDisposable
             || !agents.TryGetValue(record.Agent, out var host)) return false;
         if (host.RouteOf(sessionId) is not { Current: false }) return !host.IsLive(sessionId);
         var feed = Feed(sessionId);
+        // No turn yet: a draft, though its first prompt has already ended it as one (Promote).
+        if (!feed.Journal.HasTurns) return false;
         await feed.LifeGate.WaitAsync(ct);
         var turnTaken = false;
         try
@@ -1042,6 +1044,12 @@ public sealed class Conductor : IAsyncDisposable
         {
             if (host.RouteOf(record.SessionId) is { } open) return (open.Rpc, null);
             var rpc = await host.OpenTargetAsync(ct);
+            // A host that came back with it open while this waited for a host: it is open there.
+            if (host.RouteOf(record.SessionId) is { } came)
+            {
+                host.DoneOpening(rpc);
+                return (came.Rpc, null);
+            }
             try
             {
                 var opened = await OpenAsync(host, rpc, record, ct);

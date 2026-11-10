@@ -70,6 +70,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     readonly Dictionary<string, HostLink> route = new(StringComparer.Ordinal);                     // session -> where it is open; under linksGate
     readonly Dictionary<string, TaskCompletionSource<HostLink>> arriving = new(StringComparer.Ordinal); // slot -> its attach; under linksGate
     readonly HashSet<string> goneHosts = new(StringComparer.Ordinal);                             // under linksGate
+    readonly HashSet<string> claimed = new(StringComparer.Ordinal);                                // slots started for an open; under linksGate
     AgentInstance? instance;
 
     public string Name => adapter.Name;
@@ -202,7 +203,18 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     {
         HostLink link;
         if (PerSession)
-            link = await HostedAsync(Hosts!, $"{GeneralSlot}.{Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant()}", ct);
+        {
+            var slot = $"{GeneralSlot}.{Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant()}";
+            lock (linksGate) claimed.Add(slot); // its host counts the open from its attach on
+            try
+            {
+                link = await HostedAsync(Hosts!, slot, ct);
+            }
+            finally
+            {
+                lock (linksGate) claimed.Remove(slot);
+            }
+        }
         else
         {
             link = await GeneralLinkAsync(ct);
@@ -362,15 +374,8 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             Current = expected is null || expected.Same(hello.Generation),
             ForSession = hello.Slot.Contains('.'),
         };
-        lock (linksGate)
-        {
-            links.Add(link);
-            foreach (var s in sessions)
-                if (route.TryAdd(s, link)) link.Sessions.Add(s);
-                else ServiceLog.Warn($"{Name}: host {hello.HostId} has {s} open, which host {route[s].HostId} has too; it goes on there");
-            // An open waits for it: it is not stopped as empty before the session is opened in it.
-            if (link.ForSession && arriving.ContainsKey(link.Slot)) link.Opening++;
-        }
+        // Not seen by requests until it has sent what it kept: a client that resumes one of its sessions
+        // meanwhile waits for it (AwaitHostOfAsync), and so finds the ends of the turns it reported.
         JsonNode? replayed;
         try
         {
@@ -394,7 +399,16 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         // alone) never ended anywhere: they end here, cancelled.
         await conductor.SettleAsync(this, link, reattached ? report : null);
         TaskCompletionSource<HostLink>? arrival;
-        lock (linksGate) arriving.Remove(link.Slot, out arrival);
+        lock (linksGate)
+        {
+            links.Add(link);
+            foreach (var s in sessions)
+                if (route.TryAdd(s, link)) link.Sessions.Add(s);
+                else ServiceLog.Warn($"{Name}: host {hello.HostId} has {s} open, which host {route[s].HostId} has too; it goes on there");
+            // Started for an open: it is not stopped as empty before the session is opened in it.
+            if (link.ForSession && claimed.Remove(link.Slot)) link.Opening++;
+            arriving.Remove(link.Slot, out arrival);
+        }
         _ = rpc.Completion.ContinueWith(_ => OnClosed(link), TaskScheduler.Default);
         ServiceLog.Info($"{Name}: host {hello.HostId} ({SlotName(link.Slot)}, {(link.Current ? "current" : "stale")}, {hello.Generation?.ToString() ?? "no generation"}) " +
             $"{(reattached ? "came back" : "started")}: {init.AgentInfo?.Name} {init.AgentInfo?.Version}, {sessions.Count} sessions open, " +
@@ -414,8 +428,8 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     {
         lock (linksGate)
         {
+            if (link.HostId is { } id && Hosts is not null) goneHosts.Add(id); // also one that went before it was taken
             if (!links.Remove(link)) return [];
-            if (link.HostId is { } id && Hosts is not null) goneHosts.Add(id);
             var lost = link.Sessions.ToList();
             foreach (var s in lost)
                 if (route.TryGetValue(s, out var on) && on == link) route.Remove(s);

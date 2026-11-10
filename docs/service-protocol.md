@@ -219,7 +219,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/open_elsewhere` | method, service → adapter, `{sessionIds}` → `{sessions: {"<id>": "<holder>"}}` | which of these sessions another app has open now, the held ones only; for the lists agents see |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
-| `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), adapters (each with its `host`, the ID of the host that runs it now) |
+| `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/restart` | method, `{wait?, timeoutSeconds?, force?}` → `{restarted: true, processId, waitedSeconds, cancelledTurns}` or `{restarted: false, processId, waitedSeconds, running: [{sessionId, agent, title}]}`; with hosts always `{restarted: true, processId, waitedSeconds, cancelledTurns: 0, turnsInHosts}` | asks the service to exit for an update without breaking its clients' work; without hosts, called off when turns outlast the wait, unless `force` ([The resumable link](#the-resumable-link)); with hosts, it waits for no turn ([Adapter hosts](#adapter-hosts)) |
 | `_gorynych/restarting` | notification to clients, `{restart}` | the service has begun restart number `restart`: a client on the link holds its new prompts |
@@ -235,9 +235,9 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/read` | method, `{sessionId, cursor?, limit?, thoughts?}` → `{updates, nextCursor?, total, inProgress, trimmed}` | a page of a session's history from the journal (see [Reading a session](#reading-a-session)) |
 | `_gorynych/sessions_changed` | notification to clients, `{sessionId, change}`; from an adapter that advertises `gorynych/sessionsChanged`, `updated` only | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply`, `_gorynych/spawn` and `_gorynych/archive` | which session's `gorynych` MCP server is calling |
-| `_gorynych/host_hello` | notification, host → conductor, the first message on the host pipe, `{token, hostId, adapter, link, pid, version}` | an [adapter host](#adapter-hosts) proves itself and says what it runs |
+| `_gorynych/host_hello` | notification, host → conductor, the first message on the host pipe, `{token, hostId, adapter, link, pid, version, slot?, build?, options?}` | an [adapter host](#adapter-hosts) proves itself and says what it runs: which host of its adapter it is (`slot`), and its generation (`build`, `options`; [Updating adapters](#updating-adapters)) |
 | `gorynych/host` | `initialize` result `_meta`, host → conductor | `{hostId, link, reattached}`: the host, its link version, and whether it answers from its agent's first `initialize` (it came back) |
-| `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, turns: [{sessionId, turn, promptId?}], buffered, requests, seq}` | what a host that came back has: open sessions, running prompts, the sessions it keeps updates for, open questions, its last number |
+| `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, turns: [{sessionId, turn, promptId?}], buffered, requests, asking, seq}` | what a host that came back has: open sessions, running prompts, the sessions it keeps updates for, open questions (`asking`: the session of each), its last number |
 | `_gorynych/host_replay` | method, conductor → host, `{after: {"<sessionId>": n}}` → `{replayed, trimmed}` | sends what the host kept after each session's cursor and its open questions, then makes this conductor its own |
 | `_gorynych/host_stop` | method, conductor → host, `{}` → `{}` | the service shuts down: the host stops its agents and exits |
 | `_gorynych/turn_ended` | notification, host → conductor, `{sessionId, turn, promptId?, result \| error}` | how a prompt ended, sent before its answer, numbered like an update; the conductor marks the turn's end from it |
@@ -1657,9 +1657,9 @@ with an error. A conductor that connects while an earlier one's `initialize` is 
 stderr and exits with 1, rather than leave every request waiting for a host that cannot connect.
 
 **Options.** A host runs with the adapter options of the service that started it
-(`--claude-*`, `--no-channel`, `--no-peers`) until it exits: a service restarted with other
-options keeps the hosts that run. Stopping the service (`shutdown`) stops them, and the next
-service starts new ones with its own options; replacing them while turns run is step 3b.
+(`--claude-*`, `--no-channel`, `--no-peers`) until it exits. They are part of its generation: a
+service restarted with other options takes its hosts for stale, and their sessions move to hosts
+with the new options as an update's do ([Updating adapters](#updating-adapters)).
 
 **Versions.** The host link has a version of its own, `link` in the hello and in
 `gorynych/host`. There is only version 1 yet, and a conductor takes 1 to 1. From the next version
@@ -1667,13 +1667,94 @@ of the link on, a conductor keeps taking at least the one before, so the hosts a
 left running come back to it; until then a host of another Gorynych version comes back as long as
 it speaks link 1. The executable's version is in the hello (`version`).
 
-**Granularity.** One host per adapter, for all four. Claude runs a process per session, and gets a
-host per session with the update of adapters ([design.md](design.md#updating-without-losing-work),
-step 3b): numbers and cursors are per host already, so that changes the conductor's routing, not
-the link.
+**Granularity.** Codex, Kimi and DSH run one host for the adapter (per generation, while an update
+is under way). Claude, which runs a process per session, runs each open session in a host of its
+own, and one more host for what no session has open (the list, deleting a session that is not
+open); a session's host starts as the session opens and stops as it closes (idle unload, delete).
+Numbers and cursors are per host.
 
 **Platforms.** Hosts build everywhere and are tested on Windows. On Linux and macOS they are off by
 default, since they are untried there; `--hosts on` turns them on.
+
+## Updating adapters
+
+An update renames the running executable aside, copies the new one in its place and runs
+`restart` ([getting-started.md](getting-started.md#update)). With hosts, the new service takes back
+the hosts of the old one, and moves their sessions over to hosts of the new build one session at a
+time, as each goes idle; nothing waits for the whole machine, no turn breaks, and a client sees at
+most a pause while a session opens in its new host
+([design.md](design.md#updating-without-losing-work)).
+
+**Generations.** What a host runs is its *generation*: its build and its adapter's options.
+
+- `build`: the version and the start of the SHA-256 of what the process runs, read at its start,
+  before an update can rename its executable aside: the Native AOT executable, or with the runtime
+  the executable and every Gorynych assembly next to it. Two builds of the same version differ.
+- `options`: the service options of its adapter (Claude: `--claude-model`, `--claude-transport`,
+  `--claude-channels`, `--no-channel`; DSH: `--no-peers`; Codex and Kimi: none).
+- The hello carries both, and `slot`: which host of its adapter it is. The adapter-wide host of a
+  generation has as slot a short fingerprint of the generation (12 hex digits of a SHA-256 of
+  both); a Claude session's host has that fingerprint, a dot and a random part. Each host holds a
+  mutex for its slot (`Gorynych.Host.<pipe>.<adapter>.<slot>`), so no two hosts of one slot run.
+- The conductor knows the generation it would start now, for each adapter. A host of that one is
+  *current*; any other is *stale*, and so is a host that says no generation (of an earlier version,
+  with the empty slot and the mutex `Gorynych.Host.<pipe>.<adapter>`).
+
+**Where a session goes.** The conductor knows which host each session is open in, and sends the
+session's requests there. A new session, and one that opens, go to a host of the current
+generation: the adapter-wide one, or for Claude a new host of the session's own. A stale host takes
+no new session and, below, no new turn.
+
+**Moving a session.** A session open in a stale host moves when it is idle there: no turn runs or
+waits in it, its agent asks nothing in it (an approval, a form), and it had a turn already (a draft
+stays where it was made until its first turn ends: an agent may keep nothing of it, and Codex fails
+a thread opened again before its first turn).
+
+1. Under the session's gates, the conductor closes it in the stale host (`session/close`). Codex
+   answers once its app-server let go of the thread (`thread/closed`), so its writer lock is free.
+2. The session is then open nowhere. Its next use opens it in a host of the current generation as
+   any session that is not loaded opens: `session/resume` with the catch-up after the journal's
+   mark ([History made outside Gorynych](#history-made-outside-gorynych)), so the journal gets
+   neither a double nor a gap.
+3. A prompt, or anything else, that comes meanwhile waits for the session's gates, and then goes
+   to the new host.
+
+It moves:
+
+- when a stale host connects, every idle session of it;
+- when a session goes idle (its turn ends, its agent's question is answered, a use of it ends);
+- when a prompt comes for it, before its turn starts: also a prompt that waited behind a turn, so
+  that a stale host runs only the turns it had when it went stale;
+- and every 30 seconds, every idle session of a stale host, should a moment have been missed.
+
+A stale host left with no session is stopped (`_gorynych/host_stop`) and exits. So is a Claude
+session's host when its session closes. An adapter that could not close one session would have
+its stale host stopped as a whole once nothing runs in any of its sessions; every adapter today
+can.
+
+**No drain.** A stale host takes no new turn, so it empties as soon as the turns it runs end, which
+a drain would wait for too. A turn that never ends keeps its host, and the old executable, until
+it is cancelled from the client; `restart` with hosts never cancels a turn.
+
+**Across a restart.** At its exit the service keeps in the overlay the host each session is open in
+(`hostOf`, `hostSlot`). The next one waits up to 30 seconds for that host to come back before it
+opens the session anywhere else, and for a host of an earlier version that ran the whole adapter,
+so a session is never open in two hosts. One whose host does not run any more is opened afresh.
+
+**Updates in a row.** Hosts of several earlier generations may run at once; each empties and exits
+on its own, the same way.
+
+**What the agent and the client see.** Nothing of the move but, at the session's next use, the
+pause of its opening. A session open in a stale host is not shown as open in another app
+(`gorynych/openElsewhere`), though the new host's agent sees the old one hold it.
+
+**Several instances of an adapter.** During an update an adapter runs in two hosts or more at once,
+and Claude always runs one per session, all on the same data folder: the adapter keeps its files
+there safe for several processes ([adapter-contract.md](adapter-contract.md#1-building-and-starting-an-adapter)).
+
+**Seeing it.** `_gorynych/status` lists each adapter's hosts with their generation, sessions and
+running turns. `Gorynych.Service status` prints them, and how many sessions still wait in stale
+hosts; `restart` prints the hosts that keep running.
 
 ## Overlay
 

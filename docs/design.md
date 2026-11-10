@@ -541,7 +541,8 @@ history, the journals and the overlay, so an idle session loses nothing.
 conductor and the adapters.** Step 3a, the hosts and a conductor that restarts lightly, is
 **done** on 10 November 2026 and on by default on Windows
 ([service-protocol.md](service-protocol.md#adapter-hosts)); step 3b, updating the adapters
-themselves, is next.
+themselves, is **done** on 10 November 2026 as well
+([service-protocol.md](service-protocol.md#updating-adapters)).
 
 **Adapter hosts and a light conductor** (3a, **done**).
 - An adapter runs in a small process of its own, an *adapter host*. It is the same executable
@@ -575,22 +576,30 @@ themselves, is next.
     next service. What still lives in the conductor is cut: an `ask_agent` waiting for its answer
     gets an error that says to ask again, with the session ID.
 - How many hosts depends on the agent:
-  - Claude runs a process per session, so it is to get a host per session. In 3a it has one host
-    for the adapter, as the others do: a host per session needs the conductor to route each
-    session's requests to its own host, and it pays off only with 3b, where it lets an update of
-    the Claude adapter move one session at a time. The link is per host already (numbers,
-    cursors, hello), so 3b changes the routing, not the link.
+  - Claude runs a process per session, so it gets a host per session (3b), and one more for what
+    no session has open, such as the list.
   - Codex runs one app-server for all threads, Kimi one process, and DSH a process per mode.
     Each of them gets one host for the adapter.
 
-**Updating an adapter** (3b, **planned**). Until then a host runs the code it was started with
-until it exits: a restart onto a new executable keeps the old hosts and their adapters.
-- New sessions start on the new host at once.
-- A live session moves over when it is unloaded idle, or when its host has no running turn.
-  That is waiting for one adapter, not for the whole machine, and Claude's host per session
-  makes it one session at a time.
-- A drain is needed only when a host with running turns cannot wait. It starts no new turn,
-  holds the prompts that come in, and waits for the running turns.
+**Updating an adapter** (3b, **done**). A host runs the code it was started with until it exits;
+a restart onto a new executable, or with other adapter options, makes the running hosts stale.
+- New sessions start on a host of the new generation at once.
+- A live session moves over as soon as it is idle in its stale host: no turn runs or waits in it
+  and its agent asks nothing. It is closed there (Codex lets go of the thread's lock first) and
+  opens in the new host at its next use, with the journal caught up from its mark.
+- A prompt for a session in a stale host moves it first, so a stale host runs only the turns it
+  had, and exits once they end and its sessions moved. That is waiting for one adapter, not for
+  the whole machine, and Claude's host per session makes it one session at a time.
+- No drain: a stale host takes no new turn, so a drain would wait for the same turns.
+- How it came out:
+  - A host says its generation in its hello: the version and a SHA-256 of what it runs, read at
+    its start, and its adapter's options.
+  - Each host has a slot and a mutex of its own: an adapter-wide host per generation, and for
+    Claude a host per session.
+  - The conductor routes each session's requests to the host it is open in, and keeps that in
+    the overlay across a restart, so the next one waits for that host rather than open the
+    session twice.
+  - The Claude adapter's files are safe for several of its processes on one data folder.
 
 **One resumable link, three uses.** The same mechanism serves:
 - the hub and a remote service over ssh;
@@ -640,7 +649,7 @@ last acknowledged one, and send the pending requests again. So it is built once.
   is only version 1 yet; from the next one on, the range keeps at least the previous version.
   Bridges keep running the old code until the GUI restarts, so the bridge stays thin.
 - **Options.** A host keeps the adapter options it was started with (`--claude-*`) until it exits;
-  applying new ones to running hosts belongs to 3b.
+  they are part of its generation, so a restart with other ones moves its sessions to new hosts (3b).
 - **Orphans.** A host whose conductor does not come back, after a crash or an uninstall, lets its
   turns run for up to 10 minutes and exits once nothing runs (2 minutes after it lost the
   conductor at the earliest, also when it is idle); at 10 minutes it cancels what still runs and
@@ -772,7 +781,8 @@ Next, in order (**planned**):
    November 2026: the hosts, one per adapter, and a restart that waits for no turn, on by
    default on Windows ([service-protocol.md](service-protocol.md#adapter-hosts)).
 4. Updating an adapter on the fly (3b): new sessions start on the new host, and a live one moves
-   over once it is idle; with it a host per Claude session.
+   over once it is idle; with it a host per Claude session. **Done** on 10 November 2026
+   ([service-protocol.md](service-protocol.md#updating-adapters)).
 5. Read-only sessions, first for a Codex thread open in another app (agreed on 10 November
    2026). Today opening such a thread shows the journal, which may be stale, when Gorynych has
    one, and fails when it has none. Instead:
