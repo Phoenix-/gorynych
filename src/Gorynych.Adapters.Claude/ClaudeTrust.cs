@@ -16,7 +16,8 @@ internal sealed class ClaudeTrust(string storePath, string? claudeStatePath, Act
     readonly Lock gate = new();
     HashSet<string>? allowed;
     readonly HashSet<string> unsaved = new(Comparer); // allows whose write failed
-    FileStamp? loadedStamp;
+    string? loadedText; // what the store held when it was last read (null: no file)
+    bool loaded;
 
     /// <summary>Claude's own state file: <c>$CLAUDE_CONFIG_DIR/.claude.json</c>, else <c>~/.claude.json</c>.</summary>
     public static string DefaultClaudeStatePath() =>
@@ -45,13 +46,16 @@ internal sealed class ClaudeTrust(string storePath, string? claudeStatePath, Act
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(storePath)!);
                 using var fileLock = SharedFileLock.Acquire(storePath);
-                allowed = Load();
+                // Not readable: kept in memory rather than written over what the file holds.
+                allowed = Load(SharedFile.ReadText(storePath));
                 if (!allowed.Add(key) && unsaved.Count == 0) return;
                 allowed.UnionWith(unsaved);
-                AtomicFile.WriteAllText(storePath, new JsonObject { ["trusted"] = new JsonArray(allowed.Order(StringComparer.Ordinal).Select(f => (JsonNode)f).ToArray()) }
-                    .ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                var text = new JsonObject { ["trusted"] = new JsonArray(allowed.Order(StringComparer.Ordinal).Select(f => (JsonNode)f).ToArray()) }
+                    .ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+                AtomicFile.WriteAllText(storePath, text);
                 unsaved.Clear();
-                loadedStamp = FileStamp.Of(storePath);
+                loadedText = text;
+                loaded = true;
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
@@ -63,24 +67,37 @@ internal sealed class ClaudeTrust(string storePath, string? claudeStatePath, Act
         }
     }
 
-    /// <summary>Loads the file when it is not loaded yet or another process changed it.</summary>
+    /// <summary>
+    /// Loads the file when it is not loaded yet or another process changed it, told by what it holds
+    /// (<see cref="SharedFile"/>). Not readable, no folder counts as trusted by Gorynych until it is.
+    /// </summary>
     void Refresh()
     {
-        if (allowed is not null && FileStamp.Of(storePath) == loadedStamp) return;
-        allowed = Load();
+        string? text;
+        try { text = SharedFile.ReadText(storePath); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            log?.Invoke($"claude: {storePath} could not be read, so no folder counts as trusted by Gorynych: {e.Message}");
+            loaded = false;
+            allowed = new HashSet<string>(unsaved, Comparer);
+            return;
+        }
+        if (allowed is not null && loaded && string.Equals(text, loadedText, StringComparison.Ordinal)) return;
+        allowed = Load(text);
         allowed.UnionWith(unsaved);
     }
 
-    HashSet<string> Load()
+    HashSet<string> Load(string? text)
     {
         var set = new HashSet<string>(Comparer);
-        loadedStamp = FileStamp.Of(storePath);
+        loadedText = text;
+        loaded = true;
         try
         {
-            if (File.Exists(storePath) && JsonNode.Parse(File.ReadAllText(storePath))?["trusted"] is JsonArray list)
+            if (text is not null && JsonNode.Parse(text)?["trusted"] is JsonArray list)
                 foreach (var f in list.Select(n => (string?)n).OfType<string>()) set.Add(Key(f));
         }
-        catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException or InvalidOperationException)
+        catch (Exception e) when (e is JsonException or InvalidOperationException)
         {
             log?.Invoke($"claude: {storePath} could not be read, so no folder counts as trusted by Gorynych: {e.Message}");
         }

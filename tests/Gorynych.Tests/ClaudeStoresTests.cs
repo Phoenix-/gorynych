@@ -170,14 +170,67 @@ public sealed class ClaudeStoresTests
             a.Save(true, "s1"); // not saved
         Assert.AreEqual(true, a.Answer);
 
-        // Another process writes an answer given before this one: it does not replace it.
-        void Write(bool accepted, DateTimeOffset at) =>
-            File.WriteAllText(path, JsonSerializer.Serialize(new ChannelConsentRecord { Accepted = accepted, AnsweredAt = at, SessionId = "other" },
-                ClaudeJsonContext.Default.ChannelConsentRecord));
-        Write(false, DateTimeOffset.UtcNow.AddMinutes(-1));
+        // Another process writes an answer given before this one: it does not replace it. Then a later
+        // one, which does, in the same tick of the file system's clock: whole seconds, so it is as long.
+        var now = DateTimeOffset.UtcNow;
+        now = now.AddTicks(-(now.Ticks % TimeSpan.TicksPerSecond));
+        string Answer(bool accepted, DateTimeOffset at) =>
+            JsonSerializer.Serialize(new ChannelConsentRecord { Accepted = accepted, AnsweredAt = at, SessionId = "other" }, ClaudeJsonContext.Default.ChannelConsentRecord);
+        AtomicFile.WriteAllText(path, Answer(false, now.AddMinutes(-1)));
         Assert.AreEqual(true, a.Answer, "an earlier answer on disk does not replace the later one in memory");
-        Write(false, DateTimeOffset.UtcNow.AddMinutes(1));
+        InOneTick(path, () => AtomicFile.WriteAllText(path, Answer(false, now.AddMinutes(1))));
         Assert.AreEqual(false, a.Answer, "a later one does");
+    }
+
+    [TestMethod]
+    public void State_AChangeAsLongAsTheRecordBefore_InOneTickOfTheClock_IsSeenByTheOther()
+    {
+        var path = Path.Combine(TestDirs.New(), "sessions.json");
+        var a = new ClaudeStateStore(path);
+        var b = new ClaudeStateStore(path);
+        a.Update("s1", "/w", r => r.Title = "old");
+        Assert.AreEqual("old", b.Get("s1")!.Title);
+
+        InOneTick(path, () => a.Update("s1", "/w", r => r.Title = "new"));
+
+        Assert.AreEqual("new", b.Get("s1")!.Title);
+        Assert.AreEqual("new", b.All().Single().Title);
+    }
+
+    [TestMethod]
+    public void Trust_AFolderPutInAnothersPlace_InOneTickOfTheClock_IsSeenByTheOther()
+    {
+        var dir = TestDirs.New();
+        var store = Path.Combine(dir, "trusted.json");
+        var noClaudeState = Path.Combine(dir, "none.json");
+        var (one, two) = (Path.Combine(dir, "one"), Path.Combine(dir, "two"));
+        var a = new ClaudeTrust(store, noClaudeState, null);
+        var b = new ClaudeTrust(store, noClaudeState, null);
+        a.Remember(one);
+        Assert.IsTrue(b.IsTrusted(one));
+
+        // The person, or another process, puts another folder in its place.
+        InOneTick(store, () => AtomicFile.WriteAllText(store, File.ReadAllText(store).Replace("/one\"", "/two\"", StringComparison.Ordinal)));
+
+        Assert.IsTrue(b.IsTrusted(two));
+        Assert.IsFalse(b.IsTrusted(one));
+    }
+
+    /// <summary>
+    /// Runs a write of the file, then gives it back the write time it had before, as when two writes fall
+    /// in one tick of the clock the file system stamps them with (about 15 ms on Windows). The write must
+    /// keep the file's length: then its write time and length cannot tell that it changed.
+    /// </summary>
+    static void InOneTick(string path, Action write)
+    {
+        var before = new FileInfo(path);
+        var (time, length) = (before.LastWriteTimeUtc, before.Length);
+        var text = File.ReadAllText(path);
+        write();
+        File.SetLastWriteTimeUtc(path, time);
+        var after = new FileInfo(path);
+        Assert.AreEqual((time, length), (after.LastWriteTimeUtc, after.Length), "the same write time and length as before");
+        Assert.AreNotEqual(text, File.ReadAllText(path), "and yet another text");
     }
 
     [TestMethod]

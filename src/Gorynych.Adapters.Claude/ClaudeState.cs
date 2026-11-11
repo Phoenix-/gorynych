@@ -29,7 +29,7 @@ internal sealed partial class ClaudeJsonContext : JsonSerializerContext;
 /// <summary>
 /// The adapter's list of sessions, for <c>session/list</c> and <c>session/resume</c>. The file is
 /// shared by every adapter host process: an update re-reads it under a cross-process lock, and reads
-/// reload it when another process changed it.
+/// reload it when another process changed it, told by what the file holds (<see cref="SharedFile"/>).
 /// </summary>
 public sealed class ClaudeStateStore
 {
@@ -39,7 +39,7 @@ public sealed class ClaudeStateStore
     // Changes whose write failed, in order: applied again to what each reload reads, so another
     // process's newer change to the same session is kept, and only this one's fields go over it.
     readonly List<(string Id, string Cwd, DateTimeOffset At, Action<ClaudeSessionRecord> Change)> unsaved = [];
-    FileStamp? readStamp;
+    string? readText; // what the file held when it was last read (null: no file)
     bool read;
 
     readonly Action<string>? log;
@@ -94,9 +94,10 @@ public sealed class ClaudeStateStore
                 if (fileLock is null) return;
                 try
                 {
-                    AtomicFile.WriteAllText(path, JsonSerializer.Serialize(records.Values.ToList(), ClaudeJsonContext.Default.ListClaudeSessionRecord));
+                    var text = JsonSerializer.Serialize(records.Values.ToList(), ClaudeJsonContext.Default.ListClaudeSessionRecord);
+                    AtomicFile.WriteAllText(path, text);
                     unsaved.Clear();
-                    readStamp = FileStamp.Of(path);
+                    readText = text;
                     read = true;
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException)
@@ -109,12 +110,14 @@ public sealed class ClaudeStateStore
         }
     }
 
-    /// <summary>Reloads when the file's write time or length differ from what was last read.</summary>
+    /// <summary>Reloads when the file holds something else than it did when it was last read.</summary>
     void Refresh()
     {
-        if (read && FileStamp.Of(path) == readStamp) return;
-        try { Reload(); }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { /* read again next time */ }
+        string? text;
+        try { text = SharedFile.ReadText(path); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return; /* read again next time */ }
+        if (read && string.Equals(text, readText, StringComparison.Ordinal)) return;
+        Load(text);
     }
 
     /// <summary>
@@ -122,19 +125,20 @@ public sealed class ClaudeStateStore
     /// the unsaved changes to them again. A change that reads the clock (<c>UpdatedAt</c>) gets the
     /// time of the reload; it is written with the next change that is saved.
     /// </summary>
-    void Reload()
+    void Reload() => Load(SharedFile.ReadText(path));
+
+    void Load(string? text)
     {
-        var stamp = FileStamp.Of(path);
         var fromFile = new List<ClaudeSessionRecord>();
-        if (stamp is not null)
+        if (text is not null)
         {
-            try { fromFile = JsonSerializer.Deserialize(File.ReadAllText(path), ClaudeJsonContext.Default.ListClaudeSessionRecord) ?? []; }
+            try { fromFile = JsonSerializer.Deserialize(text, ClaudeJsonContext.Default.ListClaudeSessionRecord) ?? []; }
             catch (JsonException) { }
         }
         records.Clear();
         foreach (var r in fromFile) records[r.SessionId] = r;
         foreach (var (id, cwd, at, change) in unsaved) Apply(id, cwd, at, change);
-        readStamp = stamp;
+        readText = text;
         read = true;
     }
 

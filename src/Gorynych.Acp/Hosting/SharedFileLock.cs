@@ -36,17 +36,18 @@ public sealed class SharedFileLock : IDisposable
     public void Dispose() => stream.Dispose();
 }
 
-/// <summary>A file's last write time (UTC) and length: a cheap check that another process changed it.</summary>
-public readonly record struct FileStamp(DateTime LastWriteUtc, long Length)
+/// <summary>
+/// A small shared file read whole, so that a store can tell whether another process changed it since
+/// it last read it by what the file holds. Its write time and length cannot tell: two writes of the
+/// same length within one tick of the clock the file system stamps them with (about 15 ms on Windows,
+/// coarser on some file systems) leave both alike.
+/// </summary>
+public static class SharedFile
 {
-    /// <summary>The stamp of <paramref name="path"/>, or null when the file does not exist.</summary>
-    public static FileStamp? Of(string path)
+    /// <summary>The file's text, or null when it does not exist; other errors are thrown.</summary>
+    public static string? ReadText(string path)
     {
-        try
-        {
-            var info = new FileInfo(path);
-            return info.Exists ? new FileStamp(info.LastWriteTimeUtc, info.Length) : null;
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
+        try { return File.ReadAllText(path); }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException) { return null; }
     }
 }

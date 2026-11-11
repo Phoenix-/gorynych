@@ -45,7 +45,7 @@ internal sealed class ChannelConsentStore
     readonly Lock gate = new();
     ChannelConsentRecord? record;
     ChannelConsentRecord? unsaved; // an answer whose write failed: it holds until the file has a later one
-    FileStamp? readStamp;
+    string? readText; // what the file held when it was last read (null: no file)
     bool read;
 
     public ChannelConsentStore(string path, Action<string>? log = null)
@@ -71,23 +71,38 @@ internal sealed class ChannelConsentStore
     }
 
     /// <summary>
-    /// Reads the file when it has not been read yet or another process changed it. An answer of this
-    /// process's that could not be saved stays, unless the file holds a later one.
+    /// Takes the file's answer when it has not been read yet or another process changed it, told by
+    /// what the file holds (<see cref="SharedFile"/>). An answer of this process's that could not be
+    /// saved stays, unless the file holds a later one.
     /// </summary>
     void Refresh()
     {
-        var stamp = FileStamp.Of(path);
-        if (read && stamp == readStamp) return;
+        string? text;
+        try { text = SharedFile.ReadText(path); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            // Treated as not asked yet, like an answer that could not be saved; read again next time.
+            log?.Invoke($"claude adapter: {path} is not readable, the person is asked again: {e.Message}");
+            read = false;
+            Settle(null);
+            return;
+        }
+        if (read && string.Equals(text, readText, StringComparison.Ordinal)) return;
         read = true;
-        readStamp = stamp;
+        readText = text;
         ChannelConsentRecord? fromFile = null;
-        if (stamp is not null)
-            try { fromFile = JsonSerializer.Deserialize(File.ReadAllText(path), ClaudeJsonContext.Default.ChannelConsentRecord); }
-            catch (Exception e) when (e is JsonException or IOException or UnauthorizedAccessException)
+        if (text is not null)
+            try { fromFile = JsonSerializer.Deserialize(text, ClaudeJsonContext.Default.ChannelConsentRecord); }
+            catch (JsonException e)
             {
-                // Treated as not asked yet, like an answer that could not be saved.
                 log?.Invoke($"claude adapter: {path} is not readable, the person is asked again: {e.Message}");
             }
+        Settle(fromFile);
+    }
+
+    /// <summary>The answer: the file's, unless this process's own that could not be saved is later.</summary>
+    void Settle(ChannelConsentRecord? fromFile)
+    {
         if (unsaved is { } mine && (fromFile is null || fromFile.AnsweredAt <= mine.AnsweredAt))
         {
             record = mine;
@@ -106,8 +121,9 @@ internal sealed class ChannelConsentStore
             {
                 Directory.CreateDirectory(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path))!);
                 using var fileLock = SharedFileLock.Acquire(path);
-                AtomicFile.WriteAllText(path, JsonSerializer.Serialize(record, ClaudeJsonContext.Default.ChannelConsentRecord));
-                readStamp = FileStamp.Of(path);
+                var text = JsonSerializer.Serialize(record, ClaudeJsonContext.Default.ChannelConsentRecord);
+                AtomicFile.WriteAllText(path, text);
+                readText = text;
                 read = true;
                 unsaved = null;
             }
