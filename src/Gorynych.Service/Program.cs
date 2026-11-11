@@ -49,6 +49,12 @@ var pipeName = line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName;
 var dataDirectory = DataDirectory(line);
 Directory.CreateDirectory(dataDirectory);
 ServiceLog.Init(Path.Combine(dataDirectory, "logs"), console: line.Flag("--console"));
+// Every session's journal, the peer tokens and the logs are the user's alone (Codex's sandbox could read them).
+if (DataFolder.Protect(dataDirectory) is { } closed)
+{
+    if (closed.Failed) ServiceLog.Warn($"service: {closed.Said}");
+    else ServiceLog.Info($"service: {closed.Said}");
+}
 // What it runs is read now, before an update can rename its executable aside and copy another in its place.
 var (serviceBuild, buildTook) = Gorynych.Service.Hosts.HostGeneration.ReadAtStart(m => ServiceLog.Warn($"service: {m}"));
 // Started by the logon task, it has a console window of its own: let it go, so that closing it cannot stop the service.

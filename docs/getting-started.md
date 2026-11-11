@@ -312,7 +312,8 @@ A file that is still in use belongs to one of them.
 ## Where things are
 
 - **Programs:** `%LOCALAPPDATA%\Programs\Gorynych`, or wherever you put them.
-- **Data:** `%LOCALAPPDATA%\Gorynych`.
+- **Data:** `%LOCALAPPDATA%\Gorynych`. Only you (and SYSTEM) can read it: the service closes it at
+  each start, also to the commands Codex's sandbox runs, which can read the rest of your profile.
   - `sessions.json`: the service's list of sessions, with titles, parents and archive flags.
   - `journal\`: what each session said, as the service relayed it.
   - `claude\`: the Claude adapter's session list (with each session's selector choices),

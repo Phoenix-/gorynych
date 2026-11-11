@@ -54,6 +54,14 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   session list and `channels.json`, the person's answer about development channels),
   `host.token` (what proves an [adapter host](#adapter-hosts) to the service), `logs/`
   (`service-<date>.log`, and `host-<adapter>-<date>.log` for each host).
+  The folder is the user's alone. At each start the service gives it a protected DACL on Windows:
+  the user and SYSTEM, full control, inherited by all inside, nothing inherited from the parent.
+  Under `%LOCALAPPDATA%` it would otherwise inherit what the profile grants others, such as Codex's
+  `CodexSandboxUsers: ReadAndExecute`, through which the commands Codex's sandbox runs read every
+  journal and the peer tokens. Setting it rewrites what the files inside inherit, so an older
+  install is closed too; a folder that has it already is left alone. On Unix it is `0700`. The
+  agents, the adapter hosts and the MCP servers run as the user and read what they need there
+  (Claude's per-session `settings.json` and `mcp.json`, DSH's patch file) as before.
 
 Command line: `Gorynych.Service [serve] [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex|dsh]
 [--claude-model <model>] [--unload-after <minutes>] [--claude-transport headless|tui]
