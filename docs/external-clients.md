@@ -184,6 +184,14 @@ What the task does:
 On the machine with Zed, add an entry to `agent_servers` for each remote agent. `work-pc` is a
 host from your `~/.ssh/config` that logs in with a key:
 
+- Make a key on each machine that connects (`ssh-keygen -t ed25519`); keys, like logins, never
+  move between machines.
+- On a Windows machine where you are an administrator, OpenSSH reads your key from
+  `C:\ProgramData\ssh\administrators_authorized_keys`, not from `~\.ssh\authorized_keys`: its
+  default `sshd_config` sends the Administrators group there.
+- A host on an internal network (`*.local`, a domain name) is reached from outside only through
+  its VPN.
+
 ```json
 "Gorynych: Claude on the work PC": {
   "type": "custom",

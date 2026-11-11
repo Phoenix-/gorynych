@@ -105,7 +105,7 @@ fallback when the adapter does not provide it.
   it ([§6.4](#64-the-live-note-path)). A flag that an adapter's extension would need goes in
   `agentCapabilities._meta` under a `gorynych/` key, as ACP's extensibility rules (advertising
   custom capabilities) say, not in the result's own `_meta`; the service advertises its own
-  flags that way ([service-protocol.md](service-protocol.md#methods)).
+  flags that way ([service-protocol.md](service-protocol.md#standard-methods)).
 - The service declares no file system and no terminal (`fs.readTextFile`, `fs.writeTextFile`
   and `terminal` false), so the adapter MUST NOT call `fs/*` or `terminal/*`. It declares
   form elicitation, which it relays ([§8](#8-approvals-and-forms)).

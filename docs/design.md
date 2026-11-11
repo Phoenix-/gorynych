@@ -303,10 +303,19 @@ Titles and archive live in the harness when it has them; otherwise in the servic
       - the registry (below) listed both processes under the same `sessionId`.
     - Processes one after another are safe: each resume reads the transcript afresh. Only
       two live at once fork it.
-    - Claude's own guard covers only background sessions (read from the 2.1.302 binary, not
-      run):
-      - `--resume`, in the TUI and in `-p`, refuses a session that a background or daemon job
-        holds ("Add --fork-session to branch off a copy instead");
+    - It is known upstream, with no fix and no answer from Anthropic as of 11 November 2026:
+      [#75761](https://github.com/anthropics/claude-code/issues/75761) and
+      [#83719](https://github.com/anthropics/claude-code/issues/83719) (closed by the stale
+      bot), [#80427](https://github.com/anthropics/claude-code/issues/80427) (open). The
+      docs say only that messages from both terminals "interleave into one transcript".
+    - Claude's own guard covers only background sessions (from the 2.1.302 binary and the
+      [sessions docs](https://code.claude.com/docs/en/sessions.md), not run):
+      - `--resume` of a session that a running background job holds opens that job, not the
+        transcript. Since 2.1.285, `claude --resume <id>` typed at a terminal (also with `-p`)
+        attaches to it, as `claude attach` does. With piped or redirected input or output,
+        flags that configure or read the run (`--model`, `--settings`,
+        `--output-format json`, `--max-turns`, …) or agent view off, it refuses instead
+        ("Add --fork-session to branch off a copy instead"). A Gorynych launch is such a case;
       - a holder of kind `interactive` is not checked: another terminal, Desktop, a
         `claude -p`, Gorynych's own sessions;
       - a background launch with `--resume` of a session open elsewhere starts a copy instead
@@ -827,8 +836,10 @@ Next, in order (**planned**):
    ([service-protocol.md](service-protocol.md#updating-adapters)).
 5. Read-only sessions, first for a Codex thread open in another app (agreed on 10 November
    2026). Opening such a thread used to show the journal, which may be stale, when Gorynych had
-   one, and fail when it had none. Instead (**the service part done** on 10 November 2026,
-   [service-protocol.md](service-protocol.md#read-only-sessions); the Zed part in the fork):
+   one, and fail when it had none. Instead (**done** on 11 November 2026: the service part,
+   [service-protocol.md](service-protocol.md#read-only-sessions), and the Zed part, in the fork's
+   `gorynych` branch and its nightly; checked together live in Zed with a thread another
+   `codex app-server` held):
    - the service shows the thread's current history, read without taking the thread
      (`thread/turns/list`, which takes no writer lock: probed), also when it had no journal;
    - it says so with an ACP session notice (`notice`, which Zed shows), and refuses a prompt
