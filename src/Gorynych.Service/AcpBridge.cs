@@ -20,7 +20,8 @@ namespace Gorynych.Service;
 public static class AcpBridge
 {
     /// <param name="serviceArgs">Arguments for the service if the bridge has to start it.</param>
-    public static async Task<int> RunAsync(string agent, string pipe, IReadOnlyList<string> serviceArgs)
+    /// <param name="agent">The agent the bridge scopes its client to; null for none, as a hub's link to another machine is.</param>
+    public static async Task<int> RunAsync(string? agent, string pipe, IReadOnlyList<string> serviceArgs)
     {
         NamedPipeClientStream service;
         try
@@ -55,10 +56,10 @@ public static class AcpBridge
     /// The bridge's link: it scopes the client's <c>initialize</c> to its agent, says on stderr what
     /// happens to the connection, and gives up when no service is back within 60 seconds.
     /// </summary>
-    internal static ResumableLinkOptions LinkOptions(string agent) => new()
+    internal static ResumableLinkOptions LinkOptions(string? agent) => new()
     {
         Log = m => Console.Error.WriteLine($"gorynych acp: {m}"),
-        InitializeMeta = new JsonObject { [GorynychProtocol.MetaAgent] = agent },
+        InitializeMeta = agent is null ? null : new JsonObject { [GorynychProtocol.MetaAgent] = agent },
     };
 
     /// <summary>Connects to the service's pipe; when it is missing, starts the service and waits for it.</summary>
@@ -198,6 +199,8 @@ public static class AcpBridge
             $", {(int?)status?["clients"] ?? 0} clients, {(int?)status?["sessions"] ?? 0} sessions");
         if ((string?)status?["dataFolderOpen"] is { } open) Console.WriteLine($"warning: {open}");
         foreach (var row in HostRows(status)) Console.WriteLine("  " + row);
+        foreach (var remote in (status?[GorynychProtocol.StatusRemotes] as JsonArray ?? []).OfType<JsonObject>())
+            Console.WriteLine($"remote {(string?)remote["name"]}: {RemoteState(remote)}");
         if (hosted)
         {
             var stale = (status?["agents"] as JsonArray ?? []).OfType<JsonObject>()
@@ -210,6 +213,44 @@ public static class AcpBridge
                 : $"{waiting} session{(waiting == 1 ? "" : "s")} wait{(waiting == 1 ? "s" : "")} in hosts of an earlier build, each for what is said above");
         }
         return 0;
+    }
+
+    /// <summary>The remotes the service on <paramref name="pipe"/> has, from its <c>_gorynych/status</c>; null when none runs there.</summary>
+    internal static async Task<JsonArray?> RemoteStatesAsync(string pipe)
+    {
+        try
+        {
+            await using var stream = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(1));
+            if (stream is null) return null;
+            await using var rpc = new JsonRpcConnection(stream, stream, "remote list");
+            rpc.Start();
+            await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
+            {
+                ProtocolVersion = AcpMethods.ProtocolVersion,
+                ClientInfo = new Implementation { Name = "gorynych-remote", Version = AgentHost.Version },
+            }).WaitAsync(TimeSpan.FromSeconds(10));
+            var status = await rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject()).WaitAsync(TimeSpan.FromSeconds(10));
+            return status?[GorynychProtocol.StatusRemotes] as JsonArray ?? [];
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonRpcException or TimeoutException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>A remote's state, from its entry in <c>_gorynych/status</c>, in words.</summary>
+    internal static string RemoteState(JsonObject? remote)
+    {
+        if (remote is null) return "the running service does not have it yet: it reads remotes.json again within a few seconds";
+        var since = (string?)remote["since"] is { } at && DateTimeOffset.TryParse(at, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AssumeUniversal, out var time) ? $" since {time.ToLocalTime():yyyy-MM-dd HH:mm:ss}" : "";
+        if (remote["connected"] is JsonValue c && c.TryGetValue<bool>(out var connected) && connected)
+        {
+            var agents = string.Join(", ", (remote["agents"] as JsonArray ?? []).Select(a => (string?)a?["name"]).OfType<string>());
+            return $"connected{since}, service {(string?)remote["serviceId"]}, agents: {(agents.Length == 0 ? "none" : agents)}";
+        }
+        // No error yet: its first connection is on its way.
+        return (string?)remote["lastError"] is { } error ? $"not connected{since}: {error}" : $"connecting{since}";
     }
 
     /// <summary>

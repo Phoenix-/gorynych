@@ -26,6 +26,12 @@ public sealed class ResumableLinkOptions
 
     /// <summary>How long one request of the handshake (<c>initialize</c>, a <c>session/resume</c>) may take.</summary>
     public TimeSpan HandshakeTimeout { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Told <c>false</c> when the connection to the agent is lost and the link begins to connect again,
+    /// and <c>true</c> once it is back with the client's sessions resumed; never for the first connection.
+    /// </summary>
+    public Action<bool>? ConnectionChanged { get; init; }
 }
 
 /// <summary>
@@ -83,6 +89,9 @@ public sealed class ResumableLink
     // not notice the client again of what it shows, and the client is told of a change it missed.
     readonly Dictionary<string, JsonObject> shown = new(StringComparer.Ordinal);
     readonly HashSet<string> promptIds = new(StringComparer.Ordinal);
+    // The IDs the client gave its prompts itself (a hub passes on its own clients'): their marks and text
+    // are the client's to see, so the link resolves its prompts by them but hides none of it.
+    readonly HashSet<string> givenIds = new(StringComparer.Ordinal);
     readonly HashSet<string> resuming = new(StringComparer.Ordinal); // sessions the link's handshake is resuming now
     readonly Dictionary<long, Downstream> downstream = [];
     long nextUpstream;
@@ -185,14 +194,23 @@ public sealed class ResumableLink
         lock (state) tagPrompts = resumable;
         if (method == AcpMethods.Agent.SessionPrompt && tagPrompts && @params is not null)
         {
-            // Its ID tells after a reconnect whether it is still in progress, and marks its end.
-            request.PromptId = $"{tag}-{request.Id}";
+            // Its ID tells after a reconnect whether it is still in progress, and marks its end. A client
+            // that gave it one (a hub, for its own client) keeps it: the marks are then its own too.
             var meta = @params["_meta"] as JsonObject ?? [];
-            meta[GorynychProtocol.MetaPromptId] = request.PromptId;
+            if (Text(meta[GorynychProtocol.MetaPromptId]) is { } given)
+            {
+                request.PromptId = given;
+                lock (state) givenIds.Add(given);
+            }
+            else
+            {
+                request.PromptId = $"{tag}-{request.Id}";
+                meta[GorynychProtocol.MetaPromptId] = request.PromptId;
+                lock (state) promptIds.Add(request.PromptId);
+            }
             @params["_meta"] = meta;
-            lock (state) promptIds.Add(request.PromptId);
         }
-        if (method is AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete && request.SessionId is { } closed)
+        if (method is AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete or GorynychProtocol.MethodDetach && request.SessionId is { } closed)
             lock (state)
             {
                 // Not resumed after a reconnect from now on, whatever the answer.
@@ -538,20 +556,21 @@ public sealed class ResumableLink
                 lock (state) shown[sessionId] = InteractivityOf(meta);
             if (Text(meta?[GorynychProtocol.MetaPromptId]) is { } promptId)
             {
-                bool mine, hide;
+                bool mine, given, hide;
                 lock (state)
                 {
                     mine = promptIds.Contains(promptId);
+                    given = givenIds.Contains(promptId);
                     // Its client has the text already and never gets it live: the link's resume after a
                     // reconnect may replay it, and a prompt held across one may run only now. A load
                     // the client asked for shows it, as any history.
                     hide = mine && (resuming.Contains(sessionId) || upstream.Values.Any(r => r.PromptId == promptId));
                 }
-                // The end of a prompt's turn: the link's own business.
+                // The end of a prompt's turn: the link's own business, or also its client's, which gave the ID.
                 if (Text(meta![GorynychProtocol.MetaAgentTurn]) == "ended")
                 {
-                    if (mine) await PromptEndedAsync(promptId, meta);
-                    return;
+                    if (mine || given) await PromptEndedAsync(promptId, meta);
+                    if (!given) return;
                 }
                 if (hide && Text(update["sessionUpdate"]) == "user_message_chunk") return;
             }
@@ -664,6 +683,7 @@ public sealed class ResumableLink
                 $"The connection to the Gorynych service was lost while {request.Method} was on its way, so it may or may not have been carried out."));
         foreach (var request in over) await AnswerAsync(request, Outcome(request.Ended!));
         Log("lost the connection to the service; connecting again");
+        Tell(false);
         _ = Task.Run(ReconnectAsync);
     }
 
@@ -679,7 +699,7 @@ public sealed class ResumableLink
         AcpMethods.Agent.SessionPrompt => Policy.Hold,
         AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionResume => Policy.Reopen,
         AcpMethods.Agent.Initialize or AcpMethods.Agent.Authenticate or AcpMethods.Agent.Logout or AcpMethods.Agent.SessionList
-            or AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete or AcpMethods.Agent.SessionSetMode
+            or AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete or GorynychProtocol.MethodDetach or AcpMethods.Agent.SessionSetMode
             or AcpMethods.Agent.SessionSetConfigOption or "session/set_model" or GorynychProtocol.MethodStatus
             or GorynychProtocol.MethodRead or GorynychProtocol.MethodPeers or GorynychProtocol.MethodArchive => Policy.Again,
         _ => Policy.Fail,
@@ -703,6 +723,7 @@ public sealed class ResumableLink
                 var resumed = await HandshakeAsync(connection);
                 await FlushAsync(connection);
                 Log($"connected again; {resumed} session{(resumed == 1 ? "" : "s")} resumed");
+                Tell(true);
                 return;
             }
             catch (OperationCanceledException) when (stopping.IsCancellationRequested)
@@ -731,6 +752,12 @@ public sealed class ResumableLink
     }
 
     sealed class NotResumableException(string message) : Exception(message);
+
+    void Tell(bool connected)
+    {
+        try { options.ConnectionChanged?.Invoke(connected); }
+        catch (Exception e) { Log($"the link's listener failed: {e.Message}"); }
+    }
 
     /// <summary>Introduces the link to the agent that came back as its client did, and resumes the client's sessions there.</summary>
     async Task<int> HandshakeAsync(Connection connection)

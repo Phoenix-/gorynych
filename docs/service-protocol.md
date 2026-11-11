@@ -100,7 +100,9 @@ the TUI it is the same as `decline`.
 The same executable is
 also the `gorynych` MCP server agents start over stdio:
 `peers [--pipe … --token …] [--channel-url … | --reply-url …]` (see Opinions below), the stdio bridge
-for external ACP clients: `acp --agent claude|kimi|codex|dsh` (see [external-clients.md](external-clients.md)),
+for external ACP clients: `acp [--agent claude|kimi|codex|dsh|<agent>@<machine>]` (see [external-clients.md](external-clients.md);
+without `--agent` it scopes nothing, as a hub's link to another machine is), `remote add|remove|list`, the services of other
+machines this one shows ([Remotes](#remotes)),
 `shutdown [--pipe …]`, which sends the running service `_gorynych/shutdown` and waits up
 to 30 seconds for its process to end (exit code 0; 1 when no service runs on the pipe; 2 when
 it still runs), `restart [--pipe …] [--timeout <minutes>] [--no-wait] [--force]`, which sends
@@ -213,7 +215,11 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | Name | Where | Meaning |
 | --- | --- | --- |
 | `gorynych/agent` | `session/new` params, `SessionInfo._meta`, `session/new` result | the adapter that owns the session |
-| `gorynych/agent` | `initialize` params `_meta` | scopes the connection to one adapter: its default for `session/new` and the only one in `session/list` (the stdio bridge sets it for plain clients) |
+| `gorynych/agent` | `initialize` params `_meta` | scopes the connection to one adapter: its default for `session/new` and the only one in `session/list` (the stdio bridge sets it for plain clients); a remote one as `claude@R-PC-167` ([Remotes](#remotes)) |
+| `gorynych/hub` | `initialize` params `_meta` | `true` from a hub: the service answers it with its own sessions and agents only, and tells it no change of its remotes' sessions (one hop, [Remotes](#remotes)) |
+| `gorynych/machine` | `SessionInfo._meta`; the `_meta` of `session/new`, `session/load` and `session/resume` answers, of a `session_info_update` and of `_gorynych/sessions_changed` | the machine of a remote session, as the hub names it ([Remotes](#remotes)); a hub never lists one that carries it from its own remote |
+| `gorynych/detach` | the service's `agentCapabilities._meta` | `true`: it takes `_gorynych/detach` |
+| `_gorynych/detach` | method, `{sessionId}` → `{}` | the client lets the session go as its going away would, cancelling nothing, unlike `session/close`; a hub sends it when its last client of a remote session went without closing it |
 | `gorynych/serviceId` | `initialize` result `_meta` | the service's persistent ID; a GUI keys sessions as service/session |
 | `gorynych/agents` | `initialize` result `_meta` | the adapters this service offers (`name`, `displayName`) |
 | `gorynych/sessionsChanged` | `initialize` result `agentCapabilities._meta` (deprecated: also the result's `_meta`, for one release) | `true`: the service sends `_gorynych/sessions_changed` |
@@ -252,7 +258,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/open_elsewhere` | method, service → adapter, `{sessionIds}` → `{sessions: {"<id>": "<holder>"}}` | which of these sessions another app has open now, the held ones only; for the lists agents see |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
-| `_gorynych/status` | method | service ID, process, data folder, `dataFolderOpen` (why the data folder, or an item in it, could not be closed to other accounts at this start; null when it is closed), clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
+| `_gorynych/status` | method | service ID, process, data folder, `remotes` ([Remotes](#remotes)), `dataFolderOpen` (why the data folder, or an item in it, could not be closed to other accounts at this start; null when it is closed), clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/restart` | method, `{wait?, timeoutSeconds?, force?}` → `{restarted: true, processId, waitedSeconds, cancelledTurns}` or `{restarted: false, processId, waitedSeconds, running: [{sessionId, agent, title}]}`; with hosts always `{restarted: true, processId, waitedSeconds, cancelledTurns: 0, turnsInHosts}` | asks the service to exit for an update without breaking its clients' work; without hosts, called off when turns outlast the wait, unless `force` ([The resumable link](#the-resumable-link)); with hosts, it waits for no turn ([Adapter hosts](#adapter-hosts)) |
 | `_gorynych/restarting` | notification to clients, `{restart}` | the service has begun restart number `restart`: a client on the link holds its new prompts |
@@ -265,8 +271,8 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/set_title` | method, service → adapter, `{sessionId, title}` → `{}` | writes a session's native title; only for an adapter that advertises `gorynych/setTitle` (Codex), for a `spawn_session` name |
 | `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?, _meta}` → `{}` | tells a session's agent something that needs no answer (a child's report), with `gorynych/sender` and `gorynych/fromSessionId` in `_meta` for the user message the agent reports for it; the Claude adapter writes it into a running Claude (headless) or pushes it through the channel (TUI), an agent that answers method not found, or `-32600` because it is not running, gets it as a turn |
 | `_gorynych/mcp_message` | method, outside server → service, `{serverId, requestId, method, params}` → `{result}` or `{error}`; as a notification from the service, a notification of that request | an MCP request of `gorynych-outside`, in the shape of `mcp/message` from ACP's MCP-over-ACP RFD (see [`_gorynych/mcp_message`](#agents-outside-gorynych)) |
-| `_gorynych/read` | method, `{sessionId, cursor?, limit?, thoughts?}` → `{updates, nextCursor?, total, inProgress, trimmed}` | a page of a session's history from the journal (see [Reading a session](#reading-a-session)) |
-| `_gorynych/sessions_changed` | notification to clients, `{sessionId, change}`; from an adapter that advertises `gorynych/sessionsChanged`, `updated` only | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
+| `_gorynych/read` | method, `{sessionId, cursor?, limit?, thoughts?, budget?}` → `{updates, nextCursor?, total, first, count, inProgress, trimmed}` | a page of a session's history from the journal (see [Reading a session](#reading-a-session)) |
+| `_gorynych/sessions_changed` | notification to clients, `{sessionId, change, _meta: {"gorynych/agent", "gorynych/machine"?}}`; from an adapter that advertises `gorynych/sessionsChanged`, `updated` only | a session was `added` to, `updated` in or `removed` from the lists (see [List changes](#list-changes)) |
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply`, `_gorynych/spawn` and `_gorynych/archive` | which session's `gorynych` MCP server is calling |
 | `_gorynych/host_hello` | notification, host → conductor, the first message on the host pipe, `{token, hostId, adapter, link, pid, version, slot?, build?, options?}` | an [adapter host](#adapter-hosts) proves itself and says what it runs: which host of its adapter it is (`slot`), and its generation (`build`, `options`; [Updating adapters](#updating-adapters)) |
 | `gorynych/host` | `initialize` result `_meta`, host → conductor | `{hostId, link, reattached}`: the host, its link version, and whether it answers from its agent's first `initialize` (it came back) |
@@ -1205,8 +1211,8 @@ named `another Codex app`).
 A session may be one a client can watch but not prompt: *read-only*. Why is the agent's to say;
 the flag, its reason, what the client is told and what a prompt meets are the conductor's, the same
 for any reason and any agent. The first reason is a Codex thread another Codex app holds
-([Sessions open in another app](#sessions-open-in-another-app)); the hub will add a session whose
-machine cannot be reached.
+([Sessions open in another app](#sessions-open-in-another-app)); the second, a session of a
+remote machine the hub cannot reach ([Remotes](#remotes)).
 
 **What the client gets.** `_meta["gorynych/interactivity"]`, `"full"` or `"read-only"` (absent
 means `"full"`, as AHP's `ChatInteractivity`), and with `"read-only"` its reason for a person,
@@ -1992,6 +1998,128 @@ reason: a turn runs, the agent asks something, a draft its agent cannot open els
 failed). `Gorynych.Service status` prints them, a line per waiting session, and whether anything
 still waits; `restart` prints the hosts that keep running. The executable an update renamed aside
 (`Gorynych.Service.*.old.exe`) is free once `status` says nothing waits.
+
+## Remotes
+
+A service may show the services of other machines as its own agents: it is then their *hub*
+([design.md](design.md#several-machines)). To each remote service the hub is one more client.
+The remote's sessions, journals and approvals stay there, and the hub keeps no copy: it routes
+requests to the remote, and passes the remote's updates on to its own clients.
+
+**Configuration.** `remotes.json` in the data folder:
+`{"remotes": [{"name", "command", "args", "env": [{"name", "value"}]}]}`, an entry in the shape of
+ACP's `McpServerStdio`.
+- `name` is the machine's label. It follows the `@` of its agents' names (`claude@R-PC-167`), so
+  it has 1 to 64 letters, digits, `-`, `_` and `.`, starts with a letter or a digit, and has no
+  `@`. Two entries differ in more than case.
+- The command reaches the bridge on that machine, unscoped: `ssh -T -o BatchMode=yes <host>
+  Gorynych.Service.exe acp`. It runs with no shell, as given.
+- `remote add <name> [--data …] -- <command> [args]`, `remote remove <name> [--data …]` and
+  `remote list [--pipe …] [--data …]` change and show the file. `add` replaces an entry of the same
+  name. `list` asks the running service on the pipe whether each remote is connected, since when,
+  its service ID and agents, or why not.
+- A running service reads the file again every 2 seconds. A new entry connects, a removed one is
+  let go, and a changed one starts again. A file it cannot read is logged, and the remotes stay as
+  they were.
+
+**The connection** to each remote is always on.
+- It starts with the service, and again after a drop, after 2, 5, 15 and 30 seconds, then 1, 2 and
+  5 minutes, the last repeating. The command's stderr is logged, and its last line is the reason
+  `status` shows.
+- It is the [resumable link](#the-resumable-link) toward the remote, as the bridge's toward its
+  service, which never gives up. After a drop it resumes the remote sessions the hub has open
+  after the last update it took. The prompts on their way stay open, and are answered as the
+  marks of their ends say.
+- The hub keeps the prompt IDs of its clients' prompts as they are (`gorynych/promptId`), and
+  passes the marks of their ends on. So a client on the link (the bridge) that resumes a remote
+  session after a restart of the hub finds how its prompt ended, as after a restart of the remote.
+- The hub's `initialize` says `_meta["gorynych/hub"]: true`, with forms and notices in its client
+  capabilities: it relays both, and translates a form for a client without them.
+- A remote that answers with this service's own `gorynych/serviceId` is refused, and not tried
+  again until `remotes.json` changes.
+- `_gorynych/status` lists the remotes: `remotes: [{name, command, connected, since, lastError,
+  serviceId, agents, openSessions}]`. `status` prints a line for each.
+
+**Names.**
+- A remote's agents are this service's agents `<agent>@<machine>`, in `gorynych/agents` once it
+  answered. A connection scoped to one (`acp --agent claude@R-PC-167`) creates its sessions there
+  and lists only those. A scope on a configured machine is taken while it is unreachable too: the
+  list is then empty, and a new session fails at once.
+- Session IDs stay the remote's own. A remote session carries `gorynych/machine` in its
+  `SessionInfo._meta`, in the `_meta` of the answers to `session/new`, `session/load` and
+  `session/resume`, in its `session_info_update`s and in `_gorynych/sessions_changed`.
+- The hub routes by a table of sessions and their machines, filled from the remotes' lists and from
+  `session/new`. A session it does not know (after its own restart, say) is looked for in the
+  connected remotes' lists, archived ones included.
+- A remote session with the ID of a local one, or of another remote's, is left out and logged:
+  the local one, or the first, keeps it.
+
+**One hop.**
+- A hub shows only what a remote has itself. It drops a `SessionInfo` that carries
+  `gorynych/machine` (one the remote shows from its own remotes), an agent with `@` in the remote's
+  `gorynych/agents`, and a `sessions_changed` that carries `gorynych/machine`.
+- A service answers a hub (`gorynych/hub`) with its own sessions and agents only, and tells it no
+  change of its remotes' sessions. So two services that list each other ask nothing of each other
+  in turn, and show each session once.
+
+**The list.** Every connected remote is asked for all its pages (bounded to 30 seconds), and its
+own sessions are merged with the local ones, sorted by `updatedAt` and paged with the service's own
+cursor, as one list. The request's `cwd` and `gorynych/includeArchived` go on to the remotes. A
+remote that cannot be reached adds nothing: the hub keeps no copy of its list.
+
+**Attached only while open.**
+- The hub opens a remote session there only while one of its own clients has it open: by
+  `session/new`, `session/load` or `session/resume`, each passed on with its `_meta` (a client's
+  `gorynych/replayFrom` too). A client's `mcpServers` are not, since they run on the client's
+  machine.
+- When the last of them lets go, so does the hub. After a `session/close`, it sends
+  `session/close` there, whose ACP meaning is to cancel the session's work: as a local close, it
+  cancels a client's turn only if no other client there has the session. After a client went
+  without one, it sends `_gorynych/detach`, which cancels nothing, as a local session's client that
+  goes cancels nothing.
+- A remote that does not announce `gorynych/detach` (an older one) keeps the hub attached instead:
+  a close would cancel the person's turn there.
+- So a hub nobody sits at takes no approval there.
+
+**Several clients, one connection.** Updates go to the hub's clients that have the session open, as
+they come, untouched: positions (`gorynych/position`), prompt IDs and marks.
+- Each client gets an update with a position once, only past the last it has. A second client's
+  `session/load` replays the history on the hub's one connection, and only that client takes it.
+- An update without a position (the list of commands, an interactivity change) goes to all of them;
+  a `notice` goes only to those that show notices.
+- A client that creates a session gets its updates after the answer to its `session/new`, as from
+  a local one.
+- A question of the remote's agent (an approval, a form) goes to the client that attached last. It
+  is translated for a client without forms. While no client has the session open it waits for one,
+  and the remote withdraws it when the hub lets the session go.
+
+**An unreachable machine.**
+- Its sessions are left out of every list.
+- A direct operation on one fails at once with `-32600`, "`<machine>` is not connected
+  (`<why>`)": a prompt, a change of settings, a new session on its agents, a load.
+- A `session/cancel` waits for the connection, as the link holds it.
+- A session a client has open becomes read-only, with that reason ([Read-only
+  sessions](#read-only-sessions)): a `session_info_update` with `gorynych/interactivity:
+  "read-only"`, `gorynych/machine`, and a notice for a client that shows notices.
+- When the connection is back, the hub resumes the session after its last update. What came
+  meanwhile reaches each client that lacks it, and then the remote's own state (full, or its own
+  read-only) with "You can write here again".
+- A remote removed from `remotes.json` leaves its open sessions read-only so.
+
+**Passed through as they are.** Title and archive (`_gorynych/archive`, to a remote that announces
+`gorynych/archive`) are the remote's, as are `session/set_mode`, `session/set_config_option`,
+`session/delete` and `_gorynych/read`. A read-only flag from the remote (a Codex thread held there)
+reaches the clients unchanged. The outside server's `list_sessions` shows the remotes' sessions
+with their `machine`, and `read_session` reads them through the remote's `_gorynych/read`.
+
+**Not yet** (step 7): `ask_agent` and `spawn_session` across machines. Asking a remote session, or
+starting a session on a remote agent from a session, is refused with `-32600`: it "is on another
+machine, and asking or starting a session on another machine is not supported yet (step 7 of
+Gorynych's plan)". Updating a remote machine from the hub is later.
+
+**Not in an adapter host.** A remote is not an adapter: it has no journal here, so a restart of the
+hub drops the ssh connection, and the next service makes a new one. The bridges of its clients then
+resume their remote sessions after their positions through it, as they do after any restart.
 
 ## Overlay
 
