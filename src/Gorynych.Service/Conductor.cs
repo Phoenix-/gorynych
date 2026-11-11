@@ -37,6 +37,13 @@ public sealed class ConductorOptions
     public TimeSpan OutsideProgressInterval { get; init; } = TimeSpan.FromSeconds(60);
 
     /// <summary>
+    /// After a restart, how long an asker that comes back for an answer (<c>gorynych/reclaim</c>), or a
+    /// reply to a question an earlier service asked, waits for the host answering it to come back:
+    /// hosts dial the next service within a second or two of its start.
+    /// </summary>
+    public TimeSpan ReclaimWait { get; init; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
     /// How long a session stays loaded in its agent once it is idle (no turn running, no operation
     /// registered) with no client attached; then it is closed there. Zero closes it at once.
     /// </summary>
@@ -110,6 +117,9 @@ public sealed class Conductor : IAsyncDisposable
     readonly ConcurrentDictionary<string, string> peerTokens = new(StringComparer.Ordinal);   // token -> session
     readonly ConcurrentDictionary<string, string> sessionTokens = new(StringComparer.Ordinal); // session -> token
     readonly ConcurrentDictionary<string, PendingOpinion> pendingOpinions = new(StringComparer.Ordinal); // message_id -> request
+    readonly ConcurrentDictionary<string, byte> asking = new(StringComparer.Ordinal); // the askIds of the questions this service asks now
+    readonly ConcurrentDictionary<string, Reclaim> reclaims = new(StringComparer.Ordinal); // askId -> a question an earlier service asked
+    readonly System.Diagnostics.Stopwatch sinceStart = System.Diagnostics.Stopwatch.StartNew();
     readonly ConcurrentDictionary<string, byte> removed = new(StringComparer.Ordinal); // deleted in this run
     readonly List<string> startupDrafts;
     readonly ConcurrentDictionary<Task, byte> cleanups = new();
@@ -235,6 +245,10 @@ public sealed class Conductor : IAsyncDisposable
     /// </summary>
     internal async Task AdoptAsync(AgentHost host, HostLink link, JsonObject report, CancellationToken ct)
     {
+        // The questions it is answering for an earlier service: their askers come back for the answers.
+        foreach (var ask in (report["asks"] as JsonArray ?? []).OfType<JsonObject>())
+            if ((string?)ask["askId"] is { } askId && (string?)ask["sessionId"] is { } asked && !removed.ContainsKey(asked) && !asking.ContainsKey(askId))
+                AdoptAsk(host, askId, asked, (string?)ask["opinion"]);
         foreach (var turn in (report["turns"] as JsonArray ?? []).OfType<JsonObject>())
         {
             if ((string?)turn["sessionId"] is not { } sessionId || removed.ContainsKey(sessionId)) continue;
@@ -699,6 +713,7 @@ public sealed class Conductor : IAsyncDisposable
         Exception? failure = report["error"] is JsonObject error
             ? new JsonRpcException(error["code"] is JsonValue c && c.TryGetValue<int>(out var code) ? code : JsonRpcException.InternalError, (string?)error["message"] ?? "the prompt failed")
             : null;
+        if ((string?)report["askId"] is { } askId && !asking.ContainsKey(askId)) EndAskTurn(askId, feed, (string?)report["opinion"], failure);
         KeepMark(feed, result);
         if (promptId is not null) await MarkPromptEndAsync(feed, promptId, result, failure, hostSeq); // its answer, if it comes here, marks it no more
         long? hostTurn = report["turn"] is JsonValue t && t.TryGetValue<long>(out var number) ? number : null;
@@ -958,6 +973,11 @@ public sealed class Conductor : IAsyncDisposable
         if (method == GorynychProtocol.MethodTurnEnded)
         {
             if (@params is JsonObject report) await OnTurnEndedAsync(host, report);
+            return;
+        }
+        if (method == GorynychProtocol.MethodAskAnswered)
+        {
+            if (@params is JsonObject report) OnAskAnswered(report);
             return;
         }
         var sessionId = (string?)@params?["sessionId"];
@@ -3359,6 +3379,9 @@ public sealed class Conductor : IAsyncDisposable
                     $"\"{target}\" is this session's own session_id; ask_agent asks another session." + AskableHint(from));
             sender = $"peer_{store.Get(from)?.Agent ?? "agent"}";
         }
+        var askId = (string?)request.Params?["_meta"]?[GorynychProtocol.MetaAskId];
+        if (askId is not null && request.Params?["_meta"]?[GorynychProtocol.MetaReclaim] is JsonValue r && r.TryGetValue<bool>(out var reclaim) && reclaim)
+            return await ReclaimAsync(askId, target, ct);
         if (from is not null && Feed(from).CurrentOpinion is { } answering)
             throw new JsonRpcException(JsonRpcException.InvalidRequest,
                 $"This session is answering opinion request {answering}, so it cannot ask another session during this turn. " +
@@ -3366,7 +3389,7 @@ public sealed class Conductor : IAsyncDisposable
         // The asked agent sees who asks by the asking session's real ID, which it can pass to ask_agent;
         // sender (peer_claude) is only a label for GUIs.
         var origin = from is not null && store.Get(from) is { } asking ? $"from {Who(asking)}" : $"from {sender ?? "a Gorynych client"}";
-        return await AskAsync(target, text, new Asker(from, sender ?? "peer_agent", origin, Outside: null), onState: null, ct);
+        return await AskAsync(target, text, new Asker(from, sender ?? "peer_agent", origin, Outside: null, askId), onState: null, ct);
     }
 
     /// <summary>
@@ -3374,7 +3397,9 @@ public sealed class Conductor : IAsyncDisposable
     /// outside Gorynych (<see cref="Outside"/>, the host object of <c>_gorynych/mcp_message</c>), or
     /// a client. <see cref="Origin"/> is how the request's first line names the asker.
     /// </summary>
-    internal sealed record Asker(string? From, string Sender, string Origin, JsonObject? Outside)
+    /// <param name="AskId">The asker's own name for the question (<c>gorynych/askId</c>), passed on to the host, by which the asker
+    /// takes the answer from the next service should this one restart meanwhile.</param>
+    internal sealed record Asker(string? From, string Sender, string Origin, JsonObject? Outside, string? AskId = null)
     {
         /// <summary>An agent asks, so errors say how to recover.</summary>
         public bool IsAgent => From is not null || Outside is not null;
@@ -3389,6 +3414,21 @@ public sealed class Conductor : IAsyncDisposable
     internal async Task<JsonNode?> AskAsync(string target, string text, Asker asker, Action<string>? onState, CancellationToken ct)
     {
         if (Draining) throw Restarting();
+        // Asked here: what a host reports of it is this service's own, not one to keep for an asker that comes back.
+        if (asker.AskId is { } askId && !asking.TryAdd(askId, 0))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, $"The question {askId} is being asked already.");
+        try
+        {
+            return await AskOnceAsync(target, text, asker, onState, ct);
+        }
+        finally
+        {
+            if (asker.AskId is { } asked) asking.TryRemove(asked, out _);
+        }
+    }
+
+    async Task<JsonNode?> AskOnceAsync(string target, string text, Asker asker, Action<string>? onState, CancellationToken ct)
+    {
         var use = await UseAskedAsync(target, asker, ct);
         var turnHasUse = false; // an opinion turn releases the use when the turn ends, which may be after the answer
         var unload = false; // the person declined a question into a session this call loaded only for it
@@ -3443,6 +3483,8 @@ public sealed class Conductor : IAsyncDisposable
                 ["_meta"] = AskerMeta(asker), // for the user message the agent reports for it
             };
             if (asker.From is not null) forwarded["fromSessionId"] = asker.From;
+            // For the host, which keeps the answer for the next service if this one goes before it comes.
+            if (asker.AskId is not null) forwarded["askId"] = asker.AskId;
             // A live-note path answers at once when its agent cannot take the request, so it counts
             // as asked only after a moment.
             using var askedLater = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -3651,11 +3693,14 @@ public sealed class Conductor : IAsyncDisposable
                 await feed.ForwardGate.WaitAsync(CancellationToken.None);
                 try
                 {
+                    var promptMeta = meta.DeepClone().AsObject();
+                    // For the host, as on the live-note path; not journaled with the request.
+                    if (asker.AskId is not null) promptMeta[GorynychProtocol.MetaAskId] = asker.AskId;
                     response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, WithMessageId(AcpJson.ToNode(new PromptRequest
                     {
                         SessionId = record.SessionId,
                         Prompt = [new TextContent { Text = text }],
-                        Meta = meta.DeepClone().AsObject(),
+                        Meta = promptMeta,
                     }), askedId), CancellationToken.None);
                 }
                 finally
@@ -3723,17 +3768,188 @@ public sealed class Conductor : IAsyncDisposable
         "tool search to load reply, and do not edit files or take any other action for this request. If reply is not found " +
         "yet, search again: the gorynych server may still be connecting.";
 
-    /// <summary><c>_gorynych/reply</c>: the asked session answers an opinion request it got as a turn.</summary>
-    internal JsonObject Reply(JsonRpcRequest request)
+    /// <summary>
+    /// <c>_gorynych/reply</c>: the asked session answers an opinion request it got as a turn. A request an
+    /// earlier service asked (its <c>message_id</c> is not of this run) is waited for a while: its host
+    /// may not have come back yet with the questions it is answering (<see cref="AdoptAsk"/>).
+    /// </summary>
+    internal async Task<JsonObject> ReplyAsync(JsonRpcRequest request, CancellationToken ct)
     {
         var token = (string?)request.Params?["_meta"]?[GorynychProtocol.MetaPeerToken];
         if (token is null || !peerTokens.TryGetValue(token, out var sessionId))
             throw new JsonRpcException(JsonRpcException.InvalidRequest, "Unknown peer token");
         var messageId = (string?)request.Params?["messageId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "messageId is required");
         var text = (string?)request.Params?["text"] ?? "";
-        var delivered = pendingOpinions.TryGetValue(messageId, out var pending) && pending.SessionId == sessionId && pending.Reply.TrySetResult(text);
+        PendingOpinion? pending;
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (!pendingOpinions.TryGetValue(messageId, out pending) && IsEarlierRunsOpinion(messageId) && HostsMayComeBack && waited.Elapsed < options.ReclaimWait)
+            await Task.Delay(50, ct);
+        var delivered = pending is not null && pending.SessionId == sessionId && pending.Reply.TrySetResult(text);
         return new JsonObject { ["delivered"] = delivered };
     }
+
+    // ---------------------------------------------------------------- questions across a restart
+
+    /// <summary>For how long after its start the service waits for hosts to come back with the questions they answer.</summary>
+    internal static TimeSpan HostsComeBack { get; set; } = TimeSpan.FromMinutes(1);
+
+    bool HostsMayComeBack => sinceStart.Elapsed < HostsComeBack;
+
+    /// <summary>An opinion request's <c>message_id</c> (<c>m&lt;run&gt;-&lt;n&gt;</c>) of another run of the service.</summary>
+    bool IsEarlierRunsOpinion(string messageId) =>
+        messageId.Length > 2 && messageId[0] == 'm' && messageId.Contains('-') && !messageId.StartsWith($"m{runTag}-", StringComparison.Ordinal);
+
+    /// <summary>How long an answer no asker came back for is kept.</summary>
+    internal static TimeSpan ReclaimKeep { get; set; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// A question an earlier service asked, which a host is answering or answered: its asker, which
+    /// lost the earlier service, comes back for the answer by its <c>askId</c> (<see cref="ReclaimAsync"/>).
+    /// </summary>
+    sealed class Reclaim(string sessionId)
+    {
+        public string SessionId { get; } = sessionId;
+        public TaskCompletionSource<JsonNode?> Answer { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public long Since { get; } = Environment.TickCount64;
+        public long Answered { get; set; } = long.MaxValue;
+
+        public void Give(JsonNode? answer)
+        {
+            if (Answer.TrySetResult(answer)) Answered = Environment.TickCount64;
+        }
+
+        public void Fail(Exception e)
+        {
+            if (Answer.TrySetException(e)) Answered = Environment.TickCount64;
+        }
+
+        int taken;
+
+        /// <summary>
+        /// The answer goes to the first asker that comes back for it, and to none after: the entry stays,
+        /// taken, until it is swept, so an end its host reports later makes no second answer.
+        /// </summary>
+        public bool TryTake() => Interlocked.Exchange(ref taken, 1) == 0;
+
+        public bool Taken => Volatile.Read(ref taken) == 1;
+    }
+
+    Reclaim ReclaimOf(string askId, string sessionId)
+    {
+        // Answers nobody came back for go after a while; questions never answered, after a day.
+        var now = Environment.TickCount64;
+        foreach (var (key, old) in reclaims)
+            if (now - old.Answered > ReclaimKeep.TotalMilliseconds || now - old.Since > TimeSpan.FromDays(1).TotalMilliseconds)
+                reclaims.TryRemove(new KeyValuePair<string, Reclaim>(key, old));
+        return reclaims.GetOrAdd(askId, _ => new Reclaim(sessionId));
+    }
+
+    /// <summary>
+    /// A question a host that came back is answering for an earlier service. In a turn, its reply is
+    /// awaited under its <c>message_id</c>, and the session is answering it, so it asks no other meanwhile.
+    /// </summary>
+    void AdoptAsk(AgentHost host, string askId, string sessionId, string? opinion)
+    {
+        var reclaim = ReclaimOf(askId, sessionId);
+        if (opinion is not null && !pendingOpinions.ContainsKey(opinion))
+        {
+            var pending = new PendingOpinion(sessionId);
+            pendingOpinions[opinion] = pending;
+            _ = pending.Reply.Task.ContinueWith(t => reclaim.Give(new JsonObject { ["text"] = t.Result }),
+                CancellationToken.None, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
+            var feed = Feed(sessionId);
+            if (feed.CurrentOpinion is null) feed.BeginOpinionTurn(opinion);
+        }
+        ServiceLog.Info($"{host.Name} {sessionId}: took back question {askId} its host is answering{(opinion is null ? "" : $" in a turn ({opinion})")}");
+    }
+
+    /// <summary>
+    /// The end of an opinion turn an earlier service started: its answer is the reply, if one came, else
+    /// the turn's own text, which the journal has (the earlier service journaled what came before).
+    /// </summary>
+    void EndAskTurn(string askId, SessionFeed feed, string? opinion, Exception? failure)
+    {
+        var reclaim = ReclaimOf(askId, feed.SessionId);
+        if (opinion is not null)
+        {
+            pendingOpinions.TryRemove(opinion, out _);
+            if (feed.CurrentOpinion == opinion) feed.EndOpinionTurn();
+        }
+        if (failure is not null) reclaim.Fail(failure);
+        else
+        {
+            var text = opinion is null ? "" : OpinionTurnText(feed, opinion).Trim();
+            reclaim.Give(new JsonObject { ["text"] = text.Length == 0 ? "(no answer)" : text });
+        }
+    }
+
+    /// <summary>The agent's text in the opinion turn of <paramref name="opinion"/>, from the journal.</summary>
+    static string OpinionTurnText(SessionFeed feed, string opinion)
+    {
+        var text = new StringBuilder();
+        var inTurn = false;
+        foreach (var u in feed.Journal.ReadAll().OfType<JsonObject>())
+            switch ((string?)u["sessionUpdate"])
+            {
+                case "user_message_chunk":
+                    var mine = (string?)u["_meta"]?[GorynychProtocol.MetaOpinion] == opinion;
+                    if (mine && !inTurn) text.Clear();
+                    inTurn = mine;
+                    break;
+                case "agent_message_chunk" when inTurn:
+                    text.Append((string?)u["content"]?["text"]);
+                    break;
+            }
+        return text.ToString();
+    }
+
+    /// <summary>A host kept the answer to a question its agent took by its own way in (Claude's channel).</summary>
+    void OnAskAnswered(JsonObject report)
+    {
+        if ((string?)report["sessionId"] is not { } sessionId || (string?)report["askId"] is not { } askId || removed.ContainsKey(sessionId)) return;
+        if ((string?)report["_meta"]?[GorynychProtocol.MetaHostSeq] is { } hostSeq && !Feed(sessionId).TakeFromHost(hostSeq)) return; // taken already
+        if (asking.ContainsKey(askId)) return; // this service's own: its answer comes with the request
+        var reclaim = ReclaimOf(askId, sessionId);
+        if (report["error"] is JsonObject error)
+            reclaim.Fail(new JsonRpcException(error["code"] is JsonValue c && c.TryGetValue<int>(out var code) ? code : JsonRpcException.InternalError,
+                (string?)error["message"] ?? "the question failed"));
+        else reclaim.Give(report["result"]?.DeepClone());
+    }
+
+    /// <summary>
+    /// <c>_gorynych/opinion</c> (or <c>ask_agent</c> of the outside server) with <c>gorynych/reclaim</c>: the
+    /// asker lost the service while its question was answered, and takes the answer from this one, once.
+    /// It never asks the session again. A question no host kept (it went with the service before its
+    /// session got it) fails with <see cref="GorynychProtocol.MetaAskLost"/>.
+    /// </summary>
+    internal async Task<JsonNode?> ReclaimAsync(string askId, string target, CancellationToken ct)
+    {
+        if (Draining) throw Restarting();
+        Reclaim? reclaim;
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (!reclaims.TryGetValue(askId, out reclaim) && HostsMayComeBack && waited.Elapsed < options.ReclaimWait) await Task.Delay(50, ct);
+        if (reclaim is null || reclaim.SessionId != target || reclaim.Taken) throw AskLost(target);
+        ServiceLog.Info($"opinion: an asker came back for question {askId} to {target}");
+        JsonNode? answer;
+        try
+        {
+            answer = await reclaim.Answer.Task.WaitAsync(ct);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            // The agent failed to answer: said once, as the answer would be.
+            if (!reclaim.TryTake()) throw AskLost(target);
+            throw;
+        }
+        // Once: a second asker with the same askId (or the same one again) finds it taken.
+        if (!reclaim.TryTake()) throw AskLost(target);
+        return answer?.DeepClone();
+    }
+
+    static JsonRpcException AskLost(string target) => new(JsonRpcException.InvalidRequest,
+        $"The question to session_id {target} went with the restart of Gorynych before its session got it, so there is no answer to take. " +
+        $"Ask again: ask_agent with session_id {target} and the same question.",
+        new JsonObject { [GorynychProtocol.MetaAskLost] = true });
 
     /// <summary>
     /// The option to choose for a pre-allowed gorynych tool, or null to ask the person. A request that

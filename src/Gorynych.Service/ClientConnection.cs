@@ -126,7 +126,7 @@ internal sealed class ClientConnection
             case GorynychProtocol.MethodPeers:
                 return await conductor.PeersAsync(request, ct);
             case GorynychProtocol.MethodReply:
-                return conductor.Reply(request);
+                return await conductor.ReplyAsync(request, ct);
             case GorynychProtocol.MethodSpawn:
                 return await conductor.SpawnAsync(request, ct);
             case GorynychProtocol.MethodArchive:

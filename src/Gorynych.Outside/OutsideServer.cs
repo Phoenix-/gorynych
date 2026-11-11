@@ -52,9 +52,19 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
                 return OutsideTools.Initialize(@params, version, inside);
         }
         if (inside) return Local(request.Method, @params, inside: true, serviceDown: null);
+        // An ask_agent gets a name of its own: should the service restart while the session answers, the
+        // answer is taken from the next one by it, and the session is not asked again.
+        var askId = request.Method == "tools/call" && (string?)@params?["name"] == "ask_agent" ? Guid.NewGuid().ToString("N") : null;
         try
         {
-            return await ForwardAsync(host, request, @params, ct);
+            try
+            {
+                return await ForwardAsync(host, request, @params, askId, reclaim: false, ct);
+            }
+            catch (ServiceLostException) when (askId is not null)
+            {
+                return await ReclaimAsync(host, request, @params, askId, ct);
+            }
         }
         catch (ServiceUnreachableException e)
         {
@@ -89,7 +99,33 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
         };
     }
 
-    async Task<JsonNode?> ForwardAsync(JsonRpcConnection host, JsonRpcRequest request, JsonObject? @params, CancellationToken ct)
+    /// <summary>
+    /// The service went while the session answered: the answer from the next service, by the question's
+    /// <c>gorynych/askId</c>, once, never the question again; also across one more restart, and while the
+    /// next service is still starting (up to 30 s). A question the next service does not know went with
+    /// the earlier one before its session got it: <see cref="ServiceLostException"/>, so the agent is told
+    /// to ask again.
+    /// </summary>
+    async Task<JsonNode?> ReclaimAsync(JsonRpcConnection host, JsonRpcRequest request, JsonObject? @params, string askId, CancellationToken ct)
+    {
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        for (var lost = 1; ; )
+        {
+            try
+            {
+                return await ForwardAsync(host, request, @params, askId, reclaim: true, ct);
+            }
+            catch (JsonRpcException e) when (e.ErrorData?[GorynychProtocol.MetaAskLost] is not null || e.ErrorData?[GorynychProtocol.MetaRestarting] is not null)
+            {
+                if (e.ErrorData?[GorynychProtocol.MetaAskLost] is not null || waited.Elapsed > TimeSpan.FromSeconds(30)) throw new ServiceLostException(e.Message);
+            }
+            catch (ServiceUnreachableException) when (waited.Elapsed < TimeSpan.FromSeconds(30)) { }
+            catch (ServiceLostException) when (++lost <= 3) { }
+            await Task.Delay(500, ct);
+        }
+    }
+
+    async Task<JsonNode?> ForwardAsync(JsonRpcConnection host, JsonRpcRequest request, JsonObject? @params, string? askId, bool reclaim, CancellationToken ct)
     {
         // The host's id as a string; the answer goes back under the host's own id.
         var requestId = request.Id is JsonValue v && v.TryGetValue<string>(out var text) ? text : request.Id.ToJsonString();
@@ -110,6 +146,8 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
             ["params"] = @params?.DeepClone(),
             ["_meta"] = new JsonObject { [GorynychProtocol.MetaOutside] = HostObject(@params) },
         };
+        if (askId is not null) envelope["_meta"]![GorynychProtocol.MetaAskId] = askId;
+        if (reclaim) envelope["_meta"]![GorynychProtocol.MetaReclaim] = true;
         JsonNode? answer;
         try
         {

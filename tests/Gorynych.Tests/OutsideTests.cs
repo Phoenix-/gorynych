@@ -718,6 +718,57 @@ public sealed class OutsideTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AnAskCutOffByARestart_TakesItsAnswerFromTheNextService_ByItsAskId()
+    {
+        // The first service goes as it is asked (a restart while the asked session answers); the next one has the answer.
+        var pipe = Pipe();
+        var envelopes = new List<JsonObject>();
+        using var stop = new CancellationTokenSource();
+        var serving = Task.Run(async () =>
+        {
+            for (var n = 1; !stop.IsCancellationRequested; n++)
+            {
+                var server = PipeListener.Create(pipe);
+                try { await server.WaitForConnectionAsync(stop.Token); }
+                catch (OperationCanceledException) { await server.DisposeAsync(); break; }
+                var rpc = new JsonRpcConnection(server, server, $"service-{n}");
+                var first = n == 1;
+                rpc.RequestHandler = async (req, ct) =>
+                {
+                    if (req.Method == AcpMethods.Agent.Initialize) return new JsonObject { ["protocolVersion"] = 1, ["agentCapabilities"] = new JsonObject() };
+                    lock (envelopes) envelopes.Add(((JsonObject)req.Params!).DeepClone().AsObject());
+                    if (!first) return new JsonObject { ["result"] = OutsideTools.ToolResult("SQLite, for one user.", isError: false, modern: true) };
+                    _ = Task.Run(() => rpc.DisposeAsync().AsTask());
+                    await Task.Delay(Timeout.Infinite, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30));
+                    return null;
+                };
+                rpc.Start();
+            }
+        });
+        try
+        {
+            await using var shim = new Shim(pipe);
+            var answer = await shim.Host.SendRequestAsync("tools/call", ModernCall("ask_agent", new JsonObject { ["session_id"] = "s-42", ["question"] = "SQLite?" }));
+            Assert.AreEqual(false, (bool?)answer!["isError"]);
+            Assert.AreEqual("SQLite, for one user.", (string?)answer["content"]![0]!["text"]);
+            JsonObject[] seen;
+            lock (envelopes) seen = [.. envelopes];
+            Assert.HasCount(2, seen, "asked once, then came back for the answer once");
+            var askId = (string?)seen[0]["_meta"]![GorynychProtocol.MetaAskId];
+            Assert.IsFalse(string.IsNullOrEmpty(askId));
+            Assert.IsNull(seen[0]["_meta"]![GorynychProtocol.MetaReclaim]);
+            Assert.AreEqual(askId, (string?)seen[1]["_meta"]![GorynychProtocol.MetaAskId], "the same question");
+            Assert.AreEqual(true, (bool?)seen[1]["_meta"]![GorynychProtocol.MetaReclaim], "its answer, not the question again");
+        }
+        finally
+        {
+            stop.Cancel();
+            await serving.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
     public async Task AnAskCutOffByARestart_SaysToAskAgain_WithTheSession()
     {
         // A service that goes as it is asked, as one that restarts while the asked session answers.

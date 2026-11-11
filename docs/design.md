@@ -605,8 +605,11 @@ themselves, is **done** on 10 November 2026 as well
   - The next conductor takes the running turns back: they hold their sessions, so a new prompt
     waits for them, and a resuming bridge is told they run.
   - A restart waits for no turn. A prompt waiting behind a running turn is refused and goes to the
-    next service. What still lives in the conductor is cut: an `ask_agent` waiting for its answer
-    gets an error that says to ask again, with the session ID.
+    next service. An `ask_agent` the asked agent is answering goes on in its host, and the asker
+    takes the answer from the next service by its own name for the question (`gorynych/askId`),
+    once, without the agent being asked again. What still lives only in the conductor is cut: a
+    question that had not reached the asked agent gets an error that says to ask again, with the
+    session ID.
 - How many hosts depends on the agent:
   - Claude runs a process per session, so it gets a host per session (3b), and one more for what
     no session has open, such as the list.
@@ -708,8 +711,8 @@ last acknowledged one, and send the pending requests again. So it is built once.
 - **A host that dies** ends its turns `cancelled`, with their marks, and the next request starts
   another.
 - **The peers server inside an agent** connects for each call, and waits up to 30 seconds for a
-  service that restarts. An `ask_agent` that was waiting during the restart returns an error
-  that says to ask again.
+  service that restarts. An `ask_agent` that was waiting during the restart comes back for its
+  answer; only one whose question went with the service returns an error that says to ask again.
 - **Job objects.** Hosts are detached from the service's process, as `DetachedProcess` already
   does for the service.
 - **Platforms.** Hosts are on by default on Windows only, where they are tested; on Linux and
