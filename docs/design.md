@@ -607,7 +607,9 @@ themselves, is **done** on 10 November 2026 as well
   - A restart waits for no turn. A prompt waiting behind a running turn is refused and goes to the
     next service. An `ask_agent` the asked agent is answering goes on in its host, and the asker
     takes the answer from the next service by its own name for the question (`gorynych/askId`),
-    once, without the agent being asked again. What still lives only in the conductor is cut: a
+    once, without the agent being asked again; so does an asker whose link to the service dropped
+    with no restart, and a session's answer goes only to the session that asked. What still lives
+    only in the conductor is cut: a
     question that had not reached the asked agent gets an error that says to ask again, with the
     session ID.
 - How many hosts depends on the agent:

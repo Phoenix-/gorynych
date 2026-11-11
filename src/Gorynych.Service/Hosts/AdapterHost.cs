@@ -188,6 +188,7 @@ public sealed class AdapterHost
                     if (request.PromptId is { } promptId) report["promptId"] = promptId;
                     if (request.AskId is { } askId) report["askId"] = askId;
                     if (request.Opinion is { } opinion) report["opinion"] = opinion;
+                    if (request.AskId is not null && request.From is { } from) report["from"] = from;
                     if (message["result"] is { } r) report["result"] = r.DeepClone();
                     if (message["error"] is { } e) report["error"] = e.DeepClone();
                     ended = Number(Notification(GorynychProtocol.MethodTurnEnded, report));
@@ -197,6 +198,7 @@ public sealed class AdapterHost
                 else if (request.Method == GorynychProtocol.MethodOpinion && request.AskId is { } askId && request.SessionId is { } asked)
                 {
                     var report = new JsonObject { ["sessionId"] = asked, ["askId"] = askId };
+                    if (request.From is { } from) report["from"] = from;
                     if (message["result"] is { } r) report["result"] = r.DeepClone();
                     if (message["error"] is { } e) report["error"] = e.DeepClone();
                     ended = Number(Notification(GorynychProtocol.MethodAskAnswered, report));
@@ -594,6 +596,7 @@ public sealed class AdapterHost
                 PromptId = Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]),
                 AskId = Text(@params?["_meta"]?[GorynychProtocol.MetaAskId]) ?? Text(@params?["askId"]), // a prompt's _meta; _gorynych/opinion's params
                 Opinion = Text(@params?["_meta"]?[GorynychProtocol.MetaOpinion]),
+                From = Text(@params?["_meta"]?[GorynychProtocol.MetaFromSessionId]),
             };
         }
         message["id"] = key;
@@ -611,7 +614,7 @@ public sealed class AdapterHost
                 // The questions the agent is answering, by turn or by its own way in: the next conductor waits for their answers.
                 ["asks"] = new JsonArray(forwarded.Values.Where(f => f.AskId is not null && f.SessionId is not null
                         && f.Method is AcpMethods.Agent.SessionPrompt or GorynychProtocol.MethodOpinion)
-                    .Select(f => (JsonNode)new JsonObject { ["sessionId"] = f.SessionId, ["askId"] = f.AskId, ["opinion"] = f.Opinion }).ToArray()),
+                    .Select(f => (JsonNode)new JsonObject { ["sessionId"] = f.SessionId, ["askId"] = f.AskId, ["opinion"] = f.Opinion, ["from"] = f.From }).ToArray()),
                 ["buffered"] = new JsonArray(buffer.Select(b => b.SessionId).Distinct(StringComparer.Ordinal).Select(s => (JsonNode)s).ToArray()),
                 ["requests"] = asked.Count,
                 ["seq"] = seq,
@@ -779,6 +782,9 @@ public sealed class AdapterHost
 
         /// <summary>For an opinion asked in a turn: its <c>message_id</c> (<c>gorynych/opinion</c>), which the agent's reply names.</summary>
         public string? Opinion { get; init; }
+
+        /// <summary>For an opinion: the session that asks (<c>gorynych/fromSessionId</c>), which alone takes the answer from the next service.</summary>
+        public string? From { get; init; }
     }
 
     /// <summary>A question of the agent's no conductor has answered yet.</summary>

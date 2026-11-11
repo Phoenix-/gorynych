@@ -239,7 +239,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/fromSessionId` | `user_message_chunk._meta` of an opinion request or a report delivered as a turn | the session that asked, or the child that reports |
 | `gorynych/opinion` | `_meta` of the request message and of every update of its turn | the request's `message_id`, so a GUI can show the exchange apart from the user's own turns |
 | `gorynych/askId` | `_meta` of `_gorynych/opinion` (peers server) and of `_gorynych/mcp_message` for `ask_agent` (outside server); toward a host, `askId` in `_gorynych/opinion`'s params or the opinion turn's `session/prompt` `_meta` | the asker's random name for a question, by which it takes the answer from the next service after a restart ([Questions across a restart](#questions-across-a-restart)) |
-| `gorynych/reclaim` | next to `gorynych/askId` | `true`: the answer to that question, not the question again; a question the service does not know fails with `data: {"gorynych/askLost": true}` |
+| `gorynych/reclaim` | next to `gorynych/askId` | `true`: the answer to that question, not the question again; a question the service does not know, or that another session asked, fails with `data: {"gorynych/askLost": true}`; one still being answered is waited for |
 | `gorynych/messageId` | `session/prompt` params `_meta`, service → adapter | the `messageId` the service journals the prompt's text under, for a harness that keeps it with the message (Codex) |
 | `gorynych/setTitle` | an adapter's `agentCapabilities._meta` | `true`: the adapter takes `_gorynych/set_title {sessionId, title}` → `{}`, and the service writes a `spawn_session` name natively ([Child sessions](#child-sessions)) |
 | `gorynych/unloadAfter` | an adapter's `agentCapabilities._meta` | seconds: its sessions' idle time when shorter than `--unload-after` ([Unloading idle sessions](#unloading-idle-sessions)); read as at most a day |
@@ -268,11 +268,11 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply`, `_gorynych/spawn` and `_gorynych/archive` | which session's `gorynych` MCP server is calling |
 | `_gorynych/host_hello` | notification, host → conductor, the first message on the host pipe, `{token, hostId, adapter, link, pid, version, slot?, build?, options?}` | an [adapter host](#adapter-hosts) proves itself and says what it runs: which host of its adapter it is (`slot`), and its generation (`build`, `options`; [Updating adapters](#updating-adapters)) |
 | `gorynych/host` | `initialize` result `_meta`, host → conductor | `{hostId, link, reattached}`: the host, its link version, and whether it answers from its agent's first `initialize` (it came back) |
-| `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, turns: [{sessionId, turn, promptId?}], asks: [{sessionId, askId, opinion?}], buffered, requests, seq}` | what a host that came back has: open sessions, running prompts, the questions of other sessions its agent is answering, the sessions it keeps updates for, how many questions it asks again, its last number |
+| `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, turns: [{sessionId, turn, promptId?}], asks: [{sessionId, askId, opinion?, from?}], buffered, requests, seq}` | what a host that came back has: open sessions, running prompts, the questions of other sessions its agent is answering, the sessions it keeps updates for, how many questions it asks again, its last number |
 | `_gorynych/host_replay` | method, conductor → host, `{after: {"<sessionId>": n}}` → `{replayed, trimmed}` | sends what the host kept after each session's cursor and its open questions, then makes this conductor its own |
 | `_gorynych/host_stop` | method, conductor → host, `{}` → `{}` | the service shuts down: the host stops its agents and exits |
-| `_gorynych/turn_ended` | notification, host → conductor, `{sessionId, turn, promptId?, askId?, opinion?, result \| error}` | how a prompt ended, sent before its answer, numbered like an update; the conductor marks the turn's end from it, and answers the question of an opinion turn an earlier service started |
-| `_gorynych/ask_answered` | notification, host → conductor, `{sessionId, askId, result \| error}` | the agent's answer to a question it took by its own way in (Claude's channel), sent before the answer, numbered like an update: the next service gives it to the asker that comes back |
+| `_gorynych/turn_ended` | notification, host → conductor, `{sessionId, turn, promptId?, askId?, opinion?, from?, result \| error}` | how a prompt ended, sent before its answer, numbered like an update; the conductor marks the turn's end from it, and answers the question of an opinion turn an earlier service started |
+| `_gorynych/ask_answered` | notification, host → conductor, `{sessionId, askId, from?, result \| error}` | the agent's answer to a question it took by its own way in (Claude's channel), sent before the answer, numbered like an update: the next service gives it to the asker that comes back |
 | `gorynych/hostSeq` | `_meta` of a session's update and of `_gorynych/turn_ended`, host → conductor; kept in the journal | `"<hostId>/<n>"`: its place in its host's stream. A session's cursor is the newest its journal has from that host; never sent to clients |
 
 ## Opinions between agents
@@ -1773,11 +1773,13 @@ again:
    service passes it on to the host with the question, as `askId` in the params of
    `_gorynych/opinion` (Claude's channel) or in the `_meta` of the opinion turn's `session/prompt`;
    it is not journaled.
-2. The host keeps it with the request. Its report (`_gorynych/host_state`) lists the questions
-   its agent is answering, `asks: [{sessionId, askId, opinion?}]`. When the agent answers one, the
-   host sends `_gorynych/ask_answered {sessionId, askId, result | error}` (the channel's answer),
-   or its `_gorynych/turn_ended` carries `askId` and `opinion` (a turn's end). Both are numbered and
-   kept as session updates are, so a service that comes after the answer still gets it.
+2. The host keeps it with the request, and with the asking session (`gorynych/fromSessionId` of
+   the request's `_meta`) when a session asks. Its report (`_gorynych/host_state`) lists the
+   questions its agent is answering, `asks: [{sessionId, askId, opinion?, from?}]`. When the agent
+   answers one, the host sends `_gorynych/ask_answered {sessionId, askId, from?, result | error}`
+   (the channel's answer), or its `_gorynych/turn_ended` carries `askId`, `opinion` and `from` (a
+   turn's end). Both are numbered and kept as session updates are, so a service that comes after
+   the answer still gets it.
 3. The next service takes the questions back with the host: a turn's question is awaited under its
    `message_id` again, so the agent's `reply` reaches it, and its turn's own text answers when no
    reply came (from the journal: the earlier service journaled the start of the turn). A `reply` to
@@ -1790,8 +1792,21 @@ again:
    `data: {"gorynych/askLost": true}`, and the asking agent is told to ask again. The peers server
    comes back so across up to two more restarts; the outside server also while the next service
    starts, up to 30 seconds.
+5. The answer goes only to the asker that asked: a session's question, to that session (its peer
+   token names it, and the token outlives the restart); a reclaim from another session fails as a
+   lost question would. An agent outside Gorynych has no such name: its outside server shows only
+   its client's name and folder, neither of them its own, so its question is bound to nothing but
+   its `askId`, a random value only that server holds.
 
-An answer no asker comes back for is kept 10 minutes.
+**A link that drops without a restart.** A question with an `askId` is not cut off when its
+asker's link to the service drops (a broken pipe, the asker's connection closed): it goes on, and
+the asker that comes back with `gorynych/reclaim` waits for its answer and takes it once, as after
+a restart, for as long as its own request waits. An asker that cancels its question itself
+(`$/cancel_request` on a link that stays) withdraws it: the question is cancelled as before, and a
+reclaim of it fails as a lost question does.
+
+An answer no asker came back for is dropped 10 minutes after it came, and a question never
+answered after a day: the service looks for such every minute.
 
 **A host with no conductor** (an orphan: the service crashed, or was uninstalled, or the next one
 does not start) keeps trying to connect. With nothing running (no prompt, no open question) it exits after 2 minutes, with code

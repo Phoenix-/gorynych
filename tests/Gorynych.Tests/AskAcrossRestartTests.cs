@@ -26,13 +26,15 @@ public sealed class AskAcrossRestartTests
         public Conductor Service;
         public TestClient Zed = null!;
         public string AskedId = null!, AskerId = null!;
-        readonly TimeSpan reclaimWait;
+        readonly TimeSpan reclaimWait, reclaimKeep, reclaimSweep;
 
-        public Rig(bool channel, TimeSpan? reclaimWait = null)
+        public Rig(bool channel, TimeSpan? reclaimWait = null, TimeSpan? reclaimKeep = null, TimeSpan? reclaimSweep = null)
         {
             Asked = new LifecycleAgent("claude", canDelete: false) { HasChannel = channel };
             Hosts = new InProcessHosts(name => name == "claude" ? Asked.Adapter : Asker.Adapter);
             this.reclaimWait = reclaimWait ?? TimeSpan.FromSeconds(15);
+            this.reclaimKeep = reclaimKeep ?? TimeSpan.FromMinutes(10);
+            this.reclaimSweep = reclaimSweep ?? TimeSpan.FromMinutes(1);
             Service = Next();
         }
 
@@ -41,7 +43,7 @@ public sealed class AskAcrossRestartTests
             var service = new Conductor(new ConductorOptions
             {
                 DataDirectory = Data, ServiceId = "test-service", Hosts = Hosts, HostToken = InProcessHosts.Token,
-                PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"], ReclaimWait = reclaimWait,
+                PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"], ReclaimWait = reclaimWait, ReclaimKeep = reclaimKeep, ReclaimSweep = reclaimSweep,
             }, [Asked.Adapter, Asker.Adapter]);
             Hosts.Service = service;
             return service;
@@ -54,7 +56,7 @@ public sealed class AskAcrossRestartTests
             AskerId = await NewPromptedAsync("kimi", "Review the notes");
         }
 
-        async Task<string> NewPromptedAsync(string agent, string text)
+        public async Task<string> NewPromptedAsync(string agent, string text)
         {
             var id = (await Zed.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
             {
@@ -67,10 +69,10 @@ public sealed class AskAcrossRestartTests
 
         public string Token(string sessionId) => Service.Store.Get(sessionId)!.PeerToken!;
 
-        /// <summary>What the asker's peers server sends: the question, or with <paramref name="reclaim"/> the answer to it.</summary>
-        public JsonObject Ask(string askId, bool reclaim = false)
+        /// <summary>What the asker's peers server sends: the question, or with <paramref name="reclaim"/> the answer to it; <paramref name="from"/> asks as another session.</summary>
+        public JsonObject Ask(string askId, bool reclaim = false, string? from = null)
         {
-            var meta = new JsonObject { [GorynychProtocol.MetaPeerToken] = Token(AskerId), [GorynychProtocol.MetaAskId] = askId };
+            var meta = new JsonObject { [GorynychProtocol.MetaPeerToken] = Token(from ?? AskerId), [GorynychProtocol.MetaAskId] = askId };
             if (reclaim) meta[GorynychProtocol.MetaReclaim] = true;
             return new JsonObject { ["sessionId"] = AskedId, ["text"] = "SQLite or Postgres?", ["_meta"] = meta };
         }
@@ -101,6 +103,7 @@ public sealed class AskAcrossRestartTests
     {
         await using var rig = new Rig(channel);
         await rig.StartAsync();
+        var stranger = await rig.NewPromptedAsync("kimi", "Tidy the changelog");
         var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         if (channel) rig.Asked.HoldOpinions = hold;
         else
@@ -154,6 +157,9 @@ public sealed class AskAcrossRestartTests
             hold.SetResult();
         }
 
+        // Another session that names the question takes nothing: the host kept who asked.
+        var foreign = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => back.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-1", reclaim: true, from: stranger)).WaitAsync(Wait));
+        Assert.IsNotNull(foreign.ErrorData?[GorynychProtocol.MetaAskLost], foreign.Message);
         Assert.AreEqual(expected, (string?)(await reclaiming.WaitAsync(Wait))!["text"]);
         Assert.AreEqual(1, channel ? rig.Asked.Opinions.Count : rig.OpinionPrompts(), "the session was asked once");
         var again = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => back.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-1", reclaim: true)).WaitAsync(Wait));
@@ -190,5 +196,92 @@ public sealed class AskAcrossRestartTests
         await LinkHarness.Until(() => rig.Service.Feed(rig.AskedId).Adopted is null, "the running turn's end");
         Assert.AreEqual(0, rig.OpinionPrompts(), "never asked: not then, nor by the reclaim");
         _ = running;
+    }
+
+    /// <summary>
+    /// The asker's link to the service drops while the session answers (no restart): the question goes on,
+    /// and the asker that comes back waits for the answer and takes it, once; another session takes nothing.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    [DataRow(true, DisplayName = "by the channel")]
+    [DataRow(false, DisplayName = "in a turn")]
+    public async Task AnAskerWhoseLinkDropped_TakesTheAnswer_WhenItComesBack_Once(bool channel)
+    {
+        await using var rig = new Rig(channel);
+        await rig.StartAsync();
+        var stranger = await rig.NewPromptedAsync("kimi", "Tidy the changelog");
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (channel) rig.Asked.HoldOpinions = hold;
+        else
+            rig.Asked.BeforePrompt = async id =>
+            {
+                if (id == rig.AskedId && rig.OpinionPrompts() > 0) await hold.Task;
+            };
+        var peers = await TestClient.ConnectAsync(rig.Service, "peers");
+        var asking = peers.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-5"));
+        await LinkHarness.Until(() => channel ? rig.Asked.Opinions.Count == 1 : rig.OpinionPrompts() == 1, "the question in the session");
+        await peers.DisposeAsync(); // its link drops; the service runs on
+        await Assert.ThrowsAsync<Exception>(() => asking.WaitAsync(Wait), "its asker lost the link");
+
+        await using var back = await TestClient.ConnectAsync(rig.Service, "peers-again");
+        var reclaiming = back.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-5", reclaim: true));
+        var foreign = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => back.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-5", reclaim: true, from: stranger)).WaitAsync(Wait));
+        Assert.IsNotNull(foreign.ErrorData?[GorynychProtocol.MetaAskLost], "not another session's: " + foreign.Message);
+        await Task.Delay(300);
+        Assert.IsFalse(reclaiming.IsCompleted, "it waits for the answer still being given");
+        hold.SetResult();
+
+        Assert.AreEqual("ok", (string?)(await reclaiming.WaitAsync(Wait))!["text"]);
+        Assert.AreEqual(1, channel ? rig.Asked.Opinions.Count : rig.OpinionPrompts(), "the session was asked once");
+        var again = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => back.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-5", reclaim: true)).WaitAsync(Wait));
+        Assert.IsNotNull(again.ErrorData?[GorynychProtocol.MetaAskLost], "given once: " + again.Message);
+    }
+
+    /// <summary>An asker that withdraws its question on a link that stays: it is cancelled, and nobody takes an answer to it.</summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AQuestionItsAskerWithdrew_HasNoAnswerToTake()
+    {
+        await using var rig = new Rig(channel: true);
+        await rig.StartAsync();
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Asked.HoldOpinions = hold;
+        await using var peers = await TestClient.ConnectAsync(rig.Service, "peers");
+        using var withdraw = new CancellationTokenSource();
+        var asking = peers.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-6"), withdraw.Token);
+        await LinkHarness.Until(() => rig.Asked.Opinions.Count == 1, "the question in the session");
+
+        withdraw.Cancel(); // $/cancel_request
+        await Assert.ThrowsAsync<OperationCanceledException>(() => asking);
+        var reclaiming = peers.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-6", reclaim: true));
+        hold.SetResult();
+
+        var lost = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => reclaiming.WaitAsync(Wait));
+        Assert.IsNotNull(lost.ErrorData?[GorynychProtocol.MetaAskLost], lost.Message);
+    }
+
+    /// <summary>An answer no asker comes back for is dropped after its time on a timer, with nothing else happening.</summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AnAnswerNoAskerCameBackFor_IsDropped_OnATimer()
+    {
+        await using var rig = new Rig(channel: true, reclaimWait: TimeSpan.FromMilliseconds(200),
+            reclaimKeep: TimeSpan.FromMilliseconds(300), reclaimSweep: TimeSpan.FromMilliseconds(100));
+        await rig.StartAsync();
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Asked.HoldOpinions = hold;
+        var peers = await TestClient.ConnectAsync(rig.Service, "peers");
+        var asking = peers.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-7"));
+        await LinkHarness.Until(() => rig.Asked.Opinions.Count == 1, "the question in the session");
+        await peers.DisposeAsync();
+        await Assert.ThrowsAsync<Exception>(() => asking.WaitAsync(Wait));
+        Assert.AreEqual(1, rig.Service.KeptQuestions, "kept while it is answered");
+        hold.SetResult(); // answered, and nobody comes for it
+
+        await LinkHarness.Until(() => rig.Service.KeptQuestions == 0, "dropped once its time is up");
+        await using var late = await TestClient.ConnectAsync(rig.Service, "peers-late");
+        var lost = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => late.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-7", reclaim: true)).WaitAsync(Wait));
+        Assert.IsNotNull(lost.ErrorData?[GorynychProtocol.MetaAskLost], lost.Message);
     }
 }

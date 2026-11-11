@@ -277,10 +277,11 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
         var askId = meta is null ? null : Text(meta, GorynychProtocol.MetaAskId);
         // The outside server lost the service while it was answered (a restart): the answer, not the question again.
         if (askId is not null && meta?[GorynychProtocol.MetaReclaim] is JsonValue r && r.TryGetValue<bool>(out var reclaim) && reclaim)
-            return (string?)(await conductor.ReclaimAsync(askId, sessionId, ct))?["text"] ?? "(no answer)";
+            return (string?)(await conductor.ReclaimAsync(askId, sessionId, from: null, ct))?["text"] ?? "(no answer)";
         var token = call["_meta"]?["progressToken"];
         await using var progress = token is null ? null : new Progress(client.Rpc, requestId, token.DeepClone(), progressInterval);
-        var answer = await conductor.AskAsync(sessionId, question, Asker(host) with { AskId = askId }, progress is null ? null : progress.Report, ct);
+        var answer = await conductor.AskAsync(sessionId, question, Asker(host) with { AskId = askId }, progress is null ? null : progress.Report, ct,
+            linkGone: () => client.Rpc.IsClosed);
         return (string?)answer?["text"] ?? "(no answer)";
     }
 

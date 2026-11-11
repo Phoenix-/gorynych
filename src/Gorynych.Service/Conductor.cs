@@ -43,6 +43,12 @@ public sealed class ConductorOptions
     /// </summary>
     public TimeSpan ReclaimWait { get; init; } = TimeSpan.FromSeconds(15);
 
+    /// <summary>How long an answer no asker came back for is kept (<c>gorynych/reclaim</c>).</summary>
+    public TimeSpan ReclaimKeep { get; init; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>How often the answers kept past <see cref="ReclaimKeep"/> are looked for and dropped.</summary>
+    public TimeSpan ReclaimSweep { get; init; } = TimeSpan.FromMinutes(1);
+
     /// <summary>
     /// How long a session stays loaded in its agent once it is idle (no turn running, no operation
     /// registered) with no client attached; then it is closed there. Zero closes it at once.
@@ -123,8 +129,8 @@ public sealed class Conductor : IAsyncDisposable
     readonly ConcurrentDictionary<string, string> peerTokens = new(StringComparer.Ordinal);   // token -> session
     readonly ConcurrentDictionary<string, string> sessionTokens = new(StringComparer.Ordinal); // session -> token
     readonly ConcurrentDictionary<string, PendingOpinion> pendingOpinions = new(StringComparer.Ordinal); // message_id -> request
-    readonly ConcurrentDictionary<string, byte> asking = new(StringComparer.Ordinal); // the askIds of the questions this service asks now
-    readonly ConcurrentDictionary<string, Reclaim> reclaims = new(StringComparer.Ordinal); // askId -> a question an earlier service asked
+    // askId -> a question an asker named: one this service asks (Own), or one an earlier service asked that a host answers or answered
+    readonly ConcurrentDictionary<string, Reclaim> reclaims = new(StringComparer.Ordinal);
     readonly System.Diagnostics.Stopwatch sinceStart = System.Diagnostics.Stopwatch.StartNew();
     readonly ConcurrentDictionary<string, byte> removed = new(StringComparer.Ordinal); // deleted in this run
     readonly List<string> startupDrafts;
@@ -253,8 +259,8 @@ public sealed class Conductor : IAsyncDisposable
     {
         // The questions it is answering for an earlier service: their askers come back for the answers.
         foreach (var ask in (report["asks"] as JsonArray ?? []).OfType<JsonObject>())
-            if ((string?)ask["askId"] is { } askId && (string?)ask["sessionId"] is { } asked && !removed.ContainsKey(asked) && !asking.ContainsKey(askId))
-                AdoptAsk(host, askId, asked, (string?)ask["opinion"]);
+            if ((string?)ask["askId"] is { } askId && (string?)ask["sessionId"] is { } asked && !removed.ContainsKey(asked) && !IsOwn(askId))
+                AdoptAsk(host, askId, asked, (string?)ask["opinion"], (string?)ask["from"]);
         foreach (var turn in (report["turns"] as JsonArray ?? []).OfType<JsonObject>())
         {
             if ((string?)turn["sessionId"] is not { } sessionId || removed.ContainsKey(sessionId)) continue;
@@ -719,7 +725,7 @@ public sealed class Conductor : IAsyncDisposable
         Exception? failure = report["error"] is JsonObject error
             ? new JsonRpcException(error["code"] is JsonValue c && c.TryGetValue<int>(out var code) ? code : JsonRpcException.InternalError, (string?)error["message"] ?? "the prompt failed")
             : null;
-        if ((string?)report["askId"] is { } askId && !asking.ContainsKey(askId)) EndAskTurn(askId, feed, (string?)report["opinion"], failure);
+        if ((string?)report["askId"] is { } askId && !IsOwn(askId)) EndAskTurn(askId, feed, (string?)report["opinion"], (string?)report["from"], failure);
         KeepMark(feed, result);
         if (promptId is not null) await MarkPromptEndAsync(feed, promptId, result, failure, hostSeq); // its answer, if it comes here, marks it no more
         long? hostTurn = report["turn"] is JsonValue t && t.TryGetValue<long>(out var number) ? number : null;
@@ -3371,7 +3377,8 @@ public sealed class Conductor : IAsyncDisposable
     /// <c>_gorynych/opinion</c>: asks the agent of <c>sessionId</c> for an opinion. A call from
     /// the peers MCP server carries its token, which names the asking session and its agent.
     /// </summary>
-    internal async Task<JsonNode?> OpinionAsync(JsonRpcRequest request, CancellationToken ct)
+    /// <param name="linkGone">Whether the asker's link to the service is gone (<see cref="AskAsync"/>).</param>
+    internal async Task<JsonNode?> OpinionAsync(JsonRpcRequest request, CancellationToken ct, Func<bool>? linkGone = null)
     {
         var target = (string?)request.Params?["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
         var text = (string?)request.Params?["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
@@ -3387,7 +3394,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         var askId = (string?)request.Params?["_meta"]?[GorynychProtocol.MetaAskId];
         if (askId is not null && request.Params?["_meta"]?[GorynychProtocol.MetaReclaim] is JsonValue r && r.TryGetValue<bool>(out var reclaim) && reclaim)
-            return await ReclaimAsync(askId, target, ct);
+            return await ReclaimAsync(askId, target, from, ct);
         if (from is not null && Feed(from).CurrentOpinion is { } answering)
             throw new JsonRpcException(JsonRpcException.InvalidRequest,
                 $"This session is answering opinion request {answering}, so it cannot ask another session during this turn. " +
@@ -3395,7 +3402,7 @@ public sealed class Conductor : IAsyncDisposable
         // The asked agent sees who asks by the asking session's real ID, which it can pass to ask_agent;
         // sender (peer_claude) is only a label for GUIs.
         var origin = from is not null && store.Get(from) is { } asking ? $"from {Who(asking)}" : $"from {sender ?? "a Gorynych client"}";
-        return await AskAsync(target, text, new Asker(from, sender ?? "peer_agent", origin, Outside: null, askId), onState: null, ct);
+        return await AskAsync(target, text, new Asker(from, sender ?? "peer_agent", origin, Outside: null, askId), onState: null, ct, linkGone);
     }
 
     /// <summary>
@@ -3417,19 +3424,58 @@ public sealed class Conductor : IAsyncDisposable
     /// it if needed. <paramref name="onState"/> hears each change of state (waiting for the running
     /// turn, starting the session, asked), for an outside agent's progress notifications.
     /// </summary>
-    internal async Task<JsonNode?> AskAsync(string target, string text, Asker asker, Action<string>? onState, CancellationToken ct)
+    /// <param name="linkGone">Asked when <paramref name="ct"/> is cancelled: whether the asker's link to the service
+    /// is gone (rather than the asker withdrawing its question). A question the asker named (<see cref="Asker.AskId"/>)
+    /// then goes on, and the asker takes its answer when it comes back (<see cref="ReclaimAsync"/>).</param>
+    internal async Task<JsonNode?> AskAsync(string target, string text, Asker asker, Action<string>? onState, CancellationToken ct, Func<bool>? linkGone = null)
     {
         if (Draining) throw Restarting();
-        // Asked here: what a host reports of it is this service's own, not one to keep for an asker that comes back.
-        if (asker.AskId is { } askId && !asking.TryAdd(askId, 0))
+        if (asker.AskId is not { } askId) return await AskOnceAsync(target, text, asker, onState, ct);
+        // Asked here: what a host reports of it is this service's own. It is kept by its askId, and runs
+        // whatever becomes of the asker's link: an asker that lost it comes back for the answer, as after a restart.
+        var own = new Reclaim(target, asker.From, own: true);
+        if (!reclaims.TryAdd(askId, own))
             throw new JsonRpcException(JsonRpcException.InvalidRequest, $"The question {askId} is being asked already.");
+        KeepSweeping();
+        var withdraw = new CancellationTokenSource();
+        var listening = new StrongBox<bool>(true); // progress is for an asker still waiting here
+        var run = Task.Run(() => AskOnceAsync(target, text, asker, onState is null ? null : s =>
+        {
+            if (!Volatile.Read(ref listening.Value)) return;
+            try { onState(s); }
+            catch (Exception e) { ServiceLog.Warn($"opinion: progress of question {askId} not sent: {e.Message}"); }
+        }, withdraw.Token));
+        _ = run.ContinueWith(t =>
+        {
+            if (t.IsCompletedSuccessfully) own.Give(t.Result);
+            else own.Fail(t.Exception?.InnerException ?? new OperationCanceledException("the question was withdrawn"));
+        }, TaskScheduler.Default);
         try
         {
-            return await AskOnceAsync(target, text, asker, onState, ct);
+            var answer = await own.Answer.Task.WaitAsync(ct);
+            // The link went as the answer came: it stays for the asker to take when it comes back.
+            if (linkGone?.Invoke() == true) throw new IOException($"the asker of question {askId} is gone; its answer waits for it");
+            if (!own.TryTake()) throw AskLost(target);
+            return answer;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            if (linkGone?.Invoke() == true)
+                ServiceLog.Info($"opinion: the asker of question {askId} to {target} lost its link; the question goes on for it to take");
+            // The asker withdrew it ($/cancel_request on a link that stays): so does the service, and a
+            // reclaim of it finds it cancelled (ReclaimAsync), with no answer to take.
+            else withdraw.Cancel();
+            throw;
+        }
+        catch (Exception e) when (e is not OperationCanceledException && own.Answer.Task.IsFaulted)
+        {
+            // It failed: said once, here, unless an asker that came back took the failure already.
+            if (!own.TryTake()) throw AskLost(target);
+            throw;
         }
         finally
         {
-            if (asker.AskId is { } asked) asking.TryRemove(asked, out _);
+            Volatile.Write(ref listening.Value, false);
         }
     }
 
@@ -3805,16 +3851,22 @@ public sealed class Conductor : IAsyncDisposable
     bool IsEarlierRunsOpinion(string messageId) =>
         messageId.Length > 2 && messageId[0] == 'm' && messageId.Contains('-') && !messageId.StartsWith($"m{runTag}-", StringComparison.Ordinal);
 
-    /// <summary>How long an answer no asker came back for is kept.</summary>
-    internal static TimeSpan ReclaimKeep { get; set; } = TimeSpan.FromMinutes(10);
-
     /// <summary>
-    /// A question an earlier service asked, which a host is answering or answered: its asker, which
-    /// lost the earlier service, comes back for the answer by its <c>askId</c> (<see cref="ReclaimAsync"/>).
+    /// A question its asker named (<c>gorynych/askId</c>): one this service asks (<see cref="Own"/>), or
+    /// one an earlier service asked, which a host is answering or answered. An asker that lost its link
+    /// to the service, or the service itself, comes back for the answer by that name (<see cref="ReclaimAsync"/>).
     /// </summary>
-    sealed class Reclaim(string sessionId)
+    sealed class Reclaim(string sessionId, string? from, bool own = false)
     {
+        /// <summary>The asked session.</summary>
         public string SessionId { get; } = sessionId;
+
+        /// <summary>The session that asked, which alone takes the answer; null for an agent outside Gorynych, which has no such name.</summary>
+        public string? From { get; } = from;
+
+        /// <summary>Asked by this service: what a host reports of it is not an answer to keep, as the answer comes with the request.</summary>
+        public bool Own { get; } = own;
+
         public TaskCompletionSource<JsonNode?> Answer { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public long Since { get; } = Environment.TickCount64;
         public long Answered { get; set; } = long.MaxValue;
@@ -3840,23 +3892,43 @@ public sealed class Conductor : IAsyncDisposable
         public bool Taken => Volatile.Read(ref taken) == 1;
     }
 
-    Reclaim ReclaimOf(string askId, string sessionId)
+    bool IsOwn(string askId) => reclaims.TryGetValue(askId, out var reclaim) && reclaim.Own;
+
+    Reclaim ReclaimOf(string askId, string sessionId, string? from)
+    {
+        KeepSweeping();
+        return reclaims.GetOrAdd(askId, _ => new Reclaim(sessionId, from));
+    }
+
+    /// <summary>The questions kept by their askId now; for tests.</summary>
+    internal int KeptQuestions => reclaims.Count;
+
+    ITimer? reclaimSweep;
+
+    /// <summary>Drops, every <see cref="ConductorOptions.ReclaimSweep"/>, the answers no asker came back for and the questions never answered.</summary>
+    void KeepSweeping()
+    {
+        if (Volatile.Read(ref reclaimSweep) is not null) return;
+        var timer = TimeProvider.System.CreateTimer(_ => SweepReclaims(), null, options.ReclaimSweep, options.ReclaimSweep);
+        if (Interlocked.CompareExchange(ref reclaimSweep, timer, null) is not null) timer.Dispose();
+    }
+
+    void SweepReclaims()
     {
         // Answers nobody came back for go after a while; questions never answered, after a day.
         var now = Environment.TickCount64;
         foreach (var (key, old) in reclaims)
-            if (now - old.Answered > ReclaimKeep.TotalMilliseconds || now - old.Since > TimeSpan.FromDays(1).TotalMilliseconds)
+            if (now - old.Answered > options.ReclaimKeep.TotalMilliseconds || now - old.Since > TimeSpan.FromDays(1).TotalMilliseconds)
                 reclaims.TryRemove(new KeyValuePair<string, Reclaim>(key, old));
-        return reclaims.GetOrAdd(askId, _ => new Reclaim(sessionId));
     }
 
     /// <summary>
     /// A question a host that came back is answering for an earlier service. In a turn, its reply is
     /// awaited under its <c>message_id</c>, and the session is answering it, so it asks no other meanwhile.
     /// </summary>
-    void AdoptAsk(AgentHost host, string askId, string sessionId, string? opinion)
+    void AdoptAsk(AgentHost host, string askId, string sessionId, string? opinion, string? from)
     {
-        var reclaim = ReclaimOf(askId, sessionId);
+        var reclaim = ReclaimOf(askId, sessionId, from);
         if (opinion is not null && !pendingOpinions.ContainsKey(opinion))
         {
             var pending = new PendingOpinion(sessionId);
@@ -3873,9 +3945,9 @@ public sealed class Conductor : IAsyncDisposable
     /// The end of an opinion turn an earlier service started: its answer is the reply, if one came, else
     /// the turn's own text, which the journal has (the earlier service journaled what came before).
     /// </summary>
-    void EndAskTurn(string askId, SessionFeed feed, string? opinion, Exception? failure)
+    void EndAskTurn(string askId, SessionFeed feed, string? opinion, string? from, Exception? failure)
     {
-        var reclaim = ReclaimOf(askId, feed.SessionId);
+        var reclaim = ReclaimOf(askId, feed.SessionId, from);
         if (opinion is not null)
         {
             pendingOpinions.TryRemove(opinion, out _);
@@ -3914,8 +3986,8 @@ public sealed class Conductor : IAsyncDisposable
     {
         if ((string?)report["sessionId"] is not { } sessionId || (string?)report["askId"] is not { } askId || removed.ContainsKey(sessionId)) return;
         if ((string?)report["_meta"]?[GorynychProtocol.MetaHostSeq] is { } hostSeq && !Feed(sessionId).TakeFromHost(hostSeq)) return; // taken already
-        if (asking.ContainsKey(askId)) return; // this service's own: its answer comes with the request
-        var reclaim = ReclaimOf(askId, sessionId);
+        if (IsOwn(askId)) return; // this service's own: its answer comes with the request
+        var reclaim = ReclaimOf(askId, sessionId, (string?)report["from"]);
         if (report["error"] is JsonObject error)
             reclaim.Fail(new JsonRpcException(error["code"] is JsonValue c && c.TryGetValue<int>(out var code) ? code : JsonRpcException.InternalError,
                 (string?)error["message"] ?? "the question failed"));
@@ -3924,22 +3996,29 @@ public sealed class Conductor : IAsyncDisposable
 
     /// <summary>
     /// <c>_gorynych/opinion</c> (or <c>ask_agent</c> of the outside server) with <c>gorynych/reclaim</c>: the
-    /// asker lost the service while its question was answered, and takes the answer from this one, once.
-    /// It never asks the session again. A question no host kept (it went with the service before its
-    /// session got it) fails with <see cref="GorynychProtocol.MetaAskLost"/>.
+    /// asker lost the service, or its link to it, while its question was answered, and takes the answer
+    /// from this one, once, waiting for it while it is still being answered, for as long as its own
+    /// request waits. It never asks the session again. A question no host kept (it went with the service
+    /// before its session got it), or that another session asked (<paramref name="from"/>, the asking
+    /// session by its peer token; null for an agent outside Gorynych), fails with <see cref="GorynychProtocol.MetaAskLost"/>.
     /// </summary>
-    internal async Task<JsonNode?> ReclaimAsync(string askId, string target, CancellationToken ct)
+    internal async Task<JsonNode?> ReclaimAsync(string askId, string target, string? from, CancellationToken ct)
     {
         if (Draining) throw Restarting();
         Reclaim? reclaim;
         var waited = System.Diagnostics.Stopwatch.StartNew();
         while (!reclaims.TryGetValue(askId, out reclaim) && HostsMayComeBack && waited.Elapsed < options.ReclaimWait) await Task.Delay(50, ct);
-        if (reclaim is null || reclaim.SessionId != target || reclaim.Taken) throw AskLost(target);
+        if (reclaim is null || reclaim.SessionId != target || reclaim.From != from || reclaim.Taken) throw AskLost(target);
         ServiceLog.Info($"opinion: an asker came back for question {askId} to {target}");
         JsonNode? answer;
         try
         {
             answer = await reclaim.Answer.Task.WaitAsync(ct);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Withdrawn by its asker meanwhile: there is no answer to take.
+            throw AskLost(target);
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
@@ -4184,6 +4263,7 @@ public sealed class Conductor : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         cleanupStop.Cancel();
+        Volatile.Read(ref reclaimSweep)?.Dispose();
         try { await Task.WhenAll(cleanups.Keys).WaitAsync(TimeSpan.FromSeconds(5)); }
         catch (Exception e) { ServiceLog.Warn($"cleanup at exit: {e.Message}"); }
         // Where each session is open, before the instances are let go of.
