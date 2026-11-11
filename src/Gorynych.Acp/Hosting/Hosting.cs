@@ -61,6 +61,24 @@ public static class GorynychProtocol
     /// <summary>The opinion request a message or update belongs to (its <c>message_id</c>).</summary>
     public const string MetaOpinion = "gorynych/opinion";
 
+    /// <summary>
+    /// The asker's own name for a question (<c>ask_agent</c>), a random one it makes: in the <c>_meta</c>
+    /// of <c>_gorynych/opinion</c> from the peers server and of <c>_gorynych/mcp_message</c> from the
+    /// outside server. The service passes it on to the host with the question, so the next service, after
+    /// a restart, can give the answer to the asker that comes back for it (<see cref="MetaReclaim"/>).
+    /// </summary>
+    public const string MetaAskId = "gorynych/askId";
+
+    /// <summary>
+    /// <c>true</c> next to <see cref="MetaAskId"/>: the asker lost its connection while the question was
+    /// answered (a restart) and asks for the answer, not again. A service that does not know the question
+    /// fails with <see cref="MetaAskLost"/> in the error's <c>data</c>; it never asks the session anew.
+    /// </summary>
+    public const string MetaReclaim = "gorynych/reclaim";
+
+    /// <summary>In the <c>data</c> of the error a reclaim gets for a question no host kept: it went with the service; ask again.</summary>
+    public const string MetaAskLost = "gorynych/askLost";
+
     /// <summary>The sessions a peer can ask: <c>{token}</c> → <c>{sessions: [...]}</c>.</summary>
     public const string MethodPeers = "_gorynych/peers";
 
@@ -419,6 +437,13 @@ public static class GorynychProtocol
     /// conductor went before its answer ended so in the agent.
     /// </summary>
     public const string MethodTurnEnded = "_gorynych/turn_ended";
+
+    /// <summary>
+    /// Host → conductor, a notification: <c>{sessionId, askId, result | error}</c>: the agent answered a
+    /// question (<c>_gorynych/opinion</c>) a conductor sent with <see cref="MetaAskId"/>. Numbered and
+    /// kept as <see cref="MethodTurnEnded"/> is, so the next conductor learns an answer whose conductor went.
+    /// </summary>
+    public const string MethodAskAnswered = "_gorynych/ask_answered";
 
     /// <summary>
     /// On what a host sends: <c>"&lt;hostId&gt;/&lt;seq&gt;"</c>, its place in the host's stream, in the

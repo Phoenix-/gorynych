@@ -187,6 +187,31 @@ public static class PeersServer
         }
     }
 
+    /// <summary>
+    /// The service went while the session answered <paramref name="ask"/>: the answer from the next
+    /// service, by the question's <c>gorynych/askId</c> (<c>gorynych/reclaim</c>), once, never the question
+    /// again; also across one more restart. A question the next service does not know went with the
+    /// earlier one before its session got it: <see cref="ServiceLostException"/>, so the agent is told
+    /// to ask again.
+    /// </summary>
+    static async Task<JsonNode?> ReclaimAsync(ServiceRoute route, JsonObject ask, CancellationToken ct)
+    {
+        var reclaim = (JsonObject)ask.DeepClone();
+        reclaim["_meta"]![GorynychProtocol.MetaReclaim] = true;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await RequestAsync(route, GorynychProtocol.MethodOpinion, reclaim, ct);
+            }
+            catch (JsonRpcException e) when (e.ErrorData?[GorynychProtocol.MetaAskLost] is not null || IsRestarting(e))
+            {
+                throw new ServiceLostException(e.Message);
+            }
+            catch (ServiceLostException) when (attempt < 3) { }
+        }
+    }
+
     static bool IsRestarting(JsonRpcException e) =>
         e.ErrorData?[GorynychProtocol.MetaRestarting] is JsonValue v && v.TryGetValue<bool>(out var restarting) && restarting;
 
@@ -256,12 +281,23 @@ public static class PeersServer
                     var question = (string?)args?["question"];
                     if (string.IsNullOrWhiteSpace(target) || string.IsNullOrWhiteSpace(question))
                         return Text("session_id and question are required", error: true);
-                    var reply = await RequestAsync(route!, GorynychProtocol.MethodOpinion, new JsonObject
+                    // Its own name for the question: should the service restart while the session answers,
+                    // the answer is taken from the next one by it, and the session is not asked again.
+                    var ask = new JsonObject
                     {
                         ["sessionId"] = target,
                         ["text"] = question,
-                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token },
-                    }, ct);
+                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token, [GorynychProtocol.MetaAskId] = Guid.NewGuid().ToString("N") },
+                    };
+                    JsonNode? reply;
+                    try
+                    {
+                        reply = await RequestAsync(route!, GorynychProtocol.MethodOpinion, ask, ct);
+                    }
+                    catch (ServiceLostException)
+                    {
+                        reply = await ReclaimAsync(route!, ask, ct);
+                    }
                     return Text((string?)reply?["text"] ?? "(no answer)");
                 }
                 case "spawn_session" when pipe is not null && token is not null:

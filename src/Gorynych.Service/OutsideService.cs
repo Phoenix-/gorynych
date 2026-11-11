@@ -35,7 +35,7 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
         var host = envelope["_meta"]?[GorynychProtocol.MetaOutside] as JsonObject ?? [];
         try
         {
-            return new JsonObject { ["result"] = await DispatchAsync(client, requestId, method, envelope["params"] as JsonObject, host, ct) };
+            return new JsonObject { ["result"] = await DispatchAsync(client, requestId, method, envelope["params"] as JsonObject, host, envelope["_meta"] as JsonObject, ct) };
         }
         catch (JsonRpcException e)
         {
@@ -45,7 +45,8 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
         }
     }
 
-    async Task<JsonNode> DispatchAsync(ClientConnection client, string requestId, string method, JsonObject? inner, JsonObject host, CancellationToken ct)
+    /// <param name="meta">The envelope's <c>_meta</c>: an <c>ask_agent</c>'s <c>gorynych/askId</c>, and <c>gorynych/reclaim</c>.</param>
+    async Task<JsonNode> DispatchAsync(ClientConnection client, string requestId, string method, JsonObject? inner, JsonObject host, JsonObject? meta, CancellationToken ct)
     {
         // A modern request (MCP 2026-07-28) names its revision in params._meta; a legacy one comes after
         // an initialize that the outside server answered itself.
@@ -64,13 +65,13 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
             case "tools/list":
                 return OutsideTools.ToolsList(modern, inside: false);
             case "tools/call":
-                return await CallAsync(client, requestId, inner, host, modern, ct);
+                return await CallAsync(client, requestId, inner, host, meta, modern, ct);
             default:
                 throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {method}");
         }
     }
 
-    async Task<JsonNode> CallAsync(ClientConnection client, string requestId, JsonObject? call, JsonObject host, bool modern, CancellationToken ct)
+    async Task<JsonNode> CallAsync(ClientConnection client, string requestId, JsonObject? call, JsonObject host, JsonObject? meta, bool modern, CancellationToken ct)
     {
         var name = (string?)call?["name"];
         var args = call?["arguments"] as JsonObject ?? [];
@@ -82,7 +83,7 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
             {
                 "list_sessions" => await ListSessionsAsync(args, ct),
                 "read_session" => await ReadSessionAsync(args, ct),
-                _ => await AskAsync(client, requestId, call!, args, host, ct),
+                _ => await AskAsync(client, requestId, call!, args, host, meta, ct),
             };
             return OutsideTools.ToolResult(text, isError: false, modern);
         }
@@ -90,8 +91,11 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
         {
             return OutsideTools.ToolResult(e.Message, isError: true, modern);
         }
-        catch (JsonRpcException e)
+        catch (JsonRpcException e) when (e.ErrorData?[GorynychProtocol.MetaAskLost] is null
+                                         && (e.ErrorData?[GorynychProtocol.MetaRestarting] is null || meta?[GorynychProtocol.MetaReclaim] is null))
         {
+            // A question that went with a restart is the outside server's to say: it knows how it lost it;
+            // and a reclaim this service refuses as it restarts too is the outside server's to send again.
             return OutsideTools.ToolResult(OutsideTools.CouldNotDo(e.Message), isError: true, modern);
         }
     }
@@ -264,15 +268,20 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
     /// the outside host in the request. With a <c>progressToken</c> the host gets progress at each
     /// change of state and at least every <see cref="progressInterval"/>, none after the answer.
     /// </summary>
-    async Task<string> AskAsync(ClientConnection client, string requestId, JsonObject call, JsonObject args, JsonObject host, CancellationToken ct)
+    async Task<string> AskAsync(ClientConnection client, string requestId, JsonObject call, JsonObject args, JsonObject host, JsonObject? meta, CancellationToken ct)
     {
         var sessionId = Text(args, "session_id");
         var question = Text(args, "question");
         if (sessionId is null || question is null)
             throw new ToolInputException("session_id and question are required: pass an exact session_id from list_sessions and the question.");
+        var askId = meta is null ? null : Text(meta, GorynychProtocol.MetaAskId);
+        // The outside server lost the service while it was answered (a restart): the answer, not the question again.
+        if (askId is not null && meta?[GorynychProtocol.MetaReclaim] is JsonValue r && r.TryGetValue<bool>(out var reclaim) && reclaim)
+            return (string?)(await conductor.ReclaimAsync(askId, sessionId, from: null, ct))?["text"] ?? "(no answer)";
         var token = call["_meta"]?["progressToken"];
         await using var progress = token is null ? null : new Progress(client.Rpc, requestId, token.DeepClone(), progressInterval);
-        var answer = await conductor.AskAsync(sessionId, question, Asker(host), progress is null ? null : progress.Report, ct);
+        var answer = await conductor.AskAsync(sessionId, question, Asker(host) with { AskId = askId }, progress is null ? null : progress.Report, ct,
+            linkGone: () => client.Rpc.IsClosed);
         return (string?)answer?["text"] ?? "(no answer)";
     }
 

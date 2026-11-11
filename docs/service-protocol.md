@@ -53,13 +53,39 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   service ID), `sessions.json` (the overlay), `journal/`, `claude/` (the Claude adapter's
   session list and `channels.json`, the person's answer about development channels),
   `host.token` (what proves an [adapter host](#adapter-hosts) to the service), `logs/`
-  (`service-<date>.log`, and `host-<adapter>-<date>.log` for each host).
+  (`service-<date>.log`, and `host-<adapter>-<date>.log` for each host), `.gorynych-data` (names
+  the folder as Gorynych's) and, on Windows, `.closed` (below).
+  - **The folder is the user's alone.** At each start the service gives it a protected DACL on
+    Windows: the user and SYSTEM, full control, inherited by all inside, nothing inherited from the
+    parent. Under `%LOCALAPPDATA%` it would otherwise inherit what the profile grants others, such as
+    Codex's `CodexSandboxUsers: ReadAndExecute`, through which the commands Codex's sandbox runs read
+    every journal and the peer tokens. On Unix it is `0700`. The agents, the adapter hosts and the
+    MCP servers run as the user and read what they need there (Claude's per-session `settings.json`
+    and `mcp.json`, DSH's patch file) as before.
+  - **All inside.** Setting the folder's DACL makes Windows compute again what each item inside
+    inherits, so an older install is closed too; but Windows passes over an item it may not change
+    without a word. So the service then goes over all inside itself, gives an item that still lets
+    another account in no DACL of its own (it takes the folder's), and writes `.closed`, with the DACL
+    given, only when nothing was left open. While `.closed` is missing, or names another DACL, each
+    start goes over the folder again; what it could not close is logged as a warning and shown by
+    `status`. Neither Windows nor that pass follows a junction or a link inside the folder, nor
+    changes it: what it leads to keeps its own DACL.
+  - **Only its own folder.** Closing a folder shuts every other account out of it, so the service
+    takes only the default folder, a new or empty one, or one that is a Gorynych data folder already
+    (it has `.gorynych-data`, or the `service.json` of an earlier build). It never takes a drive's or
+    volume's root, the user profile, `%LOCALAPPDATA%`, `%APPDATA%`, `%PROGRAMDATA%` or a folder above
+    them, the Windows folder, `Program Files`, or a folder inside these last; on Unix, `/`, `$HOME`,
+    `$XDG_DATA_HOME`, `~/.local/share` or a folder above them. A folder that is or leads to one of
+    these (a junction, a link) is refused too. For such a `--data` the service exits with code 2 and
+    says on stderr which folder, why, and what to do (a new or empty folder, or the default); the
+    bridge says it before starting a service, and `task install` before registering the task. If
+    closing fails (no right to change the folder's DACL, say), the service says so and runs on.
 
 Command line: `Gorynych.Service [serve] [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex|dsh]
 [--claude-model <model>] [--unload-after <minutes>] [--claude-transport headless|tui]
 [--claude-channels ask|accept|decline] [--hosts on|off] [--no-channel] [--no-peers] [--console]`.
 `--hosts` runs each adapter in an [adapter host](#adapter-hosts) of its own, which a restart leaves
-running with its agents: on by default on Windows, off elsewhere, where hosts are not tried yet.
+running with its agents: on by default on Windows and Linux, off on macOS, where hosts are not tried yet.
 `--unload-after` is how long a session stays loaded in its agent once it is idle with no
 client: 10 minutes by default, `0` at once ([Unloading idle sessions](#unloading-idle-sessions)).
 `--claude-transport` picks how Claude Code is driven: `headless` (`claude -p`, the default) or
@@ -212,6 +238,8 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/outside` | `_meta` of `_gorynych/mcp_message`, and of the opinion request an agent outside Gorynych asked | the host: `client` (MCP `clientInfo`), `folder`, `hostSessionId` (see [Agents outside Gorynych](#agents-outside-gorynych)) |
 | `gorynych/fromSessionId` | `user_message_chunk._meta` of an opinion request or a report delivered as a turn | the session that asked, or the child that reports |
 | `gorynych/opinion` | `_meta` of the request message and of every update of its turn | the request's `message_id`, so a GUI can show the exchange apart from the user's own turns |
+| `gorynych/askId` | `_meta` of `_gorynych/opinion` (peers server) and of `_gorynych/mcp_message` for `ask_agent` (outside server); toward a host, `askId` in `_gorynych/opinion`'s params or the opinion turn's `session/prompt` `_meta` | the asker's random name for a question, by which it takes the answer from the next service after a restart ([Questions across a restart](#questions-across-a-restart)) |
+| `gorynych/reclaim` | next to `gorynych/askId` | `true`: the answer to that question, not the question again; a question the service does not know, or that another session asked, fails with `data: {"gorynych/askLost": true}`; one still being answered is waited for |
 | `gorynych/messageId` | `session/prompt` params `_meta`, service → adapter | the `messageId` the service journals the prompt's text under, for a harness that keeps it with the message (Codex) |
 | `gorynych/setTitle` | an adapter's `agentCapabilities._meta` | `true`: the adapter takes `_gorynych/set_title {sessionId, title}` → `{}`, and the service writes a `spawn_session` name natively ([Child sessions](#child-sessions)) |
 | `gorynych/unloadAfter` | an adapter's `agentCapabilities._meta` | seconds: its sessions' idle time when shorter than `--unload-after` ([Unloading idle sessions](#unloading-idle-sessions)); read as at most a day |
@@ -222,7 +250,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/open_elsewhere` | method, service → adapter, `{sessionIds}` → `{sessions: {"<id>": "<holder>"}}` | which of these sessions another app has open now, the held ones only; for the lists agents see |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
-| `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
+| `_gorynych/status` | method | service ID, process, data folder, `dataFolderOpen` (why the data folder, or an item in it, could not be closed to other accounts at this start; null when it is closed), clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/restart` | method, `{wait?, timeoutSeconds?, force?}` → `{restarted: true, processId, waitedSeconds, cancelledTurns}` or `{restarted: false, processId, waitedSeconds, running: [{sessionId, agent, title}]}`; with hosts always `{restarted: true, processId, waitedSeconds, cancelledTurns: 0, turnsInHosts}` | asks the service to exit for an update without breaking its clients' work; without hosts, called off when turns outlast the wait, unless `force` ([The resumable link](#the-resumable-link)); with hosts, it waits for no turn ([Adapter hosts](#adapter-hosts)) |
 | `_gorynych/restarting` | notification to clients, `{restart}` | the service has begun restart number `restart`: a client on the link holds its new prompts |
@@ -240,10 +268,11 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply`, `_gorynych/spawn` and `_gorynych/archive` | which session's `gorynych` MCP server is calling |
 | `_gorynych/host_hello` | notification, host → conductor, the first message on the host pipe, `{token, hostId, adapter, link, pid, version, slot?, build?, options?}` | an [adapter host](#adapter-hosts) proves itself and says what it runs: which host of its adapter it is (`slot`), and its generation (`build`, `options`; [Updating adapters](#updating-adapters)) |
 | `gorynych/host` | `initialize` result `_meta`, host → conductor | `{hostId, link, reattached}`: the host, its link version, and whether it answers from its agent's first `initialize` (it came back) |
-| `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, turns: [{sessionId, turn, promptId?}], buffered, requests, seq}` | what a host that came back has: open sessions, running prompts, the sessions it keeps updates for, how many questions it asks again, its last number |
+| `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, turns: [{sessionId, turn, promptId?}], asks: [{sessionId, askId, opinion?, from?}], buffered, requests, seq}` | what a host that came back has: open sessions, running prompts, the questions of other sessions its agent is answering, the sessions it keeps updates for, how many questions it asks again, its last number |
 | `_gorynych/host_replay` | method, conductor → host, `{after: {"<sessionId>": n}}` → `{replayed, trimmed}` | sends what the host kept after each session's cursor and its open questions, then makes this conductor its own |
 | `_gorynych/host_stop` | method, conductor → host, `{}` → `{}` | the service shuts down: the host stops its agents and exits |
-| `_gorynych/turn_ended` | notification, host → conductor, `{sessionId, turn, promptId?, result \| error}` | how a prompt ended, sent before its answer, numbered like an update; the conductor marks the turn's end from it |
+| `_gorynych/turn_ended` | notification, host → conductor, `{sessionId, turn, promptId?, askId?, opinion?, from?, result \| error}` | how a prompt ended, sent before its answer, numbered like an update; the conductor marks the turn's end from it, and answers the question of an opinion turn an earlier service started |
+| `_gorynych/ask_answered` | notification, host → conductor, `{sessionId, askId, from?, result \| error}` | the agent's answer to a question it took by its own way in (Claude's channel), sent before the answer, numbered like an update: the next service gives it to the asker that comes back |
 | `gorynych/hostSeq` | `_meta` of a session's update and of `_gorynych/turn_ended`, host → conductor; kept in the journal | `"<hostId>/<n>"`: its place in its host's stream. A session's cursor is the newest its journal has from that host; never sent to clients |
 
 ## Opinions between agents
@@ -1587,13 +1616,13 @@ answers method not found, and the command asks it to exit instead.
 Kimi keeps its drafts, and the Claude adapter opens one afresh under its ID (`gorynych/draft`,
 [adapter-contract.md](adapter-contract.md#3-new-sessions-the-list-and-discovery)); a Codex
 thread never prompted fails at its first prompt after a restart. Without
-[adapter hosts](#adapter-hosts) (`--hosts off`, the default elsewhere than Windows), a restart
+[adapter hosts](#adapter-hosts) (`--hosts off`, the default on macOS), a restart
 still stops the agents with their running turns, which is why it waits for them and is called off
 when they outlast the wait.
 
 ## Adapter hosts
 
-With hosts (`--hosts on`, the default on Windows), each adapter runs in a process of its own,
+With hosts (`--hosts on`, the default on Windows and Linux), each adapter runs in a process of its own,
 an *adapter host*, and a restart of the service leaves the hosts running with their agents
 ([design.md](design.md#updating-without-losing-work)). So a turn goes on through a restart, and
 its answer arrives whole.
@@ -1605,6 +1634,15 @@ its answer arrives whole.
   the adapter. One host runs per adapter and pipe, by a named mutex
   (`Gorynych.Host.<pipe>.<adapter>`, current user, all logon sessions). It logs to
   `logs/host-<adapter>-<date>.log`.
+- **In the logon task's job.** A service the logon task started runs in Task Scheduler's job
+  object, which lets no process break away, so its hosts stay in that job (the service logs it).
+  That job does not kill its processes when it closes: when the service exits for a restart, the
+  task goes from Running to Ready, the hosts run on and connect to the next service, and the next
+  `schtasks /Run` (a bridge's) starts that service as usual. Ending the task by hand (End in Task
+  Scheduler, `schtasks /End`) stops the service alone: its hosts, those it started in that job
+  too, wait for the next one (probed on Windows 11 on 11 November 2026, a test task on a pipe of
+  its own). Only a job that kills its processes on close (a client's, when the bridge could not
+  break away) stops the hosts with the service: then the log warns.
 - **What moves into it.** Everything that lives with an agent: the adapter, its agents, and the
   adapter's listeners (the Claude TUI's http hooks and channel, a headless Claude's reply route,
   Codex's lock watcher). The agents' `gorynych` MCP servers are the agents' children, so they live
@@ -1704,9 +1742,10 @@ hosts with the service (`_gorynych/host_stop`), and so their agents.
 
 **What a restart still cuts**, because it lives in the conductor:
 
-- an `ask_agent` waiting for its answer (from the peers server or the outside server): the asked
-  agent's turn goes on in its host, but the request it answers is gone with the old service, and
-  the asking agent is told to ask again (below);
+- an `ask_agent` whose question had not reached the asked agent yet (it waited in the service for
+  the session's running turn, or for the person's approval): the asking agent is told to ask again
+  (below). One the agent is answering goes on, and its answer reaches the asker
+  ([Questions across a restart](#questions-across-a-restart));
 - a `spawn_session` waiting for the person's approval: the agent is told it may or may not have
   started;
 - a child's report for a turn taken back: it carries the final text that came after the restart;
@@ -1716,11 +1755,58 @@ hosts with the service (`_gorynych/host_stop`), and so their agents.
 
 **The peers server** connects to the service for each call. It waits up to 30 seconds for a
 service that restarts: for its pipe, and while it refuses requests for the restart, which go
-again. A call cut off on its way is not sent again, since it may have been carried out: `ask_agent`
+again. A call cut off on its way is not sent again, since it may have been carried out: an
+`ask_agent` comes back for its answer instead (below); a question the next service does not know
 then says "Gorynych restarted while session_id `<id>` was answering, so its answer was lost. Ask
 again in a moment: ask_agent with session_id `<id>` and the same question." The outside server
-(`gorynych-outside`) says the same for its `ask_agent`, and for its other tools that the call
-is to be made again.
+(`gorynych-outside`) does the same for its `ask_agent`, and says for its other tools that the
+call is to be made again.
+
+#### Questions across a restart
+
+An agent's question (`ask_agent`) the asked agent is answering when the service restarts goes on
+in the asked agent's host, and its answer reaches the asker, once, without the agent being asked
+again:
+
+1. The asker names each question: the peers server and the outside server put a random
+   `gorynych/askId` in the `_meta` of `_gorynych/opinion` and of `_gorynych/mcp_message`. The
+   service passes it on to the host with the question, as `askId` in the params of
+   `_gorynych/opinion` (Claude's channel) or in the `_meta` of the opinion turn's `session/prompt`;
+   it is not journaled.
+2. The host keeps it with the request, and with the asking session (`gorynych/fromSessionId` of
+   the request's `_meta`) when a session asks. Its report (`_gorynych/host_state`) lists the
+   questions its agent is answering, `asks: [{sessionId, askId, opinion?, from?}]`. When the agent
+   answers one, the host sends `_gorynych/ask_answered {sessionId, askId, from?, result | error}`
+   (the channel's answer), or its `_gorynych/turn_ended` carries `askId`, `opinion` and `from` (a
+   turn's end). Both are numbered and kept as session updates are, so a service that comes after
+   the answer still gets it.
+3. The next service takes the questions back with the host: a turn's question is awaited under its
+   `message_id` again, so the agent's `reply` reaches it, and its turn's own text answers when no
+   reply came (from the journal: the earlier service journaled the start of the turn). A `reply` to
+   a question of an earlier run waits up to 15 seconds for the host that answers it, in the first
+   minute after the service starts.
+4. The asker that lost the service sends the question again with `gorynych/reclaim: true`: the
+   service waits up to 15 seconds for a host to bring the question back, then for its answer, and
+   gives it to that asker once. It never asks the session again. A question no host kept (it went
+   with the earlier service before the session got it) fails with
+   `data: {"gorynych/askLost": true}`, and the asking agent is told to ask again. The peers server
+   comes back so across up to two more restarts; the outside server also while the next service
+   starts, up to 30 seconds.
+5. The answer goes only to the asker that asked: a session's question, to that session (its peer
+   token names it, and the token outlives the restart); a reclaim from another session fails as a
+   lost question would. An agent outside Gorynych has no such name: its outside server shows only
+   its client's name and folder, neither of them its own, so its question is bound to nothing but
+   its `askId`, a random value only that server holds.
+
+**A link that drops without a restart.** A question with an `askId` is not cut off when its
+asker's link to the service drops (a broken pipe, the asker's connection closed): it goes on, and
+the asker that comes back with `gorynych/reclaim` waits for its answer and takes it once, as after
+a restart, for as long as its own request waits. An asker that cancels its question itself
+(`$/cancel_request` on a link that stays) withdraws it: the question is cancelled as before, and a
+reclaim of it fails as a lost question does.
+
+An answer no asker came back for is dropped 10 minutes after it came, and a question never
+answered after a day: the service looks for such every minute.
 
 **A host with no conductor** (an orphan: the service crashed, or was uninstalled, or the next one
 does not start) keeps trying to connect. With nothing running (no prompt, no open question) it exits after 2 minutes, with code
@@ -1776,8 +1862,14 @@ own, and one more host for what no session has open (the list, deleting a sessio
 open); a session's host starts as the session opens and stops as it closes (idle unload, delete).
 Numbers and cursors are per host.
 
-**Platforms.** Hosts build everywhere and are tested on Windows. On Linux and macOS they are off by
-default, since they are untried there; `--hosts on` turns them on.
+**Platforms.** Hosts build everywhere, and are on by default on Windows and Linux. On Linux they
+were tried on 11 November 2026 in WSL (Ubuntu 24.04) with real host processes and a stand-in Kimi
+whose turn is slow, as no agent is installed there: a restart in the middle of the turn left the
+host running, the turn's answer arrived whole and once through the bridge, and the next prompts ran
+on the next services. A host is the service's child there, and outlives it, as a process does on
+Linux; a systemd unit (planned) will need `KillMode=process`, or its restart would stop the hosts
+with the service. On macOS they are off by default, as nobody could try them there; `--hosts on`
+turns them on.
 
 ## Updating adapters
 

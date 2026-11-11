@@ -155,7 +155,9 @@ Do this once, as the person who works there.
    ```
 
    - Service options go after it (for example `--claude-model sonnet`) and become the task's
-     arguments. A relative `--data` is made absolute.
+     arguments. A relative `--data` is made absolute. A `--data` the service would refuse (a
+     drive, the profile, a folder of other files: [service-protocol.md](service-protocol.md#endpoint))
+     is refused here, before the task is registered.
    - `task uninstall` removes the task, and leaves a running service running.
    - Run `task install` again after you move the installation: the task runs the executable
      that registered it.

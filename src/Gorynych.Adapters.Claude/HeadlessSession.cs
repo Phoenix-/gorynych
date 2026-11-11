@@ -51,6 +51,7 @@ internal sealed class HeadlessSession : IClaudeSession
     TaskCompletionSource cancelSignal = NewSignal();
     long generation;
     long lastOutput;
+    bool processUp;         // the current process said system/init: it is up, its MCP servers too
     string? planError;      // an auth or billing error of the running turn
     string? lastResultError;
 
@@ -241,8 +242,9 @@ internal sealed class HeadlessSession : IClaudeSession
         finally { inputGate.Release(); }
         WithdrawAsks();
         if (await Task.WhenAny(current.Task, Task.Delay(options.InterruptGraceMs)) == current.Task) return;
-        current.TryComplete(StopReason.Cancelled);
+        // Given up before the turn ends, so a prompt sent as soon as the client reads the end starts a new process.
         Abandon(claude, "no result after the interrupt; the next prompt resumes the session in a new process");
+        current.TryComplete(StopReason.Cancelled);
     }
 
     /// <summary>
@@ -281,16 +283,24 @@ internal sealed class HeadlessSession : IClaudeSession
                 try { await Task.Delay(options.StallMs, lifetime.Token); }
                 catch (OperationCanceledException) { return; }
                 List<string> stale;
+                bool wasStarted;
                 lock (stateGate)
                 {
                     if (active || pending.Count == 0) return;
-                    if (Environment.TickCount64 - lastOutput < options.StallMs) continue;
+                    // Until it says system/init, which it does once its MCP servers are up, Claude is
+                    // starting, not silent: that is bounded by the startup time, and an init that shows
+                    // it off the plan must not come after the prompt was failed for a stall.
+                    var limit = processUp ? options.StallMs : Math.Max(options.StallMs, options.StartupTimeoutSeconds * 1000L);
+                    if (Environment.TickCount64 - lastOutput < limit) continue;
                     stale = pending.ToList();
+                    wasStarted = processUp;
                 }
                 var reason = lastResultError is { } error ? $" Claude's last error: {error}" : "";
-                agent.Log($"claude {Id}: Claude took {stale.Count} message(s) in no turn; dropping them");
+                agent.Log($"claude {Id}: Claude took {stale.Count} message(s) in no turn{(wasStarted ? "" : ", and did not start")}; dropping them");
                 foreach (var uuid in stale)
-                    Drop(uuid, new JsonRpcException(JsonRpcException.InternalError, $"Claude did not take the prompt.{reason}"));
+                    Drop(uuid, new JsonRpcException(JsonRpcException.InternalError, wasStarted
+                        ? $"Claude did not take the prompt.{reason}"
+                        : $"Claude did not take the prompt: it did not start within {options.StartupTimeoutSeconds} s.{reason}"));
                 return;
             }
         });
@@ -521,6 +531,7 @@ internal sealed class HeadlessSession : IClaudeSession
         lock (stateGate)
         {
             process = claude;
+            processUp = false;
             active = activeOwn = activeMarked = false;
             taken.Clear();
             pending.Clear();
@@ -629,6 +640,7 @@ internal sealed class HeadlessSession : IClaudeSession
             }
             case "system" when StreamJson.Subtype(m) == "init":
             {
+                lock (stateGate) if (ReferenceEquals(process, claude)) processUp = true;
                 if (StreamJson.ApiKeySourceOfInit(m) is { } apiKey)
                 {
                     StopOffThePlan(StreamJson.ApiKeyProblem(apiKey));
@@ -656,14 +668,20 @@ internal sealed class HeadlessSession : IClaudeSession
         }
     }
 
-    /// <summary>A turn about to run on something other than the plan: the client's prompt fails, and Claude is stopped before it calls the API.</summary>
+    /// <summary>
+    /// A turn about to run on something other than the plan: Claude is stopped before it calls the API,
+    /// and the client's prompt fails. In that order: the client may send its next prompt as soon as it
+    /// reads the failure, and that one must start a new process, not go into the one being stopped
+    /// (it would fail with the process's exit instead of the reason).
+    /// </summary>
     void StopOffThePlan(string problem)
     {
         Turn? current;
         ClaudeProcess? claude;
         lock (stateGate) { current = turn; claude = process; }
-        current?.TryFail(new JsonRpcException(JsonRpcException.InternalError, problem));
         if (claude is not null) Abandon(claude, problem);
+        options.OffPlanStopping?.Invoke();
+        current?.TryFail(new JsonRpcException(JsonRpcException.InternalError, problem));
     }
 
     /// <summary>Starts a turn in the state when none runs; under stateGate.</summary>

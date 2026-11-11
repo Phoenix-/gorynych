@@ -11,7 +11,8 @@
 // An opinion request (its text names `message_id "…"`) is answered through the reply route the
 // --mcp-config gives the gorynych server, as the peers server would. Files in the folder change
 // the account: `signed-out` (no login, as `--bare` gives), `no-account`, `api-key` (initialize
-// shows ANTHROPIC_API_KEY), `api-key-init` (only system/init shows it), `auth-token` (a token but
+// shows ANTHROPIC_API_KEY), `api-key-init` (only system/init shows it), `init-held` (no system/init,
+// as while slow MCP servers start, until the file goes), `auth-token` (a token but
 // no plan) and `bedrock` (another provider); `deaf` stops reading stdin after initialize;
 // `no-bypass` starts in `default` whatever --permission-mode says, as a Claude whose settings turn
 // bypassPermissions off; `force-bypass` starts in it whatever was asked; `no-leave` refuses to leave
@@ -197,6 +198,8 @@ static partial class FakeHeadless
         interrupted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         var prompt = Text(first);
         if (prompt.Contains("swallow", StringComparison.OrdinalIgnoreCase)) return;
+        // Its MCP servers take long to start: no system/init while the folder has `init-held`.
+        while (File.Exists(Path.Combine(Environment.CurrentDirectory, "init-held"))) await Task.Delay(20);
         var apiKey = File.Exists(Path.Combine(Environment.CurrentDirectory, "api-key-init")) ? "ANTHROPIC_API_KEY" : "none";
         await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "init", ["session_id"] = sessionId, ["model"] = model, ["permissionMode"] = mode, ["apiKeySource"] = apiKey });
         await ReplayAsync(first, sessionId);

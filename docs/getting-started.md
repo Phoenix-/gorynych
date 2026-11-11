@@ -280,9 +280,10 @@ answer arrives whole ([service-protocol.md](service-protocol.md#adapter-hosts)).
    moves after its first prompt, or goes when the panel closes), or a close that failed (it moves
    at a later idle moment). A restart with other adapter options (`--claude-model`, …) moves the
    sessions the same way.
-   An agent that was waiting for another session's answer (`ask_agent`) during the restart is told
-   to ask again.
-4. **Without hosts** (`--hosts off`, the default on Linux and macOS) a restart still stops the
+   An agent that was waiting for another session's answer (`ask_agent`) during the restart gets it
+   all the same, from the next service; only a question that had not reached the other session
+   yet is lost, and the agent is told to ask again.
+4. **Without hosts** (`--hosts off`, the default on macOS) a restart still stops the
    agents, so it starts no new turn and waits up to five minutes for the running ones
    (`--timeout <minutes>` changes that). **If a turn still runs after the wait**, the restart is
    called off: the command lists the sessions still at work and exits with 4, and the service goes
@@ -312,7 +313,8 @@ A file that is still in use belongs to one of them.
 ## Where things are
 
 - **Programs:** `%LOCALAPPDATA%\Programs\Gorynych`, or wherever you put them.
-- **Data:** `%LOCALAPPDATA%\Gorynych`.
+- **Data:** `%LOCALAPPDATA%\Gorynych`. Only you (and SYSTEM) can read it: the service closes it at
+  each start, also to the commands Codex's sandbox runs, which can read the rest of your profile.
   - `sessions.json`: the service's list of sessions, with titles, parents and archive flags.
   - `journal\`: what each session said, as the service relayed it.
   - `claude\`: the Claude adapter's session list (with each session's selector choices),

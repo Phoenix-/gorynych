@@ -25,7 +25,7 @@ public sealed partial class ClaudeHeadlessTests
     static readonly string FakeRoot = Path.Combine(Path.GetTempPath(), "gorynych-fake-claude");
 
     static ClaudeAdapterOptions Options(string dir, List<string>? log = null, bool liveNotes = false, Func<Task>? beforeInterrupt = null,
-        bool fetchCatalog = true, string permissionMode = "default") => new()
+        bool fetchCatalog = true, string permissionMode = "default", int stallMs = 1500, Action? offPlanStopping = null) => new()
     {
         BeforeInterrupt = beforeInterrupt,
         FetchCatalog = fetchCatalog,
@@ -39,7 +39,8 @@ public sealed partial class ClaudeHeadlessTests
         StartupTimeoutSeconds = 20,
         InterruptGraceMs = 3000,
         CloseTimeoutMs = 3000,
-        StallMs = 1500,
+        StallMs = stallMs,
+        OffPlanStopping = offPlanStopping,
         Log = log is null ? null : m => { lock (log) log.Add(m); },
     };
 
@@ -387,6 +388,65 @@ public sealed partial class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task AClaudeSlowToStart_IsNotTakenForOneThatDroppedThePrompt_AndAnOffPlanInitSaysWhy()
+    {
+        // Claude says system/init once its MCP servers are up, which may take long on a slow machine:
+        // its silence until then is its start, not a message it did not take. Were it taken for one,
+        // the person would read "did not take the prompt" instead of how to get back on the plan.
+        var dir = TestDirs.New();
+        File.WriteAllText(Path.Combine(dir, "api-key-init"), "");
+        var held = Path.Combine(dir, "init-held");
+        File.WriteAllText(held, "");
+        var log = new List<string>();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, stallMs: 100)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+
+        var prompt = PromptAsync(client, sessionId, "hello");
+        await Task.Delay(1000); // ten times what a stall is, after Claude started
+        Assert.IsFalse(prompt.IsCompleted, "still starting");
+        lock (log) Assert.IsFalse(log.Any(l => l.Contains("in no turn", StringComparison.Ordinal)), string.Join(Environment.NewLine, log));
+        File.Delete(held);
+
+        var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => prompt);
+        StringAssert.Contains(failed.Message, "remove ANTHROPIC_API_KEY");
+        Assert.IsFalse(failed.Message.Contains("did not take the prompt", StringComparison.Ordinal), failed.Message);
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ThePromptAfterAnOffPlanFailure_StartsANewClaude_NotTheOneBeingStopped()
+    {
+        // The next prompt may come as soon as the client reads the failure: by then the process is let
+        // go, so the prompt starts a new one, which says the same reason, rather than going into the
+        // one being stopped and failing with its exit. Held between the two steps, whichever comes first.
+        var dir = TestDirs.New();
+        File.WriteAllText(Path.Combine(dir, "api-key-init"), "");
+        using var stopping = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var once = 0;
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, offPlanStopping: () =>
+        {
+            if (Interlocked.Exchange(ref once, 1) != 0) return;
+            stopping.Set();
+            release.Wait(TimeSpan.FromSeconds(30));
+        })));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+
+        var first = PromptAsync(client, sessionId, "first");
+        Assert.IsTrue(stopping.Wait(TimeSpan.FromSeconds(30)), "the first launch found off the plan");
+        var second = PromptAsync(client, sessionId, "second");
+        await Task.Delay(300); // were the first failed already, the second would go into the process now
+        release.Set();
+
+        StringAssert.Contains((await Assert.ThrowsExactlyAsync<JsonRpcException>(() => first)).Message, "remove ANTHROPIC_API_KEY");
+        var next = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => second);
+        StringAssert.Contains(next.Message, "remove ANTHROPIC_API_KEY", "a new Claude, which says why: " + next.Message);
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task AStoppedClaude_LeavesNothingBehind_AndTheNextLaunchStartsClean()
     {
         var dir = TestDirs.New();
@@ -480,8 +540,11 @@ public sealed partial class ClaudeHeadlessTests
         await using var client = await TestClient.ConnectAsync(conductor);
         var sessionId = await NewAsync(client, dir);
         await PromptAsync(client, sessionId, "hello");
+        var waited = System.Diagnostics.Stopwatch.StartNew();
         var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "swallow this"));
         StringAssert.Contains(failed.Message, "did not take the prompt");
+        // Claude runs (it said system/init with "hello"): its stall time (1.5 s) holds, not its startup time (20 s).
+        Assert.IsLessThan(15, waited.Elapsed.TotalSeconds, "let go after its stall time, not its startup time");
         Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "still here")).StopReason);
         StringAssert.Contains(client.Text(), "echo: still here");
     }

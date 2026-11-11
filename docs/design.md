@@ -571,7 +571,7 @@ history, the journals and the overlay, so an idle session loses nothing.
 
 **Agreed on 10 November 2026: the process boundary moves to where ACP already is, between the
 conductor and the adapters.** Step 3a, the hosts and a conductor that restarts lightly, is
-**done** on 10 November 2026 and on by default on Windows
+**done** on 10 November 2026 and on by default on Windows, and on Linux since 11 November 2026
 ([service-protocol.md](service-protocol.md#adapter-hosts)); step 3b, updating the adapters
 themselves, is **done** on 10 November 2026 as well
 ([service-protocol.md](service-protocol.md#updating-adapters)).
@@ -588,7 +588,7 @@ themselves, is **done** on 10 November 2026 as well
      hands them over now, so the journal misses nothing.
   3. The bridge reconnects too. It keeps the client's `session/prompt` open and answers it
      when the turn ends, so the GUI sees a pause in the stream, not a break. Without hosts
-     (`--hosts off`, the default elsewhere than Windows), a turn ends with the old conductor, so
+     (`--hosts off`, the default on macOS), a turn ends with the old conductor, so
      `restart` waits for running turns and is called off when they outlast the wait, unless
      `--force` cancels them, and then the bridge answers `cancelled`.
 - How it came out:
@@ -605,8 +605,13 @@ themselves, is **done** on 10 November 2026 as well
   - The next conductor takes the running turns back: they hold their sessions, so a new prompt
     waits for them, and a resuming bridge is told they run.
   - A restart waits for no turn. A prompt waiting behind a running turn is refused and goes to the
-    next service. What still lives in the conductor is cut: an `ask_agent` waiting for its answer
-    gets an error that says to ask again, with the session ID.
+    next service. An `ask_agent` the asked agent is answering goes on in its host, and the asker
+    takes the answer from the next service by its own name for the question (`gorynych/askId`),
+    once, without the agent being asked again; so does an asker whose link to the service dropped
+    with no restart, and a session's answer goes only to the session that asked. What still lives
+    only in the conductor is cut: a
+    question that had not reached the asked agent gets an error that says to ask again, with the
+    session ID.
 - How many hosts depends on the agent:
   - Claude runs a process per session, so it gets a host per session (3b), and one more for what
     no session has open, such as the list.
@@ -708,12 +713,12 @@ last acknowledged one, and send the pending requests again. So it is built once.
 - **A host that dies** ends its turns `cancelled`, with their marks, and the next request starts
   another.
 - **The peers server inside an agent** connects for each call, and waits up to 30 seconds for a
-  service that restarts. An `ask_agent` that was waiting during the restart returns an error
-  that says to ask again.
+  service that restarts. An `ask_agent` that was waiting during the restart comes back for its
+  answer; only one whose question went with the service returns an error that says to ask again.
 - **Job objects.** Hosts are detached from the service's process, as `DetachedProcess` already
   does for the service.
-- **Platforms.** Hosts are on by default on Windows only, where they are tested; on Linux and
-  macOS they build, but are off unless `--hosts on`.
+- **Platforms.** Hosts are on by default on Windows and Linux, where they are tried (Linux in WSL,
+  with a stand-in agent); on macOS they build, but are off unless `--hosts on`.
 - **The first update** onto this scheme still stops the agents: the service it replaces has no
   hosts.
 
@@ -830,7 +835,7 @@ Next, in order (**planned**):
    2026, with `Gorynych.Service restart`, and checked live through the bridge on one machine.
 3. Adapter hosts, and a conductor that restarts without breaking a turn. **3a done** on 10
    November 2026: the hosts, one per adapter, and a restart that waits for no turn, on by
-   default on Windows ([service-protocol.md](service-protocol.md#adapter-hosts)).
+   default on Windows, and on Linux since 11 November ([service-protocol.md](service-protocol.md#adapter-hosts)).
 4. Updating an adapter on the fly (3b): new sessions start on the new host, and a live one moves
    over once it is idle; with it a host per Claude session. **Done** on 10 November 2026
    ([service-protocol.md](service-protocol.md#updating-adapters)).

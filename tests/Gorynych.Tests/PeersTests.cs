@@ -380,6 +380,42 @@ public sealed class PeersTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
+    [DataRow(true, DisplayName = "the next service has the answer")]
+    [DataRow(false, DisplayName = "the question went with the service")]
+    public async Task AQuestionWhoseServiceWentWhileItWaited_TakesTheAnswerFromTheNext_ByItsAskId(bool kept)
+    {
+        var asked = new List<JsonObject>();
+        var route = Route(async (n, req, service) =>
+        {
+            lock (asked) asked.Add(((JsonObject)req.Params!).DeepClone().AsObject());
+            if (n == 1)
+            {
+                await service.DisposeAsync(); // the service restarts while the session answers
+                return null;
+            }
+            return kept
+                ? new JsonObject { ["text"] = "SQLite, for one user." }
+                : throw new JsonRpcException(JsonRpcException.InvalidRequest, "The question to session_id s-42 went with the restart of Gorynych…",
+                    new JsonObject { [GorynychProtocol.MetaAskLost] = true });
+        });
+
+        var answer = await Ask(route);
+
+        Assert.AreEqual(kept
+            ? ("SQLite, for one user.", false)
+            : ("Gorynych restarted while session_id s-42 was answering, so its answer was lost. Ask again in a moment: " +
+               "ask_agent with session_id s-42 and the same question.", true), answer);
+        Assert.AreEqual(2, asked.Count, "asked once, then came back for the answer once");
+        var askId = (string?)asked[0]["_meta"]![GorynychProtocol.MetaAskId];
+        Assert.IsFalse(string.IsNullOrEmpty(askId));
+        Assert.IsNull(asked[0]["_meta"]![GorynychProtocol.MetaReclaim]);
+        Assert.AreEqual(askId, (string?)asked[1]["_meta"]![GorynychProtocol.MetaAskId], "the same question");
+        Assert.AreEqual(true, (bool?)asked[1]["_meta"]![GorynychProtocol.MetaReclaim], "its answer, not the question again");
+        Assert.AreEqual("SQLite?", (string?)asked[1]["text"]);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
     public async Task AQuestionWhileTheRestartGoesOnTooLong_SaysToAskAgain_AndAServiceThatNeverComesSaysSo()
     {
         Assert.AreEqual(("Gorynych is restarting and did not ask session_id s-42. Ask again in a moment: ask_agent with session_id s-42 " +

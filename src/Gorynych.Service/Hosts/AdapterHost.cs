@@ -186,9 +186,22 @@ public sealed class AdapterHost
                 {
                     var report = new JsonObject { ["sessionId"] = sessionId, ["turn"] = key };
                     if (request.PromptId is { } promptId) report["promptId"] = promptId;
+                    if (request.AskId is { } askId) report["askId"] = askId;
+                    if (request.Opinion is { } opinion) report["opinion"] = opinion;
+                    if (request.AskId is not null && request.From is { } from) report["from"] = from;
                     if (message["result"] is { } r) report["result"] = r.DeepClone();
                     if (message["error"] is { } e) report["error"] = e.DeepClone();
                     ended = Number(Notification(GorynychProtocol.MethodTurnEnded, report));
+                }
+                // So is the answer to a question the agent took by its own way in (Claude's channel):
+                // the conductor that asked may be gone, and the next one gives it to the asker.
+                else if (request.Method == GorynychProtocol.MethodOpinion && request.AskId is { } askId && request.SessionId is { } asked)
+                {
+                    var report = new JsonObject { ["sessionId"] = asked, ["askId"] = askId };
+                    if (request.From is { } from) report["from"] = from;
+                    if (message["result"] is { } r) report["result"] = r.DeepClone();
+                    if (message["error"] is { } e) report["error"] = e.DeepClone();
+                    ended = Number(Notification(GorynychProtocol.MethodAskAnswered, report));
                 }
             }
             if (ended is not null && current is { IsLost: false } connection) await TryWriteLineAsync(connection, ended);
@@ -581,6 +594,9 @@ public sealed class AdapterHost
             {
                 Connection = connection, ConductorId = id.DeepClone(), Method = method, SessionId = Text(@params?["sessionId"]),
                 PromptId = Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]),
+                AskId = Text(@params?["_meta"]?[GorynychProtocol.MetaAskId]) ?? Text(@params?["askId"]), // a prompt's _meta; _gorynych/opinion's params
+                Opinion = Text(@params?["_meta"]?[GorynychProtocol.MetaOpinion]),
+                From = Text(@params?["_meta"]?[GorynychProtocol.MetaFromSessionId]),
             };
         }
         message["id"] = key;
@@ -595,6 +611,10 @@ public sealed class AdapterHost
                 ["sessions"] = new JsonArray(live.Select(s => (JsonNode)s).ToArray()),
                 ["turns"] = new JsonArray(forwarded.Where(f => f.Value.Method == AcpMethods.Agent.SessionPrompt && f.Value.SessionId is not null)
                     .Select(f => (JsonNode)new JsonObject { ["sessionId"] = f.Value.SessionId, ["turn"] = f.Key, ["promptId"] = f.Value.PromptId }).ToArray()),
+                // The questions the agent is answering, by turn or by its own way in: the next conductor waits for their answers.
+                ["asks"] = new JsonArray(forwarded.Values.Where(f => f.AskId is not null && f.SessionId is not null
+                        && f.Method is AcpMethods.Agent.SessionPrompt or GorynychProtocol.MethodOpinion)
+                    .Select(f => (JsonNode)new JsonObject { ["sessionId"] = f.SessionId, ["askId"] = f.AskId, ["opinion"] = f.Opinion, ["from"] = f.From }).ToArray()),
                 ["buffered"] = new JsonArray(buffer.Select(b => b.SessionId).Distinct(StringComparer.Ordinal).Select(s => (JsonNode)s).ToArray()),
                 ["requests"] = asked.Count,
                 ["seq"] = seq,
@@ -756,6 +776,15 @@ public sealed class AdapterHost
         public required string Method { get; init; }
         public string? SessionId { get; init; }
         public string? PromptId { get; init; }
+
+        /// <summary>The asker's name for the question this request carries (<c>gorynych/askId</c>): an opinion, by channel or in a turn.</summary>
+        public string? AskId { get; init; }
+
+        /// <summary>For an opinion asked in a turn: its <c>message_id</c> (<c>gorynych/opinion</c>), which the agent's reply names.</summary>
+        public string? Opinion { get; init; }
+
+        /// <summary>For an opinion: the session that asks (<c>gorynych/fromSessionId</c>), which alone takes the answer from the next service.</summary>
+        public string? From { get; init; }
     }
 
     /// <summary>A question of the agent's no conductor has answered yet.</summary>
