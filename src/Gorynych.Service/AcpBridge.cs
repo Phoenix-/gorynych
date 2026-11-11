@@ -196,6 +196,7 @@ public static class AcpBridge
         Console.WriteLine($"service: process {(int?)status?["processId"]}, version {(string?)status?["version"]}" +
             (hosted ? $", build {(string?)status?["build"]}, adapters in hosts" : ", adapters in its own process") +
             $", {(int?)status?["clients"] ?? 0} clients, {(int?)status?["sessions"] ?? 0} sessions");
+        if ((string?)status?["dataFolderOpen"] is { } open) Console.WriteLine($"warning: {open}");
         foreach (var row in HostRows(status)) Console.WriteLine("  " + row);
         if (hosted)
         {
@@ -310,6 +311,10 @@ public static class AcpBridge
                     throw new InvalidOperationException($"the logon task {LogonTask.Name(pipe)} did not start: {failure}");
                 return await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(wait)) ?? throw new TimeoutException(ServiceLaunch.TaskTimeout(pipe, wait));
             default:
+                // A service would refuse this data folder and exit: say why here, rather than wait for its pipe.
+                if (serviceArgs.ToList().IndexOf("--data") is var data and >= 0 && data + 1 < serviceArgs.Count
+                    && DataFolder.Refusal(serviceArgs[data + 1]) is { } refused)
+                    throw new NotStartedException(refused);
                 var exe = Environment.ProcessPath ?? throw new InvalidOperationException("no process path");
                 List<string> args = ["--pipe", pipe, .. serviceArgs];
                 Console.Error.WriteLine($"gorynych acp: starting the service ({exe} {string.Join(' ', args)})");

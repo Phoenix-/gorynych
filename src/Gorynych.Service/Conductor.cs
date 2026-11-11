@@ -80,6 +80,12 @@ public sealed class ConductorOptions
     public string? HostToken { get; init; }
 
     /// <summary>
+    /// Why the data folder, or something inside it, could not be closed to other accounts at this start
+    /// (<see cref="DataFolder"/>); null when it is closed. <c>gorynych status</c> says it.
+    /// </summary>
+    public string? DataFolderOpen { get; init; }
+
+    /// <summary>
     /// The generation of host the conductor would start now for an adapter: this executable's build
     /// and the adapter's options. A host of another is stale; its sessions move as they go idle. Null,
     /// or a null answer: every host counts as current.
@@ -4127,6 +4133,7 @@ public sealed class Conductor : IAsyncDisposable
         ["processId"] = Environment.ProcessId,
         ["version"] = AgentHost.Version,
         ["dataDirectory"] = options.DataDirectory,
+        ["dataFolderOpen"] = options.DataFolderOpen,
         ["clients"] = clients.Count,
         ["sessions"] = store.All().Count,
         ["pendingRequests"] = feeds.Values.Sum(f => f.PendingRequests),

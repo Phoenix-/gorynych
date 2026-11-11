@@ -53,15 +53,33 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   service ID), `sessions.json` (the overlay), `journal/`, `claude/` (the Claude adapter's
   session list and `channels.json`, the person's answer about development channels),
   `host.token` (what proves an [adapter host](#adapter-hosts) to the service), `logs/`
-  (`service-<date>.log`, and `host-<adapter>-<date>.log` for each host).
-  The folder is the user's alone. At each start the service gives it a protected DACL on Windows:
-  the user and SYSTEM, full control, inherited by all inside, nothing inherited from the parent.
-  Under `%LOCALAPPDATA%` it would otherwise inherit what the profile grants others, such as Codex's
-  `CodexSandboxUsers: ReadAndExecute`, through which the commands Codex's sandbox runs read every
-  journal and the peer tokens. Setting it rewrites what the files inside inherit, so an older
-  install is closed too; a folder that has it already is left alone. On Unix it is `0700`. The
-  agents, the adapter hosts and the MCP servers run as the user and read what they need there
-  (Claude's per-session `settings.json` and `mcp.json`, DSH's patch file) as before.
+  (`service-<date>.log`, and `host-<adapter>-<date>.log` for each host), `.gorynych-data` (names
+  the folder as Gorynych's) and, on Windows, `.closed` (below).
+  - **The folder is the user's alone.** At each start the service gives it a protected DACL on
+    Windows: the user and SYSTEM, full control, inherited by all inside, nothing inherited from the
+    parent. Under `%LOCALAPPDATA%` it would otherwise inherit what the profile grants others, such as
+    Codex's `CodexSandboxUsers: ReadAndExecute`, through which the commands Codex's sandbox runs read
+    every journal and the peer tokens. On Unix it is `0700`. The agents, the adapter hosts and the
+    MCP servers run as the user and read what they need there (Claude's per-session `settings.json`
+    and `mcp.json`, DSH's patch file) as before.
+  - **All inside.** Setting the folder's DACL makes Windows compute again what each item inside
+    inherits, so an older install is closed too; but Windows passes over an item it may not change
+    without a word. So the service then goes over all inside itself, gives an item that still lets
+    another account in no DACL of its own (it takes the folder's), and writes `.closed`, with the DACL
+    given, only when nothing was left open. While `.closed` is missing, or names another DACL, each
+    start goes over the folder again; what it could not close is logged as a warning and shown by
+    `status`. Neither Windows nor that pass follows a junction or a link inside the folder, nor
+    changes it: what it leads to keeps its own DACL.
+  - **Only its own folder.** Closing a folder shuts every other account out of it, so the service
+    takes only the default folder, a new or empty one, or one that is a Gorynych data folder already
+    (it has `.gorynych-data`, or the `service.json` of an earlier build). It never takes a drive's or
+    volume's root, the user profile, `%LOCALAPPDATA%`, `%APPDATA%`, `%PROGRAMDATA%` or a folder above
+    them, the Windows folder, `Program Files`, or a folder inside these last; on Unix, `/`, `$HOME`,
+    `$XDG_DATA_HOME`, `~/.local/share` or a folder above them. A folder that is or leads to one of
+    these (a junction, a link) is refused too. For such a `--data` the service exits with code 2 and
+    says on stderr which folder, why, and what to do (a new or empty folder, or the default); the
+    bridge says it before starting a service, and `task install` before registering the task. If
+    closing fails (no right to change the folder's DACL, say), the service says so and runs on.
 
 Command line: `Gorynych.Service [serve] [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex|dsh]
 [--claude-model <model>] [--unload-after <minutes>] [--claude-transport headless|tui]
@@ -232,7 +250,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/open_elsewhere` | method, service → adapter, `{sessionIds}` → `{sessions: {"<id>": "<holder>"}}` | which of these sessions another app has open now, the held ones only; for the lists agents see |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
-| `_gorynych/status` | method | service ID, process, data folder, clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
+| `_gorynych/status` | method | service ID, process, data folder, `dataFolderOpen` (why the data folder, or an item in it, could not be closed to other accounts at this start; null when it is closed), clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/restart` | method, `{wait?, timeoutSeconds?, force?}` → `{restarted: true, processId, waitedSeconds, cancelledTurns}` or `{restarted: false, processId, waitedSeconds, running: [{sessionId, agent, title}]}`; with hosts always `{restarted: true, processId, waitedSeconds, cancelledTurns: 0, turnsInHosts}` | asks the service to exit for an update without breaking its clients' work; without hosts, called off when turns outlast the wait, unless `force` ([The resumable link](#the-resumable-link)); with hosts, it waits for no turn ([Adapter hosts](#adapter-hosts)) |
 | `_gorynych/restarting` | notification to clients, `{restart}` | the service has begun restart number `restart`: a client on the link holds its new prompts |

@@ -47,13 +47,21 @@ switch (line.Command)
 
 var pipeName = line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName;
 var dataDirectory = DataDirectory(line);
+// The service closes its data folder to every other account: never a drive, the profile, or a folder of someone else's files.
+if (DataFolder.Refusal(dataDirectory) is { } refused)
+{
+    Console.Error.WriteLine($"gorynych: {refused}");
+    return CommandLine.UsageExitCode;
+}
 Directory.CreateDirectory(dataDirectory);
+DataFolder.Claim(dataDirectory);
 ServiceLog.Init(Path.Combine(dataDirectory, "logs"), console: line.Flag("--console"));
 // Every session's journal, the peer tokens and the logs are the user's alone (Codex's sandbox could read them).
-if (DataFolder.Protect(dataDirectory) is { } closed)
+var closed = DataFolder.Protect(dataDirectory);
+if (closed is { } said)
 {
-    if (closed.Failed) ServiceLog.Warn($"service: {closed.Said}");
-    else ServiceLog.Info($"service: {closed.Said}");
+    if (said.Failed) ServiceLog.Warn($"service: {said.Said}");
+    else ServiceLog.Info($"service: {said.Said}");
 }
 // What it runs is read now, before an update can rename its executable aside and copy another in its place.
 var (serviceBuild, buildTook) = Gorynych.Service.Hosts.HostGeneration.ReadAtStart(m => ServiceLog.Warn($"service: {m}"));
@@ -112,6 +120,7 @@ await using var conductor = new Conductor(new ConductorOptions
     // A host of another build, or with other options for its adapter, is stale: its sessions move once idle.
     HostGeneration = hosted ? a => new Gorynych.Service.Hosts.HostGeneration(serviceBuild, AdapterArguments(line, a)) : null,
     SessionHosts = new HashSet<string>(["claude"], StringComparer.Ordinal),
+    DataFolderOpen = closed is { Failed: true } ? closed.Value.Said : null,
 }, adapters);
 
 // Drafts a client left behind in an earlier run (Zed quits without closing them), once the bridges
@@ -141,8 +150,7 @@ try { await hostListener; } catch { hostPipeFailed = true; }
 ServiceLog.Info(conductor.StopHostsOnExit ? "service stopping" : "service stopping; its hosts keep their agents for the next one");
 return hostPipeFailed ? 1 : 0;
 
-static string DataDirectory(CommandLine line) => Path.GetFullPath(line.Value("--data")
-    ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Gorynych"));
+static string DataDirectory(CommandLine line) => line.Value("--data") is { } data ? Path.GetFullPath(data) : DataFolder.DefaultPath();
 
 // The adapters, as the service runs them in its process or a host runs one of them.
 static List<IAgentAdapter> Adapters(CommandLine line, string dataDirectory) =>
@@ -284,6 +292,11 @@ static int TaskCommand(CommandLine line)
     // The task starts in the executable's folder, so a relative data folder is made absolute here.
     var data = serviceArgs.IndexOf("--data");
     if (data >= 0) serviceArgs[data + 1] = Path.GetFullPath(serviceArgs[data + 1]);
+    if (data >= 0 && DataFolder.Refusal(serviceArgs[data + 1]) is { } refused)
+    {
+        Console.Error.WriteLine($"gorynych task: {refused}");
+        return CommandLine.UsageExitCode;
+    }
     var (code, output) = Gorynych.Outside.LogonTask.Install(pipe, exe, serviceArgs);
     if (code != 0)
     {
