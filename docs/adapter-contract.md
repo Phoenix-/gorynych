@@ -60,7 +60,9 @@ fallback when the adapter does not provide it.
   update an old and a new host run side by side, and Claude runs one host per session
   ([service-protocol.md](service-protocol.md#updating-adapters)). A file the adapter keeps there is
   written under a lock across processes (`SharedFileLock`) after reading it again, and read again
-  when another process changed it, so no instance drops what another wrote.
+  when another process changed it, so no instance drops what another wrote. A change is told by
+  what the file holds (`SharedFile`), not by its write time and length: two writes of the same
+  length within one tick of the file system's clock (about 15 ms on Windows) leave both alike.
 - `session/close` MUST let go of the session in the agent before it answers, so that another
   instance can open it at once: Codex answers once its app-server let go of the thread's writer
   lock. A session moves between hosts so. A close that could not let go (it gave up waiting) MUST
