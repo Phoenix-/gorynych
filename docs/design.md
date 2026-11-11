@@ -276,8 +276,8 @@ Titles and archive live in the harness when it has them; otherwise in the servic
   or the CLI holds is marked in the session list with the app that holds it, and fails to open
   through Gorynych at once, naming that app (`gorynych/openElsewhere`, **done**).
 - **Claude sessions started elsewhere: possible, but laborious and fragile, so left out for
-  now.** This was looked at on 10 November 2026 with Claude Code 2.1.321; nothing below was
-  probed yet.
+  now.** This was looked at on 10 November 2026 with Claude Code 2.1.321. Two writers were
+  probed on 11 November 2026 with 2.1.302.
   - *What already works.* Claude Desktop, the terminal `claude` and the adapter write their
     transcripts to the same `~/.claude/projects`. `claude -p --resume <id>` takes any of them,
     and the catch-up imports a session the journal has never seen
@@ -291,16 +291,39 @@ Titles and archive live in the harness when it has them; otherwise in the servic
       hooks and probes.
     - The size here: 510 transcripts in 72 folders, 3.7 GB.
   - *Why it is fragile.*
-    - As far as we know, Claude does not stop a second process from resuming a live session.
-      With two writers, the transcript forks into two branches. Each process sees only its
-      own turns, and the next resume silently drops one branch from the context.
+    - Claude does not stop a second interactive process from resuming a live session. The
+      probe ran two long-lived `claude -p --resume <id>` in stream-json input mode. Such a
+      process keeps the history in memory between turns, as the TUI does. Both loaded the
+      transcript before either wrote:
+      - both opened without a word, kept the session ID and appended to the same transcript;
+      - each chained its entries from its own last one (`parentUuid`), so the file held two
+        interleaved branches, and neither process saw the other's turns;
+      - the next `--resume` took the branch written last. The other branch's turns stayed in
+        the file but left the context silently;
+      - the registry (below) listed both processes under the same `sessionId`.
+    - Processes one after another are safe: each resume reads the transcript afresh. Only
+      two live at once fork it.
+    - Claude's own guard covers only background sessions (read from the 2.1.302 binary, not
+      run):
+      - `--resume`, in the TUI and in `-p`, refuses a session that a background or daemon job
+        holds ("Add --fork-session to branch off a copy instead");
+      - a holder of kind `interactive` is not checked: another terminal, Desktop, a
+        `claude -p`, Gorynych's own sessions;
+      - a background launch with `--resume` of a session open elsewhere starts a copy instead
+        ("The original conversation is unchanged").
+
+      So Claude's rule, too, is one live writer per session, and its answer is a fork.
     - Unlike Codex, nothing native would refuse the open, so the only guard would be
       Gorynych's own. The one source for it is the live-session registry
       `~/.claude/sessions/<pid>.json`, which backs Claude's cross-session messaging but is not
-      documented. Each entry has `sessionId`, `pid`, `entrypoint` and `status`, and for
-      Desktop its `local_…` id and sidebar title.
+      documented. Each entry has `sessionId`, `pid`, `kind`, `entrypoint` and `status`, and
+      for Desktop its `local_…` id and sidebar title.
     - If the registry's format changes, the guard fails open: nothing is marked, and opening
       the session forks its transcript.
+    - The reverse is not guarded either, and it is possible today. A terminal
+      `claude --resume` of a session that Gorynych has loaded opens it, and whichever writes
+      last wins the next resume. The adapter could notice it before its next prompt: the
+      transcript's last entry is no longer its mark.
   - *Why it is worth less than with Codex.*
     - Claude Desktop keeps its own session list, so sessions started in Gorynych would not
       show there. The switch would work one way only.
