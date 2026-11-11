@@ -67,7 +67,7 @@ Command line: `Gorynych.Service [serve] [--pipe <name>] [--data <dir>] [--defaul
 [--claude-model <model>] [--unload-after <minutes>] [--claude-transport headless|tui]
 [--claude-channels ask|accept|decline] [--hosts on|off] [--no-channel] [--no-peers] [--console]`.
 `--hosts` runs each adapter in an [adapter host](#adapter-hosts) of its own, which a restart leaves
-running with its agents: on by default on Windows, off elsewhere, where hosts are not tried yet.
+running with its agents: on by default on Windows and Linux, off on macOS, where hosts are not tried yet.
 `--unload-after` is how long a session stays loaded in its agent once it is idle with no
 client: 10 minutes by default, `0` at once ([Unloading idle sessions](#unloading-idle-sessions)).
 `--claude-transport` picks how Claude Code is driven: `headless` (`claude -p`, the default) or
@@ -1598,13 +1598,13 @@ answers method not found, and the command asks it to exit instead.
 Kimi keeps its drafts, and the Claude adapter opens one afresh under its ID (`gorynych/draft`,
 [adapter-contract.md](adapter-contract.md#3-new-sessions-the-list-and-discovery)); a Codex
 thread never prompted fails at its first prompt after a restart. Without
-[adapter hosts](#adapter-hosts) (`--hosts off`, the default elsewhere than Windows), a restart
+[adapter hosts](#adapter-hosts) (`--hosts off`, the default on macOS), a restart
 still stops the agents with their running turns, which is why it waits for them and is called off
 when they outlast the wait.
 
 ## Adapter hosts
 
-With hosts (`--hosts on`, the default on Windows), each adapter runs in a process of its own,
+With hosts (`--hosts on`, the default on Windows and Linux), each adapter runs in a process of its own,
 an *adapter host*, and a restart of the service leaves the hosts running with their agents
 ([design.md](design.md#updating-without-losing-work)). So a turn goes on through a restart, and
 its answer arrives whole.
@@ -1829,8 +1829,14 @@ own, and one more host for what no session has open (the list, deleting a sessio
 open); a session's host starts as the session opens and stops as it closes (idle unload, delete).
 Numbers and cursors are per host.
 
-**Platforms.** Hosts build everywhere and are tested on Windows. On Linux and macOS they are off by
-default, since they are untried there; `--hosts on` turns them on.
+**Platforms.** Hosts build everywhere, and are on by default on Windows and Linux. On Linux they
+were tried on 11 November 2026 in WSL (Ubuntu 24.04) with real host processes and a stand-in Kimi
+whose turn is slow, as no agent is installed there: a restart in the middle of the turn left the
+host running, the turn's answer arrived whole and once through the bridge, and the next prompts ran
+on the next services. A host is the service's child there, and outlives it, as a process does on
+Linux; a systemd unit (planned) will need `KillMode=process`, or its restart would stop the hosts
+with the service. On macOS they are off by default, as nobody could try them there; `--hosts on`
+turns them on.
 
 ## Updating adapters
 

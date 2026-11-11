@@ -48,7 +48,7 @@ internal sealed class CommandLine
           --claude-transport headless|tui
           --claude-channels ask|accept|decline
           --hosts on|off                        run each adapter in a host of its own, which a restart leaves
-                                                running (default on Windows; off elsewhere, where it is untried)
+                                                running (default on Windows and Linux; off on macOS, where it is untried)
           --no-channel  --no-peers
           --console                             also log to the console (not for acp and task install)
 

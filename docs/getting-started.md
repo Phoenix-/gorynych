@@ -283,7 +283,7 @@ answer arrives whole ([service-protocol.md](service-protocol.md#adapter-hosts)).
    An agent that was waiting for another session's answer (`ask_agent`) during the restart gets it
    all the same, from the next service; only a question that had not reached the other session
    yet is lost, and the agent is told to ask again.
-4. **Without hosts** (`--hosts off`, the default on Linux and macOS) a restart still stops the
+4. **Without hosts** (`--hosts off`, the default on macOS) a restart still stops the
    agents, so it starts no new turn and waits up to five minutes for the running ones
    (`--timeout <minutes>` changes that). **If a turn still runs after the wait**, the restart is
    called off: the command lists the sessions still at work and exits with 4, and the service goes

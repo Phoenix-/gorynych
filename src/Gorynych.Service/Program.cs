@@ -89,8 +89,8 @@ ServiceLog.Info($"service {state.ServiceId} starting, pid {Environment.ProcessId
 if (Gorynych.Outside.DetachedProcess.KillOnCloseJob() is { } job) ServiceLog.Warn($"service: {job}");
 
 var adapters = Adapters(line, dataDirectory);
-// Adapter hosts: on by default on Windows, where they are tried; elsewhere only when asked for.
-var hosted = line.Value("--hosts") switch { "on" => true, "off" => false, _ => OperatingSystem.IsWindows() };
+// Adapter hosts: on by default on Windows and Linux, where they are tried; on macOS only when asked for.
+var hosted = line.Value("--hosts") switch { "on" => true, "off" => false, _ => OperatingSystem.IsWindows() || OperatingSystem.IsLinux() };
 Gorynych.Service.Hosts.IHostLauncher? hosts = null;
 string? hostToken = null;
 if (hosted)
