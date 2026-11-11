@@ -51,6 +51,7 @@ internal sealed class HeadlessSession : IClaudeSession
     TaskCompletionSource cancelSignal = NewSignal();
     long generation;
     long lastOutput;
+    bool processUp;         // the current process said system/init: it is up, its MCP servers too
     string? planError;      // an auth or billing error of the running turn
     string? lastResultError;
 
@@ -281,16 +282,24 @@ internal sealed class HeadlessSession : IClaudeSession
                 try { await Task.Delay(options.StallMs, lifetime.Token); }
                 catch (OperationCanceledException) { return; }
                 List<string> stale;
+                bool wasStarted;
                 lock (stateGate)
                 {
                     if (active || pending.Count == 0) return;
-                    if (Environment.TickCount64 - lastOutput < options.StallMs) continue;
+                    // Until it says system/init, which it does once its MCP servers are up, Claude is
+                    // starting, not silent: that is bounded by the startup time, and an init that shows
+                    // it off the plan must not come after the prompt was failed for a stall.
+                    var limit = processUp ? options.StallMs : Math.Max(options.StallMs, options.StartupTimeoutSeconds * 1000L);
+                    if (Environment.TickCount64 - lastOutput < limit) continue;
                     stale = pending.ToList();
+                    wasStarted = processUp;
                 }
                 var reason = lastResultError is { } error ? $" Claude's last error: {error}" : "";
-                agent.Log($"claude {Id}: Claude took {stale.Count} message(s) in no turn; dropping them");
+                agent.Log($"claude {Id}: Claude took {stale.Count} message(s) in no turn{(wasStarted ? "" : ", and did not start")}; dropping them");
                 foreach (var uuid in stale)
-                    Drop(uuid, new JsonRpcException(JsonRpcException.InternalError, $"Claude did not take the prompt.{reason}"));
+                    Drop(uuid, new JsonRpcException(JsonRpcException.InternalError, wasStarted
+                        ? $"Claude did not take the prompt.{reason}"
+                        : $"Claude did not take the prompt: it did not start within {options.StartupTimeoutSeconds} s.{reason}"));
                 return;
             }
         });
@@ -521,6 +530,7 @@ internal sealed class HeadlessSession : IClaudeSession
         lock (stateGate)
         {
             process = claude;
+            processUp = false;
             active = activeOwn = activeMarked = false;
             taken.Clear();
             pending.Clear();
@@ -629,6 +639,7 @@ internal sealed class HeadlessSession : IClaudeSession
             }
             case "system" when StreamJson.Subtype(m) == "init":
             {
+                lock (stateGate) if (ReferenceEquals(process, claude)) processUp = true;
                 if (StreamJson.ApiKeySourceOfInit(m) is { } apiKey)
                 {
                     StopOffThePlan(StreamJson.ApiKeyProblem(apiKey));

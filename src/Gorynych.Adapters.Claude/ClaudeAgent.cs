@@ -44,8 +44,17 @@ public sealed class ClaudeAdapterOptions
     /// </summary>
     public ChannelConsent Channels { get; init; } = ChannelConsent.Ask;
 
-    /// <summary>How long a launch may take: the TUI's first prompt, or a headless <c>initialize</c>.</summary>
+    /// <summary>
+    /// How long a launch may take: the TUI's first prompt, or a headless <c>initialize</c>, and then its
+    /// first <c>system/init</c> (once its MCP servers are up), before which silence is no stall.
+    /// </summary>
     public int StartupTimeoutSeconds { get; init; } = 90;
+
+    /// <summary>
+    /// TUI: when a launch that has not reached its prompt is given up; by default after
+    /// <see cref="StartupTimeoutSeconds"/>. Tests give a condition on the screen (its tail) instead of a time.
+    /// </summary>
+    internal Func<Func<string>, CancellationToken, Task>? GiveUpStartup { get; init; }
 
     public int PasteEnterDelayMs { get; init; } = 400;
 

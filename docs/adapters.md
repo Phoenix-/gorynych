@@ -158,7 +158,11 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   open are withdrawn. A cancel whose interrupt comes only after its turn ended sends nothing, so
   it never stops the next prompt.
 - Messages that wait with no turn running while Claude stays silent for 30 s are let go: a
-  prompt among them fails ("Claude did not take the prompt"), so nothing waits for ever.
+  prompt among them fails ("Claude did not take the prompt"), so nothing waits for ever. Until a
+  process's first `system/init`, which Claude sends once its MCP servers are up, it is starting,
+  not silent: that silence may last the startup time (90 s). Otherwise a slow start would fail the
+  prompt for a stall before the init that shows it off the plan, and the person would read the
+  wrong reason.
 - Claude exiting during a turn fails the prompt with the exit code and the end of stderr; the
   next prompt starts a new process with `--resume`.
 

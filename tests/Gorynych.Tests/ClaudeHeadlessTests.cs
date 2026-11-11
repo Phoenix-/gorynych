@@ -25,7 +25,7 @@ public sealed partial class ClaudeHeadlessTests
     static readonly string FakeRoot = Path.Combine(Path.GetTempPath(), "gorynych-fake-claude");
 
     static ClaudeAdapterOptions Options(string dir, List<string>? log = null, bool liveNotes = false, Func<Task>? beforeInterrupt = null,
-        bool fetchCatalog = true, string permissionMode = "default") => new()
+        bool fetchCatalog = true, string permissionMode = "default", int stallMs = 1500) => new()
     {
         BeforeInterrupt = beforeInterrupt,
         FetchCatalog = fetchCatalog,
@@ -39,7 +39,7 @@ public sealed partial class ClaudeHeadlessTests
         StartupTimeoutSeconds = 20,
         InterruptGraceMs = 3000,
         CloseTimeoutMs = 3000,
-        StallMs = 1500,
+        StallMs = stallMs,
         Log = log is null ? null : m => { lock (log) log.Add(m); },
     };
 
@@ -383,6 +383,33 @@ public sealed partial class ClaudeHeadlessTests
 
         Assert.AreEqual(StopReason.EndTurn, (await second).StopReason, "the late interrupt left the next prompt alone");
         Assert.IsFalse(Controls(sessionId).Any(c => (string?)c["subtype"] == "interrupt"), "no interrupt was sent for a turn that was over");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task AClaudeSlowToStart_IsNotTakenForOneThatDroppedThePrompt_AndAnOffPlanInitSaysWhy()
+    {
+        // Claude says system/init once its MCP servers are up, which may take long on a slow machine:
+        // its silence until then is its start, not a message it did not take. Were it taken for one,
+        // the person would read "did not take the prompt" instead of how to get back on the plan.
+        var dir = TestDirs.New();
+        File.WriteAllText(Path.Combine(dir, "api-key-init"), "");
+        var held = Path.Combine(dir, "init-held");
+        File.WriteAllText(held, "");
+        var log = new List<string>();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log, stallMs: 100)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+
+        var prompt = PromptAsync(client, sessionId, "hello");
+        await Task.Delay(1000); // ten times what a stall is, after Claude started
+        Assert.IsFalse(prompt.IsCompleted, "still starting");
+        lock (log) Assert.IsFalse(log.Any(l => l.Contains("in no turn", StringComparison.Ordinal)), string.Join(Environment.NewLine, log));
+        File.Delete(held);
+
+        var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => prompt);
+        StringAssert.Contains(failed.Message, "remove ANTHROPIC_API_KEY");
+        Assert.IsFalse(failed.Message.Contains("did not take the prompt", StringComparison.Ordinal), failed.Message);
     }
 
     [TestMethod]

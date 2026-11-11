@@ -351,12 +351,20 @@ public sealed class ClaudeAdapterTests
         if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
         var dir = TestDirs.New();
         var log = new List<string>();
+        var launches = 0;
         await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(new ClaudeAdapterOptions
         {
             Transport = ClaudeTransport.Tui,
             DataDirectory = Path.Combine(dir, "claude"),
             Executable = FakeClaude(),
             StartupTimeoutSeconds = 3,
+            // Given up when the dialog it stops at is on the screen, not after a time a loaded machine
+            // may need for the start; the fresh launch after it is never given up here.
+            GiveUpStartup = async (screen, ct) =>
+            {
+                if (Interlocked.Increment(ref launches) > 1) await Task.Delay(Timeout.Infinite, ct);
+                while (!screen().Contains("a dialog the adapter does not know", StringComparison.Ordinal)) await Task.Delay(25, ct);
+            },
             Log = m => { lock (log) log.Add($"{DateTime.Now:HH:mm:ss.fff} {m}"); },
         }));
         await using var client = await TestClient.ConnectAsync(conductor);

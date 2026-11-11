@@ -169,7 +169,11 @@ internal sealed partial class ClaudeSession : IClaudeSession
 
     async Task WatchStartupAsync(Turn current, ConPty launched)
     {
-        try { await Task.Delay(TimeSpan.FromSeconds(options.StartupTimeoutSeconds), lifetime.Token); }
+        try
+        {
+            if (options.GiveUpStartup is { } giveUp) await giveUp(ScreenTailText, lifetime.Token);
+            else await Task.Delay(TimeSpan.FromSeconds(options.StartupTimeoutSeconds), lifetime.Token);
+        }
         catch (OperationCanceledException) { return; }
         if (sawPrompt || current.Task.IsCompleted || !ReferenceEquals(pty, launched)) return;
         var screenText = ScreenTailText();
