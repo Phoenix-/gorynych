@@ -111,7 +111,7 @@ internal sealed class ClientConnection
                 AcpMethods.Agent.SessionClose => conductor.Remotes.Close(this, sessionId!),
                 GorynychProtocol.MethodDetach => conductor.Remotes.Detach(this, sessionId!),
                 GorynychProtocol.MethodOpinion or GorynychProtocol.MethodSpawn => throw Conductor.NotYetAcrossMachines(sessionId!, conductor.Remotes.AgentOf(sessionId!)),
-                _ => await conductor.Remotes.ForwardAsync(request.Method, p, sessionId!, ct),
+                _ => await conductor.Remotes.ForwardAsync(this, request.Method, p, sessionId!, ct),
             };
         switch (request.Method)
         {
@@ -241,8 +241,7 @@ internal sealed class ClientConnection
         {
             [GorynychProtocol.MetaServiceId] = conductor.ServiceId,
             // This service's own agents, then those of the remotes it shows (claude@R-PC-167).
-            [GorynychProtocol.MetaAgents] = new JsonArray(conductor.Agents.Values.Select(a => (a.Name, a.DisplayName)).Concat(IsHub ? [] : conductor.Remotes.Agents)
-                .Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["displayName"] = a.DisplayName }).ToArray()),
+            [GorynychProtocol.MetaAgents] = conductor.AgentList(ownOnly: IsHub),
         };
         // Deprecated: the flags' old place, kept for one release for clients built before they moved.
         foreach (var (key, value) in DeprecatedFlags()) meta[key] = value?.DeepClone();

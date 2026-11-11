@@ -32,6 +32,20 @@ public sealed class ResumableLinkOptions
     /// and <c>true</c> once it is back with the client's sessions resumed; never for the first connection.
     /// </summary>
     public Action<bool>? ConnectionChanged { get; init; }
+
+    /// <summary>
+    /// Told the agent's answer to the <c>initialize</c> the link sends again when it comes back, before the
+    /// client's sessions are resumed: what the agent is now (a hub takes its agents and extensions again).
+    /// A reason it returns not to go on with that agent ends the link, as an agent that does not resume would.
+    /// </summary>
+    public Func<JsonObject, string?>? CameBack { get; init; }
+
+    /// <summary>
+    /// The client follows the marks of prompts' ends itself (a hub, for its own clients' links): the link
+    /// keeps back only those of the prompts it gave IDs to, and passes on every other, its client's own
+    /// and those of prompts it no longer knows (a replay after the client restarted).
+    /// </summary>
+    public bool PassesMarks { get; init; }
 }
 
 /// <summary>
@@ -92,6 +106,12 @@ public sealed class ResumableLink
     // The IDs the client gave its prompts itself (a hub passes on its own clients'): their marks and text
     // are the client's to see, so the link resolves its prompts by them but hides none of it.
     readonly HashSet<string> givenIds = new(StringComparer.Ordinal);
+
+    /// <summary>The prompt IDs its client gave that the link follows now; for tests.</summary>
+    internal int GivenPromptIds
+    {
+        get { lock (state) return givenIds.Count; }
+    }
     readonly HashSet<string> resuming = new(StringComparer.Ordinal); // sessions the link's handshake is resuming now
     readonly Dictionary<long, Downstream> downstream = [];
     long nextUpstream;
@@ -570,7 +590,7 @@ public sealed class ResumableLink
                 if (Text(meta![GorynychProtocol.MetaAgentTurn]) == "ended")
                 {
                     if (mine || given) await PromptEndedAsync(promptId, meta);
-                    if (!given) return;
+                    if (mine || !options.PassesMarks) return;
                 }
                 if (hide && Text(update["sessionUpdate"]) == "user_message_chunk") return;
             }
@@ -767,6 +787,7 @@ public sealed class ResumableLink
         var answer = await RequestAsync(connection, AcpMethods.Agent.Initialize, init);
         if (!(answer["agentCapabilities"]?["_meta"]?[GorynychProtocol.CapLink] is JsonValue v && v.TryGetValue<int>(out var version) && version >= 1))
             throw new NotResumableException("the service that came back does not resume sessions (an older version)");
+        if (options.CameBack?.Invoke((JsonObject)answer.DeepClone()) is { } refused) throw new NotResumableException(refused);
         List<(string Id, JsonObject Open)> sessions;
         lock (state) sessions = live.Select(s => (s.Key, (JsonObject)s.Value.DeepClone())).ToList();
         await Task.WhenAll(sessions.Select(s => ResumeAsync(connection, s.Id, s.Open)));
@@ -977,6 +998,7 @@ public sealed class ResumableLink
             upstream.Clear();
             again.Clear();
             promptIds.Clear();
+            givenIds.Clear();
         }
         foreach (var request in waiting)
             await AnswerAsync(request, Error(JsonRpcException.InternalError, linkFailed
@@ -1094,7 +1116,11 @@ public sealed class ResumableLink
     void Forget(Upstream request)
     {
         upstream.Remove(request.Id);
-        if (request.PromptId is { } promptId) promptIds.Remove(promptId);
+        if (request.PromptId is { } promptId)
+        {
+            promptIds.Remove(promptId);
+            givenIds.Remove(promptId); // its end is known: the client's mark passes on as any other's
+        }
     }
 
     /// <summary>

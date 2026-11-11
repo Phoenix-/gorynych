@@ -1378,7 +1378,7 @@ public sealed class Conductor : IAsyncDisposable
     {
         var known = store.Get(sessionId);
         if (known is { Deleted: false }) return known;
-        if (known is null) await ListAsync(new ListSessionsRequest(), ct);
+        if (known is null) await ListAsync(new ListSessionsRequest(), ct, ownOnly: true); // this service's agents' own lists: a remote's session is not opened here
         return store.Get(sessionId) is { Deleted: false } found
             ? found
             : throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Unknown session {sessionId}");
@@ -2004,15 +2004,6 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
-    /// <c>session/close</c>: the client lets go of the session. Another client that has it open
-    /// keeps it as it is. For the last one, a draft is discarded; otherwise the session is closed
-    /// in its agent after its idle timer (<see cref="StartIdle"/>), like one a client left without
-    /// closing it (<see cref="LetGo"/>), and, as ACP asks of a close, a running turn a client's
-    /// prompt started (any client's: this is the last one) is cancelled with <c>session/cancel</c>.
-    /// A service turn (an opinion request, a report), a spawned session's first turn and a turn
-    /// the agent runs on its own go on: a client's close stops no work it did not start.
-    /// </summary>
-    /// <summary>
     /// <c>_gorynych/detach</c>: the client lets go of the session as its going away would, cancelling
     /// nothing (a hub whose last client of the session went without closing it).
     /// </summary>
@@ -2024,6 +2015,15 @@ public sealed class Conductor : IAsyncDisposable
         return new JsonObject();
     }
 
+    /// <summary>
+    /// <c>session/close</c>: the client lets go of the session. Another client that has it open
+    /// keeps it as it is. For the last one, a draft is discarded; otherwise the session is closed
+    /// in its agent after its idle timer (<see cref="StartIdle"/>), like one a client left without
+    /// closing it (<see cref="LetGo"/>), and, as ACP asks of a close, a running turn a client's
+    /// prompt started (any client's: this is the last one) is cancelled with <c>session/cancel</c>.
+    /// A service turn (an opinion request, a report), a spawned session's first turn and a turn
+    /// the agent runs on its own go on: a client's close stops no work it did not start.
+    /// </summary>
     internal async Task<JsonNode?> CloseAsync(ClientConnection client, string sessionId, CancellationToken ct)
     {
         client.Release(sessionId);
@@ -3291,6 +3291,18 @@ public sealed class Conductor : IAsyncDisposable
                 ["sessionId"] = sessionId, ["change"] = change, ["_meta"] = new JsonObject { [GorynychProtocol.MetaAgent] = agent },
             });
         }
+    }
+
+    /// <summary>The agents this service offers now, its own and its remotes': what <c>initialize</c> says in <c>gorynych/agents</c>.</summary>
+    internal JsonArray AgentList(bool ownOnly) => new(agents.Values.Select(a => (a.Name, a.DisplayName)).Concat(ownOnly ? [] : Remotes.Agents)
+        .Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["displayName"] = a.DisplayName }).ToArray());
+
+    /// <summary>The agents changed (a remote connected or dropped): the clients that see all of them are told (<c>_gorynych/agents_changed</c>).</summary>
+    internal void AnnounceAgents()
+    {
+        foreach (var client in clients.Keys)
+            if (client.Init is not null && client.AgentScope is null && !client.IsHub)
+                client.Notify(GorynychProtocol.MethodAgentsChanged, new JsonObject { ["agents"] = AgentList(ownOnly: false) });
     }
 
     /// <summary>A remote's <c>_gorynych/sessions_changed</c>, said again to the clients whose scope covers its agent (or that have none).</summary>

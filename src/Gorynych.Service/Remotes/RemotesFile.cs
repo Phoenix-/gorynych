@@ -39,7 +39,11 @@ internal static class RemotesFile
         try { root = JsonNode.Parse(File.ReadAllText(path)); }
         catch (JsonException e) { throw new FormatException($"{path} is not JSON: {e.Message}"); }
         var list = new List<RemoteEntry>();
-        foreach (var node in root?["remotes"] as JsonArray ?? [])
+        if (root is not JsonObject document)
+            throw new FormatException($"{path} is not a JSON object with \"remotes\": [...]");
+        if (document["remotes"] is not (null or JsonArray))
+            throw new FormatException($"{path}: \"remotes\" is not a list");
+        foreach (var node in document["remotes"] as JsonArray ?? [])
         {
             if (node is not JsonObject o || Text(o["name"]) is not { } name || Text(o["command"]) is not { } command)
                 throw new FormatException($"{path}: every remote needs a name and a command");

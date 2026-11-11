@@ -15,10 +15,10 @@ namespace Gorynych.Tests;
 [TestClass]
 public sealed class HubTests
 {
-    static readonly TimeSpan Wait = TimeSpan.FromSeconds(20);
+    internal static readonly TimeSpan Wait = TimeSpan.FromSeconds(20);
 
     /// <summary>A remote service and a hub that lists it as <c>box</c>.</summary>
-    sealed class Rig : IAsyncDisposable
+    internal sealed class Rig : IAsyncDisposable
     {
         public readonly LifecycleAgent RemoteClaude = new("claude", canDelete: false);
         public readonly LifecycleAgent RemoteKimi = new("kimi", canDelete: true);
@@ -30,6 +30,9 @@ public sealed class HubTests
         public volatile bool Reachable = true;
         public int Connects;
 
+        /// <summary>The service the next connection reaches: the remote, or another in its place (an update there).</summary>
+        public Conductor? Target;
+
         public Rig(bool remotesFile = true, int pageSize = 50)
         {
             Remote = new Conductor(new ConductorOptions { DataDirectory = TestDirs.New(), ServiceId = "remote-service" }, [RemoteClaude.Adapter, RemoteKimi.Adapter]);
@@ -38,12 +41,16 @@ public sealed class HubTests
         }
 
         public static Conductor HubOver(string data, string serviceId, IAgentAdapter[] adapters,
-            Func<RemoteEntry, Func<CancellationToken, Task<(Stream Input, Stream Output)>>?> connect, int pageSize = 50) =>
+            Func<RemoteEntry, Func<CancellationToken, Task<(Stream Input, Stream Output)>>?> connect, int pageSize = 50, TimeSpan? listWait = null) =>
             new(new ConductorOptions
             {
                 DataDirectory = data, ServiceId = serviceId, Remotes = true, RemoteConnect = connect, ListPageSize = pageSize,
                 RemotesWatchEvery = TimeSpan.FromMilliseconds(100),
-                RemoteTimings = new RemoteOptions { Backoff = [TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(200)], Handshake = TimeSpan.FromSeconds(10) },
+                RemoteTimings = new RemoteOptions
+                {
+                    Backoff = [TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(200)], Handshake = TimeSpan.FromSeconds(10),
+                    ListWait = listWait ?? TimeSpan.FromSeconds(5),
+                },
             }, adapters);
 
         async Task<(Stream Input, Stream Output)> ConnectAsync(CancellationToken ct)
@@ -51,7 +58,7 @@ public sealed class HubTests
             await Task.Yield();
             if (!Reachable) throw new IOException("box: no route to host (test)");
             Interlocked.Increment(ref Connects);
-            return Serve(Remote, "hub", links);
+            return Serve(Target ?? Remote, "hub", links);
         }
 
         /// <summary>The remote's ACP end for a hub: a client connection of the remote service.</summary>
@@ -91,7 +98,7 @@ public sealed class HubTests
         }
     }
 
-    static async Task<string> NewPromptedAsync(TestClient client, string agent, string text, string? cwd = null)
+    internal static async Task<string> NewPromptedAsync(TestClient client, string agent, string text, string? cwd = null)
     {
         var created = await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew, new JsonObject
         {
@@ -102,14 +109,14 @@ public sealed class HubTests
         return id;
     }
 
-    static Task<JsonNode?> PromptAsync(TestClient client, string sessionId, string text, string? promptId = null)
+    internal static Task<JsonNode?> PromptAsync(TestClient client, string sessionId, string text, string? promptId = null)
     {
         var @params = new JsonObject { ["sessionId"] = sessionId, ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }) };
         if (promptId is not null) @params["_meta"] = new JsonObject { [GorynychProtocol.MetaPromptId] = promptId };
         return client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, @params).WaitAsync(Wait);
     }
 
-    static async Task<List<JsonObject>> ListAllAsync(TestClient client, bool archived = false)
+    internal static async Task<List<JsonObject>> ListAllAsync(TestClient client, bool archived = false)
     {
         var all = new List<JsonObject>();
         string? cursor = null;
@@ -125,10 +132,10 @@ public sealed class HubTests
         return all;
     }
 
-    static string? Agent(JsonObject info) => (string?)info["_meta"]?[GorynychProtocol.MetaAgent];
+    internal static string? Agent(JsonObject info) => (string?)info["_meta"]?[GorynychProtocol.MetaAgent];
 
     /// <summary>Whether the hub has its remotes, and each answers: not true of none yet, before it read remotes.json.</summary>
-    static bool Connected(Conductor hub) => hub.Remotes.Status() is { Count: > 0 } all && all.All(r => (bool)r!["connected"]!);
+    internal static bool Connected(Conductor hub) => hub.Remotes.Status() is { Count: > 0 } all && all.All(r => (bool)r!["connected"]!);
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]

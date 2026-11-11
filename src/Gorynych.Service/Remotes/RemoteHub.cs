@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json.Nodes;
+using System.Threading.Channels;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
@@ -32,9 +33,12 @@ internal sealed class RemoteHub : IAsyncDisposable
     readonly ConcurrentDictionary<string, Route> routes = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, OpenSession> open = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, byte> collisions = new(StringComparer.Ordinal);
+    readonly ConcurrentDictionary<ClientConnection, Lazy<Outbox>> outboxes = new();
+    readonly ConcurrentDictionary<string, long> unknown = new(StringComparer.Ordinal); // IDs no remote had, and when that was found
     readonly CancellationTokenSource stopping = new();
     readonly SemaphoreSlim applying = new(1, 1);
     string? applied; // the remotes.json content the machines follow
+    bool disposed; // under applying
     long order;
 
     /// <summary>A remote session's machine and its agent there.</summary>
@@ -53,20 +57,24 @@ internal sealed class RemoteHub : IAsyncDisposable
     public string OwnServiceId => conductor.ServiceId;
 
     /// <summary>Reads <c>remotes.json</c>, connects to every remote in it, and follows its changes.</summary>
-    public void Start()
-    {
-        _ = ApplyAsync();
-        _ = Task.Run(WatchAsync);
-    }
+    public void Start() => _ = Task.Run(WatchAsync);
 
+    /// <summary>Reads the file now and then for as long as the service runs: nothing in it, or in reading it, ends that.</summary>
     async Task WatchAsync()
     {
         while (!stopping.IsCancellationRequested)
         {
+            try
+            {
+                await ApplyAsync();
+                Prune();
+            }
+            catch (Exception e) when (!stopping.IsCancellationRequested)
+            {
+                ServiceLog.Warn($"remotes: {e.GetType().Name}: {e.Message}; the remotes stay as they were, and the file is read again");
+            }
             try { await Task.Delay(watchEvery, stopping.Token); }
             catch (OperationCanceledException) { return; }
-            await ApplyAsync();
-            Prune();
         }
     }
 
@@ -74,31 +82,34 @@ internal sealed class RemoteHub : IAsyncDisposable
     internal async Task ApplyAsync()
     {
         string content;
-        try { content = File.Exists(file) ? await File.ReadAllTextAsync(file) : ""; }
-        catch (IOException) { return; } // being written: the next look takes it
+        try { content = File.Exists(file) ? await ReadSharedAsync(file) : ""; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return; } // being written: the next look takes it
         if (content == applied) return;
         await applying.WaitAsync();
         try
         {
-            if (content == applied) return;
+            if (disposed || content == applied) return;
             List<RemoteEntry> entries;
             try { entries = RemotesFile.Read(file); }
-            catch (Exception e) when (e is FormatException or IOException)
+            catch (Exception e) when (e is FormatException or IOException or UnauthorizedAccessException)
             {
                 if (applied is not null || content.Length > 0) ServiceLog.Warn($"remotes: {e.Message}; the remotes stay as they were");
                 applied = content;
                 return;
             }
             applied = content;
+            var going = new List<Task>();
             foreach (var (name, machine) in machines)
             {
                 var entry = entries.FirstOrDefault(e => string.Equals(e.Name, name, StringComparison.OrdinalIgnoreCase));
                 if (entry is not null && entry.Name == machine.Name && entry.SameLaunch(machine.Entry)) continue;
                 machines.TryRemove(name, out _);
                 ServiceLog.Info($"remotes: {name} {(entry is null ? "removed" : "changed")}");
-                await machine.DisposeAsync();
                 Gone(machine, entry is null ? $"{name} is no longer a remote of this service" : machine.NotConnected);
+                going.Add(machine.DisposeAsync().AsTask());
             }
+            await Task.WhenAll(going); // in parallel: each may take its link's while to end
+            if (going.Count > 0) OnAgentsChanged();
             foreach (var entry in entries.Where(e => !machines.ContainsKey(e.Name)))
             {
                 var machine = new RemoteMachine(entry, this, connectFor?.Invoke(entry), options);
@@ -111,6 +122,14 @@ internal sealed class RemoteHub : IAsyncDisposable
         {
             applying.Release();
         }
+    }
+
+    /// <summary>Reads the file without keeping the <c>remote</c> command, or a person's editor, from replacing it meanwhile.</summary>
+    static async Task<string> ReadSharedAsync(string path)
+    {
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        return await reader.ReadToEndAsync();
     }
 
     // ---------------------------------------------------------------- names
@@ -135,6 +154,18 @@ internal sealed class RemoteHub : IAsyncDisposable
         machines.Values.Where(m => m.Connected).OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
             .SelectMany(m => m.Agents.Select(a => ($"{a.Name}@{m.Name}", $"{a.DisplayName} on {m.Name}")));
 
+    string announcedAgents = ""; // the remote agents the clients were told of last
+
+    /// <summary>
+    /// The agents a remote offers may have changed (it connected, dropped, went from remotes.json, or came
+    /// back as another build): the clients are told the new list, once per change.
+    /// </summary>
+    internal void OnAgentsChanged()
+    {
+        var now = string.Join(", ", Agents.Select(a => $"{a.Name}={a.DisplayName}"));
+        if (Interlocked.Exchange(ref announcedAgents, now) != now) conductor.AnnounceAgents();
+    }
+
     /// <summary>Whether the session is a remote one this hub knows (from a list, a new session, a change).</summary>
     public bool Owns(string sessionId) => routes.ContainsKey(sessionId);
 
@@ -144,6 +175,17 @@ internal sealed class RemoteHub : IAsyncDisposable
 
     /// <summary>The agent of a remote session, as this service names it; null for one it does not know.</summary>
     public string? AgentOf(string sessionId) => routes.TryGetValue(sessionId, out var r) ? $"{r.Agent}@{r.Machine}" : null;
+
+    /// <summary>How many of the hub's clients have the remote session open; for tests.</summary>
+    internal int ClientsOf(string sessionId) => open.TryGetValue(sessionId, out var os) ? CountOf(os) : 0;
+
+    static int CountOf(OpenSession os)
+    {
+        lock (os.Gate) return os.Clients.Count;
+    }
+
+    /// <summary>Whether the hub follows the remote session at all; for tests.</summary>
+    internal bool Follows(string sessionId) => open.ContainsKey(sessionId);
 
     /// <summary>The remotes, for <c>_gorynych/status</c>.</summary>
     public JsonArray Status() => new(machines.Values.OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase).Select(m => (JsonNode)new JsonObject
@@ -196,7 +238,7 @@ internal sealed class RemoteHub : IAsyncDisposable
         try
         {
             using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            bounded.CancelAfter(TimeSpan.FromSeconds(30));
+            bounded.CancelAfter(options.ListWait);
             string? cursor = null;
             for (var page = 0; page < 100; page++)
             {
@@ -223,7 +265,13 @@ internal sealed class RemoteHub : IAsyncDisposable
                 if (cursor is null) break;
             }
         }
-        catch (Exception e) when (e is IOException or JsonRpcException or OperationCanceledException or System.Text.Json.JsonException && !ct.IsCancellationRequested)
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // A machine that answers but is slow (or hung) holds up no list: its sessions are left out this time.
+            ServiceLog.Warn($"remote {machine.Name}: its session/list did not come within {options.ListWait.TotalSeconds:0.#} s; its sessions are left out of this list");
+            return (machine, []);
+        }
+        catch (Exception e) when (e is IOException or JsonRpcException or System.Text.Json.JsonException && !ct.IsCancellationRequested)
         {
             ServiceLog.Warn($"remote {machine.Name}: session/list failed: {e.Message}");
         }
@@ -234,8 +282,12 @@ internal sealed class RemoteHub : IAsyncDisposable
     async Task<Route?> FindAsync(string sessionId, CancellationToken ct)
     {
         if (routes.TryGetValue(sessionId, out var known)) return known;
+        // An ID no remote had a moment ago (deleted, a typo) is not looked for in every list again at once.
+        if (unknown.TryGetValue(sessionId, out var at) && Environment.TickCount64 - at < options.UnknownFor.TotalMilliseconds) return null;
         await ListAsync(new ListSessionsRequest(), scope: null, includeArchived: true, isLocal: conductor.IsLocalSession, ct);
-        return routes.TryGetValue(sessionId, out var found) ? found : null;
+        if (routes.TryGetValue(sessionId, out var found)) return found;
+        unknown[sessionId] = Environment.TickCount64;
+        return null;
     }
 
     async Task<(Route Route, RemoteMachine Machine)> RouteAsync(string sessionId, CancellationToken ct)
@@ -267,9 +319,13 @@ internal sealed class RemoteHub : IAsyncDisposable
         {
             os.OnRemote = true;
             // Its updates wait for its answer: a client knows the session only from that (Zed drops them until then).
-            os.Attach(client, ++order, position: null, held: true);
+            os.Attach(client, Interlocked.Increment(ref order), position: null, held: true);
         }
-        afterAnswer(() => ReleaseHeldAsync(os, client));
+        afterAnswer(() =>
+        {
+            ReleaseHeld(os, client);
+            return Task.CompletedTask;
+        });
         return WithMachine(answer, machine.Name, $"{remoteAgent}@{machine.Name}");
     }
 
@@ -283,7 +339,16 @@ internal sealed class RemoteHub : IAsyncDisposable
         var sessionId = (string?)@params["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
         var (_, machine) = await RouteAsync(sessionId, ct);
         var os = Session(sessionId, machine.Name);
-        await os.Opening.WaitAsync(ct);
+        Interlocked.Increment(ref os.Pending); // not dropped while this open waits for one before it, or a close
+        try
+        {
+            await os.Opening.WaitAsync(ct);
+        }
+        catch
+        {
+            Interlocked.Decrement(ref os.Pending);
+            throw;
+        }
         try
         {
             // Where the client is: a load wants all of it, a resume after a position what follows it, a
@@ -293,7 +358,12 @@ internal sealed class RemoteHub : IAsyncDisposable
             long? position = method == AcpMethods.Agent.SessionResume && (string?)from?["type"] == GorynychProtocol.ReplayAfterMark
                 && long.TryParse((string?)from?["mark"], out var mark) ? mark : null;
             Attachment attachment;
-            lock (os.Gate) attachment = os.Attach(client, ++order, position, held: false, plain: plain);
+            Attachment? before;
+            lock (os.Gate)
+            {
+                before = os.Clients.TryGetValue(client, out var had) ? had.Copy() : null;
+                attachment = os.Attach(client, Interlocked.Increment(ref order), position, held: false, plain: plain);
+            }
             JsonObject answer;
             try
             {
@@ -301,8 +371,10 @@ internal sealed class RemoteHub : IAsyncDisposable
             }
             catch
             {
-                lock (os.Gate) os.Detach(client);
-                Forget(os);
+                // A client that had it open keeps it as it was; one that came for it lets it go, as one that went.
+                if (before is not null)
+                    lock (os.Gate) attachment.Restore(before);
+                else LetGo(os, client, close: false);
                 throw;
             }
             var meta = answer["_meta"] as JsonObject;
@@ -314,11 +386,14 @@ internal sealed class RemoteHub : IAsyncDisposable
                 if (long.TryParse((string?)meta?[GorynychProtocol.MetaPosition], out var at) && (attachment.Position is not { } had || at > had)) attachment.Position = at;
             }
             os.ClientCame();
+            // Its replay first, then its answer, as from a local session.
+            await FlushedAsync(client).WaitAsync(ct);
             return WithMachine(answer, machine.Name, agent: null);
         }
         finally
         {
             os.Opening.Release();
+            Interlocked.Decrement(ref os.Pending);
         }
     }
 
@@ -333,11 +408,13 @@ internal sealed class RemoteHub : IAsyncDisposable
         var (_, machine) = await RouteAsync(sessionId, ct);
         if (!open.TryGetValue(sessionId, out var os) || !os.Has(client))
             await OpenAsync(client, AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = sessionId, ["cwd"] = @params["cwd"]?.DeepClone() ?? "", ["mcpServers"] = new JsonArray() }, ct);
-        return await machine.RequestAsync(AcpMethods.Agent.SessionPrompt, @params.DeepClone(), CancellationToken.None).WaitAsync(ct);
+        var answer = await machine.RequestAsync(AcpMethods.Agent.SessionPrompt, @params.DeepClone(), CancellationToken.None).WaitAsync(ct);
+        await FlushedAsync(client).WaitAsync(ct); // the turn's updates before its answer
+        return answer;
     }
 
     /// <summary>Any other request about a remote session (modes, options, delete, archive, read): forwarded, failing at once while its machine is unreachable.</summary>
-    public async Task<JsonNode?> ForwardAsync(string method, JsonObject @params, string sessionId, CancellationToken ct)
+    public async Task<JsonNode?> ForwardAsync(ClientConnection? client, string method, JsonObject @params, string sessionId, CancellationToken ct)
     {
         var (_, machine) = await RouteAsync(sessionId, ct);
         if (method == GorynychProtocol.MethodArchive && !machine.Takes(GorynychProtocol.MetaArchive))
@@ -348,6 +425,7 @@ internal sealed class RemoteHub : IAsyncDisposable
             routes.TryRemove(sessionId, out _);
             if (open.TryRemove(sessionId, out var gone)) gone.Close();
         }
+        if (client is not null) await FlushedAsync(client).WaitAsync(ct); // an update it caused (an option's) before its answer
         return answer;
     }
 
@@ -395,6 +473,7 @@ internal sealed class RemoteHub : IAsyncDisposable
     {
         foreach (var os in open.Values)
             if (os.Has(client)) LetGo(os, client, close: false);
+        if (outboxes.TryRemove(client, out var outbox) && outbox.IsValueCreated) outbox.Value.Close();
     }
 
     void LetGo(OpenSession os, ClientConnection client, bool close)
@@ -403,24 +482,49 @@ internal sealed class RemoteHub : IAsyncDisposable
         lock (os.Gate)
         {
             if (!os.Detach(client)) return;
-            last = !os.HasClients && os.OnRemote;
-            if (last) os.OnRemote = false;
+            last = !os.HasClients;
         }
-        if (last && machines.TryGetValue(os.Machine, out var machine))
+        if (last) _ = Task.Run(() => ReleaseAsync(os, close));
+    }
+
+    /// <summary>
+    /// Attached only while open: the hub's last client of the remote session let it go, and so does the hub
+    /// there. Under <see cref="OpenSession.Opening"/>, after an open on its way and before the next, and its
+    /// answer is waited for: the remote never gets a close behind an open that came after it.
+    /// </summary>
+    async Task ReleaseAsync(OpenSession os, bool close)
+    {
+        await os.Opening.WaitAsync();
+        try
         {
-            // Attached only while open: the remote session goes when the hub's last client of it does.
-            var @params = new JsonObject { ["sessionId"] = os.SessionId };
-            if (close) machine.Post(AcpMethods.Agent.SessionClose, @params);
-            else if (machine.Takes(GorynychProtocol.CapDetach)) machine.Post(GorynychProtocol.MethodDetach, @params);
-            else
+            lock (os.Gate)
+            {
+                if (os.HasClients || !os.OnRemote) return; // a client came for it meanwhile, or nothing is open there
+                os.OnRemote = false;
+            }
+            if (!machines.TryGetValue(os.Machine, out var machine)) return;
+            var method = close ? AcpMethods.Agent.SessionClose : machine.Takes(GorynychProtocol.CapDetach) ? GorynychProtocol.MethodDetach : null;
+            if (method is null)
             {
                 // An older remote has no detach, and a close would cancel the person's turn there.
                 ServiceLog.Info($"remote {machine.Name}: {os.SessionId} stays attached: it takes no {GorynychProtocol.MethodDetach}");
                 lock (os.Gate) os.OnRemote = true;
                 return;
             }
+            try
+            {
+                await machine.SendAsync(method, new JsonObject { ["sessionId"] = os.SessionId }).WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            catch (Exception e) when (e is IOException or JsonRpcException or TimeoutException or OperationCanceledException)
+            {
+                ServiceLog.Info($"remote {machine.Name}: {method} for {os.SessionId}: {e.Message}");
+            }
         }
-        Forget(os);
+        finally
+        {
+            os.Opening.Release();
+            Forget(os);
+        }
     }
 
     /// <summary>
@@ -431,30 +535,50 @@ internal sealed class RemoteHub : IAsyncDisposable
     {
         var old = Environment.TickCount64 - 60_000;
         foreach (var os in open.Values)
-            if (os.Born < old) Forget(os);
+            if (Volatile.Read(ref os.Touched) < old) Forget(os);
     }
 
     /// <summary>Drops a session nobody has open from what the hub follows.</summary>
     void Forget(OpenSession os)
     {
         lock (os.Gate)
-            if (os.HasClients || os.OnRemote) return;
+            if (os.HasClients || os.OnRemote || os.Waiting > 0 || Volatile.Read(ref os.Pending) > 0) return;
         open.TryRemove(new KeyValuePair<string, OpenSession>(os.SessionId, os));
     }
 
     // ---------------------------------------------------------------- from the remote
 
     /// <summary>A notification from a remote: a session's update, to its clients here; a change of a list, said again under this service's names.</summary>
-    internal async Task OnRemoteNotificationAsync(RemoteMachine machine, string method, JsonNode? @params)
+    internal Task OnRemoteNotificationAsync(RemoteMachine machine, string method, JsonNode? @params)
     {
+        // Never waits for a client: each has its outbox, so a slow one holds up nothing from the remote.
         if (method == AcpMethods.Client.SessionUpdate && (string?)@params?["sessionId"] is { } sessionId && @params["update"] is JsonObject update)
-            await RouteUpdateAsync(machine, sessionId, (JsonObject)@params);
+            RouteUpdate(machine, sessionId, (JsonObject)@params);
         else if (method == GorynychProtocol.MethodSessionsChanged && @params is JsonObject change)
             ListChanged(machine, change);
+        return Task.CompletedTask;
     }
 
-    async Task RouteUpdateAsync(RemoteMachine machine, string sessionId, JsonObject @params)
+    /// <summary>
+    /// Whether what a machine sends about a session is its owner's: not about a local session's ID, nor
+    /// about a session routed to another machine (the same ID on two, as a copied Claude transcript has).
+    /// Anything else is dropped, and logged once.
+    /// </summary>
+    bool FromOwner(RemoteMachine machine, string sessionId)
     {
+        var other = conductor.IsLocalSession(sessionId) ? "a local session"
+            : routes.TryGetValue(sessionId, out var route) && route.Machine != machine.Name ? $"a session on {route.Machine}"
+            : open.TryGetValue(sessionId, out var os) && os.Machine != machine.Name ? $"a session on {os.Machine}"
+            : null;
+        if (other is null) return true;
+        if (collisions.TryAdd($"{machine.Name}/{sessionId}/sent", 0))
+            ServiceLog.Warn($"remote {machine.Name}: what it sends about session {sessionId} is dropped: here that ID is {other}'s");
+        return false;
+    }
+
+    void RouteUpdate(RemoteMachine machine, string sessionId, JsonObject @params)
+    {
+        if (!FromOwner(machine, sessionId)) return;
         var update = (JsonObject)@params["update"]!;
         var meta = update["_meta"] as JsonObject;
         var kind = (string?)update["sessionUpdate"];
@@ -467,9 +591,9 @@ internal sealed class RemoteHub : IAsyncDisposable
         }
         long? position = long.TryParse((string?)meta?[GorynychProtocol.MetaPosition], out var p) ? p : null;
         var os = Session(sessionId, machine.Name);
-        List<ClientConnection> to = [];
         lock (os.Gate)
         {
+            os.Touch();
             if (position is { } at && (os.Seen is not { } seen || at > seen)) os.Seen = at;
             if (kind == "session_info_update" && meta?[GorynychProtocol.MetaInteractivity] is not null) os.RemoteState = Conductor.ReadOnlyOf(meta);
             if (!os.HasClients)
@@ -486,20 +610,20 @@ internal sealed class RemoteHub : IAsyncDisposable
                     a.Position = at2;
                 }
                 if (a.Held is { } held) held.Add(@params);
-                else to.Add(client);
+                else OutboxOf(client).Add((JsonObject)@params.DeepClone());
             }
         }
-        foreach (var client in to) await SendAsync(os, client, AcpMethods.Client.SessionUpdate, @params);
     }
 
     void ListChanged(RemoteMachine machine, JsonObject change)
     {
+        unknown.Clear(); // a session came or went: what no remote had may be there now
         var meta = change["_meta"] as JsonObject;
         if (meta?[GorynychProtocol.MetaMachine] is not null) return; // one hop
-        if ((string?)change["sessionId"] is not { } sessionId || conductor.IsLocalSession(sessionId)) return;
+        if ((string?)change["sessionId"] is not { } sessionId || !FromOwner(machine, sessionId)) return;
         var remoteAgent = (string?)meta?[GorynychProtocol.MetaAgent] ?? (routes.TryGetValue(sessionId, out var known) ? known.Agent : null);
         var kind = (string?)change["change"];
-        if (kind == "removed") routes.TryRemove(sessionId, out _);
+        if (kind == "removed") routes.TryRemove(sessionId, out _); // its own: FromOwner said so
         else if (remoteAgent is not null) routes.TryAdd(sessionId, new Route(machine.Name, remoteAgent));
         var agent = remoteAgent is null ? null : $"{remoteAgent}@{machine.Name}";
         var said = new JsonObject
@@ -520,7 +644,22 @@ internal sealed class RemoteHub : IAsyncDisposable
     {
         var sessionId = (string?)request.Params?["sessionId"]
             ?? throw new JsonRpcException(JsonRpcException.MethodNotFound, $"{request.Method} is not supported by the Gorynych hub");
+        if (!FromOwner(machine, sessionId))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, $"The hub has no session {sessionId} of {machine.Name} open: here that ID is another session's.");
         var os = Session(sessionId, machine.Name);
+        Interlocked.Increment(ref os.Waiting); // not pruned while a question waits for a client
+        try
+        {
+            return await AskClientAsync(os, request, ct);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref os.Waiting);
+        }
+    }
+
+    async Task<JsonNode?> AskClientAsync(OpenSession os, JsonRpcRequest request, CancellationToken ct)
+    {
         while (true)
         {
             ClientConnection? client;
@@ -538,6 +677,8 @@ internal sealed class RemoteHub : IAsyncDisposable
             }
             try
             {
+                // What the agent did before it asked (the tool call) reaches the client first.
+                await FlushedAsync(client).WaitAsync(ct);
                 if (request.Method == AcpMethods.Client.ElicitationCreate && !client.Accepts(request.Method))
                     return await FormFallback.AskAsync(client, request, ct);
                 return await client.Rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
@@ -560,8 +701,9 @@ internal sealed class RemoteHub : IAsyncDisposable
                 was = os.Unreachable;
                 os.Unreachable = !up;
             }
-            if (was != !up) _ = TellAsync(os, machine, notice: true);
+            if (was != !up) Tell(os, machine, notice: true);
         }
+        OnAgentsChanged();
     }
 
     /// <summary>
@@ -571,6 +713,7 @@ internal sealed class RemoteHub : IAsyncDisposable
     /// </summary>
     internal void OnConnected(RemoteMachine machine) => _ = Task.Run(async () =>
     {
+        unknown.Clear();
         foreach (var os in open.Values.Where(o => o.Machine == machine.Name))
         {
             long? seen;
@@ -608,12 +751,12 @@ internal sealed class RemoteHub : IAsyncDisposable
         foreach (var os in open.Values.Where(o => o.Machine == machine.Name))
         {
             lock (os.Gate) os.Unreachable = true;
-            _ = TellAsync(os, machine, notice: true, reason: why);
+            Tell(os, machine, notice: true, reason: why);
         }
     }
 
     /// <summary>Tells the session's clients here whether they may write to it: the remote's own state, or read-only while its machine is unreachable.</summary>
-    async Task TellAsync(OpenSession os, RemoteMachine machine, bool notice, string? reason = null)
+    void Tell(OpenSession os, RemoteMachine machine, bool notice, string? reason = null)
     {
         SessionFeed.ReadOnlyState? state;
         List<ClientConnection> clients;
@@ -628,14 +771,13 @@ internal sealed class RemoteHub : IAsyncDisposable
         foreach (var client in clients)
         {
             var news = client.Tell(os.SessionId, state);
-            await SendAsync(os, client, AcpMethods.Client.SessionUpdate, update);
+            OutboxOf(client).Add((JsonObject)update.DeepClone());
             if (notice && news && client.TakesNotices)
             {
                 var said = state is null
                     ? new Notice { Severity = NoticeSeverity.Info, Title = "You can write here again", Description = $"{machine.Name} is connected again." }
                     : new Notice { Severity = NoticeSeverity.Warning, Title = "Read-only for now", Description = state.Reason };
-                await SendAsync(os, client, AcpMethods.Client.SessionUpdate,
-                    new JsonObject { ["sessionId"] = os.SessionId, ["update"] = AcpJson.ToNode<SessionUpdate>(said) });
+                OutboxOf(client).Add(new JsonObject { ["sessionId"] = os.SessionId, ["update"] = AcpJson.ToNode<SessionUpdate>(said) });
             }
         }
     }
@@ -644,40 +786,74 @@ internal sealed class RemoteHub : IAsyncDisposable
 
     OpenSession Session(string sessionId, string machine) => open.GetOrAdd(sessionId, id => new OpenSession(id, machine));
 
-    /// <summary>A client's updates held for its <c>session/new</c> answer go now, in order.</summary>
-    async Task ReleaseHeldAsync(OpenSession os, ClientConnection client)
+    /// <summary>A client's updates held for its <c>session/new</c> answer go now, in order, ahead of any that follow.</summary>
+    void ReleaseHeld(OpenSession os, ClientConnection client)
     {
-        while (true)
+        lock (os.Gate)
         {
-            List<JsonObject>? held;
-            lock (os.Gate)
-            {
-                if (!os.Clients.TryGetValue(client, out var a) || a.Held is not { } list) return;
-                if (list.Count == 0)
-                {
-                    a.Held = null;
-                    break;
-                }
-                held = [.. list];
-                list.Clear();
-            }
-            foreach (var update in held) await SendAsync(os, client, AcpMethods.Client.SessionUpdate, update);
+            if (!os.Clients.TryGetValue(client, out var a) || a.Held is not { } held) return;
+            foreach (var update in held) OutboxOf(client).Add((JsonObject)update.DeepClone());
+            a.Held = null;
         }
         os.ClientCame();
     }
 
     static readonly TimeSpan SendTimeout = TimeSpan.FromSeconds(15);
 
-    /// <summary>To one client; one that does not read for 15 seconds, or is gone, lets the session go.</summary>
-    async Task SendAsync(OpenSession os, ClientConnection client, string method, JsonNode @params)
+    Outbox OutboxOf(ClientConnection client) => outboxes.GetOrAdd(client, c => new Lazy<Outbox>(() => new Outbox(this, c))).Value;
+
+    /// <summary>Resolves once what was queued for the client so far is sent (or the client is gone).</summary>
+    Task FlushedAsync(ClientConnection client) => outboxes.TryGetValue(client, out var outbox) && outbox.IsValueCreated ? outbox.Value.Flushed() : Task.CompletedTask;
+
+    /// <summary>
+    /// What goes to one client of the hub about remote sessions, sent in order by a sender of its own: a client
+    /// that is slow to read holds up only itself, never a remote's connection or the hub's other clients. One
+    /// that does not read for 15 seconds is disconnected, as the service does with its own sessions' updates.
+    /// </summary>
+    sealed class Outbox
     {
-        try
+        readonly Channel<(JsonObject? Update, TaskCompletionSource? Sent)> queue =
+            Channel.CreateUnbounded<(JsonObject?, TaskCompletionSource?)>(new UnboundedChannelOptions { SingleReader = true });
+
+        public Outbox(RemoteHub hub, ClientConnection client) => _ = Task.Run(() => SendAsync(hub, client));
+
+        public void Add(JsonObject update) => queue.Writer.TryWrite((update, null));
+
+        public Task Flushed()
         {
-            await client.Rpc.SendNotificationAsync(method, @params.DeepClone()).WaitAsync(SendTimeout);
+            var sent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!queue.Writer.TryWrite((null, sent))) sent.TrySetResult();
+            return sent.Task;
         }
-        catch (Exception e) when (e is IOException or TimeoutException or ObjectDisposedException or OperationCanceledException)
+
+        public void Close() => queue.Writer.TryComplete();
+
+        async Task SendAsync(RemoteHub hub, ClientConnection client)
         {
-            LetGo(os, client, close: false);
+            var broken = false;
+            await foreach (var (update, sent) in queue.Reader.ReadAllAsync())
+            {
+                if (sent is not null)
+                {
+                    sent.TrySetResult();
+                    continue;
+                }
+                if (broken || client.Rpc.IsClosed) continue;
+                try
+                {
+                    await client.Rpc.SendNotificationAsync(AcpMethods.Client.SessionUpdate, update).WaitAsync(SendTimeout);
+                }
+                catch (Exception e) when (e is IOException or TimeoutException or ObjectDisposedException or OperationCanceledException)
+                {
+                    broken = true;
+                    if (e is TimeoutException)
+                    {
+                        ServiceLog.Warn($"{client.Rpc.Name}: not reading; disconnecting it");
+                        _ = client.Rpc.DisposeAsync().AsTask();
+                    }
+                    hub.ClientGone(client);
+                }
+            }
         }
     }
 
@@ -701,7 +877,19 @@ internal sealed class RemoteHub : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         stopping.Cancel();
-        foreach (var machine in machines.Values) await machine.DisposeAsync();
+        // After a change being applied, and before any other: no machine starts once this has begun.
+        await applying.WaitAsync();
+        try
+        {
+            disposed = true;
+            var all = machines.Values.ToList();
+            machines.Clear();
+            await Task.WhenAll(all.Select(m => m.DisposeAsync().AsTask()));
+        }
+        finally
+        {
+            applying.Release();
+        }
     }
 
     /// <summary>A client of the hub attached to a remote session.</summary>
@@ -717,6 +905,17 @@ internal sealed class RemoteHub : IAsyncDisposable
         public List<JsonObject>? Held;
 
         public long Order;
+
+        public Attachment Copy() => new() { Position = Position, Plain = Plain, Held = Held, Order = Order };
+
+        /// <summary>Back to what it was before an open that failed.</summary>
+        public void Restore(Attachment before)
+        {
+            Position = before.Position;
+            Plain = before.Plain;
+            Held = before.Held;
+            Order = before.Order;
+        }
     }
 
     /// <summary>A remote session the hub's clients have open, or had, while the hub follows it.</summary>
@@ -724,7 +923,16 @@ internal sealed class RemoteHub : IAsyncDisposable
     {
         public string SessionId { get; } = sessionId;
         public string Machine { get; } = machine;
-        public readonly long Born = Environment.TickCount64;
+        /// <summary>When a client, an update or a question last had to do with it.</summary>
+        public long Touched = Environment.TickCount64;
+
+        /// <summary>Questions of its agent waiting for a client: it is not dropped meanwhile.</summary>
+        public int Waiting;
+
+        /// <summary>Opens on their way, waiting for <see cref="Opening"/>: it is not dropped meanwhile.</summary>
+        public int Pending;
+
+        public void Touch() => Volatile.Write(ref Touched, Environment.TickCount64);
         public readonly Lock Gate = new();
         public readonly SemaphoreSlim Opening = new(1, 1);
         public readonly Dictionary<ClientConnection, Attachment> Clients = [];
@@ -756,6 +964,7 @@ internal sealed class RemoteHub : IAsyncDisposable
         /// <summary>Under <see cref="Gate"/>.</summary>
         public Attachment Attach(ClientConnection client, long order, long? position, bool held, bool plain = false)
         {
+            Touch();
             var a = Clients.TryGetValue(client, out var had) ? had : Clients[client] = new Attachment();
             a.Order = order;
             a.Plain = plain;
@@ -770,7 +979,11 @@ internal sealed class RemoteHub : IAsyncDisposable
         }
 
         /// <summary>Under <see cref="Gate"/>; false when the client did not have it.</summary>
-        public bool Detach(ClientConnection client) => Clients.Remove(client);
+        public bool Detach(ClientConnection client)
+        {
+            Touch();
+            return Clients.Remove(client);
+        }
 
         /// <summary>Under <see cref="Gate"/>: an update that came before any client had the session (a new one's first).</summary>
         public void Orphan(JsonObject update)

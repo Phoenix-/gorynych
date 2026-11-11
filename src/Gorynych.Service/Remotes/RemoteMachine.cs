@@ -16,6 +16,12 @@ internal sealed class RemoteOptions
 
     /// <summary>How long the remote's <c>initialize</c> may take: ssh logs in, and the bridge there may start its service.</summary>
     public TimeSpan Handshake { get; init; } = TimeSpan.FromSeconds(90);
+
+    /// <summary>How long a list waits for a remote's sessions; a later one's are left out of it.</summary>
+    public TimeSpan ListWait { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>How long an ID no remote had is not looked for in their lists again (unless a list changes first).</summary>
+    public TimeSpan UnknownFor { get; init; } = TimeSpan.FromSeconds(30);
 }
 
 /// <summary>
@@ -83,17 +89,11 @@ internal sealed class RemoteMachine : IAsyncDisposable
     }
 
     /// <summary>
-    /// A request that may wait for the remote to come back (<c>session/close</c>, a detach): it goes
-    /// through the link, which sends it when the connection is back; nothing waits for its answer.
+    /// A request that may wait for the remote to come back (<c>session/close</c>, a detach): it goes through
+    /// the link, which sends it when the connection is back; with no link at all, there is nothing to tell.
     /// </summary>
-    public void Post(string method, JsonNode? @params)
-    {
-        if (rpc is not { } link) return;
-        _ = link.SendRequestAsync(method, @params).ContinueWith(t =>
-        {
-            if (t.Exception?.GetBaseException() is { } e) ServiceLog.Info($"remote {Name}: {method} for {(string?)@params?["sessionId"]}: {e.Message}");
-        }, TaskScheduler.Default);
-    }
+    public Task<JsonNode?> SendAsync(string method, JsonNode? @params) =>
+        rpc is { } link ? link.SendRequestAsync(method, @params) : Task.FromResult<JsonNode?>(null);
 
     /// <summary>A notification to the remote (<c>session/cancel</c>); the link holds it while the connection is back on its way.</summary>
     public Task NotifyAsync(string method, JsonNode? @params) => rpc is { } link ? link.SendNotificationAsync(method, @params) : Task.CompletedTask;
@@ -138,11 +138,30 @@ internal sealed class RemoteMachine : IAsyncDisposable
             Log = m => ServiceLog.Info($"remote {Name}: {m}"),
             RetryDelays = options.Backoff,
             GiveUpAfter = TimeSpan.MaxValue,
+            // Its clients' links (Zed's bridges) follow the marks of their own prompts' ends.
+            PassesMarks = true,
             HandshakeTimeout = options.Handshake,
             ConnectionChanged = up =>
             {
                 SetState(up, up ? null : lastErrorLine ?? "the connection dropped");
                 hub.OnConnectionChanged(this, up);
+            },
+            // The remote that came back may be another build (an update) with other agents and extensions,
+            // or no longer the same service: its answer is taken again, as the first one was.
+            CameBack = answer =>
+            {
+                try
+                {
+                    Take(answer);
+                }
+                catch (SelfException e)
+                {
+                    refused = e;
+                    return e.Message;
+                }
+                ServiceLog.Info($"remote {Name}: back as service {ServiceId}; agents {string.Join(", ", Agents.Select(a => a.Name))}");
+                hub.OnAgentsChanged();
+                return null;
             },
         });
         lastErrorLine = null;
@@ -178,6 +197,7 @@ internal sealed class RemoteMachine : IAsyncDisposable
             ServiceLog.Info($"remote {Name}: connected to service {ServiceId}; agents {string.Join(", ", Agents.Select(a => a.Name))}");
             hub.OnConnected(this);
             await Task.WhenAny(linkRun, client.Completion);
+            if (refused is { } self) throw self;
         }
         finally
         {
@@ -266,6 +286,8 @@ internal sealed class RemoteMachine : IAsyncDisposable
     }
 
     sealed class SelfException(string message) : Exception(message);
+
+    SelfException? refused; // what came back is this service itself
 
     /// <summary>The remote command's output, which ends its process when the link lets the connection go.</summary>
     sealed class ProcessStream(Stream inner, Process process) : Stream

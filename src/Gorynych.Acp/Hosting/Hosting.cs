@@ -196,6 +196,13 @@ public static class GorynychProtocol
     public const string MetaHub = "gorynych/hub";
 
     /// <summary>
+    /// Notification to clients, <c>{agents: [{name, displayName}]}</c>: the agents the service offers changed
+    /// (a remote connected or dropped, or came back with others); the same list as <c>initialize</c>'s
+    /// <see cref="MetaAgents"/> would give now. Not to a connection scoped to one agent, nor to a hub.
+    /// </summary>
+    public const string MethodAgentsChanged = "_gorynych/agents_changed";
+
+    /// <summary>
     /// The service's remotes in <c>_gorynych/status</c>: <c>[{name, command, connected, since, lastError,
     /// serviceId, agents}]</c>.
     /// </summary>

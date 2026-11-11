@@ -216,6 +216,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | --- | --- | --- |
 | `gorynych/agent` | `session/new` params, `SessionInfo._meta`, `session/new` result | the adapter that owns the session |
 | `gorynych/agent` | `initialize` params `_meta` | scopes the connection to one adapter: its default for `session/new` and the only one in `session/list` (the stdio bridge sets it for plain clients); a remote one as `claude@R-PC-167` ([Remotes](#remotes)) |
+| `_gorynych/agents_changed` | notification to unscoped clients, `{agents: [{name, displayName}]}` | the agents the service offers changed: a remote connected, dropped, went, or came back with others ([Remotes](#remotes)) |
 | `gorynych/hub` | `initialize` params `_meta` | `true` from a hub: the service answers it with its own sessions and agents only, and tells it no change of its remotes' sessions (one hop, [Remotes](#remotes)) |
 | `gorynych/machine` | `SessionInfo._meta`; the `_meta` of `session/new`, `session/load` and `session/resume` answers, of a `session_info_update` and of `_gorynych/sessions_changed` | the machine of a remote session, as the hub names it ([Remotes](#remotes)); a hub never lists one that carries it from its own remote |
 | `gorynych/detach` | the service's `agentCapabilities._meta` | `true`: it takes `_gorynych/detach` |
@@ -2019,8 +2020,9 @@ ACP's `McpServerStdio`.
   name. `list` asks the running service on the pipe whether each remote is connected, since when,
   its service ID and agents, or why not.
 - A running service reads the file again every 2 seconds. A new entry connects, a removed one is
-  let go, and a changed one starts again. A file it cannot read is logged, and the remotes stay as
-  they were.
+  let go, and a changed one starts again. A file it cannot read (not JSON, not an object with a list
+  of remotes, a bad name) is logged, the remotes stay as they were, and the file is read again: a
+  good one later is taken. It reads the file without keeping the `remote` command from replacing it.
 
 **The connection** to each remote is always on.
 - It starts with the service, and again after a drop, after 2, 5, 15 and 30 seconds, then 1, 2 and
@@ -2037,6 +2039,11 @@ ACP's `McpServerStdio`.
   capabilities: it relays both, and translates a form for a client without them.
 - A remote that answers with this service's own `gorynych/serviceId` is refused, and not tried
   again until `remotes.json` changes.
+- When the link comes back to a remote that restarted (an update there), the hub takes the answer to
+  the `initialize` it sends again as it took the first: the remote's agents and extensions, and its
+  service ID, refusing it so if it is now this service itself. When the agents the service offers
+  change (a remote connected, dropped, went, or came back with others), its unscoped clients get
+  `_gorynych/agents_changed {agents}`, the list `initialize` would give now.
 - `_gorynych/status` lists the remotes: `remotes: [{name, command, connected, since, lastError,
   serviceId, agents, openSessions}]`. `status` prints a line for each.
 
@@ -2050,9 +2057,14 @@ ACP's `McpServerStdio`.
   `session/resume`, in its `session_info_update`s and in `_gorynych/sessions_changed`.
 - The hub routes by a table of sessions and their machines, filled from the remotes' lists and from
   `session/new`. A session it does not know (after its own restart, say) is looked for in the
-  connected remotes' lists, archived ones included.
+  connected remotes' lists, archived ones included. An ID no remote had (a deleted session, a typo)
+  is not looked for again for 30 seconds, unless a remote's list changes or a remote connects first.
+  A service that looks for a session of its own agents' that it does not know lists only them.
 - A remote session with the ID of a local one, or of another remote's, is left out and logged:
-  the local one, or the first, keeps it.
+  the local one, or the first, keeps it. What a machine sends about a session whose ID belongs to a
+  local session, or to a session routed to another machine (a copied Claude transcript keeps its
+  ID), is dropped and logged once: an update, a change of a list, and a question of its agent, which
+  is refused.
 
 **One hop.**
 - A hub shows only what a remote has itself. It drops a `SessionInfo` that carries
@@ -2062,10 +2074,11 @@ ACP's `McpServerStdio`.
   change of its remotes' sessions. So two services that list each other ask nothing of each other
   in turn, and show each session once.
 
-**The list.** Every connected remote is asked for all its pages (bounded to 30 seconds), and its
-own sessions are merged with the local ones, sorted by `updatedAt` and paged with the service's own
-cursor, as one list. The request's `cwd` and `gorynych/includeArchived` go on to the remotes. A
-remote that cannot be reached adds nothing: the hub keeps no copy of its list.
+**The list.** Every connected remote is asked for all its pages, and its own sessions are merged
+with the local ones, sorted by `updatedAt` and paged with the service's own cursor, as one list.
+The request's `cwd` and `gorynych/includeArchived` go on to the remotes. A remote that cannot be
+reached adds nothing: the hub keeps no copy of its list. One whose list does not come within 5
+seconds (it answers, but is slow or hung) is left out of that list, and logged.
 
 **Attached only while open.**
 - The hub opens a remote session there only while one of its own clients has it open: by
@@ -2079,6 +2092,10 @@ remote that cannot be reached adds nothing: the hub keeps no copy of its list.
   goes cancels nothing.
 - A remote that does not announce `gorynych/detach` (an older one) keeps the hub attached instead:
   a close would cancel the person's turn there.
+- The hub's close or detach there goes after an open of the session on its way, and waits for its
+  answer; an open that comes meanwhile waits for it. So the remote never gets a close behind an open
+  that came after it. An open that fails leaves a client that had the session open with it as it
+  was, and lets go of the session for one that came for it.
 - So a hub nobody sits at takes no approval there.
 
 **Several clients, one connection.** Updates go to the hub's clients that have the session open, as
@@ -2089,6 +2106,13 @@ they come, untouched: positions (`gorynych/position`), prompt IDs and marks.
   a `notice` goes only to those that show notices.
 - A client that creates a session gets its updates after the answer to its `session/new`, as from
   a local one.
+- Each client has an outbox of its own, sent in order: a client that is slow to read holds up
+  nothing from the remote, nor the hub's other clients. One that does not read for 15 seconds is
+  disconnected, as for a local session. A load's, a resume's, a prompt's or a setting's answer goes
+  after the updates queued for that client before it, and a question of the agent after them too.
+- A remote session's prompt text reaches the hub's other clients only on their next load: the
+  remote sends a prompt's text to its clients other than the one that sent it, and the hub is one
+  client there.
 - A question of the remote's agent (an approval, a form) goes to the client that attached last. It
   is translated for a client without forms. While no client has the session open it waits for one,
   and the remote withdraws it when the hub lets the session go.
