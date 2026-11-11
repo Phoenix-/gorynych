@@ -10,7 +10,9 @@ public static class AtomicFile
 {
     static readonly int[] RetryDelaysMs = [10, 25, 50, 100, 200];
 
-    public static void WriteAllText(string path, string contents, System.Text.Encoding? encoding = null)
+    /// <param name="retry">False makes one attempt: for a write whose content the next one carries anyway,
+    /// whose caller must not wait out the retries (about 400 ms) when the file is held for long.</param>
+    public static void WriteAllText(string path, string contents, System.Text.Encoding? encoding = null, bool retry = true)
     {
         var tmp = path + ".tmp";
         for (var attempt = 0; ; attempt++)
@@ -22,7 +24,7 @@ public static class AtomicFile
                 File.Move(tmp, path, overwrite: true);
                 return;
             }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException && attempt < RetryDelaysMs.Length)
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException && retry && attempt < RetryDelaysMs.Length)
             {
                 Thread.Sleep(RetryDelaysMs[attempt]);
             }

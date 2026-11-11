@@ -116,7 +116,13 @@ public sealed class SessionStore
     readonly HashSet<string> removed = new(StringComparer.Ordinal);
     long changes;     // in-memory changes so far (under gate)
     long written;     // the change count the file holds (under writeGate)
-    long lastAttempt; // when a write was last tried (under gate)
+    long lastAttempt; // when a write was last tried, and again when it ended (under gate)
+
+    /// <summary>For tests: the clock of <see cref="TouchSaveInterval"/>, in milliseconds.</summary>
+    internal Func<long> Ticks { get; init; } = static () => Environment.TickCount64;
+
+    /// <summary>For tests: writes the file (its path, the content, whether to retry), in place of <see cref="AtomicFile"/>.</summary>
+    internal Action<string, string, bool> WriteFile { get; init; } = static (path, json, retry) => AtomicFile.WriteAllText(path, json, retry: retry);
 
     public SessionStore(string path)
     {
@@ -195,8 +201,10 @@ public sealed class SessionStore
     /// <summary>
     /// Stamps activity on a session. Streaming produces many updates a second, so a stamp tries
     /// to write the file at most once per <see cref="TouchSaveInterval"/> after the last attempt
-    /// (successful or not); the next write carries it anyway. Ignores unknown, removed and deleted
-    /// sessions: an update that arrives before its session is recorded must not record it.
+    /// ended (successful or not), and only once: the next write carries it anyway, and its caller,
+    /// an agent's update on its way in, must not wait out <see cref="AtomicFile"/>'s retries while the
+    /// file is held. Ignores unknown, removed and deleted sessions: an update that arrives before its
+    /// session is recorded must not record it.
     /// </summary>
     public void Touch(string sessionId)
     {
@@ -207,10 +215,10 @@ public sealed class SessionStore
             r.UpdatedAt = DateTimeOffset.UtcNow;
             changes++;
             if (r.Listed) Active?.Invoke(r.SessionId, r.Agent);
-            if (Environment.TickCount64 - lastAttempt < TouchSaveInterval.TotalMilliseconds) return;
+            if (Ticks() - lastAttempt < TouchSaveInterval.TotalMilliseconds) return;
             snapshot = Snapshot(counted: true);
         }
-        Write(snapshot, durable: false);
+        Write(snapshot, durable: false, retry: false);
     }
 
     /// <summary>Removes the record; later updates of the same session in this run are ignored.</summary>
@@ -251,28 +259,35 @@ public sealed class SessionStore
     (string Json, long Version) Snapshot(bool counted = false)
     {
         if (!counted) changes++;
-        lastAttempt = Environment.TickCount64;
+        lastAttempt = Ticks();
         return (JsonSerializer.Serialize(records.Values.OrderBy(r => r.CreatedAt).ToList(), ServiceJsonContext.Default.ListSessionRecord), changes);
     }
 
     /// <summary>
     /// Writes a snapshot unless a later one is already on disk. A write that still fails after
-    /// <see cref="AtomicFile"/>'s retries is logged and left for the next write, or thrown when durable.
+    /// <see cref="AtomicFile"/>'s retries (or its one attempt, without <paramref name="retry"/>) is
+    /// logged and left for the next write, or thrown when durable.
     /// </summary>
-    void Write((string Json, long Version) snapshot, bool durable)
+    void Write((string Json, long Version) snapshot, bool durable, bool retry = true)
     {
         lock (writeGate)
         {
             if (written >= snapshot.Version) return;
             try
             {
-                AtomicFile.WriteAllText(path, snapshot.Json);
+                WriteFile(path, snapshot.Json, retry);
                 Volatile.Write(ref written, snapshot.Version);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
                 if (durable) throw new IOException($"The sessions file could not be saved: {e.Message}", e);
                 ServiceLog.Warn($"sessions file not saved, will retry with the next change: {e.Message}");
+            }
+            finally
+            {
+                // A stamp's interval counts from here: a write that took long (its retries, a slow disk)
+                // is not tried again by the very next stamp. The file's lock, then the records': never the other way.
+                lock (gate) lastAttempt = Ticks();
             }
         }
     }

@@ -2006,8 +2006,10 @@ The file is replaced atomically (a temporary file moved over it). An antivirus s
 the indexer can hold it open for a moment, so the move is retried for up to about 400 ms,
 outside the lock on the records. A write that still fails is logged and the change stays in
 memory for the next write; ending a draft is the exception (see above). The activity stamp of
-a streaming turn tries a write at most once a second after the last attempt, so a file that
-cannot be written does not slow every update down. A session removed in this run is not
+a streaming turn tries a write at most once a second after the last attempt ended, and makes one
+attempt, without the retries: the next write carries the stamp anyway, and the stamp's caller is
+the agent's update on its way in, which must not wait out the retries. So a file that cannot be
+written slows no update down, however long a failed write took. A session removed in this run is not
 recreated by a late write, and an activity stamp never creates a record: an update an agent
 sends before its `session/new` answer must not list the session ahead of time. The list of
 commands is no activity and stamps nothing.

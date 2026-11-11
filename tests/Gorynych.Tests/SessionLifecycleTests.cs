@@ -508,20 +508,45 @@ public sealed class SessionLifecycleTests
         Assert.AreEqual(stamped, new SessionStore(path).Get("a")!.UpdatedAt);
     }
 
+    /// <summary>
+    /// A stamp that cannot be written is not tried again by every stamp after it: the next try waits a
+    /// second from when the failed one ended, however long it took (on CI one took 1.3 s, and the next
+    /// stamp tried again at once). And a stamp makes one attempt, not AtomicFile's retries: its caller
+    /// is an agent's update on its way in, which must not wait some 400 ms for a file held for long.
+    /// </summary>
     [TestMethod]
     public void Store_BacksOffFromAFailedWrite_InsteadOfRetryingOnEveryStamp()
     {
         var path = Path.Combine(TestDirs.New(), "sessions.json");
-        var store = new SessionStore(path);
+        long now = 0;
+        List<bool> attempts = []; // whether each write retried
+        // Each write moves the clock 1.5 s on, longer than a stamp's interval: a slow machine's write.
+        var store = new SessionStore(path)
+        {
+            Ticks = () => now,
+            WriteFile = (file, json, retry) =>
+            {
+                attempts.Add(retry);
+                now += 1500;
+                AtomicFile.WriteAllText(file, json, retry: retry);
+            },
+        };
         store.Update("a", "kimi", r => r.Title = "t");
-        Thread.Sleep(1100);
+        now += 1100;
         using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
         {
-            store.Touch("a"); // tries, and spends its retries
-            var watch = System.Diagnostics.Stopwatch.StartNew();
+            store.Touch("a"); // tries once, and fails
+            CollectionAssert.AreEqual(new[] { true, false }, attempts, "an update retries; a stamp tries once");
+
             for (var i = 0; i < 20; i++) store.Touch("a");
-            Assert.IsTrue(watch.ElapsedMilliseconds < 200, $"later stamps waited {watch.ElapsedMilliseconds} ms");
+            Assert.AreEqual(2, attempts.Count, "no stamp within a second of the failed write's end tries again");
+
+            now += 1000;
+            store.Touch("a");
+            Assert.AreEqual(3, attempts.Count, "a second after it, one does");
         }
+        store.Flush();
+        Assert.AreEqual(store.Get("a")!.UpdatedAt, new SessionStore(path).Get("a")!.UpdatedAt, "the stamps reach the file with the next write");
     }
 
     [TestMethod]
