@@ -40,6 +40,10 @@ Expand-Archive $zip "$env:LOCALAPPDATA\Programs" -Force
 This gives `%LOCALAPPDATA%\Programs\Gorynych`, which holds `Gorynych.Service.exe` and
 `outside\Gorynych.Outside.exe`. Any other folder works too; the paths below then change with it.
 
+**There is nothing to start by hand.** The first thread you open in Zed starts the service
+through the bridge ([Set up Zed](#set-up-zed)), and it keeps running after Zed quits. Agents
+outside Gorynych start the outside server themselves.
+
 The binaries are not signed. A zip downloaded with a browser carries the Mark of the Web, and
 Explorer's "Extract All" copies it to every file. `Expand-Archive` and `tar` do not. Files with
 the mark may get a SmartScreen warning when you start them yourself. Clear the mark with
@@ -48,9 +52,6 @@ the mark may get a SmartScreen warning when you start them yourself. Clear the m
 ```powershell
 Get-ChildItem "$env:LOCALAPPDATA\Programs\Gorynych" -Recurse -File | Unblock-File
 ```
-
-You never start these programs by hand: Zed starts the service, and agents start the outside
-server.
 
 ### Or build from source
 
