@@ -271,9 +271,12 @@ public sealed class SpawnInitiationTests
                 await AskAsync(zed, kimi.Tokens[other], parent);
                 break;
             case "report":
-                await SpawnAsync(zed, claude.Tokens[parent], "proposal"); // a child, whose finished turn is reported as a turn
-                before = SpawnCards(zed).Length;
+                // Armed before the child starts: its finished turn is reported when it likes, as often
+                // before the spawn's answer comes back as after it. That spawn is asked too (no client
+                // turn), so its card comes first.
+                before++;
                 armed = true;
+                await SpawnAsync(zed, claude.Tokens[parent], "proposal"); // a child, whose finished turn is reported as a turn
                 await Until(() => spawned is not null, "the spawn from the report's turn");
                 break;
             default:
