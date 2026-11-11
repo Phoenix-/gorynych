@@ -399,8 +399,13 @@ written):
     entry of an unexpected shape is left out.
 - **The mark at a turn's end** is taken once two reads 50 ms apart agree (at most half a
   second): Claude may still be writing the turn's last entries when its result comes. It never
-  fails the prompt. Each read goes backwards from the file's end, as far as the last
-  `last-prompt` and the entry it names; a transcript without one is read whole.
+  fails the prompt. The adapter keeps each open session's last mark (its catch-up's, then each
+  turn end's) and reads on from it as a catch-up does: forwards from that mark's line, each
+  further read from the one before, so a turn's end costs what the turn wrote. A long-lived
+  `claude -p` writes no `last-prompt` between turns, so this is the usual case. Only when what
+  follows does not settle the branch (no mark yet, its line moved, a rewind, a `last-prompt`
+  that names an entry off its chain) is the mark read backwards from the file's end, as far as
+  the last `last-prompt` and the entry it names, or all of the file when it has none.
 - **Entries become updates** as the live stream maps them, through the same code (`StreamJson`):
   - user text by `uuid`;
   - assistant text and thinking by the API's `msg_…` ID;

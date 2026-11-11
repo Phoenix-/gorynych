@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -69,15 +70,28 @@ internal static class TranscriptHistory
     /// <summary>
     /// The transcript's mark now: the last entry of its conversation; null when it has none, is not
     /// there or cannot be read. A last line without its newline is still being written and is left
-    /// out, as a replay leaves it out. Read backwards, as far as the last <c>last-prompt</c> entry
-    /// and the entry it names (all of the file when it has none).
+    /// out, as a replay leaves it out. Given <paramref name="after"/>, a mark taken earlier, it is
+    /// read as a catch-up reads (<see cref="TakeMark"/>).
     /// </summary>
-    public static string? Mark(string path)
+    public static string? Mark(string path, string? after = null) => TakeMark(path, after).Mark;
+
+    /// <summary>
+    /// <see cref="Mark"/>, with how many bytes it read. From <paramref name="after"/> it reads forwards
+    /// only from that mark's line, as a catch-up does, so a turn's end costs what the turn wrote.
+    /// When that does not settle the conversation (no earlier mark, its line moved, a rewind, a
+    /// <c>last-prompt</c> after it that names an entry off its chain), it reads backwards from the
+    /// file's end, as far as the last <c>last-prompt</c> entry and the entry it names (all of the
+    /// file when it has none).
+    /// </summary>
+    internal static (string? Mark, long BytesRead) TakeMark(string path, string? after)
     {
+        var read = new StrongBox<long>();
         try
         {
             using var file = Open(path);
-            using var lines = Backwards(file).GetEnumerator();
+            if (Parse(after) is { } at && Continuation(file, at.Uuid, at.Offset, ref read.Value, MaxBytes, log: null) is { } next)
+                return (next.After.Count == 0 ? after : MarkOf(next.Last), read.Value);
+            using var lines = Backwards(file, read).GetEnumerator();
             var seen = new List<Entry>(); // last first
             var enough = new Enough();
             var whole = true;
@@ -92,11 +106,11 @@ internal static class TranscriptHistory
                 while (lines.MoveNext()) seen.Add(lines.Current);
                 (_, last) = LastEntry(InFileOrder(seen), whole: true);
             }
-            return last is { } entry ? MarkOf(entry) : null;
+            return (last is { } entry ? MarkOf(entry) : null, read.Value);
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
-            return null;
+            return (null, read.Value);
         }
     }
 
@@ -115,23 +129,10 @@ internal static class TranscriptHistory
             long read = 0;
             var parsed = Parse(mark);
             var markUuid = parsed?.Uuid;
-            if (parsed is { } at)
-            {
-                var (uuid, offset) = at;
-                // Read once from the mark's line: it must be the first entry there, where the mark says.
-                var fromMark = offset < file.Length ? Entries(file, offset, ref read, maxBytes) : [];
-                if (fromMark.Count > 0 && fromMark[0].Start == offset && fromMark[0].Uuid == uuid)
-                {
-                    if (AfterMark(fromMark) is { } leaf)
-                    {
-                        if (leaf.Uuid == uuid) return new Replay(true, mark, read, 0);
-                        if (ChainBack(leaf, fromMark, until: uuid) is { } chain)
-                            return new Replay(true, MarkOf(leaf), read, await SendAsync(file, chain, send, log));
-                    }
-                    log?.Invoke("what follows the mark does not continue from it (a rewind, or another process's branch): reading the whole transcript");
-                }
-                else log?.Invoke($"the mark's line is not at {offset}: reading the whole transcript");
-            }
+            if (parsed is { } at && Continuation(file, at.Uuid, at.Offset, ref read, maxBytes, log) is { } next)
+                return next.After.Count == 0
+                    ? new Replay(true, mark, read, 0)
+                    : new Replay(true, MarkOf(next.Last), read, await SendAsync(file, next.After, send, log));
             var all = Entries(file, 0, ref read, maxBytes);
             if (LastEntry(all, whole: true).Last is not { } last) return new Replay(false, null, read, 0);
             if (markUuid is not null)
@@ -156,22 +157,47 @@ internal static class TranscriptHistory
     }
 
     /// <summary>
-    /// The transcript's mark at a turn's end. Claude may still be writing the turn's last entries
-    /// when its result comes, so it is taken once two reads, <paramref name="wait"/> apart (50 ms),
-    /// agree; at most ten reads after the first.
+    /// The transcript's mark at a turn's end, read from <paramref name="after"/>, the mark the
+    /// session had before the turn (each further read from the one before it). Claude may still be
+    /// writing the turn's last entries when its result comes, so it is taken once two reads,
+    /// <paramref name="wait"/> apart (50 ms), agree; at most ten reads after the first.
     /// </summary>
-    public static async Task<string?> SettledMarkAsync(string path, Func<Task>? wait = null)
+    public static async Task<string?> SettledMarkAsync(string path, Func<Task>? wait = null, string? after = null)
     {
         wait ??= () => Task.Delay(50);
-        var mark = Mark(path);
+        var mark = Mark(path, after);
         for (var i = 0; i < 10 && mark is not null; i++)
         {
             await wait();
-            var again = Mark(path);
+            var again = Mark(path, mark);
             if (again == mark) break;
             mark = again;
         }
         return mark;
+    }
+
+    /// <summary>
+    /// What follows the mark's line, when it settles the conversation: its last entry and the chain
+    /// after the mark, oldest first (empty when nothing was added). Read once, from the mark's line,
+    /// which must be the first entry there. Null when the line is not where the mark says, or the
+    /// conversation does not continue from the mark (a rewind, or another process's branch): the
+    /// whole file decides then.
+    /// </summary>
+    static (Entry Last, List<Entry> After)? Continuation(FileStream file, string uuid, long offset, ref long read, long maxBytes, Action<string>? log)
+    {
+        var fromMark = offset < file.Length ? Entries(file, offset, ref read, maxBytes) : [];
+        if (fromMark.Count == 0 || fromMark[0].Start != offset || fromMark[0].Uuid != uuid)
+        {
+            log?.Invoke($"the mark's line is not at {offset}: reading the whole transcript");
+            return null;
+        }
+        if (AfterMark(fromMark) is { } leaf)
+        {
+            if (leaf.Uuid == uuid) return (fromMark[0], []);
+            if (ChainBack(leaf, fromMark, until: uuid) is { } chain) return (leaf, chain);
+        }
+        log?.Invoke("what follows the mark does not continue from it (a rewind, or another process's branch): reading the whole transcript");
+        return null;
     }
 
     static FileStream Open(string path) => new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -343,9 +369,10 @@ internal static class TranscriptHistory
 
     /// <summary>
     /// The entries of the file's whole lines, last first, each projected; a last line without its
-    /// newline is still being written and is left out. Gives up past <see cref="MaxBytes"/>.
+    /// newline is still being written and is left out. Adds what it reads to <paramref name="counted"/>;
+    /// gives up past <see cref="MaxBytes"/> read in this pass.
     /// </summary>
-    static IEnumerable<Entry> Backwards(FileStream file)
+    static IEnumerable<Entry> Backwards(FileStream file, StrongBox<long> counted)
     {
         // Read backwards a block at a time; a line that spans blocks is kept as its pieces until its start is found.
         var pieces = new List<byte[]>();
@@ -360,6 +387,7 @@ internal static class TranscriptHistory
             var block = new byte[size];
             file.Position = pos;
             file.ReadExactly(block);
+            counted.Value += size;
             if ((read += size) > MaxBytes) throw new TooLarge();
             var lineEnd = size;
             for (var i = size - 1; i >= 0; i--)

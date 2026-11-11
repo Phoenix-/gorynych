@@ -408,6 +408,43 @@ public sealed class ClaudeTranscriptHistoryTests
     }
 
     [TestMethod]
+    public async Task TheMarkAtATurnsEnd_ReadsOnFromThePreviousMark_OnlyWhatTheTurnWrote()
+    {
+        // A long-lived claude -p writes no last-prompt between turns: without a previous mark the
+        // whole transcript is read.
+        var path = NewTranscript();
+        string? parent = null;
+        for (var i = 0; i < 400; i++)
+        {
+            Add(path, User($"old-u{i}", parent, new string('x', 400)), Assistant($"old-a{i}", $"old-u{i}", $"msg_old{i}", Text("ok")));
+            parent = $"old-a{i}";
+        }
+        var (previous, wholeRead) = TranscriptHistory.TakeMark(path, null);
+        Assert.AreEqual(new FileInfo(path).Length, wholeRead, "no previous mark, no last-prompt: all of it");
+
+        var before = new FileInfo(path).Length;
+        Add(path, User("u1", parent, "Next"), Assistant("a1", "u1", "msg_1", Text("Done")));
+        var turn = new FileInfo(path).Length - before;
+        var (mark, read) = TranscriptHistory.TakeMark(path, previous);
+        StringAssert.StartsWith(mark, "a1@");
+        Assert.IsTrue(read < turn + 500, $"read {read} bytes for a turn of {turn}: the previous mark's line and what follows");
+        Assert.AreEqual(TranscriptHistory.Mark(path), mark, "the same mark as read from the end");
+        Assert.AreEqual(mark, await TranscriptHistory.SettledMarkAsync(path, () => Task.CompletedTask, after: previous));
+
+        var (same, again) = TranscriptHistory.TakeMark(path, mark);
+        Assert.AreEqual(mark, same, "nothing new: the mark stays");
+        Assert.IsTrue(again < 500, $"read {again} bytes: the mark's line only");
+
+        // A last-prompt after the mark that names an entry off its chain (a rewind): decided from the end.
+        Add(path, LastPrompt("old-a10", isExplicit: true, rewound: true));
+        var (rewound, fallback) = TranscriptHistory.TakeMark(path, mark);
+        StringAssert.StartsWith(rewound, "old-a10@");
+        Assert.AreEqual(TranscriptHistory.Mark(path), rewound);
+        Assert.IsTrue(fallback > turn, "read back to the entry the checkpoint names");
+        Assert.AreEqual(TranscriptHistory.Mark(path), TranscriptHistory.Mark(path, "a1@3"), "a previous mark whose line moved: decided from the end");
+    }
+
+    [TestMethod]
     public void AMarkWhoseLineMoved_IsFoundInTheFile()
     {
         var path = NewTranscript();

@@ -90,6 +90,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     readonly ClaudeStateStore state;
     readonly ConcurrentDictionary<string, IClaudeSession> sessions = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, long> cancelledAt = new(StringComparer.Ordinal);
+    /// <summary>Each open session's last transcript mark (a catch-up's or a turn end's): the next turn end reads on from it.</summary>
+    readonly ConcurrentDictionary<string, string> marks = new(StringComparer.Ordinal);
     readonly ChannelConsentStore consent;
     readonly ClaudeTrust trust;
     readonly ClaudeCatalogStore catalogStore;
@@ -261,6 +263,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             {
                 var id = (string?)request.Params?["sessionId"] ?? "";
                 if (sessions.TryRemove(id, out var s)) await s.DisposeAsync();
+                marks.TryRemove(id, out _);
                 return new JsonObject();
             }
             case GorynychProtocol.MethodOpinion:
@@ -278,14 +281,15 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     /// <summary>
     /// <c>_meta</c> with the transcript's mark (<c>gorynych/historyMark</c>) at the end of a turn: the
     /// service's journal now holds the conversation up to there. Taken once the transcript settles
-    /// (<see cref="TranscriptHistory.SettledMarkAsync"/>). Null when there is no transcript; it never
-    /// fails the turn.
+    /// (<see cref="TranscriptHistory.SettledMarkAsync"/>), read on from the session's last mark, so
+    /// it costs what the turn wrote. Null when there is no transcript; it never fails the turn.
     /// </summary>
     public async Task<JsonObject?> MarkMetaAsync(IClaudeSession session)
     {
         try
         {
-            var mark = await TranscriptHistory.SettledMarkAsync(TranscriptOf(session));
+            var mark = await TranscriptHistory.SettledMarkAsync(TranscriptOf(session), after: marks.GetValueOrDefault(session.Id));
+            Remember(session.Id, mark);
             return mark is null ? null : new JsonObject { [GorynychProtocol.MetaHistoryMark] = mark };
         }
         catch (Exception e) when (e is not OperationCanceledException)
@@ -311,7 +315,14 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             return null;
         }
         Log($"claude {session.Id}: {replay.Sent} updates replayed {(replay.FromMark ? "after the mark" : "from the start")} ({replay.BytesRead} bytes read)");
+        Remember(session.Id, replay.Mark);
         return new JsonObject { ["from"] = replay.FromMark ? "mark" : "start", ["mark"] = replay.Mark };
+    }
+
+    void Remember(string session, string? mark)
+    {
+        if (mark is null) marks.TryRemove(session, out _);
+        else marks[session] = mark;
     }
 
     IClaudeSession NewSession(string id, string cwd, bool resume)
