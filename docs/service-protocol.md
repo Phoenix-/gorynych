@@ -1613,6 +1613,15 @@ its answer arrives whole.
   the adapter. One host runs per adapter and pipe, by a named mutex
   (`Gorynych.Host.<pipe>.<adapter>`, current user, all logon sessions). It logs to
   `logs/host-<adapter>-<date>.log`.
+- **In the logon task's job.** A service the logon task started runs in Task Scheduler's job
+  object, which lets no process break away, so its hosts stay in that job (the service logs it).
+  That job does not kill its processes when it closes: when the service exits for a restart, the
+  task goes from Running to Ready, the hosts run on and connect to the next service, and the next
+  `schtasks /Run` (a bridge's) starts that service as usual. Ending the task by hand (End in Task
+  Scheduler, `schtasks /End`) stops the service alone: its hosts, those it started in that job
+  too, wait for the next one (probed on Windows 11 on 11 November 2026, a test task on a pipe of
+  its own). Only a job that kills its processes on close (a client's, when the bridge could not
+  break away) stops the hosts with the service: then the log warns.
 - **What moves into it.** Everything that lives with an agent: the adapter, its agents, and the
   adapter's listeners (the Claude TUI's http hooks and channel, a headless Claude's reply route,
   Codex's lock watcher). The agents' `gorynych` MCP servers are the agents' children, so they live

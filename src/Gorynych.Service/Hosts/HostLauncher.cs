@@ -54,7 +54,17 @@ public sealed class ProcessHostLauncher(string exe, string pipe, string dataDire
         var log = Path.Combine(dataDirectory, "logs", $"host-{adapter}-{DateTime.Now:yyyyMMdd}.log");
         var from = File.Exists(log) ? new FileInfo(log).Length : 0;
         if (!DetachedProcess.Start(exe, args, out var processId))
-            ServiceLog.Warn($"{adapter}: the host stays in the service's job object, which forbids breaking away; a restart may stop it");
+        {
+            // The logon task's job (Task Scheduler's) forbids breaking away but does not kill on close:
+            // the service's exit, or End in Task Scheduler, leaves the host running (probed); only a job
+            // that kills on close stops it.
+            if (DetachedProcess.KillOnCloseJob() is null)
+                ServiceLog.Info($"{adapter}: the host stays in the service's job object, which forbids breaking away (the logon task's does); " +
+                    "that job does not stop it when the service exits, so a restart leaves it running");
+            else
+                ServiceLog.Warn($"{adapter}: the host stays in the service's job object, which forbids breaking away and kills its processes when it closes; " +
+                    "closing whatever started the service stops the host with it, so its turns do not outlive a restart");
+        }
         System.Diagnostics.Process? process = null;
         try { process = System.Diagnostics.Process.GetProcessById(processId); }
         catch (ArgumentException) { } // gone already
