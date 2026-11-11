@@ -507,8 +507,11 @@ public sealed partial class ClaudeHeadlessTests
         await using var client = await TestClient.ConnectAsync(conductor);
         var sessionId = await NewAsync(client, dir);
         await PromptAsync(client, sessionId, "hello");
+        var waited = System.Diagnostics.Stopwatch.StartNew();
         var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "swallow this"));
         StringAssert.Contains(failed.Message, "did not take the prompt");
+        // Claude runs (it said system/init with "hello"): its stall time (1.5 s) holds, not its startup time (20 s).
+        Assert.IsLessThan(15, waited.Elapsed.TotalSeconds, "let go after its stall time, not its startup time");
         Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "still here")).StopReason);
         StringAssert.Contains(client.Text(), "echo: still here");
     }
