@@ -27,9 +27,12 @@ public sealed class AskAcrossRestartTests
         public TestClient Zed = null!;
         public string AskedId = null!, AskerId = null!;
         readonly TimeSpan reclaimWait, reclaimKeep, reclaimSweep;
+        readonly Func<string, Task>? askWaitEnded;
 
-        public Rig(bool channel, TimeSpan? reclaimWait = null, TimeSpan? reclaimKeep = null, TimeSpan? reclaimSweep = null)
+        public Rig(bool channel, TimeSpan? reclaimWait = null, TimeSpan? reclaimKeep = null, TimeSpan? reclaimSweep = null,
+            Func<string, Task>? askWaitEnded = null)
         {
+            this.askWaitEnded = askWaitEnded;
             Asked = new LifecycleAgent("claude", canDelete: false) { HasChannel = channel };
             Hosts = new InProcessHosts(name => name == "claude" ? Asked.Adapter : Asker.Adapter);
             this.reclaimWait = reclaimWait ?? TimeSpan.FromSeconds(15);
@@ -43,7 +46,7 @@ public sealed class AskAcrossRestartTests
             var service = new Conductor(new ConductorOptions
             {
                 DataDirectory = Data, ServiceId = "test-service", Hosts = Hosts, HostToken = InProcessHosts.Token,
-                PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"], ReclaimWait = reclaimWait, ReclaimKeep = reclaimKeep, ReclaimSweep = reclaimSweep,
+                PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"], ReclaimWait = reclaimWait, ReclaimKeep = reclaimKeep, ReclaimSweep = reclaimSweep, AskWaitEnded = askWaitEnded,
             }, [Asked.Adapter, Asker.Adapter]);
             Hosts.Service = service;
             return service;
@@ -254,10 +257,51 @@ public sealed class AskAcrossRestartTests
 
         withdraw.Cancel(); // $/cancel_request
         await Assert.ThrowsAsync<OperationCanceledException>(() => asking);
-        var reclaiming = peers.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-6", reclaim: true));
-        hold.SetResult();
 
-        var lost = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => reclaiming.WaitAsync(Wait));
+        // Read right behind the withdrawal, on the same link: withdrawn already, with the agent's answer still held.
+        var lost = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => peers.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-6", reclaim: true)).WaitAsync(Wait));
+        Assert.IsNotNull(lost.ErrorData?[GorynychProtocol.MetaAskLost], lost.Message);
+        Assert.IsFalse(hold.Task.IsCompleted);
+
+        // An answer the agent gives after it is no answer to take either.
+        hold.SetResult();
+        await Task.Delay(200);
+        var later = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => peers.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-6", reclaim: true)).WaitAsync(Wait));
+        Assert.IsNotNull(later.ErrorData?[GorynychProtocol.MetaAskLost], later.Message);
+    }
+
+    /// <summary>
+    /// The withdrawal is in place as the service reads the cancellation, not when the asker's own call gets
+    /// round to it: here that call is held at its cancelled wait, the question is withdrawn meanwhile, and
+    /// the answer the agent gives after it is no answer to take (a reclaim took one, once in three full runs).
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AnAnswerThatCameAfterTheWithdrawal_IsNotTaken_HoweverLateTheAskersCallEnds()
+    {
+        var waitEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var goOn = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var rig = new Rig(channel: true, askWaitEnded: async _ =>
+        {
+            waitEnded.TrySetResult();
+            await goOn.Task;
+        });
+        await rig.StartAsync();
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Asked.HoldOpinions = hold;
+        await using var peers = await TestClient.ConnectAsync(rig.Service, "peers");
+        using var withdraw = new CancellationTokenSource();
+        var asking = peers.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-8"), withdraw.Token);
+        await LinkHarness.Until(() => rig.Asked.Opinions.Count == 1, "the question in the session");
+
+        withdraw.Cancel();
+        await waitEnded.Task.WaitAsync(Wait); // the service read the cancellation; the asker's call is held
+        await LinkHarness.Until(() => rig.Service.QuestionEnded("ask-8"), "withdrawn while the asker's call is held, with no answer yet");
+        hold.SetResult(); // the agent answers after it
+        goOn.SetResult();
+        await Assert.ThrowsAsync<OperationCanceledException>(() => asking);
+
+        var lost = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => peers.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-8", reclaim: true)).WaitAsync(Wait));
         Assert.IsNotNull(lost.ErrorData?[GorynychProtocol.MetaAskLost], lost.Message);
     }
 

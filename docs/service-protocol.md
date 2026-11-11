@@ -1805,7 +1805,9 @@ asker's link to the service drops (a broken pipe, the asker's connection closed)
 the asker that comes back with `gorynych/reclaim` waits for its answer and takes it once, as after
 a restart, for as long as its own request waits. An asker that cancels its question itself
 (`$/cancel_request` on a link that stays) withdraws it: the question is cancelled as before, and a
-reclaim of it fails as a lost question does.
+reclaim of it fails as a lost question does. The withdrawal takes effect as the service reads the
+cancellation, before the asker's next message, so an answer the agent gives after it is never
+taken; one that came before it may still be.
 
 An answer no asker came back for is dropped 10 minutes after it came, and a question never
 answered after a day: the service looks for such every minute.

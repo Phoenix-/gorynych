@@ -109,6 +109,9 @@ public sealed class ConductorOptions
 
     /// <summary>For tests: awaited before a forced restart cancels a session's turn.</summary>
     internal Func<string, Task>? Cancelling { get; init; }
+
+    /// <summary>For tests: awaited, with the question's askId, when its asker's wait for the answer is cancelled.</summary>
+    internal Func<string, Task>? AskWaitEnded { get; init; }
 }
 
 /// <summary>
@@ -3438,6 +3441,18 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.InvalidRequest, $"The question {askId} is being asked already.");
         KeepSweeping();
         var withdraw = new CancellationTokenSource();
+        // The asker withdrew it ($/cancel_request on a link that stays): so does the service, at once. The
+        // connection cancels the request in its read loop, so the question is withdrawn before the asker's
+        // next message is read, and an answer that comes later is no answer to take. A link that dropped is
+        // closed before its requests are cancelled: then the question goes on, for the asker to take.
+        // The callback lives as long as the question, not this call: the wait below registers on the token
+        // after it, so its callback runs first and may end this call within the cancel.
+        var withdrawn = ct.Register(() =>
+        {
+            if (linkGone?.Invoke() == true) return;
+            own.Fail(new OperationCanceledException($"question {askId} was withdrawn by its asker"));
+            withdraw.Cancel();
+        });
         var listening = new StrongBox<bool>(true); // progress is for an asker still waiting here
         var run = Task.Run(() => AskOnceAsync(target, text, asker, onState is null ? null : s =>
         {
@@ -3447,6 +3462,7 @@ public sealed class Conductor : IAsyncDisposable
         }, withdraw.Token));
         _ = run.ContinueWith(t =>
         {
+            withdrawn.Dispose();
             if (t.IsCompletedSuccessfully) own.Give(t.Result);
             else own.Fail(t.Exception?.InnerException ?? new OperationCanceledException("the question was withdrawn"));
         }, TaskScheduler.Default);
@@ -3460,11 +3476,10 @@ public sealed class Conductor : IAsyncDisposable
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            if (linkGone?.Invoke() == true)
-                ServiceLog.Info($"opinion: the asker of question {askId} to {target} lost its link; the question goes on for it to take");
-            // The asker withdrew it ($/cancel_request on a link that stays): so does the service, and a
-            // reclaim of it finds it cancelled (ReclaimAsync), with no answer to take.
-            else withdraw.Cancel();
+            if (options.AskWaitEnded is { } ended) await ended(askId);
+            ServiceLog.Info(linkGone?.Invoke() == true
+                ? $"opinion: the asker of question {askId} to {target} lost its link; the question goes on for it to take"
+                : $"opinion: the asker withdrew question {askId} to {target}");
             throw;
         }
         catch (Exception e) when (e is not OperationCanceledException && own.Answer.Task.IsFaulted)
@@ -3902,6 +3917,9 @@ public sealed class Conductor : IAsyncDisposable
 
     /// <summary>The questions kept by their askId now; for tests.</summary>
     internal int KeptQuestions => reclaims.Count;
+
+    /// <summary>Whether the question <paramref name="askId"/> has its answer, or its failure; for tests.</summary>
+    internal bool QuestionEnded(string askId) => reclaims.TryGetValue(askId, out var reclaim) && reclaim.Answer.Task.IsCompleted;
 
     ITimer? reclaimSweep;
 
