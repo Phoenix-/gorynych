@@ -32,7 +32,7 @@ public sealed class DataFolderTests
             Assert.IsNotNull(said);
             Assert.IsFalse(said.Value.Failed, said.Value.Said);
             var user = WindowsIdentity.GetCurrent().User!;
-            Assert.AreEqual(DataFolder.Dacl(user.Value), folder.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access));
+            Assert.AreEqual(DataFolder.Wanted(user), folder.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access));
             foreach (var inside in new FileSystemSecurity[]
                      {
                          new FileInfo(Path.Combine(data, "sessions.json")).GetAccessControl(),
@@ -99,7 +99,7 @@ public sealed class DataFolderTests
         var third = DataFolder.Protect(data);
         Assert.IsNotNull(third);
         Assert.IsFalse(third.Value.Failed, third.Value.Said);
-        Assert.AreEqual(DataFolder.Dacl(user.Value), File.ReadAllText(Path.Combine(data, DataFolder.ClosedFile)), "noted, with the DACL given");
+        Assert.AreEqual(DataFolder.Wanted(user), File.ReadAllText(Path.Combine(data, DataFolder.ClosedFile)), "noted, with the DACL given");
         Assert.IsNull(DataFolder.Protect(data), "closed: left alone");
     }
 
@@ -130,6 +130,80 @@ public sealed class DataFolderTests
         Assert.IsTrue(LetsIn(new FileInfo(open).GetAccessControl(), user), "the user keeps it");
         Assert.AreEqual("{}", File.ReadAllText(open));
         Assert.IsNull(DataFolder.Protect(data));
+    }
+
+    /// <summary>
+    /// SDDL names the built-in Administrator (RID 500) <c>LA</c>: a folder closed for that user reads
+    /// back so, and must count as closed, or every start of a service run as that user (a CI runner)
+    /// goes over the folder again. Whoever runs the test, it writes that DACL and reads it back.
+    /// </summary>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "SDDL is Windows only")]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    public void ADaclForTheBuiltInAdministrator_ReadBackAsLA_IsTheOneWanted()
+    {
+        var aliased = new RawSecurityDescriptor("D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;LA)");
+        var administrator = ((CommonAce)aliased.DiscretionaryAcl![1]).SecurityIdentifier;
+        StringAssert.EndsWith(administrator.Value, "-500", "this machine's built-in Administrator");
+        Assert.AreNotEqual(DataFolder.Dacl(administrator.Value), aliased.GetSddlForm(AccessControlSections.Access), "the text differs: why it is compared in Windows' form");
+
+        // The test's user owns the folder, so it can still read its DACL and set another.
+        var folder = new DirectoryInfo(TestDirs.New());
+        var security = new DirectorySecurity();
+        security.SetSecurityDescriptorSddlForm(DataFolder.Dacl(administrator.Value), AccessControlSections.Access);
+        folder.SetAccessControl(security);
+        string read;
+        try
+        {
+            read = folder.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access);
+        }
+        finally
+        {
+            var inherit = new DirectorySecurity();
+            inherit.SetSecurityDescriptorSddlForm("D:AI", AccessControlSections.Access);
+            folder.SetAccessControl(inherit);
+            folder.Delete();
+        }
+
+        StringAssert.Contains(read, ";;;LA)", "written with the full SID, read back by its alias");
+        Assert.AreEqual(read, DataFolder.Wanted(administrator));
+        Assert.AreEqual(DataFolder.Wanted(administrator), DataFolder.Canonical(DataFolder.Wanted(administrator)), "and written back as it is");
+    }
+
+    /// <summary>
+    /// A folder closed for the built-in Administrator, and noted so, is left alone by the next start of a
+    /// service run as that user: before, its DACL read back as <c>LA</c> never matched, and every start
+    /// went over the folder again. Whoever runs the test, the service's side is that user's.
+    /// </summary>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Windows, IgnoreMessage = "DACLs are Windows only")]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    public void AFolderClosedForTheBuiltInAdministrator_IsLeftAlone_ByItsNextStart()
+    {
+        var administrator = ((CommonAce)new RawSecurityDescriptor("D:(A;;FA;;;LA)").DiscretionaryAcl![0]).SecurityIdentifier;
+        var user = WindowsIdentity.GetCurrent().User!;
+        var data = new DirectoryInfo(TestDirs.New());
+        // The note as that service wrote it, which this test's user may read as that service would.
+        var noted = Path.Combine(data.FullName, DataFolder.ClosedFile);
+        File.WriteAllText(noted, DataFolder.Wanted(administrator));
+        var readable = new FileSecurity();
+        readable.SetSecurityDescriptorSddlForm($"D:P(A;;FA;;;{user.Value})(A;;FA;;;{administrator.Value})", AccessControlSections.Access);
+        new FileInfo(noted).SetAccessControl(readable);
+        var closed = new DirectorySecurity();
+        closed.SetSecurityDescriptorSddlForm(DataFolder.Dacl(administrator.Value), AccessControlSections.Access);
+        data.SetAccessControl(closed);
+        try
+        {
+            Assert.IsNull(DataFolder.ProtectWindows(data.FullName, administrator), "closed and noted: nothing to do");
+        }
+        finally
+        {
+            // Its owner may still set another DACL, and then remove it.
+            var inherit = new DirectorySecurity();
+            inherit.SetSecurityDescriptorSddlForm("D:AI", AccessControlSections.Access);
+            data.SetAccessControl(inherit);
+            data.Delete(recursive: true);
+        }
     }
 
     /// <summary>A junction inside leads out of the data folder: what it leads to keeps its DACL.</summary>

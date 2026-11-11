@@ -66,7 +66,9 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
     inherits, so an older install is closed too; but Windows passes over an item it may not change
     without a word. So the service then goes over all inside itself, gives an item that still lets
     another account in no DACL of its own (it takes the folder's), and writes `.closed`, with the DACL
-    given, only when nothing was left open. While `.closed` is missing, or names another DACL, each
+    given, only when nothing was left open. DACLs are compared, and noted, in the SDDL Windows writes
+    back, which names some SIDs by an alias: the built-in Administrator (RID 500, as a CI runner
+    runs) as `LA`, Guest as `LG`. While `.closed` is missing, or names another DACL, each
     start goes over the folder again; what it could not close is logged as a warning and shown by
     `status`. Neither Windows nor that pass follows a junction or a link inside the folder, nor
     changes it: what it leads to keeps its own DACL.

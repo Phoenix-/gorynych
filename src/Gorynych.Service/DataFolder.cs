@@ -102,7 +102,8 @@ static class DataFolder
     {
         try
         {
-            if (OperatingSystem.IsWindows()) return ProtectWindows(path);
+            if (OperatingSystem.IsWindows())
+                return ProtectWindows(path, WindowsIdentity.GetCurrent().User ?? throw new InvalidOperationException("the process has no user SID"));
             const UnixFileMode Own = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
             var mode = File.GetUnixFileMode(path);
             if (mode == Own) return null;
@@ -118,12 +119,24 @@ static class DataFolder
     /// <summary>The DACL the folder gets: the user and SYSTEM, full control, inherited by all inside, protected from the parent's.</summary>
     internal static string Dacl(string userSid) => $"D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;{userSid})";
 
+    /// <summary>
+    /// <see cref="Dacl"/> for <paramref name="user"/> as Windows writes it back. SDDL names some SIDs by
+    /// an alias (the built-in Administrator, RID 500, as <c>LA</c>; Guest as <c>LG</c>), so the DACL
+    /// read from the folder, this one and the one noted in <see cref="ClosedFile"/> are all in this form.
+    /// </summary>
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    static (bool, string)? ProtectWindows(string path)
+    internal static string Wanted(SecurityIdentifier user) => Canonical(Dacl(user.Value));
+
+    /// <summary>An SDDL's DACL as Windows writes it: read in, and written out again.</summary>
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    internal static string Canonical(string sddl) => new RawSecurityDescriptor(sddl).GetSddlForm(AccessControlSections.Access);
+
+    /// <summary><see cref="Protect"/> on Windows, for <paramref name="user"/>: the process's user, or another in tests.</summary>
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    internal static (bool Failed, string Said)? ProtectWindows(string path, SecurityIdentifier user)
     {
-        var user = WindowsIdentity.GetCurrent().User ?? throw new InvalidOperationException("the process has no user SID");
         var folder = new DirectoryInfo(path);
-        var wanted = Dacl(user.Value);
+        var wanted = Wanted(user);
         var closedFile = Path.Combine(path, ClosedFile);
         var had = folder.GetAccessControl(AccessControlSections.Access).GetSecurityDescriptorSddlForm(AccessControlSections.Access);
         var rootClosed = string.Equals(had, wanted, StringComparison.OrdinalIgnoreCase);
