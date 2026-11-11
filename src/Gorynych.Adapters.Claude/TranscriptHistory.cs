@@ -10,14 +10,18 @@ namespace Gorynych.Adapters.Claude;
 /// up with what was done outside Gorynych (<c>claude --resume</c>, Claude Desktop; docs/adapters.md,
 /// "History made outside Gorynych"). The transcript is append-only JSONL: every entry has a
 /// <c>uuid</c> and its <c>parentUuid</c> (<c>logicalParentUuid</c> across a compaction), and the
-/// conversation as it is now is the chain from the last entry back, not the file's order: a rewind
-/// starts a new branch further down the file. A mark, <c>&lt;uuid&gt;@&lt;offset&gt;</c>, names the
-/// chain's last entry and where its line starts, so a catch-up reads only what follows it.
+/// conversation as it is now is a chain back from its last entry, not the file's order: a rewind
+/// starts a new branch further down the file, and two processes on one session write two
+/// branches. Which branch is the conversation is decided as <c>claude --resume</c> decides it
+/// (<see cref="LastEntry"/>). A mark, <c>&lt;uuid&gt;@&lt;offset&gt;</c>, names the chain's last
+/// entry and where its line starts, so a catch-up reads only what follows it.
 /// <para>
-/// Lines are read as a stream and only their <c>uuid</c>, parents, <c>type</c> and sidechain flag
-/// are taken; an entry's body is parsed only when it is part of the conversation sent, and its
-/// updates go out as they are made. Entries become ACP updates as the live stream maps them, with
-/// the same IDs. Anything unexpected fails open: no replay, never an exception. Reads only.
+/// Lines are read as a stream and only their top-level keys are taken (<c>uuid</c>, parents,
+/// <c>type</c>, the sidechain flag, a <c>last-prompt</c> entry's <c>leafUuid</c> and
+/// <c>explicit</c>, a compaction's <c>subtype</c>); an entry's body is parsed only when it is part
+/// of the conversation sent, and its updates go out as they are made. Entries become ACP updates as
+/// the live stream maps them, with the same IDs. Anything unexpected fails open: no replay, never an
+/// exception. Reads only.
 /// </para>
 /// </summary>
 internal static class TranscriptHistory
@@ -40,54 +44,55 @@ internal static class TranscriptHistory
 
     sealed class TooLarge() : Exception("the transcript is larger than a catch-up reads");
 
-    readonly record struct Entry(long Start, int Length, string? Uuid, string? Parent, string? Type, bool Sidechain)
+    /// <summary>
+    /// A line's top-level keys. <paramref name="Leaf"/> is set on a <c>last-prompt</c> entry that
+    /// names the conversation's last entry (a non-empty <c>leafUuid</c>), <paramref name="Clears"/>
+    /// on one that empties it (<c>leafUuid: null</c>, <c>explicit: true</c>), <paramref name="Explicit"/>
+    /// when it says <c>explicit: true</c>; <paramref name="Boundary"/> marks a compaction's boundary.
+    /// </summary>
+    readonly record struct Entry(long Start, int Length, string? Uuid, string? Parent, string? Type, bool Sidechain,
+        string? Leaf = null, bool Clears = false, bool Explicit = false, bool Boundary = false)
     {
         /// <summary>A part of the main conversation: a user, assistant or system entry, not a subagent's.</summary>
         public bool InChain => Uuid is not null && !Sidechain && (Type is "user" or "assistant" or "system");
+
+        /// <summary>One of the session's messages, as Claude loads them (a subagent's too; progress entries are not).</summary>
+        public bool IsMessage => Uuid is not null && Type is "user" or "assistant" or "system" or "attachment";
+
+        /// <summary>A message of the main conversation, an attachment too: it ends a checkpoint's explicit hold.</summary>
+        public bool IsRow => IsMessage && !Sidechain;
+
+        /// <summary>Whether it sets or clears Claude's checkpoint: a <c>last-prompt</c> that names a leaf or empties it, or a compaction.</summary>
+        public bool SetsCheckpoint => Leaf is not null || Clears || Boundary;
     }
 
     /// <summary>
     /// The transcript's mark now: the last entry of its conversation; null when it has none, is not
     /// there or cannot be read. A last line without its newline is still being written and is left
-    /// out, as a replay leaves it out.
+    /// out, as a replay leaves it out. Read backwards, as far as the last <c>last-prompt</c> entry
+    /// and the entry it names (all of the file when it has none).
     /// </summary>
     public static string? Mark(string path)
     {
         try
         {
             using var file = Open(path);
-            // Read backwards a block at a time; a line that spans blocks is kept as its pieces until its start is found.
-            var pieces = new List<byte[]>();
-            var piecesLength = 0L;
-            var pos = file.Length;
-            long read = 0;
-            var ended = false; // past the file's last newline: the lines from here on are whole
-            while (pos > 0)
+            using var lines = Backwards(file).GetEnumerator();
+            var seen = new List<Entry>(); // last first
+            var enough = new Enough();
+            var whole = true;
+            while (lines.MoveNext())
             {
-                var size = (int)Math.Min(Block, pos);
-                pos -= size;
-                var block = new byte[size];
-                file.Position = pos;
-                file.ReadExactly(block);
-                if ((read += size) > MaxBytes) return null;
-                var lineEnd = size;
-                for (var i = size - 1; i >= 0; i--)
-                {
-                    if (block[i] != '\n') continue;
-                    if (ended && Project(Joined(block, i + 1, lineEnd, pieces, piecesLength), pos + i + 1) is { InChain: true } entry) return MarkOf(entry);
-                    ended = true;
-                    pieces.Clear();
-                    piecesLength = 0;
-                    lineEnd = i;
-                }
-                if (ended && lineEnd > 0)
-                {
-                    pieces.Insert(0, block[..lineEnd]);
-                    piecesLength += lineEnd;
-                }
-                if (piecesLength > MaxLine) { pieces.Clear(); piecesLength = 0; } // a line too long to take
+                seen.Add(lines.Current);
+                if (enough.After(lines.Current)) { whole = false; break; }
             }
-            return ended && Project(Joined([], 0, 0, pieces, piecesLength), 0) is { InChain: true } first ? MarkOf(first) : null;
+            var (known, last) = LastEntry(InFileOrder(seen), whole);
+            if (!known)
+            {
+                while (lines.MoveNext()) seen.Add(lines.Current);
+                (_, last) = LastEntry(InFileOrder(seen), whole: true);
+            }
+            return last is { } entry ? MarkOf(entry) : null;
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
@@ -97,9 +102,10 @@ internal static class TranscriptHistory
 
     /// <summary>
     /// Sends the conversation after <paramref name="mark"/>: the chain from its last entry back to the
-    /// mark. When the chain does not reach the mark (a rewind made another branch the conversation),
-    /// or no mark is given, the whole chain from its root. Null when the transcript cannot be read,
-    /// or is larger than <paramref name="maxBytes"/>: the service then keeps its journal as it is.
+    /// mark. When the chain does not reach the mark (a rewind, or another process's branch, made
+    /// another branch the conversation), or no mark is given, the whole chain from its root. Null
+    /// when the transcript cannot be read, or is larger than <paramref name="maxBytes"/>: the service
+    /// then keeps its journal as it is.
     /// </summary>
     public static async Task<Replay?> ReadAsync(string path, string? mark, Func<SessionUpdate, Task> send, Action<string>? log = null, long maxBytes = MaxBytes)
     {
@@ -107,34 +113,34 @@ internal static class TranscriptHistory
         {
             using var file = Open(path);
             long read = 0;
-            List<Entry>? all = null;
-            if (Parse(mark) is { } parsed)
+            var parsed = Parse(mark);
+            var markUuid = parsed?.Uuid;
+            if (parsed is { } at)
             {
-                var (uuid, offset) = parsed;
-                List<Entry>? tail = null;
+                var (uuid, offset) = at;
                 // Read once from the mark's line: it must be the first entry there, where the mark says.
                 var fromMark = offset < file.Length ? Entries(file, offset, ref read, maxBytes) : [];
                 if (fromMark.Count > 0 && fromMark[0].Start == offset && fromMark[0].Uuid == uuid)
-                    tail = fromMark.Skip(1).ToList();
-                else
                 {
-                    log?.Invoke($"the mark's line is not at {offset}: reading the whole transcript");
-                    all = Entries(file, 0, ref read, maxBytes);
-                    var at = all.FindIndex(e => e.Uuid == uuid);
-                    if (at >= 0) tail = all.Skip(at + 1).ToList();
+                    if (AfterMark(fromMark) is { } leaf)
+                    {
+                        if (leaf.Uuid == uuid) return new Replay(true, mark, read, 0);
+                        if (ChainBack(leaf, fromMark, until: uuid) is { } chain)
+                            return new Replay(true, MarkOf(leaf), read, await SendAsync(file, chain, send, log));
+                    }
+                    log?.Invoke("what follows the mark does not continue from it (a rewind, or another process's branch): reading the whole transcript");
                 }
-                if (tail is not null)
-                {
-                    if (!tail.Any(e => e.InChain)) return new Replay(true, mark, read, 0);
-                    var leaf = tail.Last(e => e.InChain);
-                    if (ChainBack(leaf, tail, until: uuid) is { } chain)
-                        return new Replay(true, MarkOf(leaf), read, await SendAsync(file, chain, send, log));
-                }
-                log?.Invoke("the conversation does not reach the mark (a rewind): reading the whole transcript");
+                else log?.Invoke($"the mark's line is not at {offset}: reading the whole transcript");
             }
-            all ??= Entries(file, 0, ref read, maxBytes);
-            if (!all.Any(e => e.InChain)) return new Replay(false, null, read, 0);
-            var last = all.Last(e => e.InChain);
+            var all = Entries(file, 0, ref read, maxBytes);
+            if (LastEntry(all, whole: true).Last is not { } last) return new Replay(false, null, read, 0);
+            if (markUuid is not null)
+            {
+                if (last.Uuid == markUuid) return new Replay(true, MarkOf(last), read, 0);
+                if (ChainBack(last, all, until: markUuid) is { } chain)
+                    return new Replay(true, MarkOf(last), read, await SendAsync(file, chain, send, log));
+                log?.Invoke("the conversation does not reach the mark: replaying all of it");
+            }
             return new Replay(false, MarkOf(last), read, await SendAsync(file, ChainBack(last, all, until: null)!, send, log));
         }
         catch (TooLarge e)
@@ -208,6 +214,173 @@ internal static class TranscriptHistory
         return chain;
     }
 
+    static List<Entry> InFileOrder(List<Entry> lastFirst)
+    {
+        var entries = new List<Entry>(lastFirst.Count);
+        for (var i = lastFirst.Count - 1; i >= 0; i--) entries.Add(lastFirst[i]);
+        return entries;
+    }
+
+    /// <summary>
+    /// The conversation's last entry, as <c>claude --resume</c> picks it (Claude Code 2.1.302; the
+    /// Agent SDK's <c>getSessionMessages</c> does not read <c>last-prompt</c> and takes the file's
+    /// last branch). Claude keeps a checkpoint: the leaf the last <c>last-prompt</c> entry names,
+    /// which every process writes for its own branch when it closes, and a rewind writes as
+    /// <c>explicit</c>. The conversation ends at the checkpoint, unless it is not explicit and the
+    /// file's last main entry continues from it; then at that entry, as it does with no checkpoint.
+    /// <list type="bullet">
+    /// <item>A main entry after the checkpoint's <c>last-prompt</c> ends its explicit hold; a
+    /// <c>last-prompt</c> for the same leaf right after an explicit one keeps it (a rewind, then the
+    /// session closed).</item>
+    /// <item><c>leafUuid: null</c> with <c>explicit: true</c> empties the conversation until the
+    /// next main entry; a compaction drops the checkpoint; one that names no entry of the file (a
+    /// rewound session's next turn names the zero UUID) is no checkpoint.</item>
+    /// </list>
+    /// Not mirrored, as the probe never met them: Claude's newest-timestamp choice when the file has
+    /// no <c>last-prompt</c> at all and an entry was written before its parent, its leaf-set choice
+    /// after a compaction that keeps a segment, and its parallel-tool-call batch check.
+    /// <para>
+    /// <paramref name="entries"/> are in the file's order and end where it ends. When they are not all
+    /// of it (<paramref name="whole"/> false) and do not settle the answer, <c>Known</c> is false.
+    /// An entry is taken to come after its parent in the file. <c>Last</c> is null for an empty
+    /// conversation.
+    /// </para>
+    /// </summary>
+    static (bool Known, Entry? Last) LastEntry(List<Entry> entries, bool whole)
+    {
+        string? checkpoint = null;
+        var cleared = false;
+        var settled = whole;                // whether the checkpoint is known
+        bool? isExplicit = whole ? false : null;
+        Entry? last = null;
+        foreach (var e in entries)
+        {
+            if (e.IsRow)
+            {
+                isExplicit = false;
+                cleared = false;
+                if (e.Boundary) { checkpoint = null; settled = true; }
+                if (e.InChain) last = e;
+            }
+            else if (e.Leaf is { } leaf)
+            {
+                isExplicit = e.Explicit ? true : isExplicit is { } was ? was && leaf == checkpoint : null;
+                checkpoint = leaf;
+                cleared = false;
+                settled = true;
+            }
+            else if (e.Clears)
+            {
+                checkpoint = null;
+                cleared = true;
+                isExplicit = false;
+                settled = true;
+            }
+        }
+        if (!settled) return (false, null);
+        if (cleared) return (true, null);
+        if (last is not { } end) return (whole, null);
+        if (checkpoint is null || checkpoint == end.Uuid) return (true, end);
+        var byUuid = new Dictionary<string, Entry>(StringComparer.Ordinal);
+        foreach (var e in entries)
+            if (e.Uuid is { } id) byUuid[id] = e;
+        if (!byUuid.TryGetValue(checkpoint, out var named) || !named.IsMessage) return whole ? (true, end) : (false, null);
+        if (isExplicit == true || !Descends(end, checkpoint, byUuid)) return (true, named);
+        return isExplicit is null ? (false, null) : (true, end);
+    }
+
+    /// <summary>Whether <paramref name="ancestor"/> is on the chain back from <paramref name="entry"/>.</summary>
+    static bool Descends(Entry entry, string ancestor, Dictionary<string, Entry> byUuid)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var at = entry.Parent; at is not null && seen.Add(at); at = byUuid.TryGetValue(at, out var e) ? e.Parent : null)
+            if (at == ancestor) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// The conversation's last entry from the mark's line on (<paramref name="fromMark"/>, the mark's
+    /// entry first), or null when what follows the mark does not settle it. With no
+    /// <c>last-prompt</c> after the mark Claude's checkpoint is the one the mark was taken under, so
+    /// the conversation ends at the last main entry if that continues from the mark (the caller
+    /// checks), or at the mark when nothing was added.
+    /// </summary>
+    static Entry? AfterMark(List<Entry> fromMark)
+    {
+        var tail = fromMark.Skip(1);
+        if (!tail.Any(e => e.SetsCheckpoint))
+            return tail.LastOrDefault(e => e.InChain) is { Uuid: not null } last ? last : fromMark[0];
+        return LastEntry(fromMark, whole: false) is (true, { } leaf) ? leaf : null;
+    }
+
+    /// <summary>
+    /// Read backwards, whether the entries met so far settle the conversation's last entry: the last
+    /// main one, the last entry that sets the checkpoint, a main entry before it (so its explicit hold
+    /// is known), and the entry the checkpoint names.
+    /// </summary>
+    sealed class Enough
+    {
+        bool last, found, anchored, named;
+        string? leaf;
+
+        public bool After(Entry e)
+        {
+            if (e.InChain) last = true;
+            if (!found)
+            {
+                if (!e.SetsCheckpoint) return false;
+                found = true;
+                leaf = e.Leaf;
+            }
+            else
+            {
+                if (e.IsRow) anchored = true;
+                if (e.Uuid is not null && e.Uuid == leaf) named = true;
+            }
+            return last && (leaf is null || anchored && named); // a compaction or an emptied conversation needs nothing before it
+        }
+    }
+
+    /// <summary>
+    /// The entries of the file's whole lines, last first, each projected; a last line without its
+    /// newline is still being written and is left out. Gives up past <see cref="MaxBytes"/>.
+    /// </summary>
+    static IEnumerable<Entry> Backwards(FileStream file)
+    {
+        // Read backwards a block at a time; a line that spans blocks is kept as its pieces until its start is found.
+        var pieces = new List<byte[]>();
+        var piecesLength = 0L;
+        var pos = file.Length;
+        long read = 0;
+        var ended = false; // past the file's last newline: the lines from here on are whole
+        while (pos > 0)
+        {
+            var size = (int)Math.Min(Block, pos);
+            pos -= size;
+            var block = new byte[size];
+            file.Position = pos;
+            file.ReadExactly(block);
+            if ((read += size) > MaxBytes) throw new TooLarge();
+            var lineEnd = size;
+            for (var i = size - 1; i >= 0; i--)
+            {
+                if (block[i] != '\n') continue;
+                if (ended && Project(Joined(block, i + 1, lineEnd, pieces, piecesLength), pos + i + 1) is { } entry) yield return entry;
+                ended = true;
+                pieces.Clear();
+                piecesLength = 0;
+                lineEnd = i;
+            }
+            if (ended && lineEnd > 0)
+            {
+                pieces.Insert(0, block[..lineEnd]);
+                piecesLength += lineEnd;
+            }
+            if (piecesLength > MaxLine) { pieces.Clear(); piecesLength = 0; } // a line too long to take
+        }
+        if (ended && Project(Joined([], 0, 0, pieces, piecesLength), 0) is { } first) yield return first;
+    }
+
     /// <summary>
     /// The entries of the lines from <paramref name="offset"/> on (at most <paramref name="limit"/>),
     /// each projected, never kept whole. Adds what it reads to <paramref name="read"/>; gives up past
@@ -274,8 +447,8 @@ internal static class TranscriptHistory
         {
             var reader = new Utf8JsonReader(line);
             if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject) return null;
-            string? uuid = null, parent = null, logical = null, type = null;
-            var sidechain = false;
+            string? uuid = null, parent = null, logical = null, type = null, subtype = null, leaf = null;
+            bool sidechain = false, leafNull = false, isExplicit = false;
             while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
             {
                 var name = reader.GetString();
@@ -286,11 +459,19 @@ internal static class TranscriptHistory
                     case "parentUuid": parent = Text(ref reader); break;
                     case "logicalParentUuid": logical = Text(ref reader); break;
                     case "type": type = Text(ref reader); break;
+                    case "subtype": subtype = Text(ref reader); break;
                     case "isSidechain": sidechain = reader.TokenType == JsonTokenType.True; break;
+                    case "leafUuid": leafNull = reader.TokenType == JsonTokenType.Null; leaf = Text(ref reader); break;
+                    case "explicit": isExplicit = reader.TokenType == JsonTokenType.True; break;
                     default: reader.Skip(); break;
                 }
             }
-            return new Entry(start, line.Length, uuid, parent ?? logical, type, sidechain);
+            var checkpoint = type == "last-prompt";
+            return new Entry(start, line.Length, uuid, parent ?? logical, type, sidechain,
+                Leaf: checkpoint && leaf is { Length: > 0 } ? leaf : null,
+                Clears: checkpoint && leafNull && isExplicit,
+                Explicit: checkpoint && isExplicit,
+                Boundary: type == "system" && subtype == "compact_boundary");
         }
         catch (JsonException)
         {

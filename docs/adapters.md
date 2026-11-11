@@ -353,17 +353,45 @@ Claude's transcript, `~/.claude/projects/<folder>/<session>.jsonl` (append-only;
 written):
 
 - **The mark** is `<uuid>@<offset>`: the last entry of the conversation and the byte offset
-  where its line starts. The conversation is the chain from the file's last main entry (not a
-  subagent's `isSidechain` one) back by `parentUuid`, and by `logicalParentUuid` across a
-  compaction. It is not the file's order: a rewind or a checkpoint restore starts a new branch
-  further down. Every prompt's result carries the mark, and so does the `ended` update of a
-  turn of Claude's own.
+  where its line starts. The conversation is a chain back from that entry by `parentUuid`, and
+  by `logicalParentUuid` across a compaction. It is not the file's order: a rewind or a
+  checkpoint restore starts a new branch further down, and two processes on one session write
+  two interleaved branches. Every prompt's result carries the mark, and so does the `ended`
+  update of a turn of Claude's own.
+- **The branch** is the one `claude --resume <id>` continues. Claude Code keeps a checkpoint:
+  the leaf the last `{"type": "last-prompt", "leafUuid": …}` entry names. A process writes one
+  for its own branch at its own times, at least when it closes (a long-lived `claude -p` writes
+  none between turns), and a rewind writes one with `explicit: true`. This is Claude Code 2.1.302 as read from its code and
+  probed; it is not documented.
+  - The conversation ends at the checkpoint, unless the checkpoint is not explicit and the
+    file's last main entry (not a subagent's `isSidechain` one) continues from it: then at that
+    entry. With no checkpoint, or one that names no entry of the file (a rewound session's next
+    turn names the zero UUID), it ends at the last main entry.
+  - A main entry after the checkpoint's `last-prompt` ends its explicit hold; another
+    `last-prompt` for the same leaf right after it keeps the hold (a rewind, then the session
+    closed). `leafUuid: null` with `explicit: true` empties the conversation until the next main
+    entry. A compaction drops the checkpoint.
+  - Not mirrored, as nothing probed needs them: Claude's pick by the newest `timestamp` when
+    the file has no `last-prompt` and an entry was written before its parent, its pick among
+    leaves after a compaction that keeps a segment, and its check that the last entry continues
+    the checkpoint's batch of parallel tool calls. An entry is taken to come after its parent.
+  - The Agent SDK's public reader, `getSessionMessages` (0.3.322), does not read `last-prompt`:
+    it takes the file's last branch, as this adapter did before. The adapter follows `--resume`
+    instead, since that is the conversation Claude goes on with.
+  - Probed on 11 November 2026 ([design.md](design.md), "Claude sessions started elsewhere"):
+    two live `claude -p --resume` on one session, B closed before A. The next `--resume`
+    continued A's branch, though B's entries came last in the file, and so does the catch-up.
 - **A catch-up** reads the file once from the mark's line, which must be the first entry there.
-  If the chain from the last entry reaches the mark, the entries after it are replayed.
-  Otherwise another branch is the conversation now: the whole chain is replayed, as
-  `from: "start"`, and the log says so. A mark whose line moved is looked for in the whole file.
-  - Lines are read as a stream, and only their `uuid`, parents, `type` and sidechain flag are
-    taken. An entry's body is parsed only when it is sent.
+  - With no `last-prompt` after the mark, the checkpoint is the one the mark was taken under: if
+    the chain from the last entry reaches the mark, the entries after it are replayed. So they
+    are when a `last-prompt` after the mark names the mark or an entry after it.
+  - Otherwise the whole file is read and the branch decided there: the conversation after the
+    mark if its chain still reaches it, else all of it, as `from: "start"` (another branch is the
+    conversation now), and the log says so. An emptied conversation replays nothing, which
+    leaves the journal as it is. A mark whose line moved is looked for in the whole file.
+  - Lines are read as a stream, and only their top-level keys are taken: `uuid`, parents,
+    `type`, the sidechain flag, and a `last-prompt`'s `leafUuid` and `explicit` and a
+    compaction's `subtype`. An entry's body is parsed only when it is sent.
   - Past 512 MB read in one pass (from the mark, or the whole file) the catch-up gives up and
     fails open; a line over 64 MB is left out. A last line without its newline is still being
     written: neither the mark nor a replay takes it.
@@ -371,7 +399,8 @@ written):
     entry of an unexpected shape is left out.
 - **The mark at a turn's end** is taken once two reads 50 ms apart agree (at most half a
   second): Claude may still be writing the turn's last entries when its result comes. It never
-  fails the prompt.
+  fails the prompt. Each read goes backwards from the file's end, as far as the last
+  `last-prompt` and the entry it names; a transcript without one is read whole.
 - **Entries become updates** as the live stream maps them, through the same code (`StreamJson`):
   - user text by `uuid`;
   - assistant text and thinking by the API's `msg_…` ID;

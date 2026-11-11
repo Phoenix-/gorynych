@@ -7,7 +7,8 @@ namespace Gorynych.Tests;
 /// <summary>
 /// Claude's own history of a session from its transcript (TranscriptHistory): the conversation
 /// after the service's mark, read from the mark on, mapped as the live stream maps it; all of it
-/// when a rewind made another branch the conversation. Transcripts in Claude's shape, written here.
+/// when a rewind made another branch the conversation. The branch is the one <c>claude --resume</c>
+/// continues, by its <c>last-prompt</c> checkpoint. Transcripts in Claude's shape, written here.
 /// </summary>
 [TestClass]
 public sealed class ClaudeTranscriptHistoryTests
@@ -46,6 +47,20 @@ public sealed class ClaudeTranscriptHistoryTests
     };
 
     static JsonObject Text(string text) => new() { ["type"] = "text", ["text"] = text };
+
+    /// <summary>Claude's checkpoint: written by a process for its own branch when it closes, and as <c>explicit</c> by a rewind.</summary>
+    static JsonObject LastPrompt(string? leaf, bool isExplicit = false, bool rewound = false)
+    {
+        var e = new JsonObject { ["type"] = "last-prompt", ["lastPrompt"] = "…", ["leafUuid"] = leaf, ["sessionId"] = "s" };
+        if (isExplicit) e["explicit"] = true;
+        if (rewound) e["rewound"] = true;
+        return e;
+    }
+
+    static JsonObject Boundary(string uuid, string logicalParent) => new()
+    {
+        ["type"] = "system", ["subtype"] = "compact_boundary", ["uuid"] = uuid, ["parentUuid"] = null, ["logicalParentUuid"] = logicalParent, ["isSidechain"] = false,
+    };
 
     static JsonObject ToolResult(string uuid, string? parent, string toolUseId, string output) => new()
     {
@@ -127,6 +142,153 @@ public sealed class ClaudeTranscriptHistoryTests
         Assert.IsFalse(replay.FromMark);
         CollectionAssert.AreEqual(new[] { "user u1: First", "agent msg_1: Done", "user u3: Instead", "agent msg_3: Another answer" }, Seen(replay.Updates));
         StringAssert.StartsWith(replay.Mark, "a3@");
+    }
+
+    [TestMethod]
+    public void TwoProcessesOnOneSession_TheBranchTheLastCheckpointNames_IsTheConversation()
+    {
+        // As probed on 11 November 2026 (2.1.302): A and B resumed the session at once and each
+        // chained its turns from its own; B closed first, then A. The next --resume took A's branch.
+        var path = NewTranscript();
+        Add(path, User("u0", null, "Remember ALPHA"), Assistant("a0", "u0", "msg_0", Text("OK")), LastPrompt("a0"));
+        Add(path,
+            User("ua1", "a0", "Remember BRAVO"), Assistant("aa1", "ua1", "msg_a1", Text("OK")),             // A
+            User("ub1", "a0", "Words? Then remember CHARLIE"), Assistant("ab1", "ub1", "msg_b1", Text("ALPHA")), // B
+            User("ua2", "aa1", "Words?"), Assistant("aa2", "ua2", "msg_a2", Text("ALPHA, BRAVO")),          // A
+            User("ub2", "ab1", "Words?"), Assistant("ab2", "ub2", "msg_b2", Text("ALPHA, CHARLIE")));      // B
+        var markOfB = TranscriptHistory.Mark(path)!; // B's turn ended last: its branch, while both are open
+        StringAssert.StartsWith(markOfB, "ab2@");
+        Add(path, LastPrompt("ab2"), LastPrompt("aa2")); // B closes, then A
+
+        var replay = Read(path, markOfB)!;
+
+        Assert.IsFalse(replay.FromMark, "B's branch is not the conversation any more");
+        CollectionAssert.AreEqual(new[]
+        {
+            "user u0: Remember ALPHA", "agent msg_0: OK", "user ua1: Remember BRAVO", "agent msg_a1: OK", "user ua2: Words?", "agent msg_a2: ALPHA, BRAVO",
+        }, Seen(replay.Updates));
+        StringAssert.StartsWith(replay.Mark, "aa2@");
+        Assert.AreEqual(replay.Mark, TranscriptHistory.Mark(path));
+        CollectionAssert.AreEqual(Seen(replay.Updates), Seen(Read(path, null)!.Updates), "no mark: the same branch");
+
+        // The next --resume continues A's branch and closes: read from the mark on only.
+        var before = new FileInfo(path).Length;
+        Add(path, User("uc", "aa2", "Words?"), Assistant("ac", "uc", "msg_c", Text("ALPHA, BRAVO")), LastPrompt("ac"));
+        var next = Read(path, replay.Mark)!;
+        Assert.IsTrue(next.FromMark);
+        CollectionAssert.AreEqual(new[] { "user uc: Words?", "agent msg_c: ALPHA, BRAVO" }, Seen(next.Updates));
+        Assert.IsTrue(next.BytesRead < new FileInfo(path).Length - before + 1000, $"read {next.BytesRead} bytes: the mark's line and what follows");
+        Assert.AreEqual(next.Mark, TranscriptHistory.Mark(path));
+    }
+
+    [TestMethod]
+    public void TheLastEntry_ContinuingFromTheCheckpoint_EndsTheConversation()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")), LastPrompt("a1")); // the process closed
+        var mark = TranscriptHistory.Mark(path)!;
+        StringAssert.StartsWith(mark, "a1@");
+        Add(path, User("u2", "a1", "Again"), Assistant("a2", "u2", "msg_2", Text("Again done"))); // resumed: not closed yet
+
+        var replay = Read(path, mark)!;
+
+        Assert.IsTrue(replay.FromMark);
+        CollectionAssert.AreEqual(new[] { "user u2: Again", "agent msg_2: Again done" }, Seen(replay.Updates));
+        StringAssert.StartsWith(replay.Mark, "a2@");
+        Assert.AreEqual(replay.Mark, TranscriptHistory.Mark(path));
+    }
+
+    [TestMethod]
+    public void WithNoLastPromptAtAll_TheLastEntrysBranch_IsTheConversation()
+    {
+        var path = NewTranscript();
+        Add(path,
+            User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")),
+            User("ux", "a1", "One way"), Assistant("ax", "ux", "msg_x", Text("X")),
+            User("uy", "a1", "Another way"), Assistant("ay", "uy", "msg_y", Text("Y")),
+            User("ux2", "ax", "On the first way"), Assistant("ax2", "ux2", "msg_x2", Text("X again")));
+
+        var replay = Read(path, null)!;
+
+        CollectionAssert.AreEqual(new[]
+        {
+            "user u1: First", "agent msg_1: Done", "user ux: One way", "agent msg_x: X", "user ux2: On the first way", "agent msg_x2: X again",
+        }, Seen(replay.Updates));
+        StringAssert.StartsWith(replay.Mark, "ax2@");
+        Assert.AreEqual(replay.Mark, TranscriptHistory.Mark(path));
+    }
+
+    [TestMethod]
+    public void AnExplicitNullLeaf_EmptiesTheConversation_UntilTheNextPrompt()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")));
+        var mark = TranscriptHistory.Mark(path)!;
+        Add(path, LastPrompt(null, isExplicit: true, rewound: true)); // rewound to before the first message
+
+        Assert.IsNull(TranscriptHistory.Mark(path));
+        foreach (var from in new[] { mark, null })
+        {
+            var empty = Read(path, from)!;
+            Assert.AreEqual((false, (string?)null, 0), (empty.FromMark, empty.Mark, empty.Updates.Count), "an empty conversation, which changes nothing in the journal");
+        }
+
+        Add(path, LastPrompt(null)); // closed: a null leaf that is not explicit changes nothing
+        Assert.IsNull(TranscriptHistory.Mark(path));
+        Add(path, User("u2", null, "Anew"), Assistant("a2", "u2", "msg_2", Text("Fresh")));
+        var replay = Read(path, mark)!;
+        Assert.IsFalse(replay.FromMark);
+        CollectionAssert.AreEqual(new[] { "user u2: Anew", "agent msg_2: Fresh" }, Seen(replay.Updates));
+        Assert.AreEqual(replay.Mark, TranscriptHistory.Mark(path));
+    }
+
+    [TestMethod]
+    public void ARewind_HoldsItsCheckpoint_ThroughAClose_UntilTheNextPrompt()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")), User("u2", "a1", "Second"), Assistant("a2", "u2", "msg_2", Text("Also done")));
+        var mark = TranscriptHistory.Mark(path)!;
+        Add(path, LastPrompt("a1", isExplicit: true, rewound: true)); // rewound to a1: u2 and a2 still follow a1 in the file
+
+        var rewound = Read(path, mark)!;
+        Assert.IsFalse(rewound.FromMark);
+        CollectionAssert.AreEqual(new[] { "user u1: First", "agent msg_1: Done" }, Seen(rewound.Updates));
+        StringAssert.StartsWith(rewound.Mark, "a1@");
+        Assert.AreEqual(rewound.Mark, TranscriptHistory.Mark(path));
+
+        Add(path, LastPrompt("a1")); // the session closed: its own checkpoint, for the same leaf, keeps the hold
+        Assert.AreEqual(rewound.Mark, TranscriptHistory.Mark(path));
+        var closed = Read(path, rewound.Mark)!;
+        Assert.AreEqual((true, rewound.Mark, 0), (closed.FromMark, closed.Mark, closed.Updates.Count));
+
+        // The next prompt continues from a1; Claude names the zero UUID once its rows are on their way.
+        Add(path, User("u3", "a1", "Instead"), LastPrompt("00000000-0000-0000-0000-000000000000", isExplicit: true), Assistant("a3", "u3", "msg_3", Text("Another answer")));
+        var next = Read(path, rewound.Mark)!;
+        Assert.IsTrue(next.FromMark);
+        CollectionAssert.AreEqual(new[] { "user u3: Instead", "agent msg_3: Another answer" }, Seen(next.Updates));
+        StringAssert.StartsWith(next.Mark, "a3@");
+        Assert.AreEqual(next.Mark, TranscriptHistory.Mark(path));
+    }
+
+    [TestMethod]
+    public void ACompaction_DropsTheCheckpoint()
+    {
+        var path = NewTranscript();
+        Add(path,
+            User("u1", null, "First"), Assistant("a1", "u1", "msg_1", Text("Done")),
+            User("ux", "a1", "One way"), Assistant("ax", "ux", "msg_x", Text("X")),
+            User("uy", "a1", "Another way"), Assistant("ay", "uy", "msg_y", Text("Y")),
+            LastPrompt("ax")); // the conversation is X's branch
+        StringAssert.StartsWith(TranscriptHistory.Mark(path), "ax@");
+        Add(path, Boundary("b1", "ay"), User("s1", "b1", "This session is being continued…", summary: true), User("u2", "s1", "Go on"), Assistant("a2", "u2", "msg_2", Text("Going on")));
+
+        var replay = Read(path, null)!;
+
+        CollectionAssert.AreEqual(new[]
+        {
+            "user u1: First", "agent msg_1: Done", "user uy: Another way", "agent msg_y: Y", "user u2: Go on", "agent msg_2: Going on",
+        }, Seen(replay.Updates));
+        Assert.AreEqual(replay.Mark, TranscriptHistory.Mark(path));
     }
 
     [TestMethod]
