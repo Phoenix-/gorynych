@@ -56,6 +56,9 @@ public sealed class ClaudeAdapterOptions
     /// </summary>
     internal Func<Func<string>, CancellationToken, Task>? GiveUpStartup { get; init; }
 
+    /// <summary>Tests: runs between stopping a Claude found off the plan and failing its prompt.</summary>
+    internal Action? OffPlanStopping { get; init; }
+
     public int PasteEnterDelayMs { get; init; } = 400;
 
     /// <summary>Headless: how long a closed Claude may take to exit before its process tree is killed.</summary>

@@ -242,8 +242,9 @@ internal sealed class HeadlessSession : IClaudeSession
         finally { inputGate.Release(); }
         WithdrawAsks();
         if (await Task.WhenAny(current.Task, Task.Delay(options.InterruptGraceMs)) == current.Task) return;
-        current.TryComplete(StopReason.Cancelled);
+        // Given up before the turn ends, so a prompt sent as soon as the client reads the end starts a new process.
         Abandon(claude, "no result after the interrupt; the next prompt resumes the session in a new process");
+        current.TryComplete(StopReason.Cancelled);
     }
 
     /// <summary>
@@ -667,14 +668,20 @@ internal sealed class HeadlessSession : IClaudeSession
         }
     }
 
-    /// <summary>A turn about to run on something other than the plan: the client's prompt fails, and Claude is stopped before it calls the API.</summary>
+    /// <summary>
+    /// A turn about to run on something other than the plan: Claude is stopped before it calls the API,
+    /// and the client's prompt fails. In that order: the client may send its next prompt as soon as it
+    /// reads the failure, and that one must start a new process, not go into the one being stopped
+    /// (it would fail with the process's exit instead of the reason).
+    /// </summary>
     void StopOffThePlan(string problem)
     {
         Turn? current;
         ClaudeProcess? claude;
         lock (stateGate) { current = turn; claude = process; }
-        current?.TryFail(new JsonRpcException(JsonRpcException.InternalError, problem));
         if (claude is not null) Abandon(claude, problem);
+        options.OffPlanStopping?.Invoke();
+        current?.TryFail(new JsonRpcException(JsonRpcException.InternalError, problem));
     }
 
     /// <summary>Starts a turn in the state when none runs; under stateGate.</summary>
