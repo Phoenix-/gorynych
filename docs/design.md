@@ -833,10 +833,12 @@ What an AHP face would take, checked on 10 November 2026:
   its own methods is plain AHP:
   - several agents behind one host (`RootState.agents`, a session's or chat's `provider`):
     the four scoped entries and `gorynych/agents`;
-  - one list across agents, whose title and archived and read bits clients change by actions
-    (`session/titleChanged`, `session/isArchivedChanged`, `session/isReadChanged`), with
-    `root/session*` notifications: `gorynych/setTitle`, `_gorynych/archive`, `_gorynych/read`,
-    `_gorynych/sessions_changed`;
+  - one list across agents, with `root/session*` notifications and an archived bit that clients
+    change by an action (`session/isArchivedChanged`): `_gorynych/sessions_changed` and
+    `_gorynych/archive`. AHP's read bit (`session/isReadChanged`) has no native counterpart, and a
+    client's rename (`session/titleChanged`) waits for the native rename, which is planned
+    (`gorynych/setTitle` only lets the service name a spawned Codex session);
+  - a chat's history in pages (`fetchTurns`): `_gorynych/read`;
   - reconnecting with `lastSeenServerSeq`, then a replay or a snapshot: the resumable link and
     `gorynych/replayFrom`;
   - `ChatInteractivity`: `gorynych/interactivity`;
@@ -851,8 +853,10 @@ What an AHP face would take, checked on 10 November 2026:
   methods, channels and actions, next to `_meta`.
 - **To build.** The state tree, its reducers, the action log with `serverSeq` and the replay
   (the weight above), and a mapper from the agents' ACP updates to AHP actions, which AHP's guide
-  names as the host's job. AHP moves fast, so its types are better generated from its JSON
-  Schema than taken from a NuGet release.
+  names as the host's job. The types and reducers come from Microsoft's NuGet package, pinned to
+  1.0.0, since the host must reduce exactly as its clients do (decided 13 November 2026,
+  [ahp-face.md](ahp-face.md#version-and-library)); AHP moves fast, so a newer version is taken
+  up as a change of its own.
 
 **Several machines in AHP.** AHP covers one client-to-host connection and leaves several hosts
 to the client: each of its SDKs carries a `MultiHostClient` (hosts, reconnects, session URIs
@@ -882,12 +886,14 @@ The idea (the user, 12 November 2026) is an AHP face next to ACP, not a move awa
 Zed stays on ACP, VS Code gets AHP, both over one conductor. ACP and AHP compete for the
 client's side, and which wins is unclear; ACP stays below the service either way, so the
 adapters do not change.
-- **At once, by default.** Several clients already watch one session through the conductor,
+- **At once, by default** once the face can do the work; off by default while it is built.
+  Several clients already watch one session through the conductor,
   which is AHP's model. Where the faces meet is an approval: open to every AHP client and to
   the ACP client it went to, the first answer withdraws it from the rest, as `$/cancel_request`
   already withdraws one.
 - **A setting turns the AHP face off.** It costs little next to the face, and it is the
   fallback should the faces conflict.
+- **The specification** and the steps it is built in are in [ahp-face.md](ahp-face.md).
 
 ## Stage one and what comes next
 
