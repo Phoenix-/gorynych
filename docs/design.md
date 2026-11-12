@@ -502,6 +502,9 @@ again.
   remote agent is a transport to it (the Streamable HTTP and WebSocket RFD, active), as the
   direct entry is over ssh. And a session is active on a connection, whose `session/close` must
   cancel its work: the hub needed its own `_gorynych/detach` to let go without that.
+- AHP, which VS Code's Agents window speaks, says the same: it covers one client-to-host
+  connection and leaves several hosts to the client, whose SDKs all carry a multi-host layer;
+  hosts do not chain ([The GUI](#the-gui)).
 - The code stays in `main` and does nothing without `remotes.json`; a client scoped to a local
   agent never asks the remotes.
 
@@ -801,11 +804,19 @@ treats sessions, and what the service does about it, is in
 [external-clients.md](external-clients.md#zed).
 
 VS Code's Agents window, a preview since VS Code 1.120, may become a second GUI. **This looks
-interesting, but it is not planned yet.** The window does not speak ACP. It speaks Microsoft's
+interesting; an AHP face next to the ACP one is being weighed ([Two faces](#two-faces)), but
+it is not planned yet.** The window does not speak ACP. It speaks Microsoft's
 [Agent Host Protocol](https://microsoft.github.io/agent-host-protocol/) (AHP, 1.0 since
 2 October 2026): a sessions server holds the state, several clients see it in sync over a
 WebSocket, and a client that reconnects gets what it missed. A third-party host is added
 through VS Code's `chat.remoteAgentHosts` setting.
+
+AHP does not replace ACP; it sits above it. Its own guide (`docs/guide/ahp-and-acp.md` in its
+repository, read 12 November 2026) calls AHP a coordination layer and ACP a communication
+layer: a host speaks AHP to its clients and ACP to its agents. That is the service's shape: one
+process per machine with several agents, one list of their sessions, several clients in sync.
+An AHP face would sit next to the ACP one over the same conductor, and the adapters stay ACP
+agents.
 
 AHP leaves the session list to the host. A client asks for it with `listSessions` on
 `ahp-root://`, a page at a time, and the host reports changes with `root/sessionAdded`,
@@ -826,8 +837,8 @@ service, next to ACP. Until then the gateway is the way in
 
 VS Code itself has no ACP. A generic ACP provider for it is an open pull request,
 [microsoft/vscode#340863](https://github.com/microsoft/vscode/pull/340863), awaiting review and
-unchanged since 6 November 2026. Merged, it would not show existing sessions either: VS Code's
-agent host lets a provider bring in sessions made outside (`startChatDiscovery`,
+unchanged since 6 November 2026 (still so on 12 November). Merged, it would not show existing
+sessions either: VS Code's agent host lets a provider bring in sessions made outside (`startChatDiscovery`,
 `onDidDiscoverChats`), but that provider implements neither and never calls `session/list`.
 
 What an AHP face would take, checked on 10 November 2026:
@@ -842,8 +853,12 @@ What an AHP face would take, checked on 10 November 2026:
   the archive bit are read and written natively, as for Zed
   ([Sessions](#sessions-catalog-titles-archive)). The client picks a new session's URI in
   `createSession`, so the overlay keeps the map from that URI to the session's ID.
-- **Child sessions** might become chats: an AHP session holds several, including ones the agent
-  starts. Whether the window lets a person prompt such a chat is not checked.
+- **Child sessions** might become chats. An agent can start chats in its session (a
+  `ChatOrigin` of kind `tool`), and since October a chat may be backed by another agent than
+  the session's (`multipleChatProviders`, a chat's `provider`), so a Claude session with a
+  DeepSeek child fits one AHP session. The spec lets a client prompt any chat, but the Agents
+  window shows subagent chats read-only, with a lock (VS Code's docs, 12 November 2026).
+  Whether a host's `ChatInteractivity` of `full` lifts that is not checked.
 - **The commands.** The 21 the gateway serves were enough for the trial: `initialize`,
   `reconnect`, `ping`; `listSessions`, `createSession`, `disposeSession`, `createChat`,
   `disposeChat`, `subscribe`, `unsubscribe`, `dispatchAction`, `fetchTurns`;
@@ -856,8 +871,57 @@ What an AHP face would take, checked on 10 November 2026:
   actions, a journal and a replay, close to the service's journals and the
   [resumable link](service-protocol.md#the-resumable-link).
 
+**How well the service fits AHP**, checked on 12 November 2026 against AHP's `main`
+(protocol 1.1.0, unreleased; some thirty change notes since 1.0).
+- **Native in AHP, our own on ACP.** Much of what the service adds to ACP through `_meta` and
+  its own methods is plain AHP:
+  - several agents behind one host (`RootState.agents`, a session's or chat's `provider`):
+    the four scoped entries and `gorynych/agents`;
+  - one list across agents, whose title and archived and read bits clients change by actions
+    (`session/titleChanged`, `session/isArchivedChanged`, `session/isReadChanged`), with
+    `root/session*` notifications: `gorynych/setTitle`, `_gorynych/archive`, `_gorynych/read`,
+    `_gorynych/sessions_changed`;
+  - reconnecting with `lastSeenServerSeq`, then a replay or a snapshot: the resumable link and
+    `gorynych/replayFrom`;
+  - `ChatInteractivity`: `gorynych/interactivity`;
+  - browsing the host's files (`resourceList`, `defaultDirectory`, and `environment.pathStyle`
+    for Windows paths): what ACP lacks to pick a folder on another machine.
+- **Different, not missing.** An approval is a piece of state that every client sees, and the
+  first answer wins. The service gives it to the session's most recently attached client and
+  moves it on if that client leaves.
+- **Ours either way.** Questions and child sessions between agents (`_gorynych/opinion`,
+  `_gorynych/spawn`, the `gorynych` MCP server): AHP leaves agent-to-agent talk out. Managing
+  the service (`_gorynych/restart` and the like), for which AHP reserves an `x-` prefix on
+  methods, channels and actions, next to `_meta`.
+- **To build.** The state tree, its reducers, the action log with `serverSeq` and the replay
+  (the weight above), and a mapper from the agents' ACP updates to AHP actions, which AHP's guide
+  names as the host's job. AHP moves fast, so its types are better generated from its JSON
+  Schema than taken from a NuGet release.
+
+**Several machines in AHP.** AHP covers one client-to-host connection and leaves several hosts
+to the client: each of its SDKs carries a `MultiHostClient` (hosts, reconnects, session URIs
+scoped by host), and the Agents window lists local, SSH, tunnel and WSL hosts. Hosts do not
+chain. So a service per machine, gathered by the client, is AHP's norm, and it is where this
+design arrived on ACP ([Several machines](#several-machines)). VS Code reaches its own agent
+host on another machine by installing its CLI there over SSH; for a third-party host its docs
+name nothing but an address, so a remote service would need a forwarded port or a tunnel (not
+checked).
+
 Model, mode and effort selectors for Claude are deferred: the Claude adapter exposes none yet.
 The Codex adapter exposes all three as ACP session config options.
+
+### Two faces
+
+The idea (the user, 12 November 2026) is an AHP face next to ACP, not a move away from Zed:
+Zed stays on ACP, VS Code gets AHP, both over one conductor. ACP and AHP compete for the
+client's side, and which wins is unclear; ACP stays below the service either way, so the
+adapters do not change.
+- **At once, by default.** Several clients already watch one session through the conductor,
+  which is AHP's model. Where the faces meet is an approval: open to every AHP client and to
+  the ACP client it went to, the first answer withdraws it from the rest, as `$/cancel_request`
+  already withdraws one.
+- **A setting turns the AHP face off.** It costs little next to the face, and it is the
+  fallback should the faces conflict.
 
 ## Stage one and what comes next
 
