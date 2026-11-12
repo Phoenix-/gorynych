@@ -140,15 +140,14 @@ service writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
 
 ## A remote machine
 
-Zed reaches the agents of another Windows machine through ssh, in one of two ways
-([Several machines](design.md#several-machines)):
+Zed reaches the agents of another Windows machine through ssh: a Zed entry starts `ssh -T` to
+that machine and runs the bridge there, which talks to that machine's service ([The Zed
+entry](#the-zed-entry)). Zed then shows that machine's sessions on their own, and nothing else is
+needed on Zed's machine.
 
-- **Through the hub** (below): the service on Zed's machine connects to the other machine's
-  service and shows its agents next to its own, as `claude@work-pc`, in one list. Zed's entries all
-  run the local bridge.
-- **Directly**: a Zed entry starts `ssh -T` to that machine and runs the bridge there, which talks
-  to that machine's service ([The Zed entry](#the-zed-entry)). Zed then shows that machine's
-  sessions on their own, and nothing else is needed on Zed's machine.
+The hub ([Through the hub](#through-the-hub), below), where the service on Zed's machine shows
+the other machine's agents as its own, is built but **parked**: it is not the way to use for now
+([why](design.md#several-machines)).
 
 ### Setting up the remote machine
 
@@ -225,6 +224,9 @@ host from your `~/.ssh/config` that logs in with a key:
   Zed can open the session again.
 
 ### Through the hub
+
+**Parked** (12 November 2026): built and checked live, not used for now
+([why](design.md#several-machines)). What follows describes it as built.
 
 On the machine with Zed, tell its service how to reach the other one, once:
 

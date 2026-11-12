@@ -123,8 +123,8 @@ flowchart LR
   open only to the current user. Plain ACP clients start agents over stdio, so the **bridge**
   (`Gorynych.Service acp --agent <name>`) passes ACP between its stdio and the pipe and scopes
   the connection to one agent. Remote machines: over `ssh -T` to the bridge there, from a Zed
-  entry or from the hub, the service that shows them as its own agents
-  ([Several machines](#several-machines), the hub **done**).
+  entry ([Several machines](#several-machines); the hub, a service that shows them as its own
+  agents, is built but **parked**).
 - **The conductor** keeps what is common: process supervision, a bounded journal per session
   (replayed by `session/load`), the overlay (archive flags, names given at spawn, tombstones,
   parent links), the router for questions between sessions, and the idle unload. Everything
@@ -469,9 +469,33 @@ cannot overwrite a running exe: the service could not be updated while an outsid
 
 The person works on several machines, for example a home PC and a powerful work PC that is on
 around the clock, and sometimes on a laptop while the home PC sleeps. Each machine runs its own
-service with its own agents and logins. The hub is **done** (12 November 2026,
-[service-protocol.md](service-protocol.md#remotes)); questions and child sessions between machines
-are next (step 7).
+service with its own agents and logins. The hub below was built and checked live on 12 November
+2026 ([service-protocol.md](service-protocol.md#remotes)), and **parked** the same day: for now
+another machine is reached directly, by a Zed entry that runs the bridge there over ssh
+([external-clients.md](external-clients.md#a-remote-machine)). Questions and child sessions
+between machines (step 7) wait until the idea is thought through again.
+
+**Why parked** (the user and the coordinator, 12 November 2026).
+- In Zed every entry is scoped to one agent anyway, so `claude@R-PC-167` through the hub shows
+  just what the direct entry shows. The one list helps only an unscoped client (the outside
+  server).
+- Working in a folder of the other machine is what Zed's own remote projects (ssh) are for: the
+  agent runs there, with that machine's paths. Through the hub a new session gets a folder of
+  this machine, which may not exist there.
+- Its own value, questions and child sessions between machines, is not needed yet, while it adds
+  a layer to keep: routing, ID collisions, merged lists, approvals that go to the client that
+  attached last, and an ssh link that is always up.
+- What it does better, a link that survives a drop (2.4 s in the live check, where a direct
+  entry loses its ssh process and Zed its agent), can come to the direct entry without it: the
+  bridge can run its ssh through the same resumable link.
+- ACP has no place for it (checked 12 November 2026). The proxy-chains RFD's chain is linear,
+  each proxy with one successor; `session/list` lists one agent's sessions; nothing routes one
+  connection to several agents or merges their lists, which is the client's part. ACP's way to a
+  remote agent is a transport to it (the Streamable HTTP and WebSocket RFD, active), as the
+  direct entry is over ssh. And a session is active on a connection, whose `session/close` must
+  cancel its work: the hub needed its own `_gorynych/detach` to let go without that.
+- The code stays in `main` and does nothing without `remotes.json`; a client scoped to a local
+  agent never asks the remotes.
 
 **A service is the hub, not the GUI.** A service connects to the services of other machines and
 shows their agents as its own. A remote Gorynych is an ACP agent, and a conductor can stand behind
@@ -894,10 +918,11 @@ Next, in order (**planned**):
    - the first `session/list` already carries the marks, and its order follows Codex's own
      times, so the list does not jump.
 6. The hub: remote services as agents of this one, over the resumable link, and one list.
-   **Done** on 12 November 2026 ([service-protocol.md](service-protocol.md#remotes)), and tested
-   with two services on one machine, the remote reached through its bridge as over ssh. The live
-   check with R-PC-167 is next.
-7. Questions and child sessions between machines, through the hub.
+   **Built** on 12 November 2026 ([service-protocol.md](service-protocol.md#remotes)), tested
+   with two services on one machine and live with R-PC-167, then **parked** the same day
+   ([why](#several-machines)): the code stays and does nothing without `remotes.json`.
+7. Questions and child sessions between machines: **postponed** until the hub is thought through
+   again.
 
 ## Probe results
 

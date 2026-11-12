@@ -2004,6 +2004,10 @@ still waits; `restart` prints the hosts that keep running. The executable an upd
 
 ## Remotes
 
+**Parked** (12 November 2026): built and checked live, not used for now
+([why](design.md#several-machines)). A service with no `remotes.json`, or an empty one, does none
+of what follows.
+
 A service may show the services of other machines as its own agents: it is then their *hub*
 ([design.md](design.md#several-machines)). To each remote service the hub is one more client.
 The remote's sessions, journals and approvals stay there, and the hub keeps no copy: it routes
