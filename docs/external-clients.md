@@ -142,8 +142,8 @@ Gorynych set up on that machine ([below](#setting-up-the-remote-machine)).
 
 - **In a remote project**, the way to work there ([In a remote project](#in-a-remote-project)):
   Zed opens a folder of that machine, as its own remote development does, and runs the agents
-  there as that machine's Zed settings name them. The folder, its paths and the sessions are all
-  that machine's.
+  there through its entries, which that machine's Zed settings may override. The folder, its
+  paths and the sessions are all that machine's.
 - **A Zed entry over ssh** ([The Zed entry](#the-zed-entry)): an entry on Zed's machine runs the
   bridge there through `ssh -T`. Zed shows that machine's sessions next to this one's, which is
   handy for following or continuing them. A new session, though, gets the folder of Zed's
@@ -191,15 +191,27 @@ What the task does:
   service lets it go at once, so the window only flashes at logon. *Unverified* on a real
   logon.
 
+3. For [remote projects](#in-a-remote-project), check that the Zed entries of Zed's machine fit
+   this one. Zed sends its own user settings to this machine, and Zed's remote server here lays
+   this machine's own `%APPDATA%\Zed\settings.json` over them; an entry of the same name is taken
+   whole from that file ([which agents](#in-a-remote-project)).
+   - **Entries with `~`**, as in [getting-started.md](getting-started.md#set-up-zed), need
+     nothing here: the remote server turns `~` into this machine's home folder. Checked live on
+     12 November 2026.
+   - **An entry with a full path** holds the profile folder of Zed's machine, which this machine
+     may not have, and the agent fails to start. Give this machine an entry of the same name with
+     its own path; likewise when Gorynych is installed elsewhere here.
+   - This machine needs no Zed of its own: the remote server reads the file. From a remote
+     project window, `zed: open server settings` opens it, and creates it when it is missing.
+     *Unverified* live; read from Zed's code.
+
 ### In a remote project
 
 Checked on 12 November 2026 against a Windows 11 machine, with stock Zed 1.27 and with the
 fork's nightly from `ac4b93b`.
 
-1. On that machine: Gorynych and its logon task, as above, and the Gorynych entries in that
-   machine's own Zed `settings.json`, with that machine's paths
-   ([getting-started.md](getting-started.md#set-up-zed)). Give them the same names as on Zed's
-   machine.
+1. On that machine: Gorynych and its logon task, and Zed entries that fit it, as
+   [above](#setting-up-the-remote-machine).
 2. In Zed: *Open Remote Project* (`projects: open remote`), pick the host and the folder. From a
    terminal, `zed ssh://work-pc/~/src/project` does the same. Zed connects through your
    `~/.ssh/config` and key, as `ssh` does.
@@ -214,8 +226,8 @@ What happens:
   - An entry of the same name is that machine's, whole: command, arguments, `env` and
     `auto_import_sessions`.
   - An entry only this machine has is added and runs there too. It fails there when its command
-    does not exist, for example an entry over ssh. With `auto_import_sessions`, the fork tries it
-    three times and logs why.
+    does not exist, for example an entry over ssh, or a path under a profile folder that machine
+    does not have. With `auto_import_sessions`, the fork tries it three times and logs why.
 - **Between sessions.** Questions and child sessions work as on one machine, since all of them
   are that machine's.
 

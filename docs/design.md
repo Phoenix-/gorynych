@@ -475,8 +475,8 @@ machines as its own agents, was built and checked live on 12 November 2026, then
 design as built. Instead:
 - **Work on another machine** goes through Zed's own remote projects
   ([external-clients.md](external-clients.md#in-a-remote-project), checked the same day). Zed
-  opens a folder there over ssh and runs the agents there, as that machine's Zed settings name
-  them, so the folder and every path are that machine's.
+  opens a folder there over ssh and runs the agents there, through its own entries with `~` for
+  the home folder, so the folder and every path are that machine's.
   - The fork imports their sessions and nests child sessions there as it does locally.
   - Its nightly carries the remote server that a dev-channel build cannot download.
 - **Following that machine's sessions** from a local window is a Zed entry that runs the bridge

@@ -78,33 +78,32 @@ Two choices:
 - **Stock [Zed](https://zed.dev).** It works through the same bridge, but without the automatic
   pickup and without the tree: sessions made by agents show up only through "Import threads".
 
-In Zed run `zed: open settings file` from the command palette and add the agents, with your own
-user name in the paths:
+In Zed run `zed: open settings file` from the command palette and add the agents:
 
 ```json
 {
   "agent_servers": {
     "Gorynych: Claude": {
       "type": "custom",
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
+      "command": "~\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
       "args": ["acp", "--agent", "claude"],
       "auto_import_sessions": true
     },
     "Gorynych: Kimi": {
       "type": "custom",
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
+      "command": "~\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
       "args": ["acp", "--agent", "kimi"],
       "auto_import_sessions": true
     },
     "Gorynych: Codex": {
       "type": "custom",
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
+      "command": "~\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
       "args": ["acp", "--agent", "codex"],
       "auto_import_sessions": true
     },
     "Gorynych: DeepSeek": {
       "type": "custom",
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
+      "command": "~\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
       "args": ["acp", "--agent", "dsh"],
       "auto_import_sessions": true
     }
@@ -113,6 +112,10 @@ user name in the paths:
 ```
 
 - Leave out the agents you do not use.
+- Zed turns a leading `~` in `command` into the home folder of the machine where the agent
+  runs; it expands nothing else, neither `%LOCALAPPDATA%` nor anything in `args` or `env`. So
+  the same entries work on another machine in a remote project
+  ([external-clients.md](external-clients.md#in-a-remote-project)).
 - `auto_import_sessions` exists only in the fork. Stock Zed does not know it and ignores it.
 - `default_config_options` is a stock Zed setting. It sets an agent's selectors for new
   threads, for example `"default_config_options": { "mode": "auto" }` for Codex.
@@ -248,8 +251,8 @@ timeouts and how to try it without registering:
 
 With Gorynych set up on a second machine that this one reaches with `ssh` and a key, open a
 folder there as a Zed remote project (*Open Remote Project*). Zed runs that machine's agents
-there, in that folder, as that machine's own Zed settings name them. The fork's nightly brings
-the server Zed needs on that machine with it.
+there, in that folder, through the same entries: `~` in them is that machine's home folder. The
+fork's nightly brings the server Zed needs on that machine with it.
 
 Setting up the other machine (its logon task, its Zed entries, the ssh key) and the other way,
 a Zed entry that runs the bridge there over ssh, are in
