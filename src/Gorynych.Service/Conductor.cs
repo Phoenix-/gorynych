@@ -1760,6 +1760,7 @@ public sealed class Conductor : IAsyncDisposable
     /// <param name="hostSeq">The host's report it comes from, journaled with it so that it is marked once.</param>
     async Task MarkPromptEndAsync(SessionFeed feed, string promptId, JsonNode? result, Exception? failure, string? hostSeq = null)
     {
+        if (promptId.Length == 0) return;
         if (!feed.ClaimEndMark(promptId))
         {
             ServiceLog.Info($"{feed.SessionId}: the end of prompt {promptId} is marked already");
@@ -1788,6 +1789,14 @@ public sealed class Conductor : IAsyncDisposable
             ServiceLog.Warn($"{feed.SessionId}: the end of prompt {promptId} could not be journaled: {e.Message}");
         }
     }
+
+    /// <summary>
+    /// The prompt ID of a turn the service starts itself (an opinion request, a report, a spawned
+    /// session's first prompt), so that its end is marked as a client's prompt's is: its user message
+    /// and its <c>session/prompt</c> carry it, and <see cref="MarkPromptEndAsync"/> marks the end with it.
+    /// A client that shows turns (the AHP face) so has an end for every turn it saw begin.
+    /// </summary>
+    static string ServicePromptId(string messageId) => "service-" + messageId;
 
     async Task<JsonNode?> PromptInProgressAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionUse use, Action handed, CancellationToken ct)
     {
@@ -2779,6 +2788,7 @@ public sealed class Conductor : IAsyncDisposable
     /// <summary>The first turn of a spawned session. Holds the session's turn gate, taken before the spawn returned.</summary>
     async Task SpawnedTurnAsync(SessionFeed feed, SessionRecord record, SessionRecord parent, string prompt, bool approved)
     {
+        string? promptId = null; // once its user message is out
         try
         {
             using var use = await UseAsync(record.SessionId, CancellationToken.None);
@@ -2796,11 +2806,14 @@ public sealed class Conductor : IAsyncDisposable
             };
             var shown = new TextContent { Text = $"{task.Text}\n\n{context.Text}" };
             var messageId = SessionFeed.NewMessageId();
+            var id = ServicePromptId(messageId);
+            meta[GorynychProtocol.MetaPromptId] = id;
             var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
             {
                 Content = shown, MessageId = messageId, Meta = meta,
             })!.AsObject();
             await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
+            promptId = id;
             await ProvisionalTitleAsync(feed, use.Record, [task]);
             feed.BeginTurnText(ReportLimit + 1);
             Task<JsonNode?> response;
@@ -2808,7 +2821,11 @@ public sealed class Conductor : IAsyncDisposable
             try
             {
                 response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt,
-                    WithMessageId(AcpJson.ToNode(new PromptRequest { SessionId = record.SessionId, Prompt = [task, context] }), messageId),
+                    WithMessageId(AcpJson.ToNode(new PromptRequest
+                    {
+                        SessionId = record.SessionId, Prompt = [task, context],
+                        Meta = new JsonObject { [GorynychProtocol.MetaPromptId] = id },
+                    }), messageId),
                     CancellationToken.None);
             }
             finally
@@ -2817,11 +2834,13 @@ public sealed class Conductor : IAsyncDisposable
             }
             var result = await response;
             KeepMark(feed, result);
+            await MarkPromptEndAsync(feed, id, result, null);
             ReportTurnEnd(record.SessionId, Outcome(result), feed.EndTurnText());
         }
         catch (Exception e)
         {
             ServiceLog.Warn($"{record.Agent} {record.SessionId}: the spawned session's first turn failed: {e.Message}");
+            if (promptId is not null) await MarkPromptEndAsync(feed, promptId, null, e);
             // The parent holds the child's ID and may wait for news of it, so a turn that never got going is reported too.
             ReportTurnEnd(record.SessionId, $"failed: {e.Message}", feed.EndTurnText());
         }
@@ -3059,27 +3078,40 @@ public sealed class Conductor : IAsyncDisposable
             };
             var block = new TextContent { Text = text };
             var messageId = SessionFeed.NewMessageId();
+            var promptId = ServicePromptId(messageId);
+            meta[GorynychProtocol.MetaPromptId] = promptId;
             var told = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
             {
                 Content = block, MessageId = messageId, Meta = meta,
             })!.AsObject();
             await feed.PublishAsync(told, except: null, () => store.Touch(use.Record.SessionId));
-            Task<JsonNode?> response;
-            await feed.ForwardGate.WaitAsync(CancellationToken.None);
             try
             {
-                response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, WithMessageId(AcpJson.ToNode(new PromptRequest
+                Task<JsonNode?> response;
+                await feed.ForwardGate.WaitAsync(CancellationToken.None);
+                try
                 {
-                    SessionId = use.Record.SessionId,
-                    Prompt = [block],
-                    Meta = meta.DeepClone().AsObject(),
-                }), messageId), CancellationToken.None);
+                    response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, WithMessageId(AcpJson.ToNode(new PromptRequest
+                    {
+                        SessionId = use.Record.SessionId,
+                        Prompt = [block],
+                        Meta = meta.DeepClone().AsObject(),
+                    }), messageId), CancellationToken.None);
+                }
+                finally
+                {
+                    feed.ForwardGate.Release();
+                }
+                var result = await response;
+                KeepMark(feed, result);
+                await MarkPromptEndAsync(feed, promptId, result, null);
             }
-            finally
+            catch (Exception e)
             {
-                feed.ForwardGate.Release();
+                // Its message is out: a prompt that never reached the agent ends its turn too.
+                await MarkPromptEndAsync(feed, promptId, null, e);
+                throw;
             }
-            KeepMark(feed, await response);
         }
         finally
         {
@@ -3735,6 +3767,7 @@ public sealed class Conductor : IAsyncDisposable
                 await feed.TurnGate.WaitAsync(ct);
             }
             Task turnDone;
+            string? askedPromptId = null; // once its message is out
             try
             {
                 if (feed.Retired) throw NotFound(record.SessionId);
@@ -3750,11 +3783,14 @@ public sealed class Conductor : IAsyncDisposable
                 if (asker.From is not null) meta[GorynychProtocol.MetaFromSessionId] = asker.From;
                 if (asker.Outside is not null) meta[GorynychProtocol.MetaOutside] = asker.Outside.DeepClone();
                 var askedId = SessionFeed.NewMessageId();
+                var promptId = ServicePromptId(askedId);
+                meta[GorynychProtocol.MetaPromptId] = promptId;
                 var asked = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
                 {
                     Content = new TextContent { Text = text }, MessageId = askedId, Meta = meta,
                 })!.AsObject();
                 await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
+                askedPromptId = promptId;
                 feed.BeginOpinionTurn(messageId);
                 Task<JsonNode?> response;
                 await feed.ForwardGate.WaitAsync(CancellationToken.None);
@@ -3774,20 +3810,30 @@ public sealed class Conductor : IAsyncDisposable
                 {
                     feed.ForwardGate.Release();
                 }
-                turnDone = response.ContinueWith(t =>
+                turnDone = response.ContinueWith(async t =>
                 {
-                    if (t.IsCompletedSuccessfully) KeepMark(feed, t.Result);
-                    pending.TurnText = feed.EndOpinionTurn();
-                    pending.TurnError = t.Exception?.InnerException;
-                    feed.TurnEnded();
-                    feed.TurnGate.Release();
-                    use.Dispose(); // the turn may end after the answer: the session's idle time starts only now
-                }, TaskScheduler.Default);
+                    try
+                    {
+                        if (t.IsCompletedSuccessfully) KeepMark(feed, t.Result);
+                        // The end of its turn, before the session takes the next one.
+                        await MarkPromptEndAsync(feed, promptId, t.IsCompletedSuccessfully ? t.Result : null, t.Exception?.InnerException);
+                    }
+                    finally
+                    {
+                        pending.TurnText = feed.EndOpinionTurn();
+                        pending.TurnError = t.Exception?.InnerException;
+                        feed.TurnEnded();
+                        feed.TurnGate.Release();
+                        use.Dispose(); // the turn may end after the answer: the session's idle time starts only now
+                    }
+                }, TaskScheduler.Default).Unwrap();
                 turnStarted = true;
                 onState?.Invoke(AskedState(record.SessionId));
             }
-            catch
+            catch (Exception e) when (!turnStarted)
             {
+                // Its message is out but the prompt never reached the agent: its turn ends too.
+                if (askedPromptId is not null) await MarkPromptEndAsync(feed, askedPromptId, null, e);
                 feed.EndOpinionTurn();
                 feed.TurnGate.Release();
                 throw;
@@ -4238,7 +4284,11 @@ public sealed class Conductor : IAsyncDisposable
         ["hosts"] = options.Hosts is not null,
         ["build"] = options.Hosts is null ? null : HostGeneration.ThisBuild,
         ["agents"] = new JsonArray(agents.Values.Select(a => (JsonNode)a.Describe(s => !removed.ContainsKey(s) && Feed(s).TurnRunning, WhyNotMoved)).ToArray()),
+        ["ahp"] = AhpStatus?.Invoke(),
     };
+
+    /// <summary>The AHP face's state for <c>_gorynych/status</c> (its port, or why it is off); null without the face.</summary>
+    internal Func<JsonObject>? AhpStatus { get; set; }
 
     static string? FirstText(IEnumerable<ContentBlock> blocks) =>
         blocks.OfType<TextContent>().Select(t => t.Text).FirstOrDefault(t => !string.IsNullOrWhiteSpace(t));

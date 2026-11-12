@@ -3,7 +3,8 @@
 The service speaks [AHP](https://github.com/microsoft/agent-host-protocol) (Microsoft's Agent
 Host Protocol) to clients such as VS Code's Agents window, next to ACP for Zed, over the same
 conductor ([design.md](design.md#two-faces)). This file is the face's specification. **Status:**
-specified, not built; it is built in the steps at the end, each closed by a live check.
+step 1 (reading) built on 13 November 2026 (`src/Gorynych.Service/Ahp`), off by default, its live
+check in VS Code to come; steps 2 to 5 specified, not built. Each step is closed by a live check.
 
 What the face is, in one paragraph: a translator inside the service. Toward AHP clients it is
 a host: it keeps AHP's state tree, sequences actions, serves snapshots and replays. Toward the
@@ -58,11 +59,12 @@ describes: a host speaks AHP to its clients and ACP to its agents.
   frame. Another machine reaches it through ssh ([step 5](#step-5-another-machine)).
 - **Access.** AHP leaves the gate to the transport. The face takes the upgrade only with the
   token, as `?tkn=` (what VS Code sends for an entry's `connectionToken`) or
-  `Authorization: Bearer`, compared in constant time; otherwise 401 before any AHP message.
+  `Authorization: Bearer`, compared in constant time; otherwise 401 before any AHP message. Any
+  other path than `/ahp` is 404, and a request that is no WebSocket upgrade 400.
   - The token is 32 random bytes in hex, in `ahp.token` in the data folder, which is the user's
     alone ([service-protocol.md](service-protocol.md#endpoint)). It is made when the face first
     starts; deleting the file and restarting the service makes a new one.
-  - A request whose `Origin` is a web page (`http:` or `https:`) is refused, whatever its token:
+  - A request whose `Origin` is a web page (`http:` or `https:`) is refused with 403, whatever its token:
     a browser lets any page open a WebSocket to localhost. VS Code sends
     `vscode-file://vscode-app`; other clients send none.
   - A port that another process holds leaves the face off with a warning in the log and in
@@ -109,7 +111,9 @@ describes: a host speaks AHP to its clients and ACP to its agents.
 - `ping` answers `{}` before `initialize` too. `subscribe` answers a snapshot, `unsubscribe`
   drops the channel. `serverSeq` is one counter across all channels.
 - Unknown methods, and those of what the face does not serve ([Not in the face](#not-in-the-face)):
-  `-32601`. The session and chat commands it serves only from a later step are answered as each
+  `-32601`. Before `initialize` or `reconnect`, any method but `ping` gets `-32600`. A connection's
+  requests are answered in order, except `subscribe`, which may wait for its session to open and so
+  does not hold up what follows it. The session and chat commands it serves only from a later step are answered as each
   step says ([step 1](#step-1-reading)). Unknown channels: `SessionNotFound` (`-32001`) for a
   session, chat or other URI the face does not serve (VS Code subscribes to
   `<session>/annotations` and takes this calmly). The notification `setClientManagedSettingsPermissions` that VS Code sends is not
@@ -117,7 +121,8 @@ describes: a host speaks AHP to its clients and ACP to its agents.
 - Client actions arrive by `dispatchAction`. The face checks `IsClientDispatchable`, then the
   channel's rules (below), applies an accepted action through the reducer and echoes it with its
   `origin`; a refused one is echoed with `rejectionReason`. An action for a channel that does not
-  exist is dropped without an echo, as AHP says.
+  exist is dropped without an echo, as AHP says. A refused action takes a `serverSeq` and goes into
+  the replay log like an applied one.
 
 ## The internal client
 
@@ -164,14 +169,17 @@ honoured up to 200. A `SessionSummary`:
 | `title` | `title`, or the empty string for a session without one (how the window shows that is checked in step 1) |
 | `status` | activity bits (below), plus `IsRead` and `IsArchived` |
 | `workingDirectories` | `[cwd]` |
-| `createdAt`, `modifiedAt` | `updatedAt` for both until the conductor reports a creation time |
+| `createdAt`, `modifiedAt` | until the conductor reports a creation time: `createdAt` the first `updatedAt` the face saw (it keeps it, rather than move it with each change), `modifiedAt` the latest of `updatedAt` and its chats' times |
 | `chats`, `defaultChat` | the session's own chat first, then its descendants' chats; the own chat is the default |
 | `_meta` | `gorynych/sessionId`, `gorynych/agent` |
 
 - **Activity bits** (`Idle` 1, `Error` 2, `InProgress` 8, `InputNeeded` 24): from the chats the
   face has open, aggregated as AHP's session channel says (`InputNeeded` and `Error` promoted from
   any chat). A session the face does not have open is `Idle`; whether `session/list` should say
-  that a turn runs is left for later.
+  that a turn runs is left for later. AHP 1.0.0 has no action that sets a session's activity, and the
+  package's session reducer does not aggregate it from the chats, so the activity bits are in the
+  summaries (`listSessions`, `root/sessionSummaryChanged`) and in the chat catalog only; the session
+  channel's own `status` keeps the read and archive bits.
 - **`IsArchived`** (64) is `gorynych/archived`.
 - **`IsRead`** (32) lives in the face's memory, for each session and each chat, and is not
   persisted. Everything is read when the face starts. AHP's chat reducer clears a chat's bit
@@ -185,7 +193,9 @@ honoured up to 200. A `SessionSummary`:
 - **The chat catalog stays in step with the chats**, as AHP requires of the host: whenever a
   chat's summary fields change (title, `status` with its read, archived and activity bits,
   `activity`, `modifiedAt`, `interactivity`), the face sends `session/chatUpdated` on the
-  session's channel and the compact `chats` in `root/sessionSummaryChanged`. AHP 1.0.0 has no
+  session's channel and the compact `chats` in `root/sessionSummaryChanged`. A partial update
+  cannot remove a field, so a cleared activity goes as the empty string. The chat reducer moves
+  `modifiedAt` only when a turn starts or ends, not with each update. AHP 1.0.0 has no
   action for a chat's own title, so a `ChatState.title` already sent stays until the client
   subscribes again; the catalog has the new one at once.
 
@@ -235,6 +245,10 @@ into a fresh state without `serverSeq`; only live actions are numbered.
   user message ends a turn still open as complete; so does a load whose answer says
   `gorynych/turn: "idle"`. At a turn's end the face clears the chat's `activity`; AHP's reducer
   itself cancels a tool call still running then.
+- Every turn the face sees begin has a mark of its end: a client's prompt on the link (Zed's bridge
+  gives each an ID), the agent's own turns, and the service's own turns, which the conductor marks
+  from step 1 on. A prompt of a client not on the link carries no ID and gets no mark: its turn ends
+  at the next user message, or when the face opens the session again.
 
 **Within a turn.**
 
@@ -250,11 +264,14 @@ into a fresh state without `serverSeq`; only live actions are numbered.
 | `available_commands_update`, `current_mode_update`, `config_option_update`, `usage_update` | nothing in step 1 ([step 2](#step-2-working-in-sessions)) |
 | `session_info_update`, title | for the session's own chat `session/titleChanged` and `session/chatUpdated`; for a child's, `session/chatUpdated` |
 | `session_info_update`, `gorynych/archived` | `session/isArchivedChanged`, or for a child `chat/isArchivedChanged` |
-| `session_info_update`, `gorynych/interactivity` | `session/chatUpdated` with `interactivity`, the reason in `_meta["gorynych/interactivityReason"]` |
+| `session_info_update`, `gorynych/interactivity` | `session/chatUpdated` with `interactivity`. In step 1 nothing: every chat is read-only. Where the reason goes is settled in step 2: `PartialChatSummary` has no `_meta`, so it cannot go in `session/chatUpdated` |
 
-Tool content: ACP `content` blocks with text become `text` results; a `diff` becomes a
-`fileEdit`; a `terminal` becomes text naming the terminal, as the face serves no terminal
-channel; a resource link a `resource`.
+Tool content: ACP `content` blocks with text become `text` results; a `terminal` becomes text
+naming the terminal, as the face serves no terminal channel; a resource link a `resource`. A
+`diff` is text in step 1 (`Edited <path>`, then its lines with `-` and `+`, or their counts past 200
+lines): AHP's `fileEdit` names its two sides by `ContentRef` URIs a client reads with
+`resourceRead`, which the face serves only from step 2, and a diff's old text is in no file. It
+becomes a `fileEdit` in step 2, with a URI scheme of the face's own for the two sides.
 
 Client actions on a chat in step 1: `chat/isReadChanged` and `chat/draftChanged` are applied;
 `chat/isArchivedChanged` on a child's chat archives the child; everything else is refused
@@ -279,11 +296,11 @@ window opens such a chat from its card and prompts it when it is not read-only.
 
 Small additions to the ACP side, each in [service-protocol.md](service-protocol.md) when built:
 
-- **Step 1.** `gorynych/requests: false` in a client's `initialize` `_meta`: the conductor routes
-  no agent → client request (approval, form) to that client. And the end mark for service turns
-  too (an opinion, a report, a spawn's first prompt delivered as a turn): today only a client's
-  prompt with `gorynych/promptId` and the agent's own turns get one, and the face needs an end for
-  each turn it began.
+- **Step 1** (built). `gorynych/requests: false` in a client's `initialize` `_meta`: the conductor
+  routes no agent → client request (approval, form) to that client. And the end mark for service
+  turns too (an opinion, a report, a spawn's first prompt delivered as a turn): each gets a prompt ID
+  of the service's own, `service-<messageId>`, on its user message and its prompt, and its end is
+  marked with it as a client's prompt's is.
 - **Step 2.** `gorynych/ahpUri` on `session/new`, kept in the overlay and returned in
   `SessionInfo._meta`.
 - **Step 3.** An approval or form goes to every attached client; the first answer wins and the
@@ -317,10 +334,15 @@ face on its own port and data folder) before the next one starts.
 - **Limits of this step.** A snapshot holds the chat's whole history (a journal keeps at most
   5000 entries; the window asks for no `view.turns`). While the face takes no requests, an
   approval waits for an ACP client (Zed) to attach, and VS Code shows its tool call as running.
-- **Tests.** The mapping as unit tests: sequences of ACP updates in, actions and reduced state
-  out. The face end to end with `AhpClient` over a WebSocket against a service with the test
-  adapter: list, subscribe, a live turn, an archive both ways, a dropped connection replayed, an
-  unknown client after a restart.
+- **Tests.** The mapping as unit tests (`AhpChatModelTests`): sequences of ACP updates in,
+  actions and reduced state out. The face end to end (`AhpFaceTests`) with `AhpClient` over a
+  WebSocket against a service with the test adapters: the list and its pages, subscribing to a
+  session and a chat built from its history (read as it was), a live turn with a tool call and its
+  catalog and summary, an archive both ways, a dropped connection replayed, an unknown client after
+  a restart, a web page and a missing or wrong token refused, a session never closed while its turn
+  runs, the commands of later steps, the client actions, a child as a read-only chat, a service
+  turn's end, and a client that takes no requests. Built and checked on 13 November 2026, the AOT
+  build too, live on a port of its own.
 - **Live check.** VS Code lists the same sessions as Zed (count, titles, archived); a Claude
   session with tool calls reads well; a turn run from Zed streams into VS Code as it runs; an
   archive in either shows in the other; a service restart leaves VS Code working after it

@@ -43,6 +43,15 @@ public static class GorynychProtocol
     /// <summary>The adapters a service offers, in the <c>initialize</c> result.</summary>
     public const string MetaAgents = "gorynych/agents";
 
+    /// <summary>
+    /// In a client's <c>initialize</c> <c>_meta</c>: <c>false</c> when the client takes no agent → client
+    /// requests (approvals, forms): the service routes none to it (the AHP face, step 1).
+    /// </summary>
+    public const string MetaRequests = "gorynych/requests";
+
+    /// <summary>In the AHP face's <c>SessionSummary._meta</c>: the Gorynych session ID of an AHP session (docs/ahp-face.md).</summary>
+    public const string MetaSessionId = "gorynych/sessionId";
+
     /// <summary>Where a user message came from when it was not typed by the user (for example <c>channel</c>).</summary>
     public const string MetaOrigin = "gorynych/origin";
 

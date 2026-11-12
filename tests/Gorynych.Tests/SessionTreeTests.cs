@@ -119,7 +119,11 @@ public sealed class SessionTreeTests
         var replay = other.Snapshot();
         var infos = replay.Where(u => (string?)u["sessionUpdate"] == "session_info_update").ToArray();
         Assert.AreEqual(parent, (string?)infos[0]["_meta"]![GorynychProtocol.MetaParentSessionId]);
-        CollectionAssert.AreEqual(new[] { "Flaky test" }, infos.Select(u => (string?)u["title"]).Distinct().ToArray(), "Kimi's own title does not replace the name");
+        CollectionAssert.AreEqual(new[] { "Flaky test" }, infos.Select(u => (string?)u["title"]).OfType<string>().Distinct().ToArray(), "Kimi's own title does not replace the name");
+        // The spawned turn's end is marked, as a client's prompt's is (for the AHP face).
+        var end = infos.Single(u => (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended");
+        StringAssert.StartsWith((string?)end["_meta"]![GorynychProtocol.MetaPromptId], "service-");
+        Assert.AreEqual("end_turn", (string?)end["_meta"]![GorynychProtocol.MetaStopReason]);
         var asked = replay.Single(u => (string?)u["sessionUpdate"] == "user_message_chunk");
         Assert.AreEqual("spawn", (string?)asked["_meta"]![GorynychProtocol.MetaOrigin]);
         Assert.IsFalse(string.IsNullOrEmpty((string?)asked["messageId"]), "the service names the first prompt it writes");

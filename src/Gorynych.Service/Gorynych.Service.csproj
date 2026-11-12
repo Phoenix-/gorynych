@@ -8,6 +8,12 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
+    <!-- The AHP face (docs/ahp-face.md): Microsoft's types and reducers, pinned, and Kestrel's WebSockets. -->
+    <PackageReference Include="Microsoft.VisualStudioCode.AgentHostProtocol" Version="1.0.0" />
+    <PackageReference Include="Microsoft.VisualStudioCode.AgentHostProtocol.Abstractions" Version="1.0.0" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Gorynych.Acp\Gorynych.Acp.csproj" />
     <ProjectReference Include="..\Gorynych.Adapters.Kimi\Gorynych.Adapters.Kimi.csproj" />
     <ProjectReference Include="..\Gorynych.Adapters.Claude\Gorynych.Adapters.Claude.csproj" />

@@ -33,6 +33,8 @@ internal sealed class CommandLine
               asks the running service to exit for an update: it starts no new turn, waits for the
               running ones (5 minutes at most by default; none with --no-wait), and its bridges start
               the new one; if turns still run then, it stays (exit code 4), unless --force cancels them
+          Gorynych.Service ahp address [--pipe <name>]
+              prints the entry for VS Code's chat.remoteAgentHosts: the running service's AHP face, with its token
           Gorynych.Service task install [--pipe <name>] [service options]
           Gorynych.Service task uninstall [--pipe <name>]
               registers or removes the Windows logon task that starts the service in this user's session
@@ -47,6 +49,8 @@ internal sealed class CommandLine
           --unload-after <minutes>              how long an idle session with no client stays loaded (default 10)
           --claude-transport headless|tui
           --claude-channels ask|accept|decline
+          --ahp off|on|<port>                   the AHP face for VS Code's Agents window, on 127.0.0.1 (on: port 8766);
+                                                off by default
           --hosts on|off                        run each adapter in a host of its own, which a restart leaves
                                                 running (default on Windows and Linux; off on macOS, where it is untried)
           --no-channel  --no-peers
@@ -58,7 +62,7 @@ internal sealed class CommandLine
         """;
 
     static readonly string[] ServiceValues =
-        ["--pipe", "--data", "--default-agent", "--claude-model", "--unload-after", "--claude-transport", "--claude-channels", "--hosts"];
+        ["--pipe", "--data", "--default-agent", "--claude-model", "--unload-after", "--claude-transport", "--claude-channels", "--hosts", "--ahp"];
 
     /// <summary>The options an adapter host takes: those of the adapters, and where the service is.</summary>
     static readonly string[] HostValues = ["--adapter", "--slot", "--pipe", "--data", "--claude-model", "--claude-transport", "--claude-channels"];
@@ -129,6 +133,17 @@ internal sealed class CommandLine
             case "peers":
                 known = (["--pipe", "--token", "--channel-url", "--reply-url"], []);
                 break;
+            case "ahp":
+                action = args.Length > 1 ? args[1] : null;
+                rest = 2;
+                known = action switch
+                {
+                    _ when IsHelp(action) => throw new UsageException(null),
+                    "address" => (["--pipe"], []),
+                    null => throw new UsageException("ahp takes address"),
+                    _ => throw new UsageException($"ahp takes address, not '{action}'"),
+                };
+                break;
             case "task":
                 action = args.Length > 1 ? args[1] : null;
                 rest = 2;
@@ -194,6 +209,7 @@ internal sealed class CommandLine
             "--claude-channels" => value is "ask" or "accept" or "decline",
             "--unload-after" or "--timeout" => MinutesOf(value) is not null,
             "--hosts" => value is "on" or "off",
+            "--ahp" => value is "on" or "off" || (int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var port) && port is > 0 and < 65536),
             "--adapter" => AdapterNames.Contains(value),
             _ => true,
         };
@@ -203,10 +219,19 @@ internal sealed class CommandLine
             "--claude-transport" => $"--claude-transport takes headless or tui, not '{value}'",
             "--claude-channels" => $"--claude-channels takes ask, accept or decline, not '{value}'",
             "--hosts" => $"--hosts takes on or off, not '{value}'",
+            "--ahp" => $"--ahp takes off, on or a port, not '{value}'",
             "--adapter" => $"--adapter takes {string.Join(", ", AdapterNames)}, not '{value}'",
             _ => $"{name} takes a number of minutes, 0 or more, not '{value}'",
         });
     }
+
+    /// <summary>The AHP face's port <c>--ahp</c> asks for; null for off (the default).</summary>
+    public static int? AhpPortOf(string? value) => value switch
+    {
+        null or "off" => null,
+        "on" => Gorynych.Service.Ahp.AhpEndpoint.DefaultPort,
+        _ => int.Parse(value, CultureInfo.InvariantCulture),
+    };
 
     /// <summary>A number of minutes, 0 or more, that makes a time span; null for anything else.</summary>
     public static TimeSpan? MinutesOf(string? value) =>

@@ -893,7 +893,9 @@ adapters do not change.
   already withdraws one.
 - **A setting turns the AHP face off.** It costs little next to the face, and it is the
   fallback should the faces conflict.
-- **The specification** and the steps it is built in are in [ahp-face.md](ahp-face.md).
+- **The specification** and the steps it is built in are in [ahp-face.md](ahp-face.md). Step 1,
+  reading, is built (13 November 2026), off by default (`--ahp on`), its live check in VS Code to
+  come.
 
 ## Stage one and what comes next
 
