@@ -397,7 +397,9 @@ public sealed class SessionTreeTests
         Assert.AreEqual("kimi-1", child);
         kimi.BeforeResume = _ => throw new JsonRpcException(JsonRpcException.InternalError, "Kimi lost the session");
         await kimi.Adapter.Current!.Rpc.DisposeAsync();
-        await Until(() => !conductor.Agents["kimi"].IsRunning, "the agent's exit");
+        // Its connection closes before the service forgets the sessions open in it: wait for both,
+        // or the turn finds the session still routed to the closed connection.
+        await Until(() => !conductor.Agents["kimi"].IsRunning && !conductor.Agents["kimi"].IsLive(child), "the agent's exit");
         childFeed.LifeGate.Release();
 
         await conductor.BackgroundTurnsIdleAsync();
