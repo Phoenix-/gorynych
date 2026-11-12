@@ -112,21 +112,6 @@ public sealed class ConductorOptions
 
     /// <summary>For tests: awaited, with the question's askId, when its asker's wait for the answer is cancelled.</summary>
     internal Func<string, Task>? AskWaitEnded { get; init; }
-
-    /// <summary>
-    /// Follows <c>remotes.json</c> in the data folder and shows the remote services in it as agents
-    /// (docs/design.md, "Several machines"). Off for the conductors of tests that need no remotes.
-    /// </summary>
-    public bool Remotes { get; init; }
-
-    /// <summary>The timings of the connections to remotes; null for the defaults.</summary>
-    internal Remotes.RemoteOptions? RemoteTimings { get; init; }
-
-    /// <summary>For tests: connects to a remote in place of running its command; null runs the command.</summary>
-    internal Func<Remotes.RemoteEntry, Func<CancellationToken, Task<(Stream Input, Stream Output)>>?>? RemoteConnect { get; init; }
-
-    /// <summary>How often <c>remotes.json</c> is read again; null for every 2 seconds.</summary>
-    internal TimeSpan? RemotesWatchEvery { get; init; }
 }
 
 /// <summary>
@@ -188,8 +173,6 @@ public sealed class Conductor : IAsyncDisposable
         store.Removed = r => { if (r.Listed) AnnounceList(r.SessionId, r.Agent, "removed"); };
         store.Active = AnnounceActivity;
         Outside = new OutsideService(this, options.OutsideProgressInterval);
-        Remotes = new Remotes.RemoteHub(this, options.DataDirectory, options.RemoteTimings, options.RemoteConnect, options.RemotesWatchEvery);
-        if (options.Remotes) Remotes.Start();
         // A session's peer token outlives this run: the agent's peers server (in a host) keeps it.
         foreach (var r in store.All())
             if (r.PeerToken is { Length: > 0 } token && !r.Deleted)
@@ -200,17 +183,6 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     public string DefaultAgent { get; }
-
-    /// <summary>The services of other machines, shown as agents of this one (docs/design.md, "Several machines").</summary>
-    internal Remotes.RemoteHub Remotes { get; }
-
-    /// <summary>Whether a session is this service's own: the hub keeps such an ID's local session over a remote's.</summary>
-    internal bool IsLocalSession(string sessionId) => store.Get(sessionId) is not null;
-
-    /// <summary>For an agent that asks or spawns across machines: step 7 of the plan, not yet.</summary>
-    internal static JsonRpcException NotYetAcrossMachines(string sessionOrAgent, string? agent) => new(JsonRpcException.InvalidRequest,
-        $"{(agent is null ? sessionOrAgent : $"session_id {sessionOrAgent} ({agent})")} is on another machine, and asking or starting a session on " +
-        "another machine is not supported yet (step 7 of Gorynych's plan). Ask a session on this machine instead.");
 
     /// <summary>Starts the adapter hosts; null when the adapters run in this process.</summary>
     internal IHostLauncher? Hosts => options.Hosts;
@@ -672,7 +644,7 @@ public sealed class Conductor : IAsyncDisposable
         });
 
     /// <summary>The read-only state a <c>_meta</c> says (<c>gorynych/interactivity</c>); null for full, also when it says nothing.</summary>
-    internal static SessionFeed.ReadOnlyState? ReadOnlyOf(JsonNode? meta)
+    static SessionFeed.ReadOnlyState? ReadOnlyOf(JsonNode? meta)
     {
         if (meta is not JsonObject m || TextOf(m[GorynychProtocol.MetaInteractivity]) != GorynychProtocol.InteractivityReadOnly) return null;
         return new(TextOf(m[GorynychProtocol.MetaInteractivityReason]) is { Length: > 0 } reason ? reason : "Its agent takes no prompt in it now.",
@@ -682,7 +654,7 @@ public sealed class Conductor : IAsyncDisposable
     static string? TextOf(JsonNode? node) => node is JsonValue v && v.TryGetValue<string>(out var text) ? text : null;
 
     /// <summary>Says a session's interactivity in a <c>_meta</c>, in full (<c>full</c> too), with why and who holds it while it is read-only.</summary>
-    internal static JsonObject PutInteractivity(JsonObject meta, SessionFeed.ReadOnlyState? state)
+    static JsonObject PutInteractivity(JsonObject meta, SessionFeed.ReadOnlyState? state)
     {
         meta[GorynychProtocol.MetaInteractivity] = state is null ? GorynychProtocol.InteractivityFull : GorynychProtocol.InteractivityReadOnly;
         meta.Remove(GorynychProtocol.MetaInteractivityReason);
@@ -708,7 +680,7 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>The notice that tells a person the session is read-only now, and why, or that it can be written to again.</summary>
-    internal static JsonObject NoticeOf(SessionFeed.ReadOnlyState? state) => AcpJson.ToNode<SessionUpdate>(state is null
+    static JsonObject NoticeOf(SessionFeed.ReadOnlyState? state) => AcpJson.ToNode<SessionUpdate>(state is null
         ? new Notice { Severity = NoticeSeverity.Info, Title = "You can write here again", Description = "Nothing else holds this session now." }
         : new Notice { Severity = NoticeSeverity.Warning, Title = "Read-only for now", Description = state.Reason })!.AsObject();
 
@@ -972,7 +944,6 @@ public sealed class Conductor : IAsyncDisposable
             // quits sends none. That includes one it was detached from while it went, by a request
             // or an update that failed first.
             foreach (var sessionId in client.Held) LetGo(sessionId, client.OnLink);
-            Remotes.ClientGone(client);
         }
     }
 
@@ -1000,7 +971,6 @@ public sealed class Conductor : IAsyncDisposable
     internal AgentHost Agent(string? name)
     {
         name ??= DefaultAgent;
-        if (!agents.ContainsKey(name) && Remotes.IsRemoteAgent(name)) throw NotYetAcrossMachines(name, agent: null);
         return agents.TryGetValue(name, out var host)
             ? host
             : throw new JsonRpcException(JsonRpcException.InvalidParams, $"Unknown agent '{name}'. Known: {string.Join(", ", agents.Keys)}");
@@ -1243,8 +1213,7 @@ public sealed class Conductor : IAsyncDisposable
     // ---------------------------------------------------------------- for clients
 
     /// <param name="agentScope">Only this adapter's sessions (a client scoped to one agent), or all.</param>
-    /// <param name="ownOnly">This service's own sessions only, not its remotes' (for a hub: one hop).</param>
-    internal async Task<ListSessionsResponse> ListAsync(ListSessionsRequest request, CancellationToken ct, string? agentScope = null, bool ownOnly = false)
+    internal async Task<ListSessionsResponse> ListAsync(ListSessionsRequest request, CancellationToken ct, string? agentScope = null)
     {
         // Archived sessions are left out unless the client asks for them, as Codex and Kimi do.
         var includeArchived = request.Meta?[GorynychProtocol.MetaIncludeArchived] is JsonValue all && all.TryGetValue<bool>(out var include) && include;
@@ -1290,10 +1259,6 @@ public sealed class Conductor : IAsyncDisposable
             if (agents.TryGetValue(r.Agent, out var host) && host.IsRunning && host.CanList) continue; // the agent no longer has it
             found[r.SessionId] = Describe(r, null);
         }
-        // The remotes' own sessions, under their machines' names (one hop); a local session keeps its ID.
-        if (!ownOnly)
-            foreach (var s in await Remotes.ListAsync(request, agentScope, includeArchived, IsLocalSession, ct))
-                found.TryAdd(s.SessionId, s);
         var ordered = found.Values.OrderByDescending(s => ParseTime(s.UpdatedAt) ?? DateTimeOffset.MinValue).ToList();
         var offset = DecodeCursor(request.Cursor);
         var pageItems = ordered.Skip(offset).Take(options.ListPageSize).ToList();
@@ -1381,7 +1346,7 @@ public sealed class Conductor : IAsyncDisposable
     {
         var known = store.Get(sessionId);
         if (known is { Deleted: false }) return known;
-        if (known is null) await ListAsync(new ListSessionsRequest(), ct, ownOnly: true); // this service's agents' own lists: a remote's session is not opened here
+        if (known is null) await ListAsync(new ListSessionsRequest(), ct);
         return store.Get(sessionId) is { Deleted: false } found
             ? found
             : throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Unknown session {sessionId}");
@@ -2004,18 +1969,6 @@ public sealed class Conductor : IAsyncDisposable
         await feed.ForwardGate.WaitAsync();
         try { await rpc.SendNotificationAsync(method, @params?.DeepClone()); }
         finally { feed.ForwardGate.Release(); }
-    }
-
-    /// <summary>
-    /// <c>_gorynych/detach</c>: the client lets go of the session as its going away would, cancelling
-    /// nothing (a hub whose last client of the session went without closing it).
-    /// </summary>
-    internal JsonNode Detach(ClientConnection client, string sessionId)
-    {
-        client.Release(sessionId);
-        if (feeds.TryGetValue(sessionId, out var feed)) feed.Detach(client, notify: false);
-        LetGo(sessionId, client.OnLink);
-        return new JsonObject();
     }
 
     /// <summary>
@@ -3288,33 +3241,7 @@ public sealed class Conductor : IAsyncDisposable
         foreach (var client in clients.Keys)
         {
             if (client.Init is null || (client.AgentScope is not null && client.AgentScope != agent)) continue;
-            // Its agent, so that a hub re-emits it under its own names and drops what this service shows from its remotes.
-            client.Notify(GorynychProtocol.MethodSessionsChanged, new JsonObject
-            {
-                ["sessionId"] = sessionId, ["change"] = change, ["_meta"] = new JsonObject { [GorynychProtocol.MetaAgent] = agent },
-            });
-        }
-    }
-
-    /// <summary>The agents this service offers now, its own and its remotes': what <c>initialize</c> says in <c>gorynych/agents</c>.</summary>
-    internal JsonArray AgentList(bool ownOnly) => new(agents.Values.Select(a => (a.Name, a.DisplayName)).Concat(ownOnly ? [] : Remotes.Agents)
-        .Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["displayName"] = a.DisplayName }).ToArray());
-
-    /// <summary>The agents changed (a remote connected or dropped): the clients that see all of them are told (<c>_gorynych/agents_changed</c>).</summary>
-    internal void AnnounceAgents()
-    {
-        foreach (var client in clients.Keys)
-            if (client.Init is not null && client.AgentScope is null && !client.IsHub)
-                client.Notify(GorynychProtocol.MethodAgentsChanged, new JsonObject { ["agents"] = AgentList(ownOnly: false) });
-    }
-
-    /// <summary>A remote's <c>_gorynych/sessions_changed</c>, said again to the clients whose scope covers its agent (or that have none).</summary>
-    internal void AnnounceRemote(JsonObject said, string? agent)
-    {
-        foreach (var client in clients.Keys)
-        {
-            if (client.Init is null || client.IsHub || (client.AgentScope is not null && client.AgentScope != agent)) continue;
-            client.Notify(GorynychProtocol.MethodSessionsChanged, said.DeepClone());
+            client.Notify(GorynychProtocol.MethodSessionsChanged, new JsonObject { ["sessionId"] = sessionId, ["change"] = change });
         }
     }
 
@@ -3423,12 +3350,10 @@ public sealed class Conductor : IAsyncDisposable
         var cursor = (string?)request.Params?["cursor"];
         var limit = request.Params?["limit"] is JsonValue l && l.TryGetValue<int>(out var n) ? n : SessionReader.DefaultLimit;
         var thoughts = request.Params?["thoughts"] is JsonValue t && t.TryGetValue<bool>(out var b) && b;
-        // How much text a page may have, as the outside server's read_session asks of a hub's remote.
-        int? budget = request.Params?["budget"] is JsonValue bv && bv.TryGetValue<int>(out var most) && most > 0 ? most : null;
         SessionRead read;
         try
         {
-            read = await ReadAsync(sessionId, cursor, limit, thoughts, budget, ct);
+            read = await ReadAsync(sessionId, cursor, limit, thoughts, budget: null, ct);
         }
         catch (SessionReader.UnknownCursorException e)
         {
@@ -3442,8 +3367,6 @@ public sealed class Conductor : IAsyncDisposable
         {
             ["updates"] = new JsonArray(read.Page.Updates.Select(u => (JsonNode)u).ToArray()),
             ["total"] = read.Page.Total,
-            ["first"] = read.Page.First,
-            ["count"] = read.Page.Count,
             ["inProgress"] = read.InProgress,
             ["trimmed"] = read.Trimmed,
         };
@@ -3510,7 +3433,6 @@ public sealed class Conductor : IAsyncDisposable
     internal async Task<JsonNode?> AskAsync(string target, string text, Asker asker, Action<string>? onState, CancellationToken ct, Func<bool>? linkGone = null)
     {
         if (Draining) throw Restarting();
-        if (!IsLocalSession(target) && Remotes.Owns(target)) throw NotYetAcrossMachines(target, Remotes.AgentOf(target));
         if (asker.AskId is not { } askId) return await AskOnceAsync(target, text, asker, onState, ct);
         // Asked here: what a host reports of it is this service's own. It is kept by its askId, and runs
         // whatever becomes of the asker's link: an asker that lost it comes back for the answer, as after a restart.
@@ -4205,25 +4127,6 @@ public sealed class Conductor : IAsyncDisposable
             if (caller.ParentSessionId is { } parentId && store.Get(parentId) is { Deleted: false } parent) result["callerParent"] = Who(parent);
         }
         if (!includeArchived) result["hiddenArchived"] = Askable(self, includeArchived: true).Count(c => c.Record.Archived);
-        // An agent outside Gorynych sees the remotes' sessions too (the hub); asking them is step 7.
-        if (self is null)
-            foreach (var s in (await Remotes.ListAsync(new ListSessionsRequest(), scope: null, includeArchived, IsLocalSession, ct))
-                         .OrderByDescending(s => ParseTime(s.UpdatedAt) ?? DateTimeOffset.MinValue))
-            {
-                var entry = new JsonObject
-                {
-                    ["session_id"] = s.SessionId,
-                    ["agent"] = (string?)s.Meta?[GorynychProtocol.MetaAgent],
-                    ["title"] = s.Title,
-                    ["cwd"] = s.Cwd,
-                    ["status"] = "saved",
-                    ["updated_at"] = s.UpdatedAt,
-                    ["parent_session_id"] = (string?)s.Meta?[GorynychProtocol.MetaParentSessionId],
-                    ["machine"] = (string?)s.Meta?[GorynychProtocol.MetaMachine],
-                };
-                if (includeArchived) entry["archived"] = s.Meta?[GorynychProtocol.MetaArchived] is JsonValue a && a.TryGetValue<bool>(out var archived) && archived;
-                sessions.Add((JsonNode)entry);
-            }
         return result;
     }
 
@@ -4328,7 +4231,6 @@ public sealed class Conductor : IAsyncDisposable
         ["version"] = AgentHost.Version,
         ["dataDirectory"] = options.DataDirectory,
         ["dataFolderOpen"] = options.DataFolderOpen,
-        [GorynychProtocol.StatusRemotes] = Remotes.Status(),
         ["clients"] = clients.Count,
         ["sessions"] = store.All().Count,
         ["pendingRequests"] = feeds.Values.Sum(f => f.PendingRequests),
@@ -4379,7 +4281,6 @@ public sealed class Conductor : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         cleanupStop.Cancel();
-        await Remotes.DisposeAsync();
         Volatile.Read(ref reclaimSweep)?.Dispose();
         try { await Task.WhenAll(cleanups.Keys).WaitAsync(TimeSpan.FromSeconds(5)); }
         catch (Exception e) { ServiceLog.Warn($"cleanup at exit: {e.Message}"); }

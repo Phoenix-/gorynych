@@ -122,9 +122,8 @@ flowchart LR
 - **Transport.** Locally, a named pipe (`gorynych-acp-<user>`) carrying ACP's stdio framing,
   open only to the current user. Plain ACP clients start agents over stdio, so the **bridge**
   (`Gorynych.Service acp --agent <name>`) passes ACP between its stdio and the pipe and scopes
-  the connection to one agent. Remote machines: over `ssh -T` to the bridge there, from a Zed
-  entry ([Several machines](#several-machines); the hub, a service that shows them as its own
-  agents, is built but **parked**).
+  the connection to one agent. Remote machines: a Zed remote project runs the bridge there, or
+  a Zed entry here reaches it over `ssh -T` ([Several machines](#several-machines)).
 - **The conductor** keeps what is common: process supervision, a bounded journal per session
   (replayed by `session/load`), the overlay (archive flags, names given at spawn, tombstones,
   parent links), the router for questions between sessions, and the idle unload. Everything
@@ -469,8 +468,11 @@ cannot overwrite a running exe: the service could not be updated while an outsid
 
 The person works on several machines, for example a home PC and a powerful work PC that is on
 around the clock, and sometimes on a laptop while the home PC sleeps. Each machine runs its own
-service with its own agents and logins. The hub below was built and checked live on 12 November
-2026 ([service-protocol.md](service-protocol.md#remotes)), and **parked** the same day. Instead:
+service with its own agents and logins. A hub, a service that showed the services of other
+machines as its own agents, was built and checked live on 12 November 2026, then parked and
+**removed** the same day; the tag
+[`hub-parked`](https://github.com/Phoenix-/gorynych/tree/hub-parked) keeps its code and its
+design as built. Instead:
 - **Work on another machine** goes through Zed's own remote projects
   ([external-clients.md](external-clients.md#in-a-remote-project), checked the same day). Zed
   opens a folder there over ssh and runs the agents there, as that machine's Zed settings name
@@ -480,20 +482,20 @@ service with its own agents and logins. The hub below was built and checked live
 - **Following that machine's sessions** from a local window is a Zed entry that runs the bridge
   there over ssh.
 
-Questions and child sessions between machines (step 7) wait until the idea is thought through
-again.
+Questions and child sessions between machines (step 7) are postponed.
 
-**Why parked** (the user and the coordinator, 12 November 2026).
-- In Zed every entry is scoped to one agent anyway, so `claude@R-PC-167` through the hub shows
-  just what the direct entry shows. The one list helps only an unscoped client (the outside
+**Why removed** (the user and the coordinator, 12 November 2026). The experiment answered its
+question: the way to another machine is Zed's remote project, not a chain of services.
+- In Zed every entry is scoped to one agent anyway, so `claude@R-PC-167` through the hub showed
+  just what the direct entry shows. The one list helped only an unscoped client (the outside
   server).
 - Working in a folder of the other machine is what Zed's own remote projects (ssh) are for: the
-  agent runs there, with that machine's paths. Through the hub a new session gets a folder of
+  agent runs there, with that machine's paths. Through the hub a new session got a folder of
   this machine, which may not exist there.
-- Its own value, questions and child sessions between machines, is not needed yet, while it adds
+- Its own value, questions and child sessions between machines, is not needed yet, while it added
   a layer to keep: routing, ID collisions, merged lists, approvals that go to the client that
   attached last, and an ssh link that is always up.
-- What it does better, a link that survives a drop (2.4 s in the live check, where a direct
+- What it did better, a link that survives a drop (2.4 s in the live check, where a direct
   entry loses its ssh process and Zed its agent), can come to the direct entry without it: the
   bridge can run its ssh through the same resumable link.
 - ACP has no place for it (checked 12 November 2026). The proxy-chains RFD's chain is linear,
@@ -505,76 +507,18 @@ again.
 - AHP, which VS Code's Agents window speaks, says the same: it covers one client-to-host
   connection and leaves several hosts to the client, whose SDKs all carry a multi-host layer;
   hosts do not chain ([The GUI](#the-gui)).
-- The code stays in `main` and does nothing without `remotes.json`; a client scoped to a local
-  agent never asks the remotes.
-
-**A service is the hub, not the GUI.** A service connects to the services of other machines and
-shows their agents as its own. A remote Gorynych is an ACP agent, and a conductor can stand behind
-another conductor, as the proxy-chains RFD has it.
-- **How it was built** (decided 12 November 2026).
-  - **Not an adapter.** The remote's sessions do not go through the conductor's journal, overlay and
-    feeds: the hub keeps no copy, and positions, prompt IDs and marks must pass through untouched. A
-    router of its own (`RemoteHub`) keeps only a table of sessions and their machines, and which of
-    its clients have each open.
-  - **Not in an adapter host.** A host carries the journaling the remote must not get, so a restart
-    of the hub drops its ssh connection. Its clients' bridges then resume by the remote's positions,
-    and lose nothing.
-  - **One connection per machine.** It runs the remote's command (`ssh -T <host> Gorynych.Service.exe
-    acp`, the bridge there, unscoped) through the resumable link, which never gives up and keeps a
-    client's prompt IDs. It starts again after a drop, from a few seconds to five minutes apart.
-  - **Configuration.** The remotes are in `remotes.json`, in the shape of ACP's `McpServerStdio`. The
-    `remote add|remove|list` command edits it, and a running service follows its changes.
-  - **Agents and sessions.** Remote agents are named `<agent>@<machine>`, and Zed's entry for one
-    runs the local bridge with that scope. Session IDs stay native, with `gorynych/machine` in their
-    `_meta`.
-- **One list.** The GUI and the outside server see one list, with `claude@R-PC-167` and the
-  like next to the local agents. Each remote session carries its machine in `_meta`; the
-  persistent service ID tells services apart.
-- **Asking and spawning from the hub's machine.** `ask_agent` and `spawn_session` reach a
-  remote session through the hub, as ordinary requests to the remote service. A coordinator
-  at home can so start coders on the work PC.
-- **Asking from the remote machine.** A remote session that asks one on the hub's machine goes
-  through its service, which sends a `_gorynych/…` request to its client, the hub. ACP lets an
-  agent send requests to its client; permission requests already travel that way.
-- **The remote service keeps its journals.** The hub keeps no copy: it passes `session/load`
-  and its replay through.
-- **Why not the GUI.** The GUI was the earlier plan: the GUI connected to each service and
-  forwarded questions between them, so the services did not know each other. In Zed that
-  meant a separate entry for every agent on every machine, no combined list, forwarding
-  written in the fork in Rust, and questions between machines only while Zed is open. The
-  outside server would also have seen only its own machine. The hub means fewer points of
-  failure, and Zed needs no change.
-
-**Rules.**
-- **No ownership.** A remote service never depends on a hub, which is only one more of its
-  clients. Its sessions, journals and approvals stay its own. A hub going to sleep is a client
-  leaving; the agents work on, and an approval goes to whichever client is attached.
-- **A GUI may connect to any service directly.** For example, from a laptop to the work PC
-  while the home PC sleeps: everything on the work PC works, and the home sessions are simply
-  out of reach until the home PC wakes and its hub reconnects.
-- **Hub is a role, not a machine.** Any service may list remotes, even one with no agents of
-  its own. Then a laptop with Gorynych and no agents shows whatever machines it can reach.
-- **One hop.** A hub shows and forwards only the sessions a remote service hosts itself, never
-  what that service gathers from others. So any graph of connections is safe: the home PC and
-  the work PC may list each other, and the laptop both, without duplicates or loops.
-- **A hub attaches to a remote session only while one of its own clients has it open.** So a
-  hub with nobody at it never takes an approval that a person on another client is waiting
-  for. It lets the session go as its client did: `session/close`, which cancels the session's work
-  as ACP has it, after a close, and `_gorynych/detach`, which cancels nothing, after a client that
-  went.
-- **One hop also for what a hub asks.** A hub says so at `initialize` (`gorynych/hub`), and a
-  service answers it with its own sessions only. Two services that list each other would otherwise
-  ask each other for their lists without end, as the first test showed.
-- **An unreachable machine is an error at once, not a wait.** For example: "R-PC-167 is not
-  connected". Its sessions leave the list, and one a client has open becomes read-only with that
-  reason (the step 5 flag) until the connection is back and the hub resumed it.
+- Dormant, it still had to be carried: about 3,000 lines with its tests, hooks in the
+  conductor, the bridge and the resumable link, and extensions of its own (`_gorynych/detach`,
+  `gorynych/hub`, `gorynych/machine`, `_gorynych/agents_changed`). Every change to the
+  conductor had to keep it working, for a feature nobody used.
 
 **Transport: `ssh -T` to the bridge on the remote machine.**
 - ACP standardizes only stdio so far. ssh brings key authentication and needs no open port,
   so it also reaches a machine inside a corporate network.
-- The hub starts ssh and starts it again when the connection drops. It then resumes the
-  sessions its clients have open. This uses the same resumable link as the bridge and the
-  adapter hosts ([Updating without losing work](#updating-without-losing-work)).
+- A drop ends the ssh process, and Zed loses the agent of its entry. Running that ssh through
+  the resumable link of the bridge and the adapter hosts
+  ([Updating without losing work](#updating-without-losing-work)) would carry the entry over a
+  drop (not built).
 - An earlier note said that the standard OpenSSH for Windows hangs on synchronous pipes. The
   first probe saw no hang: OpenSSH for Windows 9.5 and Git's ssh both worked for a client with
   synchronous pipes.
@@ -585,8 +529,8 @@ another conductor, as the proxy-chains RFD has it.
 - The bridge behind ssh never starts the service as its own child: started from ssh, the
   service would run elevated, in session 0. When the pipe is missing, the bridge runs the logon
   task instead (**done**).
-- A dropped connection then ends only the bridge: the agents work on, and the hub resumes
-  their sessions when it reconnects.
+- A dropped connection then ends only the bridge: the agents work on, and a client that
+  comes back opens their sessions again.
 - **Checked live** on 10 November 2026, on a Windows 11 work PC:
   - The bridge ran the task, and the service came up in the person's session, not elevated.
   - Claude, Codex and Kimi answered over `ssh -T`.
@@ -607,10 +551,6 @@ found both.
   service.
 - Checked live on the same day: an elevated ssh login of an administrator got into the plain
   service that the task had started.
-
-**Versions may differ between machines.** The hub and a remote service speak ACP and the
-extensions each announces at `initialize`, and pass on fields they do not know. A hub can
-update a remote machine: it copies the new build over ssh and starts the update there.
 
 **Code stays where its agents work.**
 - Diffs come with the tool calls in the thread.
@@ -717,8 +657,7 @@ a restart onto a new executable, or with other adapter options, makes the runnin
   go of the overlay's name for it, before requests could see it. A resume in between opened the
   session in a second host, and the old one was stopped mid-turn.
 
-**One resumable link, three uses.** The same mechanism serves:
-- the hub and a remote service over ssh;
+**One resumable link, two uses.** The same mechanism serves:
 - the bridge and the service across a restart (**done** on 10 November 2026:
   `ResumableLink` and `Gorynych.Service restart`,
   [service-protocol.md](service-protocol.md#the-resumable-link));
@@ -980,8 +919,7 @@ Next, in order (**planned**):
      (`gorynych/interactivityReason`) and the holder (`gorynych/openElsewhere`), on
      `session/load` and `session/resume`, in `session/list` and in `session_info_update`, which
      always says the value when it changes;
-   - it is the conductor's own, for any reason an agent gives: Codex is the first, and the hub
-     will add a machine that cannot be reached;
+   - it is the conductor's own, for any reason an agent gives: Codex is the first;
    - Zed learns read-only sessions as such, not only for Codex: the input is off and the reason
      shown, as Zed does for a subagent's thread, and it comes back when the flag clears. It is
      built in the fork so that it can go to Zed itself, and a session interactivity like AHP's
@@ -990,11 +928,10 @@ Next, in order (**planned**):
    - the first `session/list` already carries the marks, and its order follows Codex's own
      times, so the list does not jump.
 6. The hub: remote services as agents of this one, over the resumable link, and one list.
-   **Built** on 12 November 2026 ([service-protocol.md](service-protocol.md#remotes)), tested
-   with two services on one machine and live with R-PC-167, then **parked** the same day
-   ([why](#several-machines)): the code stays and does nothing without `remotes.json`.
-7. Questions and child sessions between machines: **postponed** until the hub is thought through
-   again.
+   **Built** on 12 November 2026, tested with two services on one machine and live with
+   R-PC-167, then parked and **removed** the same day ([why](#several-machines)); the tag
+   `hub-parked` keeps it.
+7. Questions and child sessions between machines: **postponed**.
 
 ## Probe results
 
