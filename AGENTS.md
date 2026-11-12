@@ -32,9 +32,10 @@ architecture. Keep this file short: it is loaded into every agent session.
 ## Code
 
 - Specifications live in `docs/` (design, service protocol, the adapter contract, adapters,
-  ACP types); keep them in step with the code. A new adapter is checked against
+  ACP types, the AHP face); keep them in step with the code. A new adapter is checked against
   `docs/adapter-contract.md`. ACP types are generated: change `tools/Gorynych.AcpGen`, not `Acp.g.cs`;
-  Codex's app-server types likewise: `tools/Gorynych.CodexGen`, not `Codex.g.cs`.
+  Codex's app-server types likewise: `tools/Gorynych.CodexGen`, not `Codex.g.cs`. AHP's types and
+  reducers are Microsoft's NuGet package, pinned (`docs/ahp-face.md`).
 
 - C# on .NET 10. A build-time assembly per adapter; no runtime assembly loading, so the
   service stays Native AOT compatible.
