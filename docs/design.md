@@ -470,10 +470,18 @@ cannot overwrite a running exe: the service could not be updated while an outsid
 The person works on several machines, for example a home PC and a powerful work PC that is on
 around the clock, and sometimes on a laptop while the home PC sleeps. Each machine runs its own
 service with its own agents and logins. The hub below was built and checked live on 12 November
-2026 ([service-protocol.md](service-protocol.md#remotes)), and **parked** the same day: for now
-another machine is reached directly, by a Zed entry that runs the bridge there over ssh
-([external-clients.md](external-clients.md#a-remote-machine)). Questions and child sessions
-between machines (step 7) wait until the idea is thought through again.
+2026 ([service-protocol.md](service-protocol.md#remotes)), and **parked** the same day. Instead:
+- **Work on another machine** goes through Zed's own remote projects
+  ([external-clients.md](external-clients.md#in-a-remote-project), checked the same day). Zed
+  opens a folder there over ssh and runs the agents there, as that machine's Zed settings name
+  them, so the folder and every path are that machine's.
+  - The fork imports their sessions and nests child sessions there as it does locally.
+  - Its nightly carries the remote server that a dev-channel build cannot download.
+- **Following that machine's sessions** from a local window is a Zed entry that runs the bridge
+  there over ssh.
+
+Questions and child sessions between machines (step 7) wait until the idea is thought through
+again.
 
 **Why parked** (the user and the coordinator, 12 November 2026).
 - In Zed every entry is scoped to one agent anyway, so `claude@R-PC-167` through the hub shows

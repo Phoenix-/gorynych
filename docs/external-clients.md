@@ -140,10 +140,17 @@ service writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
 
 ## A remote machine
 
-Zed reaches the agents of another Windows machine through ssh: a Zed entry starts `ssh -T` to
-that machine and runs the bridge there, which talks to that machine's service ([The Zed
-entry](#the-zed-entry)). Zed then shows that machine's sessions on their own, and nothing else is
-needed on Zed's machine.
+Zed works with the agents of another Windows machine through ssh, in one of two ways. Both need
+Gorynych set up on that machine ([below](#setting-up-the-remote-machine)).
+
+- **In a remote project**, the way to work there ([In a remote project](#in-a-remote-project)):
+  Zed opens a folder of that machine, as its own remote development does, and runs the agents
+  there as that machine's Zed settings name them. The folder, its paths and the sessions are all
+  that machine's.
+- **A Zed entry over ssh** ([The Zed entry](#the-zed-entry)): an entry on Zed's machine runs the
+  bridge there through `ssh -T`. Zed shows that machine's sessions next to this one's, which is
+  handy for following or continuing them. A new session, though, gets the folder of Zed's
+  project on this machine, which that machine may not have.
 
 The hub ([Through the hub](#through-the-hub), below), where the service on Zed's machine shows
 the other machine's agents as its own, is built but **parked**: it is not the way to use for now
@@ -188,6 +195,52 @@ What the task does:
   service lets it go at once, so the window only flashes at logon. *Unverified* on a real
   logon.
 
+### In a remote project
+
+Checked on 12 November 2026 against a Windows 11 machine, with stock Zed 1.27 and with the
+fork's nightly from `ac4b93b`.
+
+1. On that machine: Gorynych and its logon task, as above, and the Gorynych entries in that
+   machine's own Zed `settings.json`, with that machine's paths
+   ([getting-started.md](getting-started.md#set-up-zed)). Give them the same names as on Zed's
+   machine.
+2. In Zed: *Open Remote Project* (`projects: open remote`), pick the host and the folder. From a
+   terminal, `zed ssh://work-pc/~/src/project` does the same. Zed connects through your
+   `~/.ssh/config` and key, as `ssh` does.
+
+What happens:
+
+- **Where things run.** Zed's remote server runs on that machine (Zed keeps it in `~\.zed_server`
+  there). The agents of a remote project run there too, so the bridge talks to that machine's
+  service, and `cwd` is the remote folder. ACP's working directory needs nothing from Gorynych.
+- **Which agents.** The remote server takes Zed's user settings from this machine and lays that
+  machine's own `settings.json` over them.
+  - An entry of the same name is that machine's, whole: command, arguments, `env` and
+    `auto_import_sessions`.
+  - An entry only this machine has is added and runs there too. It fails there when its command
+    does not exist, for example an entry over ssh. With `auto_import_sessions`, the fork tries it
+    three times and logs why.
+- **Between sessions.** Questions and child sessions work as on one machine, since all of them
+  are that machine's.
+
+Notes:
+
+- **A drive letter in the URL fails.** `zed ssh://work-pc/C:/src/project` becomes `/C:/...`,
+  and Zed reports `DevServerProjectPathDoesNotExist`. A path from the home folder (`~/...`)
+  works, and so does the folder picker of *Open Remote Project*.
+- **Restricted Mode** shows the first time Zed opens a remote folder, as it does for a local one.
+- **Stock Zed** shows that machine's sessions only through "Import threads", as it does locally,
+  and nests no child sessions.
+- **The fork** does more:
+  - It imports the sessions of the agents with `auto_import_sessions` as the window opens, and
+    keeps them apart from this machine's sessions of an agent with the same name.
+  - It nests child sessions under their parents, across agents.
+  - Its nightly carries a remote server for Windows x64 machines and uploads it on the first
+    connection, as `~\.zed_server\zed-remote-server-dev-<commit>.exe`.
+  - A fork build from before `ac4b93b` cannot open remote projects: a dev-channel build
+    downloads no server.
+- **Linux and macOS machines** have not been tried, and the fork ships no server for them.
+
 ### The Zed entry
 
 On the machine with Zed, add an entry to `agent_servers` for each remote agent. `work-pc` is a
@@ -220,6 +273,9 @@ host from your `~/.ssh/config` that logs in with a key:
   by default, which expands `%LOCALAPPDATA%`; with another default shell, give the full path.
 - **Service options** given to a bridge over ssh never apply: the task's do.
 - **Paths** in such a thread, such as folders and links to files, are the remote machine's.
+- **A new session** gets the folder of Zed's project on this machine. When the remote machine
+  has no such folder, the agent cannot work there: open a [remote project](#in-a-remote-project)
+  instead.
 - **A dropped connection** ends only the bridge. The remote service and its agents work on, and
   Zed can open the session again.
 

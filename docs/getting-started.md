@@ -246,9 +246,13 @@ timeouts and how to try it without registering:
 
 ## Optional: another machine
 
-With Gorynych on a second machine that this one reaches with `ssh` and a key, a Zed entry can
-run that machine's agents over ssh, with the bridge there. Setting up the other machine (its
-logon task, the ssh key) and the entry are in
+With Gorynych set up on a second machine that this one reaches with `ssh` and a key, open a
+folder there as a Zed remote project (*Open Remote Project*). Zed runs that machine's agents
+there, in that folder, as that machine's own Zed settings name them. The fork's nightly brings
+the server Zed needs on that machine with it.
+
+Setting up the other machine (its logon task, its Zed entries, the ssh key) and the other way,
+a Zed entry that runs the bridge there over ssh, are in
 [external-clients.md](external-clients.md#a-remote-machine).
 
 ## Update
