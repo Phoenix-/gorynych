@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using Gorynych.Acp.Hosting;
 using Gorynych.Adapters.Claude;
 using Gorynych.Adapters.Codex;
@@ -37,10 +36,7 @@ switch (line.Command)
             CommandLine.MinutesOf(line.Value("--timeout")) ?? Conductor.DefaultRestartTimeout, line.Flag("--force"));
     // The stdio entry point for external ACP clients (Zed); starts the service when needed.
     case "acp":
-        return await AcpBridge.RunAsync(line.Value("--agent"), line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName, line.ServiceArguments("--pipe"));
-    // The services of other machines this one shows as its own agents (docs/service-protocol.md, "Remotes").
-    case "remote":
-        return await RemoteCommand(line);
+        return await AcpBridge.RunAsync(line.Value("--agent")!, line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName, line.ServiceArguments("--pipe"));
     // The Windows logon task that starts the service in this user's session (docs/external-clients.md).
     case "task":
         return TaskCommand(line);
@@ -125,8 +121,6 @@ await using var conductor = new Conductor(new ConductorOptions
     HostGeneration = hosted ? a => new Gorynych.Service.Hosts.HostGeneration(serviceBuild, AdapterArguments(line, a)) : null,
     SessionHosts = new HashSet<string>(["claude"], StringComparer.Ordinal),
     DataFolderOpen = closed is { Failed: true } ? closed.Value.Said : null,
-    // The services of other machines in remotes.json, shown as agents of this one.
-    Remotes = true,
 }, adapters);
 
 // Drafts a client left behind in an earlier run (Zed quits without closing them), once the bridges
@@ -277,77 +271,6 @@ static void Stop(CancellationTokenSource cts)
 // task install|uninstall [--pipe <name>] [service options]: registers or removes the logon task that starts
 // this executable with these options in the user's session, with a limited token; it works from an elevated
 // ssh login too, and the bridge and the outside server run it when the pipe is missing.
-// remote add <machine> -- <command> [args] | remote remove <machine> | remote list: the remotes.json of the
-// data folder (docs/service-protocol.md, "Remotes"); a running service reads it again when it changes.
-static async Task<int> RemoteCommand(CommandLine line)
-{
-    var data = DataDirectory(line);
-    var file = Gorynych.Service.Remotes.RemotesFile.PathIn(data);
-    List<Gorynych.Service.Remotes.RemoteEntry> remotes;
-    try { remotes = Gorynych.Service.Remotes.RemotesFile.Read(file); }
-    catch (Exception e) when (e is FormatException or IOException or UnauthorizedAccessException)
-    {
-        Console.Error.WriteLine($"gorynych remote: {e.Message}");
-        return 1;
-    }
-    switch (line.Action)
-    {
-        case "add":
-        {
-            var name = line.Target!;
-            if (Gorynych.Service.Remotes.RemotesFile.NameProblem(name) is { } problem)
-            {
-                Console.Error.WriteLine($"gorynych remote: {problem}");
-                return CommandLine.UsageExitCode;
-            }
-            if (DataFolder.Refusal(data) is { } refused)
-            {
-                Console.Error.WriteLine($"gorynych remote: {refused}");
-                return CommandLine.UsageExitCode;
-            }
-            var entry = new Gorynych.Service.Remotes.RemoteEntry(name, line.Rest[0], [.. line.Rest.Skip(1)], []);
-            var had = remotes.FindIndex(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
-            if (had >= 0) remotes[had] = entry;
-            else remotes.Add(entry);
-            Directory.CreateDirectory(data);
-            DataFolder.Claim(data);
-            Gorynych.Service.Remotes.RemotesFile.Write(file, remotes);
-            Console.WriteLine($"gorynych remote: {(had >= 0 ? "replaced" : "added")} {name}: {entry.Shown}. A running service connects to it now; " +
-                $"its agents show as <agent>@{name}, and Zed reaches one with: acp --agent claude@{name}");
-            return 0;
-        }
-        case "remove":
-        {
-            var gone = remotes.RemoveAll(r => string.Equals(r.Name, line.Target, StringComparison.OrdinalIgnoreCase));
-            if (gone == 0)
-            {
-                Console.Error.WriteLine($"gorynych remote: there is no remote '{line.Target}'{(remotes.Count == 0 ? "" : $"; there are {string.Join(", ", remotes.Select(r => r.Name))}")}");
-                return 1;
-            }
-            Gorynych.Service.Remotes.RemotesFile.Write(file, remotes);
-            Console.WriteLine($"gorynych remote: removed {line.Target}. A running service lets it go now; its sessions stay on that machine.");
-            return 0;
-        }
-        default:
-        {
-            if (remotes.Count == 0)
-            {
-                Console.WriteLine($"gorynych remote: no remotes in {file}");
-                return 0;
-            }
-            // What the running service says of each, if one runs on the pipe.
-            var states = await AcpBridge.RemoteStatesAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName);
-            foreach (var r in remotes)
-            {
-                var state = states?.FirstOrDefault(s => string.Equals((string?)s?["name"], r.Name, StringComparison.OrdinalIgnoreCase));
-                Console.WriteLine($"{r.Name}: {r.Shown}");
-                Console.WriteLine("  " + (states is null ? "(no service runs on the pipe to say whether it is connected)" : AcpBridge.RemoteState(state as JsonObject)));
-            }
-            return 0;
-        }
-    }
-}
-
 static int TaskCommand(CommandLine line)
 {
     var pipe = line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName;

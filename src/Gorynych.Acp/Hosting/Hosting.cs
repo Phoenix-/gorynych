@@ -171,44 +171,6 @@ public static class GorynychProtocol
     public const string MethodArchive = "_gorynych/archive";
 
     /// <summary>
-    /// The client lets go of a session as its going away would, <c>{sessionId}</c> → <c>{}</c>: unlike
-    /// <c>session/close</c>, which ACP has cancel the session's work, it cancels nothing. A hub sends it
-    /// when the last of its own clients that had a remote session open went without closing it.
-    /// </summary>
-    public const string MethodDetach = "_gorynych/detach";
-
-    /// <summary>In the service's <c>agentCapabilities._meta</c>: <c>true</c> when it takes <see cref="MethodDetach"/>.</summary>
-    public const string CapDetach = "gorynych/detach";
-
-    /// <summary>
-    /// The machine a session of a remote service is on, as a hub names it (the remote's label in its
-    /// <c>remotes.json</c>): in <c>SessionInfo._meta</c>, the <c>_meta</c> of <c>session/new</c>, <c>session/load</c>
-    /// and <c>session/resume</c> answers, of a <c>session_info_update</c> and of <c>_gorynych/sessions_changed</c>.
-    /// A hub never lists a session that carries it from its own remote: one hop.
-    /// </summary>
-    public const string MetaMachine = "gorynych/machine";
-
-    /// <summary>
-    /// In a client's <c>initialize</c> <c>_meta</c>: <c>true</c> from a hub. One hop: the service then lists, and
-    /// tells of, only its own sessions and agents, never those of its own remotes, so two services that
-    /// list each other ask nothing of each other in turn.
-    /// </summary>
-    public const string MetaHub = "gorynych/hub";
-
-    /// <summary>
-    /// Notification to clients, <c>{agents: [{name, displayName}]}</c>: the agents the service offers changed
-    /// (a remote connected or dropped, or came back with others); the same list as <c>initialize</c>'s
-    /// <see cref="MetaAgents"/> would give now. Not to a connection scoped to one agent, nor to a hub.
-    /// </summary>
-    public const string MethodAgentsChanged = "_gorynych/agents_changed";
-
-    /// <summary>
-    /// The service's remotes in <c>_gorynych/status</c>: <c>[{name, command, connected, since, lastError,
-    /// serviceId, agents}]</c>.
-    /// </summary>
-    public const string StatusRemotes = "remotes";
-
-    /// <summary>
     /// Sets a session's native title in its agent: <c>{sessionId, title}</c> → <c>{}</c>. The
     /// service calls it only on an adapter that advertises <see cref="CapSetTitle"/>
     /// (docs/adapter-contract.md, §9).

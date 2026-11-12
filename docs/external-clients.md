@@ -11,10 +11,7 @@ When the service is not running, the bridge starts it: with the logon task when 
 and never from an ssh login without it ([A remote machine](#a-remote-machine)). It changes one thing: it adds
 `_meta["gorynych/agent"]` to the client's `initialize`, which scopes that connection to one
 agent. New sessions then go to that agent and `session/list` shows only its sessions, so the
-client needs no Gorynych extensions. `codex app-server proxy` follows the same idea. An agent
-of another machine's service that this one shows ([Through the hub](#through-the-hub)) is scoped
-the same way, as `claude@work-pc`. Without `--agent` the bridge scopes nothing: the client sees
-every agent and session, as a hub does when it reaches another machine through ssh.
+client needs no Gorynych extensions. `codex app-server proxy` follows the same idea.
 
 Service options after `--agent` (`--data`, `--claude-model`, `--default-agent`,
 `--unload-after <minutes>`, `--claude-transport headless|tui`, `--claude-channels ask|accept|decline`, `--no-channel`,
@@ -152,9 +149,8 @@ Gorynych set up on that machine ([below](#setting-up-the-remote-machine)).
   handy for following or continuing them. A new session, though, gets the folder of Zed's
   project on this machine, which that machine may not have.
 
-The hub ([Through the hub](#through-the-hub), below), where the service on Zed's machine shows
-the other machine's agents as its own, is built but **parked**: it is not the way to use for now
-([why](design.md#several-machines)).
+A third way, a hub where the service on Zed's machine showed the other machine's agents as its
+own, was built, parked and removed ([why](design.md#several-machines)).
 
 ### Setting up the remote machine
 
@@ -278,46 +274,6 @@ host from your `~/.ssh/config` that logs in with a key:
   instead.
 - **A dropped connection** ends only the bridge. The remote service and its agents work on, and
   Zed can open the session again.
-
-### Through the hub
-
-**Parked** (12 November 2026): built and checked live, not used for now
-([why](design.md#several-machines)). What follows describes it as built.
-
-On the machine with Zed, tell its service how to reach the other one, once:
-
-```
-%LOCALAPPDATA%\Programs\Gorynych\Gorynych.Service.exe remote add work-pc -- ssh -T -o BatchMode=yes work-pc %LOCALAPPDATA%\Programs\Gorynych\Gorynych.Service.exe acp
-```
-
-- `work-pc`, the machine's name, follows the `@` of its agents' names: letters, digits, `-`, `_`
-  and `.`, no `@`. Everything after `--` is the command, run by the service as it is, with no
-  shell on this side; the remote shell there expands `%LOCALAPPDATA%` as for the entry above.
-  `BatchMode=yes` matters even more here: the service has no terminal to ask a password in.
-- The running service connects at once and keeps the connection up, starting it again after a
-  drop. `remote list` shows each remote and whether it is connected (since when, or why not);
-  `remote remove work-pc` lets it go. Both change `remotes.json` in the data folder, which a
-  running service reads again within a few seconds.
-- Then a Zed entry per remote agent, with the local bridge:
-
-```json
-"Gorynych: Claude on the work PC": {
-  "type": "custom",
-  "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Gorynych\\Gorynych.Service.exe",
-  "args": ["acp", "--agent", "claude@work-pc"]
-}
-```
-
-*Unverified:* this entry has not been tried with Zed yet.
-
-- **One list.** A client of the service without an agent scope (the outside server's
-  `list_sessions`, a GUI) sees the local sessions and those of every connected remote together;
-  each remote one carries its machine in `_meta["gorynych/machine"]`.
-- **A remote that cannot be reached** is an error at once, "work-pc is not connected"; its sessions
-  are not listed, and one that Zed has open becomes read-only with that reason until the
-  connection is back, when it resumes where Zed was.
-- **Not yet:** `ask_agent` and `spawn_session` between machines, and updating a remote machine from
-  the hub.
 
 ## VS Code's Agents window
 

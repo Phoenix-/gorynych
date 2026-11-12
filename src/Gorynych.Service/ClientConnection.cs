@@ -61,9 +61,6 @@ internal sealed class ClientConnection
     /// </summary>
     public bool OnLink => Init?.Meta?[GorynychProtocol.CapLink] is JsonValue v && v.TryGetValue<int>(out var version) && version >= 1;
 
-    /// <summary>The client is another machine's hub (<c>gorynych/hub</c>): it is shown this service's own sessions and agents only.</summary>
-    public bool IsHub => Init?.Meta?[GorynychProtocol.MetaHub] is JsonValue v && v.TryGetValue<bool>(out var hub) && hub;
-
     /// <summary>The client shows ACP's <c>notice</c> session updates (<c>clientCapabilities.session.notices</c>); none is sent to another.</summary>
     public bool TakesNotices => Init?.ClientCapabilities?.Session?.Notices is not null;
 
@@ -93,32 +90,14 @@ internal sealed class ClientConnection
         _ => true,
     };
 
-    /// <summary>
-    /// Whether a request is about a session of another machine's service (docs/design.md, "Several
-    /// machines"): one the hub knows, or finds in a remote's list, that is not a session of this service.
-    /// </summary>
-    async ValueTask<bool> RemoteAsync(string? sessionId, CancellationToken ct) =>
-        sessionId is not null && !conductor.IsLocalSession(sessionId) && await conductor.Remotes.HasAsync(sessionId, ct);
-
     async Task<JsonNode?> HandleAsync(JsonRpcRequest request, CancellationToken ct)
     {
-        var sessionId = (string?)request.Params?["sessionId"];
-        if (request.Params is JsonObject p && request.Method != AcpMethods.Agent.SessionNew && !IsHub && await RemoteAsync(sessionId, ct))
-            return request.Method switch
-            {
-                AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionResume => await conductor.Remotes.OpenAsync(this, request.Method, p, ct),
-                AcpMethods.Agent.SessionPrompt => await conductor.Remotes.PromptAsync(this, p, ct),
-                AcpMethods.Agent.SessionClose => conductor.Remotes.Close(this, sessionId!),
-                GorynychProtocol.MethodDetach => conductor.Remotes.Detach(this, sessionId!),
-                GorynychProtocol.MethodOpinion or GorynychProtocol.MethodSpawn => throw Conductor.NotYetAcrossMachines(sessionId!, conductor.Remotes.AgentOf(sessionId!)),
-                _ => await conductor.Remotes.ForwardAsync(this, request.Method, p, sessionId!, ct),
-            };
         switch (request.Method)
         {
             case AcpMethods.Agent.Initialize:
                 Init = request.ParamsAs<InitializeRequest>();
-                if (AgentScope is { } scope && !conductor.Agents.ContainsKey(scope) && !conductor.Remotes.KnowsScope(scope))
-                    throw new JsonRpcException(JsonRpcException.InvalidParams, $"Unknown agent '{scope}'. Known: {string.Join(", ", conductor.Agents.Keys.Concat(conductor.Remotes.Agents.Select(a => a.Name)))}");
+                if (AgentScope is { } scope && !conductor.Agents.ContainsKey(scope))
+                    throw new JsonRpcException(JsonRpcException.InvalidParams, $"Unknown agent '{scope}'. Known: {string.Join(", ", conductor.Agents.Keys)}");
                 // A client that comes during a restart learns of it as the others did.
                 if (conductor.RestartingNotice() is { } restarting)
                     request.AfterResult(() => { Notify(GorynychProtocol.MethodRestarting, restarting); return Task.CompletedTask; });
@@ -127,11 +106,8 @@ internal sealed class ClientConnection
             case AcpMethods.Agent.Logout:
                 return new JsonObject();
             case AcpMethods.Agent.SessionList:
-                return AcpJson.ToNode(await conductor.ListAsync(request.ParamsAs<ListSessionsRequest>(), ct, AgentScope, ownOnly: IsHub));
+                return AcpJson.ToNode(await conductor.ListAsync(request.ParamsAs<ListSessionsRequest>(), ct, AgentScope));
             case AcpMethods.Agent.SessionNew:
-                // A remote agent's session is created on its machine, and stays there.
-                if (((string?)request.Params?["_meta"]?[GorynychProtocol.MetaAgent] ?? AgentScope) is { } agent && conductor.Remotes.ParseAgent(agent) is not null)
-                    return await conductor.Remotes.NewAsync(this, (JsonObject)request.Params!, agent, request.AfterResult, ct);
                 return AcpJson.ToNode(await conductor.NewSessionAsync(this, request.ParamsAs<NewSessionRequest>(), request.AfterResult, ct));
             case AcpMethods.Agent.SessionLoad:
                 return await conductor.LoadAsync(this, request.ParamsAs<LoadSessionRequest>(), ct);
@@ -143,8 +119,6 @@ internal sealed class ClientConnection
                 return await conductor.CloseAsync(this, RequireSession(request), ct);
             case AcpMethods.Agent.SessionDelete:
                 return await conductor.DeleteAsync(RequireSession(request), ct);
-            case GorynychProtocol.MethodDetach:
-                return conductor.Detach(this, RequireSession(request));
             case GorynychProtocol.MethodStatus:
                 return conductor.Status();
             case GorynychProtocol.MethodOpinion:
@@ -179,11 +153,6 @@ internal sealed class ClientConnection
     async Task OnNotificationAsync(string method, JsonNode? @params)
     {
         if ((string?)@params?["sessionId"] is not { } sid) return;
-        if (!conductor.IsLocalSession(sid) && conductor.Remotes.Owns(sid))
-        {
-            await conductor.Remotes.ForwardNotificationAsync(method, @params, sid);
-            return;
-        }
         if (method == AcpMethods.Agent.SessionCancel) cancelledAt[sid] = Rpc.NotificationSequence;
         try { await conductor.ForwardNotificationAsync(method, @params, sid); }
             catch (Exception e) when (e is IOException or JsonRpcException) { ServiceLog.Warn($"{method} for {sid}: {e.Message}"); }
@@ -195,9 +164,7 @@ internal sealed class ClientConnection
         AgentInfo = new Implementation
         {
             Name = "gorynych",
-            Title = AgentScope is { } scope
-                ? conductor.Agents.TryGetValue(scope, out var host) ? $"Gorynych: {host.DisplayName}" : $"Gorynych: {scope}"
-                : "Gorynych",
+            Title = AgentScope is { } scope && conductor.Agents.TryGetValue(scope, out var host) ? $"Gorynych: {host.DisplayName}" : "Gorynych",
             Version = AgentHost.Version,
         },
         AgentCapabilities = new AgentCapabilities
@@ -223,7 +190,6 @@ internal sealed class ClientConnection
     {
         var flags = DeprecatedFlags();
         flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
-        flags[GorynychProtocol.CapDetach] = true;
         return flags;
     }
 
@@ -240,8 +206,8 @@ internal sealed class ClientConnection
         var meta = new JsonObject
         {
             [GorynychProtocol.MetaServiceId] = conductor.ServiceId,
-            // This service's own agents, then those of the remotes it shows (claude@R-PC-167).
-            [GorynychProtocol.MetaAgents] = conductor.AgentList(ownOnly: IsHub),
+            [GorynychProtocol.MetaAgents] = new JsonArray(conductor.Agents.Values
+                .Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["displayName"] = a.DisplayName }).ToArray()),
         };
         // Deprecated: the flags' old place, kept for one release for clients built before they moved.
         foreach (var (key, value) in DeprecatedFlags()) meta[key] = value?.DeepClone();

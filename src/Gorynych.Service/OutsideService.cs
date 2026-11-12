@@ -118,8 +118,7 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
         Conductor.SessionRead read;
         try
         {
-            read = await conductor.Remotes.ReadAsync(sessionId, before, limit, thoughts, ReadBudget, ct)
-                ?? await conductor.ReadAsync(sessionId, before, limit, thoughts, ReadBudget, ct);
+            read = await conductor.ReadAsync(sessionId, before, limit, thoughts, ReadBudget, ct);
         }
         catch (JsonRpcException e) when (e.Code == JsonRpcException.ResourceNotFound)
         {
