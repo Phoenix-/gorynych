@@ -244,6 +244,19 @@ The server starts the service from its parent folder when the service is not run
 timeouts and how to try it without registering:
 [external-clients.md](external-clients.md#agents-outside-gorynych).
 
+## Optional: another machine
+
+With Gorynych on a second machine that this one reaches with `ssh` and a key, this machine's
+service can show that one's agents next to its own, as `claude@work-pc`, in one list:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Gorynych\Gorynych.Service.exe" remote add work-pc -- ssh -T -o BatchMode=yes work-pc '%LOCALAPPDATA%\Programs\Gorynych\Gorynych.Service.exe' acp
+```
+
+Then add a Zed entry with `"args": ["acp", "--agent", "claude@work-pc"]`. `remote list` shows
+whether it is connected. Setting up the other machine (its logon task, the ssh key) is in
+[external-clients.md](external-clients.md#a-remote-machine).
+
 ## Update
 
 Zed can stay open: its threads go on with the new service

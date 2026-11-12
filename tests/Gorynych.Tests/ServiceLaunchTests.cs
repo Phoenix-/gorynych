@@ -142,6 +142,12 @@ public sealed class ServiceLaunchTests
         foreach (var help in new[] { new[] { "--help" }, ["-h"], ["/?"], ["help"], ["acp", "--agent", "kimi", "-?"], ["task", "--help"], ["task", "install", "--help"] })
             Assert.IsNull(Assert.ThrowsExactly<UsageException>(() => CommandLine.Parse(help)).Problem, string.Join(' ', help));
 
+        Assert.IsNull(CommandLine.Parse(["acp", "--pipe", "p"]).Value("--agent"), "a bridge without an agent: a hub's, unscoped");
+        var add = CommandLine.Parse(["remote", "add", "box", "--data", "d", "--", "ssh", "-T", "box", "Gorynych.Service.exe", "acp", "--pipe", "x"]);
+        Assert.AreEqual("box", add.Target);
+        Assert.AreEqual("d", add.Value("--data"));
+        CollectionAssert.AreEqual(new[] { "ssh", "-T", "box", "Gorynych.Service.exe", "acp", "--pipe", "x" }, add.Rest.ToArray(), "after --, all is the command, its options too");
+
         foreach (var (wrong, problem) in new[]
         {
             (new[] { "--bogus" }, "unknown option '--bogus'"),
@@ -152,7 +158,13 @@ public sealed class ServiceLaunchTests
             (["--claude-model", "--no-peers"], "--claude-model needs a value"),
             (["--pipe", ""], "--pipe needs a value"),
             (["--pipe", "a", "--pipe", "b"], "--pipe is given twice"),
-            (["acp", "--pipe", "p"], "acp needs --agent"),
+            (["remote"], "remote takes add, remove or list"),
+            (["remote", "start"], "remote takes add, remove or list, not 'start'"),
+            (["remote", "add"], "remote add needs the machine's name"),
+            (["remote", "add", "box"], "remote add needs the command after --, as: remote add <machine> -- ssh -T <host> Gorynych.Service.exe acp"),
+            (["remote", "add", "box", "--"], "remote add needs the command after --, as: remote add <machine> -- ssh -T <host> Gorynych.Service.exe acp"),
+            (["remote", "list", "--console"], "remote list does not take '--console'"),
+            (["remote", "remove", "box", "--pipe", "p"], "remote remove does not take '--pipe'"),
             (["acp", "--agent", "kimi", "--console"], "acp does not take '--console'"),
             (["shutdown", "--data", "d"], "shutdown does not take '--data'"),
             (["task"], "task takes install or uninstall"),

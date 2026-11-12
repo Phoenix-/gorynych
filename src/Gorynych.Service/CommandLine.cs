@@ -22,8 +22,10 @@ internal sealed class CommandLine
         Usage:
           Gorynych.Service [serve] [service options]
               runs the service in the foreground (docs/service-protocol.md)
-          Gorynych.Service acp --agent claude|kimi|codex|dsh [--pipe <name>] [service options]
-              the stdio bridge for ACP clients such as Zed; starts the service when its pipe is missing
+          Gorynych.Service acp [--agent <agent>] [--pipe <name>] [service options]
+              the stdio bridge for ACP clients such as Zed; starts the service when its pipe is missing.
+              --agent scopes it to one agent: claude, kimi, codex, dsh, or a remote one, as claude@<machine>;
+              without it the client sees every agent (a hub uses it so, through ssh)
           Gorynych.Service shutdown [--pipe <name>]
               asks the running service to exit and waits for it
           Gorynych.Service status [--pipe <name>]
@@ -33,6 +35,12 @@ internal sealed class CommandLine
               asks the running service to exit for an update: it starts no new turn, waits for the
               running ones (5 minutes at most by default; none with --no-wait), and its bridges start
               the new one; if turns still run then, it stays (exit code 4), unless --force cancels them
+          Gorynych.Service remote add <machine> [--data <dir>] -- <command> [arguments]
+          Gorynych.Service remote remove <machine> [--data <dir>]
+          Gorynych.Service remote list [--pipe <name>] [--data <dir>]
+              the services of other machines this one shows as its own agents (claude@<machine>): the
+              command reaches the bridge there, for example: ssh -T <host> Gorynych.Service.exe acp;
+              a running service takes a change at once; list shows whether each is connected
           Gorynych.Service task install [--pipe <name>] [service options]
           Gorynych.Service task uninstall [--pipe <name>]
               registers or removes the Windows logon task that starts the service in this user's session
@@ -78,8 +86,14 @@ internal sealed class CommandLine
     /// <summary>null for the service itself, else <c>acp</c>, <c>shutdown</c>, <c>restart</c>, <c>task</c> or <c>peers</c>.</summary>
     public string? Command { get; }
 
-    /// <summary><c>install</c> or <c>uninstall</c> for <c>task</c>.</summary>
+    /// <summary><c>install</c> or <c>uninstall</c> for <c>task</c>; <c>add</c>, <c>remove</c> or <c>list</c> for <c>remote</c>.</summary>
     public string? Action { get; }
+
+    /// <summary>For <c>remote add</c> and <c>remote remove</c>: the machine's name.</summary>
+    public string? Target { get; private set; }
+
+    /// <summary>For <c>remote add</c>: the command and its arguments, after <c>--</c>.</summary>
+    public IReadOnlyList<string> Rest { get; private set; } = [];
 
     public string? Value(string name) => options.FirstOrDefault(o => o.Name == name).Value;
 
@@ -129,6 +143,18 @@ internal sealed class CommandLine
             case "peers":
                 known = (["--pipe", "--token", "--channel-url", "--reply-url"], []);
                 break;
+            case "remote":
+                action = args.Length > 1 ? args[1] : null;
+                rest = 2;
+                known = action switch
+                {
+                    _ when IsHelp(action) => throw new UsageException(null),
+                    "add" or "remove" => (["--data"], []),
+                    "list" => (["--pipe", "--data"], []),
+                    null => throw new UsageException("remote takes add, remove or list"),
+                    _ => throw new UsageException($"remote takes add, remove or list, not '{action}'"),
+                };
+                break;
             case "task":
                 action = args.Length > 1 ? args[1] : null;
                 rest = 2;
@@ -146,7 +172,22 @@ internal sealed class CommandLine
         }
 
         var line = new CommandLine(command, action);
-        for (var i = rest; i < args.Length; i++)
+        if (command == "remote" && action is "add" or "remove")
+        {
+            if (args.Length <= 2 || args[2].StartsWith('-')) throw new UsageException($"remote {action} needs the machine's name");
+            line.Target = args[2];
+            rest = 3;
+        }
+        var end = args.Length;
+        if (command == "remote" && action == "add")
+        {
+            // Everything after "--" is the command that reaches the other machine's bridge, as it is.
+            var dashes = Array.IndexOf(args, "--", rest);
+            if (dashes < 0 || dashes == args.Length - 1) throw new UsageException("remote add needs the command after --, as: remote add <machine> -- ssh -T <host> Gorynych.Service.exe acp");
+            line.Rest = args[(dashes + 1)..];
+            end = dashes;
+        }
+        for (var i = rest; i < end; i++)
         {
             var name = args[i];
             string? value = null;
@@ -164,7 +205,6 @@ internal sealed class CommandLine
             if (line.Flag(name)) throw new UsageException($"{name} is given twice");
             line.options.Add((name, value));
         }
-        if (command == "acp" && line.Value("--agent") is null) throw new UsageException("acp needs --agent");
         if (command == "host" && line.Value("--adapter") is null) throw new UsageException("host needs --adapter");
         return line;
     }

@@ -122,8 +122,9 @@ flowchart LR
 - **Transport.** Locally, a named pipe (`gorynych-acp-<user>`) carrying ACP's stdio framing,
   open only to the current user. Plain ACP clients start agents over stdio, so the **bridge**
   (`Gorynych.Service acp --agent <name>`) passes ACP between its stdio and the pipe and scopes
-  the connection to one agent. Remote machines: over `ssh -T` to the bridge there
-  ([Several machines](#several-machines), **planned**).
+  the connection to one agent. Remote machines: over `ssh -T` to the bridge there, from a Zed
+  entry or from the hub, the service that shows them as its own agents
+  ([Several machines](#several-machines), the hub **done**).
 - **The conductor** keeps what is common: process supervision, a bounded journal per session
   (replayed by `session/load`), the overlay (archive flags, names given at spawn, tombstones,
   parent links), the router for questions between sessions, and the idle unload. Everything
@@ -468,11 +469,29 @@ cannot overwrite a running exe: the service could not be updated while an outsid
 
 The person works on several machines, for example a home PC and a powerful work PC that is on
 around the clock, and sometimes on a laptop while the home PC sleeps. Each machine runs its own
-service with its own agents and logins. All of this is **planned**.
+service with its own agents and logins. The hub is **done** (12 November 2026,
+[service-protocol.md](service-protocol.md#remotes)); questions and child sessions between machines
+are next (step 7).
 
-**A service is the hub, not the GUI.** A service connects to the services of other machines as
-one more adapter. A remote Gorynych is an ACP agent, and a conductor can stand behind another
-conductor, as the proxy-chains RFD has it.
+**A service is the hub, not the GUI.** A service connects to the services of other machines and
+shows their agents as its own. A remote Gorynych is an ACP agent, and a conductor can stand behind
+another conductor, as the proxy-chains RFD has it.
+- **How it was built** (decided 12 November 2026).
+  - **Not an adapter.** The remote's sessions do not go through the conductor's journal, overlay and
+    feeds: the hub keeps no copy, and positions, prompt IDs and marks must pass through untouched. A
+    router of its own (`RemoteHub`) keeps only a table of sessions and their machines, and which of
+    its clients have each open.
+  - **Not in an adapter host.** A host carries the journaling the remote must not get, so a restart
+    of the hub drops its ssh connection. Its clients' bridges then resume by the remote's positions,
+    and lose nothing.
+  - **One connection per machine.** It runs the remote's command (`ssh -T <host> Gorynych.Service.exe
+    acp`, the bridge there, unscoped) through the resumable link, which never gives up and keeps a
+    client's prompt IDs. It starts again after a drop, from a few seconds to five minutes apart.
+  - **Configuration.** The remotes are in `remotes.json`, in the shape of ACP's `McpServerStdio`. The
+    `remote add|remove|list` command edits it, and a running service follows its changes.
+  - **Agents and sessions.** Remote agents are named `<agent>@<machine>`, and Zed's entry for one
+    runs the local bridge with that scope. Session IDs stay native, with `gorynych/machine` in their
+    `_meta`.
 - **One list.** The GUI and the outside server see one list, with `claude@R-PC-167` and the
   like next to the local agents. Each remote session carries its machine in `_meta`; the
   persistent service ID tells services apart.
@@ -505,9 +524,15 @@ conductor, as the proxy-chains RFD has it.
   the work PC may list each other, and the laptop both, without duplicates or loops.
 - **A hub attaches to a remote session only while one of its own clients has it open.** So a
   hub with nobody at it never takes an approval that a person on another client is waiting
-  for.
+  for. It lets the session go as its client did: `session/close`, which cancels the session's work
+  as ACP has it, after a close, and `_gorynych/detach`, which cancels nothing, after a client that
+  went.
+- **One hop also for what a hub asks.** A hub says so at `initialize` (`gorynych/hub`), and a
+  service answers it with its own sessions only. Two services that list each other would otherwise
+  ask each other for their lists without end, as the first test showed.
 - **An unreachable machine is an error at once, not a wait.** For example: "R-PC-167 is not
-  connected".
+  connected". Its sessions leave the list, and one a client has open becomes read-only with that
+  reason (the step 5 flag) until the connection is back and the hub resumed it.
 
 **Transport: `ssh -T` to the bridge on the remote machine.**
 - ACP standardizes only stdio so far. ssh brings key authentication and needs no open port,
@@ -868,7 +893,10 @@ Next, in order (**planned**):
      (a draft, not sent: [proposals/acp-session-interactivity.md](proposals/acp-session-interactivity.md));
    - the first `session/list` already carries the marks, and its order follows Codex's own
      times, so the list does not jump.
-6. The hub: remote services as an adapter over the same link, and one list.
+6. The hub: remote services as agents of this one, over the resumable link, and one list.
+   **Done** on 12 November 2026 ([service-protocol.md](service-protocol.md#remotes)), and tested
+   with two services on one machine, the remote reached through its bridge as over ssh. The live
+   check with R-PC-167 is next.
 7. Questions and child sessions between machines, through the hub.
 
 ## Probe results
