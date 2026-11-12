@@ -856,9 +856,14 @@ What an AHP face would take, checked on 10 November 2026:
 - **Child sessions** might become chats. An agent can start chats in its session (a
   `ChatOrigin` of kind `tool`), and since October a chat may be backed by another agent than
   the session's (`multipleChatProviders`, a chat's `provider`), so a Claude session with a
-  DeepSeek child fits one AHP session. The spec lets a client prompt any chat, but the Agents
-  window shows subagent chats read-only, with a lock (VS Code's docs, 12 November 2026).
-  Whether a host's `ChatInteractivity` of `full` lifts that is not checked.
+  DeepSeek child fits one AHP session. VS Code's docs show subagent chats read-only, with a
+  lock, but that is its own host's choice: it marks them `read-only`, and the window follows
+  the host. Checked on 12 November 2026 (VS Code 1.145.2, a scripted host): a chat of origin
+  `tool` with `interactivity` `full` or unset opens from its tool card as a tab with an input
+  box, and a prompt there reaches the host as `chat/turnStarted` on that chat; `read-only` gives
+  the lock and no input box; `session/chatUpdated` switches it live. A child backed by another
+  agent of the host (its `provider`) takes prompts too, with that agent's models. Such chats
+  stay out of the session's tabs until opened from the card.
 - **The commands.** The 21 the gateway serves were enough for the trial: `initialize`,
   `reconnect`, `ping`; `listSessions`, `createSession`, `disposeSession`, `createChat`,
   `disposeChat`, `subscribe`, `unsubscribe`, `dispatchAction`, `fetchTurns`;
@@ -867,6 +872,18 @@ What an AHP face would take, checked on 10 November 2026:
   `disposeTerminal`; `invokeChangesetOperation`. VS Code 1.145.2 calls more, which the window
   did without: writing the host's files, `moveChat`, automations, `sessionConfigCompletions`
   and `tools/*`. The trials were short, and a tool card did not stay in the transcript.
+  Against a bare host (12 November 2026) a basic session needed less: `initialize` or
+  `reconnect`, `ping` every five seconds, `listSessions`, `createSession`,
+  `resolveSessionConfig`, `subscribe`, `unsubscribe` and `dispatchAction`, plus a subscription
+  to the session's `/annotations` channel (an error did no harm) and a
+  `setClientManagedSettingsPermissions` notification that AHP does not define. The window asks
+  for no windowed delivery (no `delivery`, `flowControl` or `windows`). It offers protocol
+  1.0.0, 0.10.0 and 0.9.0, and puts 1.1.0 first only under its
+  `chat.agentHost.multipleChatProviders.enabled` setting, which lets a person create a chat with
+  another agent; a host's child chat with another `provider` works at 1.0.0 too. It pushes its
+  own settings into the host's root config with `root/configChanged`. After a dropped
+  connection it sends `reconnect` within a second; a `NotFound` (-32008) answer makes it
+  initialize afresh.
 - **The weight** is in the state, not in the commands: session and chat state built from
   actions, a journal and a replay, close to the service's journals and the
   [resumable link](service-protocol.md#the-resumable-link).
@@ -903,9 +920,19 @@ to the client: each of its SDKs carries a `MultiHostClient` (hosts, reconnects, 
 scoped by host), and the Agents window lists local, SSH, tunnel and WSL hosts. Hosts do not
 chain. So a service per machine, gathered by the client, is AHP's norm, and it is where this
 design arrived on ACP ([Several machines](#several-machines)). VS Code reaches its own agent
-host on another machine by installing its CLI there over SSH; for a third-party host its docs
-name nothing but an address, so a remote service would need a forwarded port or a tunnel (not
-checked).
+host on another machine by installing its CLI there over SSH, on Linux and macOS only (it
+checks `uname`). A scripted third-party host on R-PC-167, a Windows machine, was reached two
+ways on 12 November 2026:
+- **An address.** A `chat.remoteAgentHosts` entry pointing at `ssh -L` worked as a local host
+  does. The setting takes `ws://` and `wss://` addresses and a `connectionToken`, so a tunnel or
+  a TLS proxy would do as well.
+- **VS Code's own SSH route.** `chat.sshRemoteAgentHostCommand` (marked "for development", one
+  command for every SSH host) replaces the CLI install: the window runs the command over SSH
+  inside `bash -l -c`, reads `ws://127.0.0.1:PORT?tkn=TOKEN` from its output and opens the
+  WebSocket through the SSH connection. Windows OpenSSH runs commands in `cmd`, which has no
+  `bash`, so the plain command failed; written to survive `cmd` (`x & node …`), it started the
+  host, and the window listed it and talked to it. The host outlived the window, so a service
+  that keeps running suits this route. `chat.wslRemoteAgentHostCommand` is the same for WSL.
 
 Model, mode and effort selectors for Claude are deferred: the Claude adapter exposes none yet.
 The Codex adapter exposes all three as ACP session config options.
