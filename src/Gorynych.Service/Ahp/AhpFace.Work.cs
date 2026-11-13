@@ -393,8 +393,9 @@ internal sealed partial class AhpFace
     /// <summary>A message's ACP prompt: its text, and its attachments a prompt can carry (a file as a resource link, a client's own text).</summary>
     static JsonArray Blocks(Message message)
     {
-        var blocks = new JsonArray();
-        if (message.Text.Length > 0 || message.Attachments is not { Count: > 0 }) blocks.Add(new JsonObject { ["type"] = "text", ["text"] = message.Text });
+        var blocks = new List<JsonNode?>();
+        static JsonNode Text(string text) => new JsonObject { ["type"] = "text", ["text"] = text };
+        if (message.Text.Length > 0 || message.Attachments is not { Count: > 0 }) blocks.Add(Text(message.Text));
         foreach (var attachment in message.Attachments ?? [])
             switch (attachment.Value)
             {
@@ -402,11 +403,11 @@ internal sealed partial class AhpFace
                     blocks.Add(new JsonObject { ["type"] = "resource_link", ["uri"] = r.Uri, ["name"] = r.Label });
                     break;
                 case SimpleMessageAttachment simple when simple.Meta?.ContainsKey(CommandMeta) != true && simple.ModelRepresentation is { Length: > 0 } text:
-                    blocks.Add(new JsonObject { ["type"] = "text", ["text"] = text });
+                    blocks.Add(Text(text));
                     break;
             }
-        if (blocks.Count == 0) blocks.Add(new JsonObject { ["type"] = "text", ["text"] = message.Text });
-        return blocks;
+        if (blocks.Count == 0) blocks.Add(Text(message.Text));
+        return new JsonArray([.. blocks]);
     }
 
     /// <summary>The model a message names, set on its session before its prompt when it is another of the agent's models.</summary>
