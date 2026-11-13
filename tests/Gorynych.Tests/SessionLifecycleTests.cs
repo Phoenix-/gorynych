@@ -739,7 +739,9 @@ sealed class LifecycleAgent
                             Sessions = sessions.Select(s => new SessionInfo { SessionId = s, Cwd = ListCwd, Title = this.titles.GetValueOrDefault(s) }).ToList(),
                         });
                 case AcpMethods.Agent.SessionPrompt:
-                    var blocks = req.ParamsAs<PromptRequest>().Prompt.OfType<TextContent>().Select(t => t.Text).ToArray();
+                    // Text, and a link as the Claude adapter writes one.
+                    var blocks = req.ParamsAs<PromptRequest>().Prompt.Select(b => b switch { TextContent t => t.Text, ResourceLink l => $"@{l.Uri}", _ => null })
+                        .OfType<string>().ToArray();
                     // The blocks joined as the Claude adapter joins them; the title from the first, like Kimi's.
                     var text = string.Join("\n\n", blocks);
                     lock (Prompts) { Prompts.Add((sessionId!, text)); firstBlocks.TryAdd(sessionId!, blocks); }

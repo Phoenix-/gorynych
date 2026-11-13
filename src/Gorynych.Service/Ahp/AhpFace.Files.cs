@@ -88,9 +88,14 @@ internal sealed partial class AhpFace
 
     // ---------------------------------------------------------------- folders and files
 
-    /// <summary>The local path of a <c>file:</c> URI a client names; any other URI is none this host serves.</summary>
+    /// <summary>
+    /// The local path of a <c>file:</c> URI a client names (<see cref="AhpNames.FilePath"/>). Another scheme names nothing
+    /// this host has (<c>NotFound</c>); a <c>file:</c> URI it does not serve, another machine's above all, is refused.
+    /// </summary>
     static string LocalPath(string uri) =>
-        AhpNames.FilePath(uri) ?? throw new AhpError(AhpErrorCodes.NotFound, $"{uri}: this host serves file: URIs only");
+        AhpNames.FilePath(uri) ?? throw (uri.StartsWith("file:", StringComparison.OrdinalIgnoreCase)
+            ? new AhpError(AhpErrorCodes.PermissionDenied, $"{uri}: this host serves its own files only, by file:///<path> URIs")
+            : new AhpError(AhpErrorCodes.NotFound, $"{uri}: this host serves file: URIs only"));
 
     /// <summary>A file system failure as AHP's error.</summary>
     static AhpError Failure(string uri, Exception e) => e switch

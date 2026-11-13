@@ -17,14 +17,17 @@ public sealed partial class AhpFaceTests
 
     static string Now() => AhpNames.Time(DateTimeOffset.UtcNow);
 
-    /// <summary>Creates a session through the face, as VS Code does, subscribes to it and its chat, and waits until it is ready.</summary>
+    /// <summary>
+    /// Creates a session through the face, as VS Code does (its folder as VS Code writes a <c>file:</c> URI), subscribes to
+    /// it and its chat, and waits until it is ready.
+    /// </summary>
     static async Task<(string Session, string Chat, string Id)> CreateAsync(Rig rig, Peer vscode, string agent, string? folder = null,
         Dictionary<string, JsonElement>? config = null)
     {
         var sessionUri = $"ahp-session:/{Guid.NewGuid()}";
         await vscode.Client.RequestAsync<CreateSessionParams, ListSessionsResult>("createSession", new CreateSessionParams
         {
-            Channel = sessionUri, Provider = agent, WorkingDirectories = folder is null ? null : [AhpNames.FileUri(folder)!], Config = config,
+            Channel = sessionUri, Provider = agent, WorkingDirectories = folder is null ? null : [AhpNamesTests.VsCodeUri(folder)], Config = config,
         }, CancellationToken.None).WaitAsync(Wait);
         var state = (await vscode.SubscribeAsync(sessionUri)).State.Session!;
         var chatUri = AhpNames.ChatOf(sessionUri);
@@ -51,11 +54,14 @@ public sealed partial class AhpFaceTests
     {
         await using var rig = await Rig.StartAsync();
         await using var vscode = await rig.ConnectAsync();
-        var folder = TestDirs.New();
+        // A folder VS Code names with its drive as c%3A, its space, '#' and the rest percent-encoded.
+        var folder = Path.Combine(TestDirs.New(), "My Project #2 Дима");
+        Directory.CreateDirectory(folder);
+        var notes = Path.Combine(folder, "notes 1.md");
         var (sessionUri, chatUri, id) = await CreateAsync(rig, vscode, "claude", folder);
 
         var record = rig.Service.Store.Get(id)!;
-        Assert.AreEqual(Path.GetFullPath(folder).TrimEnd('\\', '/'), record.Cwd, "the folder picked through the host");
+        Assert.AreEqual(Path.GetFullPath(folder), record.Cwd, "the folder picked through the host");
         Assert.IsTrue(record.Draft, "not prompted yet");
         Assert.IsTrue(vscode.Events().Any(e => e.Event is SubscriptionEventSessionAdded added && added.Params.Summary.Resource == sessionUri),
             "the root says it once it is ready");
@@ -64,9 +70,11 @@ public sealed partial class AhpFaceTests
         await LinkHarness.Until(() => vscode.ListAsync().Result.Items.Any(i => i.Resource == AhpNames.SessionUri(other)), "the list read again");
         Assert.IsFalse(vscode.Events().Any(e => e.Event is SubscriptionEventSessionRemoved removed && removed.Params.Session == sessionUri), "the draft stays");
 
-        await Send(vscode, chatUri, "t1", "Port the parser");
+        await Send(vscode, chatUri, "t1", "Port the parser", attachments:
+            [new MessageAttachment(new MessageResourceAttachment { Uri = AhpNamesTests.VsCodeUri(notes), Label = "notes 1.md" })]);
         await TurnEndedAsync(vscode, chatUri, "t1");
-        Assert.AreEqual("Port the parser", rig.Claude.Prompts.Single(p => p.SessionId == id).Text);
+        Assert.AreEqual($"Port the parser\n\n@{AhpNames.FileUri(notes)}", rig.Claude.Prompts.Single(p => p.SessionId == id).Text,
+            "a file attached as the agents see one");
         Assert.IsTrue(vscode.Of<ChatTurnCompleteAction>(chatUri).Any(a => a.TurnId == "t1"));
         Assert.AreEqual("ok", string.Concat(vscode.Of<ChatResponsePartAction>(chatUri).Select(p => p.Part.Value).OfType<MarkdownResponsePart>().Select(p => p.Content))
             + string.Concat(vscode.Of<ChatDeltaAction>(chatUri).Select(d => d.Content)));
@@ -466,11 +474,12 @@ public sealed partial class AhpFaceTests
     {
         await using var rig = await Rig.StartAsync();
         await using var vscode = await rig.ConnectAsync();
-        var folder = TestDirs.New();
+        var folder = Path.Combine(TestDirs.New(), "a b #1 Дима");
         Directory.CreateDirectory(Path.Combine(folder, "src"));
         File.WriteAllText(Path.Combine(folder, "a.txt"), "hello");
         File.WriteAllBytes(Path.Combine(folder, "b.bin"), [0xff, 0xfe, 0x00, 0x01]);
-        string Uri(params string[] parts) => AhpNames.FileUri(Path.Combine([folder, .. parts]))!;
+        // As VS Code names them: file:///c%3A/.../a%20b%20%231%20%D0%94...
+        string Uri(params string[] parts) => AhpNamesTests.VsCodeUri(Path.Combine([folder, .. parts]));
         var ct = CancellationToken.None;
 
         var list = await vscode.Client.ResourceListAsync(new ResourceListParams { Channel = AhpNames.Root, Uri = Uri() }, ct).WaitAsync(Wait);
@@ -491,6 +500,16 @@ public sealed partial class AhpFaceTests
         async Task<int> Code(Func<Task> call) => (await Assert.ThrowsExactlyAsync<AhpRpcException>(call)).Code;
         Assert.AreEqual(AhpErrorCodes.NotFound, await Code(() => vscode.Client.ResourceReadAsync(new ResourceReadParams { Channel = AhpNames.Root, Uri = Uri("missing.txt") }, ct)));
         Assert.AreEqual(AhpErrorCodes.NotFound, await Code(() => vscode.Client.ResourceListAsync(new ResourceListParams { Channel = AhpNames.Root, Uri = "ahp-session:/x" }, ct)));
+        // Another machine's files are not this host's to serve, nor a folder for a session.
+        const string share = "file://server/share/x";
+        Assert.AreEqual(AhpErrorCodes.PermissionDenied, await Code(() => vscode.Client.ResourceListAsync(new ResourceListParams { Channel = AhpNames.Root, Uri = share }, ct)));
+        Assert.AreEqual(AhpErrorCodes.PermissionDenied, await Code(() => vscode.Client.ResourceResolveAsync(new ResourceResolveParams { Channel = AhpNames.Root, Uri = share }, ct)));
+        Assert.AreEqual(AhpErrorCodes.PermissionDenied, await Code(() => vscode.Client.ResourceReadAsync(new ResourceReadParams { Channel = AhpNames.Root, Uri = share }, ct)));
+        Assert.AreEqual(AhpErrorCodes.PermissionDenied, await Code(() => vscode.Client.ResourceMkdirAsync(new ResourceMkdirParams { Channel = AhpNames.Root, Uri = share }, ct)));
+        var elsewhere = $"ahp-session:/{Guid.NewGuid()}";
+        Assert.AreEqual(JsonRpcErrorCodes.InvalidParams, await Code(() => vscode.Client.RequestAsync<CreateSessionParams, ListSessionsResult>("createSession",
+            new CreateSessionParams { Channel = elsewhere, Provider = "claude", WorkingDirectories = [share] }, ct)));
+        Assert.IsFalse(rig.Service.Store.All().Any(r => r.AhpUri == elsewhere), "no session made elsewhere");
         Assert.AreEqual(AhpErrorCodes.PermissionDenied, await Code(() => vscode.Client.ResourceWriteAsync(new ResourceWriteParams
         {
             Channel = AhpNames.Root, Uri = Uri("a.txt"), Data = Convert.ToBase64String(Encoding.UTF8.GetBytes("bye")), Encoding = ContentEncoding.Base64,

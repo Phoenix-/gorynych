@@ -406,7 +406,8 @@ internal sealed partial class AhpFace
             switch (attachment.Value)
             {
                 case MessageResourceAttachment r:
-                    blocks.Add(new JsonObject { ["type"] = "resource_link", ["uri"] = r.Uri, ["name"] = r.Label });
+                    // A file of this host as the agents see one (file:///C:/x, not VS Code's file:///c%3A/x); any other as it came.
+                    blocks.Add(new JsonObject { ["type"] = "resource_link", ["uri"] = AhpNames.FileUri(AhpNames.FilePath(r.Uri)) ?? r.Uri, ["name"] = r.Label });
                     break;
                 case SimpleMessageAttachment simple when simple.Meta?.ContainsKey(CommandMeta) != true && simple.ModelRepresentation is { Length: > 0 } text:
                     blocks.Add(Text(text));
@@ -688,8 +689,11 @@ internal sealed partial class AhpFace
             if (!agentNames.TryGetValue(provider, out var display)) throw new AhpError(AhpErrorCodes.ProviderNotFound, $"No agent {provider} on this host");
             if (sessions.ContainsKey(p.Channel) || chats.ContainsKey(AhpNames.ChatOf(p.Channel)))
                 throw new AhpError(AhpErrorCodes.SessionAlreadyExists, $"Session {p.Channel} exists already");
-            var folder = (p.WorkingDirectories ?? []).Select(AhpNames.FilePath).FirstOrDefault(f => f is not null)
-                ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            // The first folder the host serves; none named, the user's home. Named but none served: refused, not put elsewhere.
+            var folder = p.WorkingDirectories is { Count: > 0 } folders
+                ? folders.Select(AhpNames.FilePath).FirstOrDefault(f => f is not null)
+                    ?? throw new AhpError(JsonRpcErrorCodes.InvalidParams, $"workingDirectories: {folders[0]} is no folder of this host (a file:///<path> URI)")
+                : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             var now = AhpNames.Time(DateTimeOffset.UtcNow);
             var title = $"New {display} session";
             s = new FaceSession(p.Channel, "")

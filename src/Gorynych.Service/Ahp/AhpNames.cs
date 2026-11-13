@@ -54,11 +54,36 @@ internal static class AhpNames
         catch (UriFormatException) { return null; }
     }
 
-    /// <summary>The local path a <c>file:</c> URI names (<c>C:\Users\x</c> for <c>file:///C:/Users/x</c>); null for any other URI.</summary>
+    /// <summary>
+    /// The local path a client's <c>file:</c> URI names (RFC 8089), read as VS Code writes one: <c>file:///c%3A/Users/x</c>
+    /// and <c>file:///C:/Users/x</c> are both <c>C:\Users\x</c> (the drive letter upper-cased, as Windows writes it), the
+    /// path percent-decoded as UTF-8, no trailing separator but a root's. Null for a URI that names no file of this host:
+    /// another scheme, another machine's (<c>file://host/…</c>; <c>localhost</c> is this one), one with a query or a
+    /// fragment, or on Windows one with no drive. .NET's <see cref="Uri"/> is not used: it reads <c>c%3A</c> as no drive.
+    /// </summary>
     public static string? FilePath(string? uri)
     {
-        if (string.IsNullOrEmpty(uri) || !Uri.TryCreate(uri, UriKind.Absolute, out var parsed) || !parsed.IsFile) return null;
-        try { return Path.GetFullPath(parsed.LocalPath); }
+        const string scheme = "file:";
+        if (string.IsNullOrEmpty(uri) || !uri.StartsWith(scheme, StringComparison.OrdinalIgnoreCase)) return null;
+        var rest = uri[scheme.Length..];
+        if (rest.AsSpan().IndexOfAny('?', '#') >= 0) return null;
+        if (rest.StartsWith("//", StringComparison.Ordinal))
+        {
+            var slash = rest.IndexOf('/', 2);
+            var host = slash < 0 ? rest[2..] : rest[2..slash];
+            if (host.Length > 0 && !host.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return null;
+            rest = slash < 0 ? "/" : rest[slash..];
+        }
+        if (!rest.StartsWith('/')) return null;
+        var path = Uri.UnescapeDataString(rest);
+        if (OperatingSystem.IsWindows())
+        {
+            // "/c:/Users/x" or "/c:": a drive, then its path.
+            if (path.Length < 3 || path[0] != '/' || !char.IsAsciiLetter(path[1]) || path[2] != ':' || (path.Length > 3 && path[3] is not ('/' or '\\')))
+                return null;
+            path = $"{char.ToUpperInvariant(path[1])}:\\{path[Math.Min(4, path.Length)..].Replace('/', '\\')}";
+        }
+        try { return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)); }
         catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { return null; }
     }
 

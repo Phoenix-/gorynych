@@ -95,8 +95,21 @@ describes: a host speaks AHP to its clients and ACP to its agents.
 - **A turn** is the `gorynych/promptId` of its prompt when it has one, else the `messageId` of
   its user message, else `agent-<position>` for a turn the agent began itself, `<position>`
   being the `gorynych/position` of its first update.
-- **Folders** are `file:` URIs; on Windows `file:///C:/Users/x` for the service's `C:\Users\x`,
-  both ways. (AHP's `environment.pathStyle` is newer than 1.0.0.)
+- **Folders** are `file:` URIs (RFC 8089; AHP 1.0.0 says nothing more of them). (AHP's
+  `environment.pathStyle` is newer than 1.0.0.)
+  - The face writes the service's `C:\Users\x` as `file:///C:/Users/x`, percent-encoded as .NET
+    encodes a path. VS Code parses a host's URI and compares URIs as URIs, its drive letter and
+    encoding normalized, so this matches its own form.
+  - It reads a client's URI by RFC 8089 itself, not with .NET's `Uri`, which sees no drive in VS
+    Code's `c%3A`. `file:///c%3A/Users/x` (VS Code's form) and `file:///C:/Users/x` are both
+    `C:\Users\x`: the path percent-decoded as UTF-8, the drive letter upper-cased as Windows writes
+    it (an agent keeps a folder's sessions by its path), no trailing separator but a root's.
+    `file://localhost/…` is local.
+  - Refused: another machine's `file://host/share/…`, a URI with a query or a fragment, and on
+    Windows one with no drive. A host serves its own files, and an agent's working folder is a
+    local one: Windows tools take no UNC working folder, and opening one sends the user's
+    credentials to that machine.
+  - A file a message attaches goes to the agent in the face's form, as Zed's do.
 
 ## Connection
 
@@ -421,7 +434,8 @@ Built on 13 November 2026; its live check is to come.
 
 - **Creating and deleting.** `createSession`: the session at the URI its client chose, `creating` at
   once, with its own chat (`ahp-chat:/<id>`, the same `<id>`) open from the start; `session/new` in the
-  agent its `provider` names, in its first working directory (else the user's profile folder), with
+  agent its `provider` names, in the first of its working directories the face serves (none named, the
+  user's profile folder; named but none served, the command fails with `InvalidParams`), with
   `gorynych/ahpUri`; then the options its client chose (below); then `session/ready` and
   `root/sessionAdded`; or `session/creationFailed` with the error. A provider the face does not have is
   `ProviderNotFound`, a URI it has `SessionAlreadyExists`. A turn a client starts while the session is
@@ -432,7 +446,8 @@ Built on 13 November 2026; its live check is to come.
 - **Folders.** On `file:` URIs: `resourceList` (folders first, then files, each by name),
   `resourceResolve` (a file, a folder, or a link when asked not to follow it; links followed to their
   canonical URI), `resourceRead` (UTF-8 text when the file is valid UTF-8 and base64 was not asked for,
-  else base64; at most 16 MB) and `resourceMkdir` (with its parents). Another URI is `NotFound`.
+  else base64; at most 16 MB) and `resourceMkdir` (with its parents). A `file:` URI the face does not
+  serve (see "Identifiers") is `PermissionDenied`; another scheme is `NotFound`.
   `resourceWrite`, `resourceCopy`, `resourceMove`, `resourceDelete`, `resourceRequest` and
   `createResourceWatch` are `PermissionDenied`.
 - **Configuration.**
@@ -525,7 +540,10 @@ Built on 13 November 2026; its live check is to come.
   answer); a cancel and its tail; a cancel right after a message with another model, after its prompt;
   a draft kept while the list changes; a queued message; options, a change Zed sees, a message's model;
   options chosen before a session exists; a session disposed; slash commands; the terminal (made, its
-  line, input taken, disposed); the folder methods and those refused.
+  line, input taken, disposed); the folder methods and those refused. Every folder and file there is
+  named as VS Code names it (`file:///c%3A/…`, spaces, `#` and non-ASCII percent-encoded): the session's
+  folder, an attached file, each `resource*` method; another machine's is refused in each and in
+  `createSession`. `AhpNamesTests` reads such URIs and the face's own back into paths.
 - **Live check.** In VS Code: a Claude session in a folder picked through the host; a prompt; a Write
   approved; a turn cancelled; a Kimi session with its model picked; each visible in Zed; no terminal
   toast.
