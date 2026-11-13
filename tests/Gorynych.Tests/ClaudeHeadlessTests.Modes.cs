@@ -29,8 +29,18 @@ public sealed partial class ClaudeHeadlessTests
         });
 
     static Task<SetSessionConfigOptionResponse> SetModeAsync(TestClient client, string sessionId, string mode) =>
+        SetOptionAsync(client, sessionId, "mode", mode);
+
+    static Task<SetSessionConfigOptionResponse> SetOptionAsync(TestClient client, string sessionId, string configId, string value) =>
         client.Rpc.RequestAsync<SetSessionConfigOptionRequest, SetSessionConfigOptionResponse>(AcpMethods.Agent.SessionSetConfigOption,
-            new SetSessionConfigOptionRequestValueId { SessionId = sessionId, ConfigId = "mode", Value = mode });
+            new SetSessionConfigOptionRequestValueId { SessionId = sessionId, ConfigId = configId, Value = value });
+
+    /// <summary>The text of the user entries in the fake's transcript of a session.</summary>
+    static string FakeTranscript(string dir, string sessionId) =>
+        string.Join("\n", File.ReadAllLines(TranscriptTitles.ExpectedPath(dir, sessionId, Path.Combine(FakeRoot, "projects")))
+            .Select(l => JsonNode.Parse(l)!)
+            .Where(e => (string?)e["type"] == "user")
+            .Select(e => e["message"]?["content"] is JsonValue v && v.TryGetValue<string>(out var s) ? s : ""));
 
     static string[] Ids(IEnumerable<SessionConfigOption>? options) => options?.Select(o => o.Id).ToArray() ?? [];
 
@@ -368,6 +378,58 @@ public sealed partial class ClaudeHeadlessTests
 
         StringAssert.Contains(refused.Message, "did not choose");
         Assert.IsFalse(File.Exists(Path.Combine(dir, "fake.txt")), "nothing ran");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    [DataRow("model", "fast")]
+    [DataRow("reasoning_effort", "low")]
+    [DataRow("mode", "plan")]
+    public async Task ThePromptAfterAnOptionChange_RunsInTheSameClaude(string configId, string value)
+    {
+        // A set_model in a session that has a conversation makes Claude (2.1.302) replay its record of
+        // /model, "<local-command-stdout>Set model to …", under a uuid of its own, with no turn and no
+        // result. Taken for the start of a turn, it held every later prompt of the session for ever.
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        await PromptAsync(client, id, "hello");
+
+        await SetOptionAsync(client, id, configId, value);
+        var next = await PromptAsync(client, id, "again").WaitAsync(TimeSpan.FromSeconds(20));
+
+        Assert.AreEqual(StopReason.EndTurn, next.StopReason);
+        StringAssert.Contains(client.Text(), "echo: again");
+        Assert.AreEqual(1, Controls(id).Count(c => (string?)c["subtype"] == "initialize"), "the same Claude took it");
+        Assert.AreEqual(configId == "model", FakeTranscript(dir, id).Contains("<local-command-stdout>Set model to", StringComparison.Ordinal),
+            "Claude records /model only");
+        Assert.IsFalse(client.Text("user_message_chunk").Contains("Set model", StringComparison.Ordinal), "Claude's record of the command is not shown");
+        Assert.IsFalse(client.Snapshot().Any(u => Mark(u) is not null), "no turn of Claude's own");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AModelChangeWhileAPromptWaitsInClaude_LeavesThatTurnTheClients()
+    {
+        // Claude runs /model at once, so its record can come between a prompt's write and its replay.
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false, stallMs: 10_000)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        await PromptAsync(client, id, "hello");
+        var held = Path.Combine(dir, "init-held");
+        File.WriteAllText(held, ""); // the fake holds the next turn before its replay
+
+        var prompt = PromptAsync(client, id, "again");
+        await Task.Delay(500); // written by now; were the change first, the old fault would hold the prompt instead
+        await SetOptionAsync(client, id, "model", "fast");
+        Assert.IsTrue(FakeTranscript(dir, id).Contains("<local-command-stdout>", StringComparison.Ordinal), "Claude replayed its record before it answered");
+        File.Delete(held);
+
+        Assert.AreEqual(StopReason.EndTurn, (await prompt.WaitAsync(TimeSpan.FromSeconds(20))).StopReason);
+        StringAssert.Contains(client.Text(), "echo: again");
+        Assert.IsFalse(client.Snapshot().Any(u => Mark(u) is not null), "the client's turn, not one of Claude's own");
     }
 
     [TestMethod]
