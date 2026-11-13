@@ -445,7 +445,8 @@ found what the second round fixed: VS Code's form of a `file:` URI (L1), the mod
 the review's items below; an approved tool call VS Code no longer shows once done (L2) is VS Code's
 way, explained under "Limits". A re-check and a third review (13 November) found the rest fixed in a
 third round: the model choice, the terminal limit, file URIs, asks tied to their turn, a new session's
-early updates.
+early updates. A fourth round: agents never seen selectable (L5), a new session's later updates after
+its answer, a queued message's and a stale draft's model, and smaller items.
 
 - **Creating and deleting.** `createSession`: the session at the URI its client chose, `creating` at
   once, with its own chat (`ahp-chat:/<id>`, the same `<id>`) open from the start; `session/new` in the
@@ -458,9 +459,10 @@ early updates.
   conductor lists it the session is a draft: the face keeps it. The conductor lists it once its first
   prompt has made it a session (its promotion); a list read before that does not take it away, nor its
   chat, nor what its agent asks. Closing a draft never prompted (two minutes with no AHP client on it)
-  discards it, as a draft Zed made. What the conductor passes on of a new session before its
-  `session/new` answer reaches the face (its commands, its title, its options) is kept for it, and taken
-  once the face has its ID, before the answer's own options. `disposeSession` is `session/delete`, which
+  discards it, as a draft Zed made. What the conductor passes on of a new session after its answer but
+  before the face has taken the answer (its commands; its title; its options: Claude's adapter says the
+  model Claude reports so, Codex's its settings) is kept for it, and taken after the answer's own
+  options, being newer. (What an agent says before its answer the conductor passes on to no client.) `disposeSession` is `session/delete`, which
   deletes the session in its agent where the agent can, as a delete from Zed does, then
   `root/sessionRemoved`; the children the face had open, which a delete leaves, are closed.
 - **Folders.** On `file:` URIs: `resourceList` (folders first, then files, each by name),
@@ -487,23 +489,35 @@ early updates.
   - The model is AHP's own: the choices of the model option are the agent's `AgentInfo.models` (`id`
     the ACP value, its name, its description in `_meta`), from the latest session of that agent the face
     has seen, and `root/agentsChanged` says when they change.
+  - **Never none.** VS Code disables an agent whose `models` is empty ("No models are available for this
+    agent"; live check, right after a start, for every agent but the one the window had made a draft
+    of). So the face keeps each agent's models, and its options' schema, in its own state file in the
+    data folder (`ahp-face.json`), written when they change and read at its start; and an agent it knows
+    nothing of has one model, `gorynych/agent-default` ("Agent's default"), which is no value of any
+    agent's model option, so the face never sets it on a session: the agent keeps its own default.
+    ACP has no way to learn an agent's models without a session, and a session made only to ask would
+    be a session in the agent's own list (Claude's and Codex's keep every one), so the face makes none.
   - The session's model is in its chat's draft (`chat/draftChanged`, the draft's text left alone), as
     VS Code's model picker takes a chat's model from its draft (else from its last turn's message, else
     its own default, its first model: "Default (recommended)" for Claude). The face puts it there when the
     chat has no draft and when the model changes, from any client.
   - VS Code's picker shows the draft's model and follows it live (its live check: a change made in Zed
     showed in the window at once), and it sends its model with every message: the session's own, unless
-    its user picked another. A message's `model` is set with `session/set_config_option` before its
-    prompt when it is one of the session's models and not its current one; a set that fails ends the turn
-    with the error. Nothing is remembered of a pick, for a client or a chat: once set it is the session's
-    model, which the draft offers again; a set that failed leaves the session's, so the same pick again is
-    set again. A window that reloads, or a second window, reads the same draft. (The second round also
-    counted as a pick only a model other than the one the chat's clients sent last; with the draft
-    followed live that is the session's model, so the rule added nothing, and its memory per chat broke
-    the cases the third review named.)
+    its user picked another. A message's `model` is a pick when it is another than the session's model
+    when the message was written: sent (`chat/turnStarted`), or queued (`chat/pendingMessageSet`, whose
+    model is compared with the session's then, not when it starts, so a change made elsewhere while it
+    waits stands). A pick is set with `session/set_config_option` before its prompt when it is one of
+    the session's models and not its current one; a set that fails ends the turn with the error. While
+    the session's model is not known (its agent said none) no model is set: the window's fallback is no
+    pick. Nothing is remembered of a pick: once set it is the session's model, which the draft offers
+    again; a set that failed leaves the session's, so the same pick again is set again. A window that
+    reloads, or a second window, reads the same draft.
+  - A client's draft (`chat/draftChanged`) that carries the model the face offered before the current
+    one was built before the client took the offer: the face offers the session's model in it again,
+    its text kept. A cleared draft gets the session's model again.
   - **Before a session exists** (the open question of this step): `resolveSessionConfig` answers the
-    options of the latest session of that agent the face has seen while the service runs (none before
-    it has seen one), with only the values the client gave that those options take. A new session gets
+    options of the latest session of that agent the face has seen (kept across restarts; none before
+    it has ever seen one), with only the values the client gave that those options take. A new session gets
     its agent's own defaults, and the values the client chose are set on it after `session/new`, before
     `session/ready`. Not a draft session to ask: VS Code asks again at each change in its picker, and a
     draft would start the agent each time.
@@ -525,7 +539,8 @@ early updates.
     which the conductor would then run: it cancels only the prompts that came before a cancel. The turn is over for its clients at
     once; what its agent still sends of it is left out until the end mark of its prompt comes (or
     another turn's user message, or 10 s of quiet).
-  - Queued and steering messages (`chat/pendingMessageSet`) stay in the chat, and the face starts the
+  - Queued and steering messages (`chat/pendingMessageSet`) stay in the chat (with the session's model
+    then, for their own model's sake, above), and the face starts the
     next when no turn runs: `chat/pendingMessageRemoved`, then `chat/turnStarted` with `queuedMessageId`,
     then the prompt; a steering message first (the face cannot put one into a running turn, so it goes
     next), then the queue in order, after a turn however it ended. The face holds them rather than send
@@ -598,7 +613,11 @@ early updates.
   kept past 32, one with no URI refused. From the third round: a model picked again after a change
   elsewhere, after a failed set, and a second window's followed model; an ask whose handler runs after
   its cancelled turn ended; a new terminal kept though every older one is shown; what an agent says of a
-  new session right after its answer; a file URI's `%` escaped; a real path through links.
+  new session right after its answer; a file URI's `%` escaped; a real path through links. From the
+  fourth: an agent never seen has its default as its one model, never set; models and options kept across
+  a restart; options said right after a new session's answer win over the answer's; a queued message's
+  model against the model when it was queued; a client's stale draft given the session's model again;
+  no file URI for a drive-relative or device path.
 - **Live check.** In VS Code: a Claude session in a folder picked through the host; a prompt; a Write
   approved; a turn cancelled; a Kimi session with its model picked; each visible in Zed; no terminal
   toast.

@@ -62,9 +62,11 @@ internal static class AhpNames
             if (path.StartsWith(@"\\", StringComparison.Ordinal) && path.Length > 2) // another machine's share
             {
                 var host = path[2..].Split('\\', 2);
+                if (host[0] is "?" or "." || host[0].Length == 0) return null; // a device path (\\?\x, \\.\x) names no file a URI can
                 return $"file://{Uri.EscapeDataString(host[0])}/{(host.Length > 1 ? Segments(host[1]) : "")}";
             }
-            if (path.Length < 2 || !char.IsAsciiLetter(path[0]) || path[1] != ':') return null;
+            // A drive's path; not one relative to a drive's current folder (C:x, C:).
+            if (path.Length < 3 || !char.IsAsciiLetter(path[0]) || path[1] != ':' || path[2] is not ('\\' or '/')) return null;
             return $"file:///{char.ToUpperInvariant(path[0])}:/{Segments(path[2..].TrimStart('\\', '/'))}";
         }
         return path.StartsWith('/') ? $"file:///{Segments(path[1..])}" : null;

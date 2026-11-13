@@ -82,6 +82,8 @@ public sealed class AhpNamesTests
             Assert.AreEqual("file:///C:/x/100%2541%20a%23b", AhpNames.FileUri(@"C:\x\100%41 a#b"));
             Assert.AreEqual("file:///C:/", AhpNames.FileUri(@"C:\"));
             Assert.AreEqual("file://server/share/x", AhpNames.FileUri(@"\\server\share\x"));
+            foreach (var odd in new[] { "C:x", "C:", @"\\?\C:\x", @"\\.\pipe\x", @"\\" })
+                Assert.IsNull(AhpNames.FileUri(odd), odd); // relative to a drive's current folder, or a device's
         }
         else
         {

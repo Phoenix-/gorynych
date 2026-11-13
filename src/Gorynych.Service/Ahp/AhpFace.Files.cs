@@ -21,7 +21,7 @@ internal sealed partial class AhpFace
         public string Uri { get; } = uri;
         public TerminalState State { get; } = state;
         public long BaseSeq { get; } = baseSeq;
-        public DateTimeOffset Made { get; } = DateTimeOffset.UtcNow;
+        public long Made { get; } = System.Diagnostics.Stopwatch.GetTimestamp(); // monotonic: a clock set back does not stop its ageing
     }
 
 
@@ -36,7 +36,9 @@ internal sealed partial class AhpFace
     /// and toasts an error when it cannot; this one answers, shows one line saying the host has no shell, and is
     /// <c>exited</c> from the start (no process ever ran, so it reports no exit code). The window keeps it as a tab
     /// with that line: it acts on a <c>terminal/exited</c> action, not on the state it subscribes to, and a later
-    /// action would close the tab at once. It stays until <c>disposeTerminal</c>; past 32, the oldest no client shows goes.
+    /// action would close the tab at once. It stays until <c>disposeTerminal</c>; past 32, the oldest no client shows
+    /// goes, but never one younger than <see cref="AhpFaceOptions.TerminalYoung"/> (30 s), this one above all: its client
+    /// subscribes only once this answers.
     /// </summary>
     JsonElement? CreateTerminal(CreateTerminalParams p)
     {
@@ -56,9 +58,8 @@ internal sealed partial class AhpFace
             terminalOrder.Add(p.Channel);
             // Past the limit the oldest a client does not show goes; one shown stays until it is disposed, and a young one
             // (this one above all) until its client could subscribe.
-            var now = DateTimeOffset.UtcNow;
             while (terminalOrder.Count > TerminalsKept
-                && terminalOrder.FirstOrDefault(t => t != p.Channel && now - terminals[t].Made >= options.TerminalYoung
+                && terminalOrder.FirstOrDefault(t => t != p.Channel && System.Diagnostics.Stopwatch.GetElapsedTime(terminals[t].Made) >= options.TerminalYoung
                     && !connections.Any(c => c.Subscriptions.Contains(t))) is { } unseen)
             {
                 terminals.Remove(unseen);

@@ -17,6 +17,12 @@ internal sealed class AhpFaceOptions
     /// <summary>How long a session the face loaded stays open with no AHP client on its chat.</summary>
     public TimeSpan CloseAfter { get; init; } = TimeSpan.FromMinutes(2);
 
+    /// <summary>
+    /// The face's own state file (each agent's models and options schema, kept across restarts); none in tests that
+    /// do not ask for one.
+    /// </summary>
+    public string? StateFile { get; init; }
+
     /// <summary>How long a new terminal is kept whatever the limit: its client subscribes once its creation is answered.</summary>
     public TimeSpan TerminalYoung { get; init; } = TimeSpan.FromSeconds(30);
 
@@ -136,11 +142,13 @@ internal sealed partial class AhpFace : IAsyncDisposable
             lock (gate)
             {
                 foreach (var (name, display) in agents) agentNames[name] = display;
+                LoadState();
                 root = new RootState
                 {
                     Agents = [.. agents.Select(a => new AgentInfo
                     {
-                        Provider = a.Name, DisplayName = a.Display, Description = $"{a.Display} through Gorynych", Models = [],
+                        // Never none: VS Code disables an agent with no models.
+                        Provider = a.Name, DisplayName = a.Display, Description = $"{a.Display} through Gorynych", Models = ModelInfos(a.Name),
                         // Without it VS Code shows a session's chats that came from a tool or a side chat only, so not its children (docs/ahp-face.md).
                         Capabilities = new AgentCapabilities { MultipleChats = new MultipleChatsCapability() },
                     })],
@@ -378,6 +386,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
         public bool Prompted; // a draft whose first prompt went to the conductor, which lists it once it has promoted it
         public Task Created = Task.CompletedTask; // its session/new, for one created through the face
         public Task Written = Task.CompletedTask; // the last step the face queued to write to the conductor for it
+        public Task Archives = Task.CompletedTask; // the last archive or unarchive the face queued for it
         public JsonArray? AcpOptions; // its agent's config options, as it last said them
         public JsonObject? AcpModes; // its agent's modes, as it last said them
         public bool ModesAsMode; // its modes are the config property "mode"
@@ -416,6 +425,8 @@ internal sealed partial class AhpFace : IAsyncDisposable
         public string? ReadOnlyReason;
         public List<(string Name, string? Description)> Commands = []; // its agent's commands, for completions
         public string? Offered; // the session's model as the face last put it in the chat's draft
+        public string? PreviousOffer; // the one it offered before that: a client's draft that says it was built before the offer
+        public readonly Dictionary<string, string?> QueuedOn = new(StringComparer.Ordinal); // a waiting message -> the session's model when it came
     }
 
     /// <summary>Takes the conductor's list: sessions and children that came, went or changed, said to the clients.</summary>
@@ -1058,7 +1069,8 @@ internal sealed partial class AhpFace : IAsyncDisposable
                     else if (request.Method is "resourceList" or "resourceResolve" or "resourceRead" or "resourceMkdir" && c.Initialized)
                         _ = Task.Run(async () =>
                         {
-                            await c.Files.WaitAsync();
+                            try { await c.Files.WaitAsync(c.Ended.Token); }
+                            catch (OperationCanceledException) { return; } // its client went while it waited
                             try { await AnswerAsync(c, request, () => CommandAsync(c, request)); }
                             finally { c.Files.Release(); }
                         });
@@ -1071,6 +1083,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
         {
             lock (gate) connections.Remove(c);
             c.Complete();
+            try { c.Ended.Cancel(); } catch (ObjectDisposedException) { } // what it asked and still waits goes
             try { await c.Sending.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
         }
     }
@@ -1500,7 +1513,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
                         ConfigChanged(c, s, p.Action, config, origin);
                         return;
                     case SessionIsArchivedChangedAction archive:
-                        ArchiveAsync(c, p.Channel, p.Action, origin, s.SessionId, archive.IsArchived);
+                        ArchiveAsync(p.Channel, p.Action, origin, s, null, archive.IsArchived);
                         return;
                     case SessionIsReadChangedAction read:
                         ApplySession(s, read, origin);
@@ -1528,9 +1541,10 @@ internal sealed partial class AhpFace : IAsyncDisposable
                     return;
                 case ChatDraftChangedAction when chat.Model is not null:
                     ApplyChat(chat, action, origin);
+                    OfferModel(chat); // a draft cleared, or one with a model offered before: the session's again
                     return;
                 case ChatIsArchivedChangedAction archive when chat.IsChild && chat.Model is not null:
-                    ArchiveAsync(c, p.Channel, p.Action, origin, chat.SessionId, archive.IsArchived);
+                    ArchiveAsync(p.Channel, p.Action, origin, chat.Session, chat, archive.IsArchived);
                     return;
                 case ChatTurnStartedAction started:
                     TurnStarted(c, chat, p.Action, started, origin);
@@ -1569,17 +1583,20 @@ internal sealed partial class AhpFace : IAsyncDisposable
     /// matches its pending actions to the echoes in that order); then <c>_gorynych/archive</c>. One the service refuses
     /// goes back, by the host.
     /// </summary>
-    void ArchiveAsync(Connection c, string channel, StateAction action, ActionOrigin origin, string sessionId, bool archived)
+    /// <param name="child">The child whose chat it is; null for the session itself.</param>
+    void ArchiveAsync(string channel, StateAction action, ActionOrigin origin, FaceSession s, FaceChat? child, bool archived)
     {
         SetArchivedHere(channel, archived, action.Value!, origin);
-        var s = sessions.TryGetValue(channel, out var session) ? session : chats[channel].Session;
-        // In the session's write order, so an archive and an unarchive reach the service in the order they came.
-        _ = Write(s, async () =>
+        // In an order of the session's archives own, so an archive and an unarchive reach the service in the order they
+        // came, and no prompt or cancel waits for one; the ID taken then, of a session that was being made.
+        var step = s.Archives.ContinueWith(async _ =>
         {
+            await s.Created;
+            var sessionId = child?.SessionId ?? s.SessionId;
             try
             {
+                if (sessionId.Length == 0) throw new IOException("the session could not be made");
                 await acp!.SendRequestAsync(GorynychProtocol.MethodArchive, new JsonObject { ["sessionId"] = sessionId, ["archived"] = archived }, stopping.Token);
-                return true;
             }
             catch (Exception e) when (e is IOException or JsonRpcException or OperationCanceledException)
             {
@@ -1591,9 +1608,9 @@ internal sealed partial class AhpFace : IAsyncDisposable
                         : new ChatIsArchivedChangedAction { IsArchived = !archived };
                     SetArchivedHere(channel, !archived, back, null, only: archived);
                 }
-                return false;
             }
-        });
+        }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default).Unwrap();
+        s.Archives = step.ContinueWith(_ => { }, TaskScheduler.Default);
     }
 
     /// <summary>Under the gate: a session's or a child's archive as the face shows it; <paramref name="only"/> when it is still so.</summary>

@@ -89,6 +89,9 @@ internal sealed partial class AhpFace
         return await ask.Answer.Task;
     }
 
+    /// <summary>For tests: runs once a session/new the face sent is answered, before the face takes the answer.</summary>
+    internal Func<Task>? NewAnswered;
+
     /// <summary>For tests: runs as an ask's handler begins, as a busy thread pool would delay it.</summary>
     internal Func<Task>? AskHandling;
 
@@ -121,7 +124,12 @@ internal sealed partial class AhpFace
     {
         var ask = new FaceAsk($"ask-{++asks}", form, Text(@params["sessionId"])!, (JsonObject)@params.DeepClone());
         requests[ask.Id] = ask;
-        Show(ask);
+        try { Show(ask); }
+        catch
+        {
+            requests.Remove(ask.Id);
+            throw;
+        }
         return ask;
     }
 
@@ -395,7 +403,7 @@ internal sealed partial class AhpFace
         ApplyChat(chat, x, origin);
         chat.Model!.ClientTurnStarted(x.TurnId);
         Unread(chat.Session);
-        Prompt(chat, x.TurnId, x.Message);
+        Prompt(chat, x.TurnId, x.Message, CurrentModel(chat.Session));
         Sync(chat.Session);
     }
 
@@ -405,14 +413,21 @@ internal sealed partial class AhpFace
     /// prompt, with the turn's ID as its <c>gorynych/promptId</c>, whose end mark ends the turn. A prompt that fails
     /// before its agent could mark its end (a restart refused it) ends its turn with the error.
     /// </summary>
-    void Prompt(FaceChat chat, string turnId, Message message)
+    /// <param name="basis">
+    /// The session's model when the message was written (sent, or queued): its model is set only when it is another, a
+    /// pick of its user; null when the session's was not known yet (the session being made), then its model once known.
+    /// </param>
+    void Prompt(FaceChat chat, string turnId, Message message, string? basis)
     {
         var s = chat.Session;
         var started = Write(s, async () =>
         {
             await s.Created; // a session still being made: its first prompt waits for it
             if (s.SessionId.Length == 0) throw new JsonRpcException(JsonRpcException.InternalError, "The session could not be created");
-            if (message.Model?.Id is { Length: > 0 } model) await UseModelAsync(s, model);
+            string? current;
+            lock (gate) current = CurrentModel(s);
+            // While the session's model is not known no model is set: VS Code's fallback is no pick.
+            if (message.Model?.Id is { Length: > 0 } model && current is not null && model != (basis ?? current)) await UseModelAsync(s, model);
             var @params = new JsonObject
             {
                 ["sessionId"] = s.SessionId, ["prompt"] = Blocks(message),
@@ -529,6 +544,7 @@ internal sealed partial class AhpFace
             return;
         }
         ApplyChat(chat, x, origin);
+        chat.QueuedOn[x.Id] = CurrentModel(chat.Session); // what its picker's model is a pick against, when it starts later
         ConsumeQueued(chat);
         Sync(chat.Session);
     }
@@ -543,6 +559,7 @@ internal sealed partial class AhpFace
             return;
         }
         ApplyChat(chat, x, origin);
+        chat.QueuedOn.Remove(x.Id);
     }
 
     /// <summary>
@@ -562,7 +579,7 @@ internal sealed partial class AhpFace
         ApplyChat(chat, new ChatTurnStartedAction { TurnId = turnId, StartedAt = AhpNames.Time(DateTimeOffset.UtcNow), Message = next.Message, QueuedMessageId = next.Id });
         model.ClientTurnStarted(turnId);
         Unread(chat.Session);
-        Prompt(chat, turnId, next.Message);
+        Prompt(chat, turnId, next.Message, chat.QueuedOn.Remove(next.Id, out var queuedOn) ? queuedOn : null);
     }
 
     // ---------------------------------------------------------------- configuration
@@ -586,6 +603,7 @@ internal sealed partial class AhpFace
         }
         if (config is null) return;
         agentConfigs[s.Agent] = Clone(config);
+        SchemaSeen(s.Agent, config.Schema);
         if (s.State.Config is not { } had)
         {
             s.State.Config = config;
@@ -612,9 +630,11 @@ internal sealed partial class AhpFace
     /// </summary>
     void OfferModel(FaceChat chat)
     {
-        if (chat.IsChild || chat.Model is not { } model || AhpConfig.Model(chat.Session.AcpOptions)?.Current is not { Length: > 0 } current) return;
+        if (chat.IsChild || chat.Model is not { } model || CurrentModel(chat.Session) is not { } current) return;
         var draft = model.State.Draft;
-        if (draft is not null && (chat.Offered == current || draft.Model?.Id == current))
+        // A client's draft with the model offered before this one was built before it saw the offer: offered again.
+        var stale = draft?.Model?.Id is { } drafted && drafted != current && drafted == chat.PreviousOffer;
+        if (draft is not null && !stale && (chat.Offered == current || draft.Model?.Id == current))
         {
             chat.Offered = current;
             return;
@@ -622,8 +642,12 @@ internal sealed partial class AhpFace
         var offered = draft is null ? new Message { Text = "", Origin = new MessageOrigin { Kind = MessageKind.User } } : Clone(draft);
         offered.Model = new ModelSelection { Id = current };
         ApplyChat(chat, new ChatDraftChangedAction { Draft = offered });
+        if (chat.Offered != current) chat.PreviousOffer = chat.Offered;
         chat.Offered = current;
     }
+
+    /// <summary>The session's model, as its agent last said it; null when it has none, or did not say it.</summary>
+    static string? CurrentModel(FaceSession s) => AhpConfig.Model(s.AcpOptions)?.Current is { Length: > 0 } current ? current : null;
 
     /// <summary>Under the gate: the agent's mode changed (<c>current_mode_update</c>).</summary>
     void ModeChanged(FaceSession s, string? modeId)
@@ -639,16 +663,13 @@ internal sealed partial class AhpFace
     /// <summary>Under the gate: the models the face has seen for an agent, in the root's agents when they changed.</summary>
     void ModelsSeen(string agent, List<AhpConfig.Choice> models)
     {
-        if (agentModels.TryGetValue(agent, out var had) && had.SequenceEqual(models)) return;
+        if (models.Count == 0 || (agentModels.TryGetValue(agent, out var had) && had.SequenceEqual(models))) return;
         agentModels[agent] = models;
+        SaveState();
         var agents = root.Agents.Select(a => a.Provider != agent ? a : new AgentInfo
         {
             Provider = a.Provider, DisplayName = a.DisplayName, Description = a.Description, Capabilities = a.Capabilities,
-            Models = [.. models.Select(m => new SessionModelInfo
-            {
-                Id = m.Value, Provider = agent, Name = m.Name,
-                Meta = m.Description is { } d ? new Dictionary<string, JsonElement>(StringComparer.Ordinal) { ["description"] = AhpNames.Element(JsonValue.Create(d)) } : null,
-            })],
+            Models = ModelInfos(agent),
         }).ToList();
         var action = new StateAction(new RootAgentsChangedAction { Agents = agents });
         Broadcast(AhpNames.Root, action);
@@ -849,6 +870,7 @@ internal sealed partial class AhpFace
                         });
                 return;
             }
+            if (NewAnswered is { } answered) await answered();
             if (Text(answer?["sessionId"]) is not { Length: > 0 } id)
             {
                 lock (gate)
@@ -873,9 +895,10 @@ internal sealed partial class AhpFace
                 sessionsById[id] = s;
                 chatsById[id] = own;
                 ApplySession(s, new SessionMetaChangedAction { Meta = MetaOf(s) });
-                // What its agent said of it before its answer came (its commands, its title), then the answer's options, newer.
-                if (unclaimed.Remove(id, out var early)) foreach (var update in early) TakeUpdate(own, update);
-                OptionsChanged(s, answer?["configOptions"]?.DeepClone() as JsonArray ?? s.AcpOptions, answer?["modes"]?.DeepClone() as JsonObject ?? s.AcpModes);
+                // The answer's options, then what the conductor passed on after the answer before the face had the ID (its
+                // commands, its title, newer options: Claude's adapter says its real model so, Codex its settings).
+                OptionsChanged(s, answer?["configOptions"]?.DeepClone() as JsonArray, answer?["modes"]?.DeepClone() as JsonObject);
+                if (unclaimed.Remove(id, out var later)) foreach (var update in later) TakeUpdate(own, update);
                 var config = s.State.Config;
                 changes = config is null ? [] : [.. wanted.Where(w => AhpConfig.Takes(config, w.Key, w.Value) && !AhpConfig.Same(config.Values.GetValueOrDefault(w.Key), w.Value))];
                 foreach (var ask in requests.Values.Where(r => r.Chat is null && r.SessionId == id).ToList()) Show(ask);

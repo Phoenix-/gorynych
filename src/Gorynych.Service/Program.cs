@@ -161,7 +161,7 @@ return hostPipeFailed ? 1 : 0;
 static async Task<AhpFaceRun?> AhpFaceStart(CommandLine line, string dataDirectory, Conductor conductor)
 {
     if (CommandLine.AhpPortOf(line.Value("--ahp")) is not { } port) return null;
-    var face = new Gorynych.Service.Ahp.AhpFace(conductor);
+    var face = new Gorynych.Service.Ahp.AhpFace(conductor, new Gorynych.Service.Ahp.AhpFaceOptions { StateFile = Path.Combine(dataDirectory, "ahp-face.json") });
     conductor.AhpStatus = face.Status;
     try
     {
