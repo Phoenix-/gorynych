@@ -458,9 +458,28 @@ public sealed partial class AhpFaceTests
         var again = await Assert.ThrowsExactlyAsync<AhpRpcException>(() => vscode.Client.RequestAsync<CreateTerminalParams, ListSessionsResult>("createTerminal",
             new CreateTerminalParams { Channel = terminal, Claim = claim }, CancellationToken.None));
         Assert.AreEqual(AhpErrorCodes.AlreadyExists, again.Code);
+        var nameless = await Assert.ThrowsExactlyAsync<AhpRpcException>(() => vscode.Client.RequestAsync<CreateTerminalParams, ListSessionsResult>("createTerminal",
+            new CreateTerminalParams { Channel = "", Claim = claim }, CancellationToken.None));
+        Assert.AreEqual(JsonRpcErrorCodes.InvalidParams, nameless.Code);
+
+        // Its title is the catalog's too.
+        await raw.AnswerAsync(await raw.RequestAsync("dispatchAction", new JsonObject
+        {
+            ["channel"] = terminal, ["clientSeq"] = 2, ["action"] = new JsonObject { ["type"] = "terminal/titleChanged", ["title"] = "Renamed" },
+        }));
+        await LinkHarness.Until(() => vscode.Of<RootTerminalsChangedAction>(AhpNames.Root).Last().Terminals.Single(t => t.Resource == terminal).Title == "Renamed", "the catalog has its title");
+        // Past 32 terminals the oldest no client shows goes, not one shown.
+        for (var i = 0; i < 32; i++)
+            await vscode.Client.RequestAsync<CreateTerminalParams, ListSessionsResult>("createTerminal",
+                new CreateTerminalParams { Channel = $"agenthost-terminal:/n{i}", Claim = claim }, CancellationToken.None).WaitAsync(Wait);
+        await LinkHarness.Until(() => vscode.Of<RootTerminalsChangedAction>(AhpNames.Root).Last().Terminals.Any(t => t.Resource == "agenthost-terminal:/n31"), "all made");
+        var kept = vscode.Of<RootTerminalsChangedAction>(AhpNames.Root).Last().Terminals.Select(t => t.Resource).ToList();
+        Assert.AreEqual(32, kept.Count);
+        Assert.IsTrue(kept.Contains(terminal), "the one shown stays");
+        Assert.IsFalse(kept.Contains("agenthost-terminal:/n0"), "the oldest not shown went");
 
         await vscode.Client.RequestAsync<DisposeTerminalParams, ListSessionsResult>("disposeTerminal", new DisposeTerminalParams { Channel = terminal }, CancellationToken.None).WaitAsync(Wait);
-        await LinkHarness.Until(() => vscode.Of<RootTerminalsChangedAction>(AhpNames.Root).Last().Terminals.Count == 0, "out of the catalog");
+        await LinkHarness.Until(() => !vscode.Of<RootTerminalsChangedAction>(AhpNames.Root).Last().Terminals.Any(t => t.Resource == terminal), "out of the catalog");
         var (_, gone) = await raw.AnswerAsync(await raw.RequestAsync("subscribe", new JsonObject { ["channel"] = terminal }));
         Assert.AreEqual(AhpErrorCodes.SessionNotFound, (int?)gone["error"]?["code"]);
         var disposedTwice = await Assert.ThrowsExactlyAsync<AhpRpcException>(() => vscode.Client.RequestAsync<DisposeTerminalParams, ListSessionsResult>("disposeTerminal",

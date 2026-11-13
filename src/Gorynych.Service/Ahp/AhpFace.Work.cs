@@ -21,6 +21,14 @@ internal sealed partial class AhpFace
     readonly Dictionary<string, SessionConfigState> agentConfigs = new(StringComparer.Ordinal); // agent -> the options of its latest session seen
     readonly Dictionary<string, List<AhpConfig.Choice>> agentModels = new(StringComparer.Ordinal); // agent -> its models, as last seen
     long asks;
+    int making; // sessions in session/new
+    readonly Dictionary<string, List<(string Name, string? Description)>> unclaimedCommands = new(StringComparer.Ordinal); // their commands, said early
+
+    /// <summary>An agent's commands (<c>available_commands_update</c>), for completions.</summary>
+    static List<(string Name, string? Description)> Commands(JsonObject update) =>
+        [.. (update["availableCommands"] as JsonArray ?? []).OfType<JsonObject>()
+            .Where(c => AhpNames.Text(c["name"]) is { Length: > 0 })
+            .Select(c => (AhpNames.Text(c["name"])!, AhpNames.Text(c["description"])))];
 
     static T Clone<T>(T value) => Json.Deserialize<T>(Json.SerializeToElement(value))!;
 
@@ -99,6 +107,12 @@ internal sealed partial class AhpFace
             if (chat?.Loading is null) Resolve(ask, ask.Cancelled());
             return;
         }
+        if (model.Settling)
+        {
+            // Asked under a turn a client cancelled: ACP has a cancelling client answer it so, and no turn here would show it.
+            Resolve(ask, ask.Cancelled());
+            return;
+        }
         ask.Chat = chat;
         SessionInputRequest needed;
         if (ask.Form)
@@ -142,6 +156,7 @@ internal sealed partial class AhpFace
         }
         ask.Needed = true;
         ApplySession(chat.Session, new SessionInputNeededSetAction { Request = needed });
+        Unread(chat.Session);
         if (model.Unmarked) ScheduleQuiet(chat); // a turn it opened ends once the session goes quiet after the answer
         Sync(chat.Session);
     }
@@ -329,12 +344,12 @@ internal sealed partial class AhpFace
         : chat.Session.State.Lifecycle == SessionLifecycle.Failed ? "This session could not be created"
         : null;
 
-    /// <summary>A turn that starts makes its session unread, as the chat reducer makes the chat.</summary>
-    void TurnBegan(FaceChat chat)
+    /// <summary>A turn that starts, or a question it asks, makes its session unread, as the chat reducer makes the chat.</summary>
+    void Unread(FaceSession s)
     {
-        if (!chat.Session.IsRead) return;
-        chat.Session.IsRead = false;
-        ApplySession(chat.Session, new SessionIsReadChangedAction { IsRead = false });
+        if (!s.IsRead) return;
+        s.IsRead = false;
+        ApplySession(s, new SessionIsReadChangedAction { IsRead = false });
     }
 
     /// <summary>A client's message: its turn, and <c>session/prompt</c> with the turn's ID as the prompt's.</summary>
@@ -351,8 +366,8 @@ internal sealed partial class AhpFace
         }
         ApplyChat(chat, x, origin);
         chat.Model!.ClientTurnStarted(x.TurnId);
-        TurnBegan(chat);
-        Prompt(chat, x.TurnId, x.Message);
+        Unread(chat.Session);
+        Prompt(chat, x.TurnId, x.Message, Chosen(chat, x.Message));
         Sync(chat.Session);
     }
 
@@ -362,21 +377,23 @@ internal sealed partial class AhpFace
     /// prompt, with the turn's ID as its <c>gorynych/promptId</c>, whose end mark ends the turn. A prompt that fails
     /// before its agent could mark its end (a restart refused it) ends its turn with the error.
     /// </summary>
-    void Prompt(FaceChat chat, string turnId, Message message)
+    void Prompt(FaceChat chat, string turnId, Message message, string? chosen)
     {
         var s = chat.Session;
         var started = Write(s, async () =>
         {
             await s.Created; // a session still being made: its first prompt waits for it
             if (s.SessionId.Length == 0) throw new JsonRpcException(JsonRpcException.InternalError, "The session could not be created");
-            if (message.Model?.Id is { Length: > 0 } model) await UseModelAsync(s, model);
+            if (chosen is not null) await UseModelAsync(s, chosen);
             var @params = new JsonObject
             {
                 ["sessionId"] = s.SessionId, ["prompt"] = Blocks(message),
                 ["_meta"] = new JsonObject { [GorynychProtocol.MetaPromptId] = turnId },
             };
             var response = await acp!.StartRequestAsync(AcpMethods.Agent.SessionPrompt, @params, stopping.Token);
-            lock (gate) s.Draft = false; // prompted: the conductor keeps it now, and lists it
+            // Prompted: the conductor keeps it now, and lists it once it has made it a session; a draft until then, which
+            // a list read before that does not take away.
+            lock (gate) s.Prompted = true;
             return response;
         });
         _ = Task.Run(async () =>
@@ -516,8 +533,8 @@ internal sealed partial class AhpFace
         ApplyChat(chat, new ChatPendingMessageRemovedAction { Kind = kind, Id = next.Id });
         ApplyChat(chat, new ChatTurnStartedAction { TurnId = turnId, StartedAt = AhpNames.Time(DateTimeOffset.UtcNow), Message = next.Message, QueuedMessageId = next.Id });
         model.ClientTurnStarted(turnId);
-        TurnBegan(chat);
-        Prompt(chat, turnId, next.Message);
+        Unread(chat.Session);
+        Prompt(chat, turnId, next.Message, Chosen(chat, next.Message));
     }
 
     // ---------------------------------------------------------------- configuration
@@ -534,7 +551,11 @@ internal sealed partial class AhpFace
         s.AcpModes = modes;
         var config = AhpConfig.Of(options, modes, out var modesAsMode);
         s.ModesAsMode = modesAsMode;
-        if (AhpConfig.Model(options) is { } model) ModelsSeen(s.Agent, model.Models);
+        if (AhpConfig.Model(options) is { } model)
+        {
+            ModelsSeen(s.Agent, model.Models);
+            OfferModel(s.Chats[0]);
+        }
         if (config is null) return;
         agentConfigs[s.Agent] = Clone(config);
         if (s.State.Config is not { } had)
@@ -552,6 +573,42 @@ internal sealed partial class AhpFace
         var changed = config.Values.Where(v => !had.Values.TryGetValue(v.Key, out var was) || !AhpConfig.Same(was, v.Value))
             .ToDictionary(v => v.Key, v => v.Value, StringComparer.Ordinal);
         if (changed.Count > 0) ApplySession(s, new SessionConfigChangedAction { Config = changed });
+    }
+
+    /// <summary>
+    /// Under the gate: the session's model, in its chat's draft (<c>chat/draftChanged</c>), where a client's model picker
+    /// takes it from (VS Code's reads the draft's model, else its last turn's, else its own default). The face puts it
+    /// there when the chat has no draft and when the model changed; the draft's text, and a model a client chose in it,
+    /// are left alone otherwise.
+    /// </summary>
+    void OfferModel(FaceChat chat)
+    {
+        if (chat.IsChild || chat.Model is not { } model || AhpConfig.Model(chat.Session.AcpOptions)?.Current is not { Length: > 0 } current) return;
+        var draft = model.State.Draft;
+        if (draft is not null && (chat.Offered == current || draft.Model?.Id == current))
+        {
+            chat.Offered = current;
+            chat.ClientModel ??= current;
+            return;
+        }
+        var offered = draft is null ? new Message { Text = "", Origin = new MessageOrigin { Kind = MessageKind.User } } : Clone(draft);
+        offered.Model = new ModelSelection { Id = current };
+        ApplyChat(chat, new ChatDraftChangedAction { Draft = offered });
+        chat.Offered = current;
+        chat.ClientModel ??= current;
+    }
+
+    /// <summary>
+    /// The model a message asks for when its client chose it: another than its picker held before (the model it sent
+    /// last, or the one the face offered). VS Code sends its picker's model with every message, and its picker does not
+    /// follow a change made elsewhere: the same model again is no choice, and does not undo that change.
+    /// </summary>
+    static string? Chosen(FaceChat chat, Message message)
+    {
+        if (message.Model?.Id is not { Length: > 0 } model) return null;
+        var chosen = model != chat.ClientModel ? model : null;
+        chat.ClientModel = model;
+        return chosen;
     }
 
     /// <summary>Under the gate: the agent's mode changed (<c>current_mode_update</c>).</summary>
@@ -585,8 +642,10 @@ internal sealed partial class AhpFace
     }
 
     /// <summary>
-    /// A client changes the session's options (<c>session/configChanged</c>): each value its agent's with
-    /// <c>session/set_config_option</c> (or <c>session/set_mode</c>), then echoed; refused with the agent's error.
+    /// A client changes the session's options (<c>session/configChanged</c>): refused at once when the session has no
+    /// such option or value; else echoed at once, in the order the client sent its actions (an AHP client matches its
+    /// pending actions to the echoes in that order), then each value set in its agent with
+    /// <c>session/set_config_option</c> (or <c>session/set_mode</c>). A value its agent refuses goes back, by the host.
     /// </summary>
     void ConfigChanged(Connection c, FaceSession s, StateAction raw, SessionConfigChangedAction x, ActionOrigin origin)
     {
@@ -599,29 +658,35 @@ internal sealed partial class AhpFace
             return;
         }
         var changes = x.Config.ToList();
+        var before = changes.Where(v => s.State.Config!.Values.ContainsKey(v.Key)).ToDictionary(v => v.Key, v => s.State.Config!.Values[v.Key], StringComparer.Ordinal);
+        ApplySession(s, x, origin);
         _ = Write(s, async () =>
         {
             string? failed = null;
             JsonArray? options = null;
-            try { options = await ConfigureAsync(s, changes); }
+            var set = new List<string>();
+            try { options = await ConfigureAsync(s, changes, set); }
             catch (Exception e) when (e is IOException or JsonRpcException or OperationCanceledException or ObjectDisposedException) { failed = e.Message; }
             lock (gate)
             {
                 if (!sessions.TryGetValue(s.Uri, out var now) || now != s) return false;
-                if (failed is not null)
-                {
-                    Broadcast(s.Uri, raw, origin, failed, c);
-                    return false;
-                }
-                ApplySession(s, x, origin);
                 if (options is not null) OptionsChanged(s, options, s.AcpModes);
-                return true;
+                if (failed is null) return true;
+                // What the agent did not take goes back to what it was, unless it changed since.
+                ServiceLog.Warn($"ahp: {s.SessionId}: an option change was refused: {failed}");
+                var back = before.Where(b => !set.Contains(b.Key) && s.State.Config?.Values.TryGetValue(b.Key, out var value) == true && AhpConfig.Same(value, x.Config[b.Key]))
+                    .ToDictionary(b => b.Key, b => b.Value, StringComparer.Ordinal);
+                if (back.Count > 0) ApplySession(s, new SessionConfigChangedAction { Config = back });
+                return false;
             }
         });
     }
 
-    /// <summary>Sets options of the session in its agent; returns its options after the last change, when it said them.</summary>
-    async Task<JsonArray?> ConfigureAsync(FaceSession s, List<KeyValuePair<string, JsonElement>> changes)
+    /// <summary>
+    /// Sets options of the session in its agent; returns its options after the last change, when it said them. The keys
+    /// it set go in <paramref name="set"/> as it goes, so that a failure part way says which.
+    /// </summary>
+    async Task<JsonArray?> ConfigureAsync(FaceSession s, List<KeyValuePair<string, JsonElement>> changes, List<string>? set = null)
     {
         JsonArray? options = null;
         foreach (var (key, value) in changes)
@@ -632,6 +697,7 @@ internal sealed partial class AhpFace
             {
                 await acp!.SendRequestAsync(AcpMethods.Agent.SessionSetMode, new JsonObject { ["sessionId"] = s.SessionId, ["modeId"] = value.GetString() }, stopping.Token);
                 lock (gate) ModeChanged(s, value.GetString());
+                set?.Add(key);
                 continue;
             }
             var @params = new JsonObject { ["sessionId"] = s.SessionId, ["configId"] = key };
@@ -643,6 +709,7 @@ internal sealed partial class AhpFace
             else @params["value"] = value.GetString();
             var answer = await acp!.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption, @params, stopping.Token);
             options = answer?["configOptions"]?.DeepClone() as JsonArray ?? options;
+            set?.Add(key);
         }
         return options;
     }
@@ -733,6 +800,7 @@ internal sealed partial class AhpFace
 
     async Task CreateInAgentAsync(FaceSession s, FaceChat own, List<KeyValuePair<string, JsonElement>> wanted, TaskCompletionSource created)
     {
+        lock (gate) making++;
         try
         {
             JsonNode? answer;
@@ -778,6 +846,7 @@ internal sealed partial class AhpFace
                 s.SessionId = own.SessionId = id;
                 sessionsById[id] = s;
                 chatsById[id] = own;
+                if (unclaimedCommands.Remove(id, out var commands)) own.Commands = commands;
                 ApplySession(s, new SessionMetaChangedAction { Meta = MetaOf(s) });
                 OptionsChanged(s, answer?["configOptions"]?.DeepClone() as JsonArray, answer?["modes"]?.DeepClone() as JsonObject);
                 var config = s.State.Config;
@@ -807,6 +876,8 @@ internal sealed partial class AhpFace
         catch (Exception) when (stopping.IsCancellationRequested) { }
         finally
         {
+            lock (gate)
+                if (--making == 0) unclaimedCommands.Clear();
             created.TrySetResult();
         }
     }

@@ -729,7 +729,7 @@ sealed class LifecycleAgent
                     if (req.Params?["mcpServers"]?.AsArray().FirstOrDefault(s => (string?)s?["name"] == "gorynych")?["args"]?.AsArray() is { Count: > 0 } peerArgs)
                         lock (Tokens) Tokens[id] = (string)peerArgs[peerArgs.Count - 1]!;
                     if (BeforeNew is { } beforeNew) await beforeNew(id);
-                    await agent.Update(id, new AvailableCommandsUpdate { AvailableCommands = [] });
+                    await agent.Update(id, new AvailableCommandsUpdate { AvailableCommands = CommandsOnNew ?? [] });
                     return WithModes(AcpJson.ToNode(new NewSessionResponse { SessionId = id })!.AsObject(), id);
                 case AcpMethods.Agent.SessionList:
                     if (BeforeList is { } beforeList) await beforeList();
@@ -786,6 +786,8 @@ sealed class LifecycleAgent
                 }
                 case AcpMethods.Agent.SessionLoad when LoadsWithoutIds:
                     foreach (var u in TurnsAfter(sessionId!, null).Turns.SelectMany(t => t.Updates)) await SendUpdateAsync(agent, sessionId!, u);
+                    return WithModes([], sessionId!);
+                case AcpMethods.Agent.SessionSetConfigOption when OnSetConfig is { } onSetConfig && await onSetConfig((string)req.Params!["configId"]!, req.Params["value"]):
                     return WithModes([], sessionId!);
                 case AcpMethods.Agent.SessionSetConfigOption when ReportsModes && Equals((string?)req.Params?["configId"], "mode"):
                     lock (Modes) Modes[sessionId!] = (string)req.Params!["value"]!;
@@ -904,6 +906,12 @@ sealed class LifecycleAgent
 
     /// <summary>The <c>systemPrompt</c> param of every <c>session/new</c> and <c>session/resume</c>, in order.</summary>
     public List<(string Method, string SessionId, JsonNode? SystemPrompt)> SystemPrompts { get; } = [];
+
+    /// <summary>The commands it says of a new session, right after making it (none when null).</summary>
+    public List<AvailableCommand>? CommandsOnNew { get; set; }
+
+    /// <summary>Runs first on <c>session/set_config_option</c> (its option and value): may wait or throw; true answers it as is.</summary>
+    public Func<string, JsonNode?, Task<bool>>? OnSetConfig { get; set; }
 
     /// <summary>Chunks a prompt answers with instead of <see cref="Answer"/>, sent as given (so without a messageId unless they have one).</summary>
     public List<SessionUpdate>? AnswerUpdates { get; set; }

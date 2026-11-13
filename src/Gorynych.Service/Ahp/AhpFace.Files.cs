@@ -34,13 +34,14 @@ internal sealed partial class AhpFace
     /// and toasts an error when it cannot; this one answers, shows one line saying the host has no shell, and is
     /// <c>exited</c> from the start (no process ever ran, so it reports no exit code). The window keeps it as a tab
     /// with that line: it acts on a <c>terminal/exited</c> action, not on the state it subscribes to, and a later
-    /// action would close the tab at once. It stays until <c>disposeTerminal</c>; the face keeps the newest 32.
+    /// action would close the tab at once. It stays until <c>disposeTerminal</c>; past 32, the oldest no client shows goes.
     /// </summary>
     JsonElement? CreateTerminal(CreateTerminalParams p)
     {
         lock (gate)
         {
-            if (Exists(p.Channel) || p.Channel.Length == 0) throw new AhpError(AhpErrorCodes.AlreadyExists, $"Channel {p.Channel} exists already");
+            if (p.Channel.Length == 0) throw new AhpError(JsonRpcErrorCodes.InvalidParams, "channel: the terminal's URI");
+            if (Exists(p.Channel)) throw new AhpError(AhpErrorCodes.AlreadyExists, $"Channel {p.Channel} exists already");
             var state = new TerminalState
             {
                 Title = p.Name is { Length: > 0 } name ? name : "Gorynych",
@@ -51,10 +52,12 @@ internal sealed partial class AhpFace
             };
             terminals[p.Channel] = new FaceTerminal(p.Channel, state, serverSeq);
             terminalOrder.Add(p.Channel);
-            while (terminalOrder.Count > TerminalsKept)
+            // Past the limit the oldest a client does not show goes; one shown stays until it is disposed.
+            while (terminalOrder.Count > TerminalsKept
+                && terminalOrder.FirstOrDefault(t => !connections.Any(c => c.Subscriptions.Contains(t))) is { } unseen)
             {
-                terminals.Remove(terminalOrder[0]);
-                terminalOrder.RemoveAt(0);
+                terminals.Remove(unseen);
+                terminalOrder.Remove(unseen);
             }
             TerminalsChanged();
             return Null;
@@ -121,7 +124,10 @@ internal sealed partial class AhpFace
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException) { throw Failure(p.Uri, e); }
     }
 
-    /// <summary><c>resourceResolve</c>: what a URI is (a file, a folder, a link), its size and times; links followed unless asked not to.</summary>
+    /// <summary>
+    /// <c>resourceResolve</c>: what a URI is (a file, a folder, a link), its size and times. Followed (unless asked not
+    /// to), it is the file its real path names, each link on the way resolved, and that path is its URI.
+    /// </summary>
     static JsonElement? ResourceResolve(ResourceResolveParams p)
     {
         var path = LocalPath(p.Uri);
@@ -134,11 +140,11 @@ internal sealed partial class AhpFace
             if (info.LinkTarget is not null && p.FollowSymlinks == false) type = ResourceType.Symlink;
             else
             {
-                if (info.LinkTarget is not null)
+                if (RealPath(path) is var real && real != path)
                 {
-                    info = info.ResolveLinkTarget(returnFinalTarget: true) ?? info;
-                    if (!info.Exists) throw new AhpError(AhpErrorCodes.NotFound, $"{p.Uri}: the link goes nowhere");
-                    uri = AhpNames.FileUri(info.FullName) ?? uri;
+                    info = Directory.Exists(real) ? new DirectoryInfo(real) : new FileInfo(real);
+                    if (!info.Exists) throw new AhpError(AhpErrorCodes.NotFound, $"{p.Uri}: a link on the way goes nowhere");
+                    uri = AhpNames.FileUri(real) ?? uri;
                 }
                 type = info is DirectoryInfo ? ResourceType.Directory : ResourceType.File;
             }
@@ -151,6 +157,23 @@ internal sealed partial class AhpFace
             });
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException) { throw Failure(p.Uri, e); }
+    }
+
+    /// <summary>A path with every link on it resolved (<c>realpath</c>), from its root down; at most 40 links, as a cycle has more.</summary>
+    static string RealPath(string path)
+    {
+        var root = Path.GetPathRoot(path) ?? "";
+        var current = root;
+        var hops = 0;
+        foreach (var part in path[root.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, part);
+            FileSystemInfo info = Directory.Exists(current) ? new DirectoryInfo(current) : new FileInfo(current);
+            if (info.LinkTarget is null) continue;
+            if (++hops > 40) throw new IOException($"{path}: too many links");
+            if (info.ResolveLinkTarget(returnFinalTarget: true) is { } target) current = Path.TrimEndingDirectorySeparator(target.FullName);
+        }
+        return current;
     }
 
     /// <summary><c>resourceRead</c>: a file's content, as UTF-8 text when it is text (and not asked for base64), else in base64.</summary>

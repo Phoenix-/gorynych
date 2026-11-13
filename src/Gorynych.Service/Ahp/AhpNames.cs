@@ -83,7 +83,12 @@ internal static class AhpNames
                 return null;
             path = $"{char.ToUpperInvariant(path[1])}:\\{path[Math.Min(4, path.Length)..].Replace('/', '\\')}";
         }
-        try { return Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)); }
+        try
+        {
+            var full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+            // Never a device or another machine's path (\\.\x, \\?\x, \\host\x), whatever the path made of itself.
+            return OperatingSystem.IsWindows() && !(full.Length >= 3 && char.IsAsciiLetter(full[0]) && full[1] == ':' && full[2] == '\\') ? null : full;
+        }
         catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { return null; }
     }
 

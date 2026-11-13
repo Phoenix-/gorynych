@@ -157,7 +157,7 @@ describes: a host speaks AHP to its clients and ACP to its agents.
 - Its `initialize` `_meta`: `gorynych/link: 1`, so its prompts carry `gorynych/promptId` and
   their ends are marked. From step 2 it takes approvals and forms, and declares
   `clientCapabilities.elicitation.form` (in step 1 it said `gorynych/requests: false`, so the conductor
-  sent it none).
+  sent it none) and `clientCapabilities.session.configOptions.boolean`, as it sets boolean options.
 - **Sessions it opens.** It loads a session (`session/load`) when an AHP client first subscribes
   to one of its chats, or to the session's own channel (so that the session's snapshot has its agent's
   options), builds the chat state from the replay, and answers the subscription when the load answers. It closes the session (`session/close`) when no AHP client has subscribed to
@@ -203,9 +203,11 @@ describes: a host speaks AHP to its clients and ACP to its agents.
   - `createTerminal` at the URI the client chose (VS Code's is `agenthost-terminal:/<uuid>`) makes one
     whose state is one `unclassified` line, "This host has no shell: Gorynych runs agents here, not
     terminals.", `lifecycle: {status: "exited"}` with no exit code from the start (no process ever ran),
-    `isPty: false`, and the client's claim. `root/terminalsChanged` adds it to the catalog,
-    `disposeTerminal` takes it out (`NotFound` for one the face does not have), and the face keeps the
-    newest 32. A client's terminal actions go through the reducer; `terminal/input` reaches nothing.
+    `isPty: false`, and the client's claim. `root/terminalsChanged` adds it to the catalog (and says a
+    title or claim a client changes), `disposeTerminal` takes it out (`NotFound` for one the face does
+    not have); a terminal with no URI is `InvalidParams`. Past 32 terminals the oldest no client
+    subscribes to goes; one a client shows stays until it is disposed. A client's terminal actions go
+    through the reducer; `terminal/input` reaches nothing.
   - What VS Code makes of it (its bundle's `AgentHostPty`): it creates the terminal, subscribes, writes
     the content and signals ready. It ends a terminal on a `terminal/exited` action, not on the state
     it subscribed to, so the tab stays with the line and no toast; an exit with no code (or 0) never
@@ -239,10 +241,11 @@ honoured up to 200. A `SessionSummary`:
 - **`IsArchived`** (64) is `gorynych/archived`.
 - **`IsRead`** (32) lives in the face's memory, for each session and each chat, and is not
   persisted. Everything is read when the face starts. AHP's chat reducer clears a chat's bit
-  when a turn starts (and on `chat/inputRequested`); the face clears the session's bit at the
-  same time. A replay would clear it for every past turn, so after building a chat from a replay
+  when a turn starts (and on `chat/inputRequested`); the face clears the session's bit when a turn
+  starts and when the agent asks something of the face (an approval or a form). A replay would clear it for every past turn, so after building a chat from a replay
   the face sets the bit back to what it had.
-- **Notifications on `ahp-root://`.** A new root session: `root/sessionAdded`. A deleted one:
+- **Notifications on `ahp-root://`.** A new root session: `root/sessionAdded` (one a client creates,
+  once it is ready: nothing is said of it, nor listed, while it is made). A deleted one:
   `root/sessionRemoved`. A changed one (title, archive, `modifiedAt`, its chats): one
   `root/sessionSummaryChanged` with the changed fields only. A new child: `session/chatAdded` on
   its root's channel and a `root/sessionSummaryChanged` with the new `chats`.
@@ -266,12 +269,17 @@ Client actions on a session:
 
 | Action | What the face does |
 | --- | --- |
-| `session/isArchivedChanged` | `_gorynych/archive {sessionId, archived}`; echoed when it succeeds, refused with its error when not |
+| `session/isArchivedChanged` | echoed at once, then `_gorynych/archive {sessionId, archived}`; one the service refuses goes back by the host (see below) |
 | `session/isReadChanged` | applied in memory |
 | `session/titleChanged` | refused (`Renaming is not supported yet`) until renaming reaches the native side ([design.md](design.md#sessions-catalog-titles-archive), planned) |
 | `session/activeClientSet`, `session/activeClientRemoved` | applied |
-| `session/configChanged` | set in the agent, then echoed ([step 2](#step-2-working-in-sessions)) |
+| `session/configChanged` | echoed at once, then set in the agent; a value the agent refuses goes back by the host ([step 2](#step-2-working-in-sessions)) |
 | anything else | refused |
+
+A change that waits for the service or an agent is echoed at once rather than once done: an AHP client
+matches the echoes of its pending actions in the order it sent them, and a later action of the same
+client must not be echoed first. One the service or the agent then refuses goes back with an action of
+the host's own (no `origin`), which the client takes as any server change; the refusal is logged.
 
 ## Chats
 
@@ -430,7 +438,10 @@ face on its own port and data folder) before the next one starts.
 
 ### Step 2: working in sessions
 
-Built on 13 November 2026; its live check is to come.
+Built on 13 November 2026. Its live check (VS Code 1.145.2, the same day) and an independent review
+found what the second round fixed: VS Code's form of a `file:` URI (L1), the model picker (L3), and
+the review's items below; an approved tool call VS Code no longer shows once done (L2) is VS Code's
+way, explained under "Limits".
 
 - **Creating and deleting.** `createSession`: the session at the URI its client chose, `creating` at
   once, with its own chat (`ahp-chat:/<id>`, the same `<id>`) open from the start; `session/new` in the
@@ -439,15 +450,21 @@ Built on 13 November 2026; its live check is to come.
   `gorynych/ahpUri`; then the options its client chose (below); then `session/ready` and
   `root/sessionAdded`; or `session/creationFailed` with the error. A provider the face does not have is
   `ProviderNotFound`, a URI it has `SessionAlreadyExists`. A turn a client starts while the session is
-  being made waits for it. `listSessions` leaves out a session still being made. Until its first prompt
-  the session is a draft, which no list has: the face keeps it, and closing it (two minutes with no AHP
-  client on it) discards it, as a draft Zed made. `disposeSession` is `session/delete`, which deletes
-  the session in its agent where the agent can, as a delete from Zed does, then `root/sessionRemoved`.
+  being made waits for it. `listSessions` and the root leave out a session until it is ready. Until the
+  conductor lists it the session is a draft: the face keeps it. The conductor lists it once its first
+  prompt has made it a session (its promotion); a list read before that does not take it away, nor its
+  chat, nor what its agent asks. Closing a draft never prompted (two minutes with no AHP client on it)
+  discards it, as a draft Zed made. The commands an agent says of a new session before its
+  `session/new` answer reaches the face are kept for it. `disposeSession` is `session/delete`, which
+  deletes the session in its agent where the agent can, as a delete from Zed does, then
+  `root/sessionRemoved`; the children the face had open, which a delete leaves, are closed.
 - **Folders.** On `file:` URIs: `resourceList` (folders first, then files, each by name),
-  `resourceResolve` (a file, a folder, or a link when asked not to follow it; links followed to their
-  canonical URI), `resourceRead` (UTF-8 text when the file is valid UTF-8 and base64 was not asked for,
-  else base64; at most 16 MB) and `resourceMkdir` (with its parents). A `file:` URI the face does not
-  serve (see "Identifiers") is `PermissionDenied`; another scheme is `NotFound`.
+  `resourceResolve` (a file, a folder, or a link when asked not to follow it; followed, the real path,
+  each link on the way resolved, is its URI), `resourceRead` (UTF-8 text when the file is valid UTF-8
+  and base64 was not asked for, else base64; at most 16 MB) and `resourceMkdir` (with its parents). They
+  run off the client's connection loop, so a slow disk holds up none of its other messages. A `file:`
+  URI the face does not serve (see "Identifiers"; on Windows a path must be a drive's, never a device's
+  or another machine's) is `PermissionDenied`; another scheme is `NotFound`.
   `resourceWrite`, `resourceCopy`, `resourceMove`, `resourceDelete`, `resourceRequest` and
   `createResourceWatch` are `PermissionDenied`.
 - **Configuration.**
@@ -455,17 +472,25 @@ Built on 13 November 2026; its live check is to come.
     with its name as `title`, its choices as `enum` (groups flattened) with their names and descriptions,
     and `sessionMutable`; but not the option of category `model`. An agent with ACP modes and no config
     option of category `mode` has its modes as `mode`.
-  - `session/configChanged` from a client sets each value in the agent (`session/set_config_option`, or
-    `session/set_mode` for modes) and is then echoed; a key or value the session does not have, a
-    `replace`, or a change the agent refuses (its error as the reason) is refused. The options the agent
+  - `session/configChanged` from a client is echoed at once (see [Sessions](#sessions)), then sets each
+    value in the agent (`session/set_config_option`, or `session/set_mode` for modes); a key or value
+    the session does not have, or a `replace`, is refused; a value the agent refuses goes back. The options the agent
     says later (`config_option_update`, `current_mode_update`, the answer to a change) change the values
     with `session/configChanged`. AHP 1.0.0 has no action for a config's schema: one that changes reaches
     a client when it subscribes again.
   - The model is AHP's own: the choices of the model option are the agent's `AgentInfo.models` (`id`
     the ACP value, its name, its description in `_meta`), from the latest session of that agent the face
-    has seen, and `root/agentsChanged` says when they change. A message's `model` is set with
-    `session/set_config_option` before its prompt, when it is one of the session's models and not its
-    current one; a set that fails ends the turn with the error.
+    has seen, and `root/agentsChanged` says when they change.
+  - The session's model is in its chat's draft (`chat/draftChanged`, the draft's text left alone), as
+    VS Code's model picker takes a chat's model from its draft (else from its last turn's message, else
+    its own default, its first model: "Default (recommended)" for Claude). The face puts it there when the
+    chat has no draft and when the model changes, from any client.
+  - VS Code's picker takes the draft's model once, does not follow a later change made elsewhere, and
+    sends its model with every message. So a message's `model` is a choice only when it is another than
+    the one the chat's clients sent last (at first, the one the face offered): only then is it set, with
+    `session/set_config_option` before its prompt (when it is one of the session's models and not its
+    current one); a set that fails ends the turn with the error. The same model again leaves the
+    session's as it is, a change made in Zed among others.
   - **Before a session exists** (the open question of this step): `resolveSessionConfig` answers the
     options of the latest session of that agent the face has seen while the service runs (none before
     it has seen one), with only the values the client gave that those options take. A new session gets
@@ -520,7 +545,9 @@ Built on 13 November 2026; its live check is to come.
     (`confirmed: "not-needed"`), a form completed as `cancel`, and out of `inputNeeded`. What the agent
     asks about a session the face does not show (it let it go, or could not open it) is answered as
     cancelled, so the agent never waits for nobody; one that comes while the face opens the session is
-    shown once it is open. The face does not close a session whose agent waits for an answer here.
+    shown once it is open. What the agent asks while a turn a client cancelled settles is answered as
+    cancelled at once, as ACP has a cancelling client do; no turn opens for it. The face does not close a
+    session whose agent waits for an answer here.
   - Routing, until step 3: a request goes, as the conductor routes any, to the client attached to the
     session last: VS Code only when the face opened (or created) the session after any ACP client did,
     else Zed. Neither sees the other's approvals.
@@ -528,6 +555,13 @@ Built on 13 November 2026; its live check is to come.
   only ([Chats](#chats)). `multipleChats` stays: the step-1 check showed children vanish without it.
 - **The terminal**: one that says the host has no shell ([Root channel](#root-channel)).
 - **Limits of this step.** A request goes to the client attached last (step 3). A diff is still text.
+  - An approved tool call leaves VS Code's chat once it completes (L2). The window gives a tool call
+    that waits for confirmation `presentation: "hiddenAfterComplete"` (its bundle's `rue`), and on
+    completion clears it only for content it renders itself: a terminal, file edits (`fileEdit`), a
+    subagent, an image. So once its card is answered, a completed Write with text content goes; the
+    chat state has it, and a reload shows it (a completed call built from history is not hidden). The
+    same holds for any host's approved tool with plain content. It shows once ACP's `diff` becomes a
+    `fileEdit` and an `execute` tool's output a terminal, a step of its own.
   Queued messages live in the face's memory: a restart loses those not started. A config schema that
   changes reaches a client only when it subscribes again. Attachments other than files and a client's
   own text are left out of a prompt.
@@ -543,7 +577,13 @@ Built on 13 November 2026; its live check is to come.
   line, input taken, disposed); the folder methods and those refused. Every folder and file there is
   named as VS Code names it (`file:///c%3A/…`, spaces, `#` and non-ASCII percent-encoded): the session's
   folder, an attached file, each `resource*` method; another machine's is refused in each and in
-  `createSession`. `AhpNamesTests` reads such URIs and the face's own back into paths.
+  `createSession`. `AhpNamesTests` reads such URIs and the face's own back into paths. From the live
+  check and the review: the session's model in its chat's draft, and VS Code's unchanged model no
+  choice; a session in its first turn kept through a list read before its promotion; an approval
+  asked while a cancelled turn settles; an approval making a read session unread; a deleted root's
+  open children closed; a new session's early commands; a session being made on no list; a client's
+  changes echoed in order, a refused one going back; the terminal's title in the catalog, a shown one
+  kept past 32, one with no URI refused.
 - **Live check.** In VS Code: a Claude session in a folder picked through the host; a prompt; a Write
   approved; a turn cancelled; a Kimi session with its model picked; each visible in Zed; no terminal
   toast.
