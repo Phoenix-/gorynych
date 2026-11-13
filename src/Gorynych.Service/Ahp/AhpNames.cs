@@ -25,6 +25,15 @@ internal static class AhpNames
     /// <summary>The Gorynych session ID an <c>ahp-session:</c> URI names; null for another URI.</summary>
     public static string? SessionIdOfSession(string uri) => Id(uri, SessionScheme);
 
+    /// <summary>
+    /// The URI of a session's own chat: <c>ahp-chat:/</c> with its session URI's path, so that a session an AHP
+    /// client created under a URI of its choosing has its chat under the same <c>&lt;id&gt;</c>.
+    /// </summary>
+    public static string ChatOf(string sessionUri) => ChatScheme + sessionUri[SessionScheme.Length..];
+
+    /// <summary>Whether a URI is an <c>ahp-session:/&lt;id&gt;</c> of one path segment.</summary>
+    public static bool IsSessionUri(string uri) => Id(uri, SessionScheme) is not null;
+
     /// <summary>The Gorynych session ID an <c>ahp-chat:</c> URI names; null for another URI.</summary>
     public static string? SessionIdOfChat(string uri) => Id(uri, ChatScheme);
 
@@ -43,6 +52,14 @@ internal static class AhpNames
         if (string.IsNullOrEmpty(path)) return null;
         try { return new Uri(path).AbsoluteUri; }
         catch (UriFormatException) { return null; }
+    }
+
+    /// <summary>The local path a <c>file:</c> URI names (<c>C:\Users\x</c> for <c>file:///C:/Users/x</c>); null for any other URI.</summary>
+    public static string? FilePath(string? uri)
+    {
+        if (string.IsNullOrEmpty(uri) || !Uri.TryCreate(uri, UriKind.Absolute, out var parsed) || !parsed.IsFile) return null;
+        try { return Path.GetFullPath(parsed.LocalPath); }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { return null; }
     }
 
     /// <summary>A time as AHP writes it: ISO 8601 in UTC with milliseconds.</summary>

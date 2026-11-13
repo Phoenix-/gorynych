@@ -788,6 +788,9 @@ sealed class LifecycleAgent
                 case AcpMethods.Agent.SessionSetConfigOption when ReportsModes && Equals((string?)req.Params?["configId"], "mode"):
                     lock (Modes) Modes[sessionId!] = (string)req.Params!["value"]!;
                     return WithModes([], sessionId!);
+                case AcpMethods.Agent.SessionSetConfigOption when ReportsModels && Equals((string?)req.Params?["configId"], "model"):
+                    lock (ModelsChosen) ModelsChosen[sessionId!] = (string)req.Params!["value"]!;
+                    return WithModes([], sessionId!);
                 case AcpMethods.Agent.SessionClose:
                     return new JsonObject();
                 case GorynychProtocol.MethodOpinion when HasChannel:
@@ -836,6 +839,12 @@ sealed class LifecycleAgent
     /// </summary>
     public bool ReportsModes { get; set; }
 
+    /// <summary>Reports a <c>model</c> config option (category model) too: <c>small</c> or <c>large</c>, kept per session in <see cref="ModelsChosen"/>.</summary>
+    public bool ReportsModels { get; set; }
+
+    /// <summary>Each session's model (<c>small</c> when absent).</summary>
+    public Dictionary<string, string> ModelsChosen { get; } = [];
+
     /// <summary>Advertises <c>gorynych/openElsewhere</c> and answers <c>_gorynych/open_elsewhere</c> from <see cref="OpenElsewhere"/>; set before the first use.</summary>
     public bool TellsOpenElsewhere { get; set; }
 
@@ -861,7 +870,24 @@ sealed class LifecycleAgent
         if (!ReportsModes) return response;
         string current;
         lock (Modes) current = Modes.GetValueOrDefault(sessionId, "ask");
-        response["configOptions"] = new JsonArray(AcpJson.ToNode<SessionConfigOption>(new SessionConfigSelect
+        var options = new JsonArray();
+        if (ReportsModels)
+        {
+            string model;
+            lock (ModelsChosen) model = ModelsChosen.GetValueOrDefault(sessionId, "small");
+            options.Add(AcpJson.ToNode<SessionConfigOption>(new SessionConfigSelect
+            {
+                Id = "model",
+                Name = "Model",
+                Category = SessionConfigOptionCategory.Model,
+                CurrentValue = model,
+                Options = new JsonArray(
+                    AcpJson.ToNode(new SessionConfigSelectOption { Value = "small", Name = "Small", Description = "Quick" }),
+                    AcpJson.ToNode(new SessionConfigSelectOption { Value = "large", Name = "Large" })),
+            }));
+        }
+        response["configOptions"] = options;
+        options.Add(AcpJson.ToNode<SessionConfigOption>(new SessionConfigSelect
         {
             Id = "mode",
             Name = "Permissions",

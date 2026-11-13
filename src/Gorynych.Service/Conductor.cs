@@ -1300,6 +1300,7 @@ public sealed class Conductor : IAsyncDisposable
         meta[GorynychProtocol.MetaAgent] = r.Agent;
         if (r.ParentSessionId is not null) meta[GorynychProtocol.MetaParentSessionId] = r.ParentSessionId;
         if (r.Archived) meta[GorynychProtocol.MetaArchived] = true;
+        if (r.AhpUri is not null) meta[GorynychProtocol.MetaAhpUri] = r.AhpUri;
         return new SessionInfo
         {
             SessionId = r.SessionId,
@@ -1332,7 +1333,9 @@ public sealed class Conductor : IAsyncDisposable
         {
             host.DoneOpening(rpc);
         }
-        store.Update(response.SessionId, host.Name, r => { r.Cwd = FolderPath.Normalize(request.Cwd); r.Draft = true; r.PeerToken = token; });
+        // The URI an AHP client chose for the session it creates, kept so that every list names it so.
+        var ahpUri = AhpUriOf(request.Meta);
+        store.Update(response.SessionId, host.Name, r => { r.Cwd = FolderPath.Normalize(request.Cwd); r.Draft = true; r.PeerToken = token; r.AhpUri = ahpUri; });
         var feed = Feed(response.SessionId);
         feed.CaptureState(AcpJson.ToNode(response));
         // Attached now, for the agent's requests; its list of commands only once it has the answer.
@@ -1341,9 +1344,19 @@ public sealed class Conductor : IAsyncDisposable
         if (options.Answering is { } hold) await hold(response.SessionId);
         response.Meta ??= [];
         response.Meta[GorynychProtocol.MetaAgent] = host.Name;
+        if (ahpUri is not null) response.Meta[GorynychProtocol.MetaAhpUri] = ahpUri;
         ServiceLog.Info($"{host.Name}: new session {response.SessionId} in {request.Cwd}");
         return response;
     }
+
+    /// <summary>
+    /// <c>gorynych/ahpUri</c> of a <c>session/new</c>: an <c>ahp-session:/</c> URI of one path segment, at most
+    /// 512 characters; null for none or anything else, which is not kept.
+    /// </summary>
+    static string? AhpUriOf(JsonObject? meta) =>
+        meta?[GorynychProtocol.MetaAhpUri] is JsonValue v && v.TryGetValue<string>(out var uri)
+        && uri.Length is > 13 and <= 512 && uri.StartsWith("ahp-session:/", StringComparison.Ordinal) && !uri[13..].Contains('/')
+            ? uri : null;
 
     /// <summary>Resolves a session ID the client names, refreshing from the agents if needed.</summary>
     internal async Task<SessionRecord> FindAsync(string sessionId, CancellationToken ct)
@@ -1977,13 +1990,21 @@ public sealed class Conductor : IAsyncDisposable
         if (use.Feed.OpenedReadOnly && request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode or "session/set_model")
             rpc = await RetakeAsync(HostOf(use.Record), use.Record, rpc, ReadOnlyUse.Setting, ct);
         var response = await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
+        // A change one client made reaches the session's other clients as if its agent had said it (an AHP client
+        // and Zed on one session, say): the session's state, not its history, so not journaled.
         switch (request.Method)
         {
             case AcpMethods.Agent.SessionSetConfigOption:
                 use.Feed.CaptureState(response); // the full list with the new values
+                if (response?["configOptions"] is JsonArray options)
+                    await use.Feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "config_option_update", ["configOptions"] = options.DeepClone() },
+                        except: null, () => { }, journal: false);
                 break;
             case AcpMethods.Agent.SessionSetMode:
                 use.Feed.SetCurrent("modes", "currentModeId", request.Params?["modeId"]);
+                if (request.Params?["modeId"] is JsonValue mode)
+                    await use.Feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "current_mode_update", ["currentModeId"] = mode.DeepClone() },
+                        except: null, () => { }, journal: false);
                 break;
             case "session/set_model": // unstable in ACP; agents that have it answer the same way
                 use.Feed.SetCurrent("models", "currentModelId", request.Params?["modelId"]);
