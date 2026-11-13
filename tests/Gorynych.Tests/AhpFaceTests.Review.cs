@@ -294,16 +294,24 @@ public sealed partial class AhpFaceTests
         await using var vscode = await rig.ConnectAsync();
         var (sessionUri, chatUri, id) = await CreateAsync(rig, vscode, "claude");
         Task<JsonNode?>? asked = null;
+        var handling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var turns = 0;
         rig.Claude.DuringPrompt = async (agent, sid) =>
         {
             if (Interlocked.Increment(ref turns) > 1) return;
             await agent.Update(sid, new SessionUpdateAgentMessageChunk { Content = new TextContent { Text = "Working" }, MessageId = "m1" });
             await LinkHarness.Until(() => { lock (rig.Claude.Adapter.Methods) return rig.Claude.Adapter.Methods.Contains(AcpMethods.Agent.SessionCancel); }, "the cancel reached the agent");
-            asked = agent.Rpc.SendRequestAsync(AcpMethods.Client.SessionRequestPermission, AskToWrite(sid, "w1")); // its turn ends meanwhile
+            asked = agent.Rpc.SendRequestAsync(AcpMethods.Client.SessionRequestPermission, AskToWrite(sid, "w1"));
+            // The turn ends once the face has the ask (its handler begins after it arrived): the conductor may pass an
+            // ask on after the turn's end mark, and then it came after its turn.
+            await handling.Task.WaitAsync(Wait);
         };
         // Its handler runs late, once the turn's end has come: the ask still belongs to the turn it came in.
-        rig.Face.AskHandling = () => LinkHarness.Until(() => !rig.Face.Settling(id), "the cancelled turn's end came");
+        rig.Face.AskHandling = () =>
+        {
+            handling.TrySetResult();
+            return LinkHarness.Until(() => !rig.Face.Settling(id), "the cancelled turn's end came");
+        };
 
         await Send(vscode, chatUri, "t1", "Write the notes");
         await LinkHarness.Until(() => vscode.Of<ChatResponsePartAction>(chatUri).Length == 1, "the turn runs");
