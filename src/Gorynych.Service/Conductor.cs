@@ -3953,7 +3953,7 @@ public sealed class Conductor : IAsyncDisposable
         var waited = System.Diagnostics.Stopwatch.StartNew();
         while (!pendingOpinions.TryGetValue(messageId, out pending) && IsEarlierRunsOpinion(messageId) && HostsMayComeBack && waited.Elapsed < options.ReclaimWait)
             await Task.Delay(50, ct);
-        var delivered = pending is not null && pending.SessionId == sessionId && pending.Reply.TrySetResult(text);
+        var delivered = pending is not null && pending.SessionId == sessionId && pending.Deliver(text);
         return new JsonObject { ["delivered"] = delivered };
     }
 
@@ -3988,9 +3988,12 @@ public sealed class Conductor : IAsyncDisposable
         public long Since { get; } = Environment.TickCount64;
         public long Answered { get; set; } = long.MaxValue;
 
-        public void Give(JsonNode? answer)
+        /// <summary>Gives the answer, unless it has one, or its failure, already.</summary>
+        public bool Give(JsonNode? answer)
         {
-            if (Answer.TrySetResult(answer)) Answered = Environment.TickCount64;
+            if (!Answer.TrySetResult(answer)) return false;
+            Answered = Environment.TickCount64;
+            return true;
         }
 
         public void Fail(Exception e)
@@ -4051,10 +4054,7 @@ public sealed class Conductor : IAsyncDisposable
         var reclaim = ReclaimOf(askId, sessionId, from);
         if (opinion is not null && !pendingOpinions.ContainsKey(opinion))
         {
-            var pending = new PendingOpinion(sessionId);
-            pendingOpinions[opinion] = pending;
-            _ = pending.Reply.Task.ContinueWith(t => reclaim.Give(new JsonObject { ["text"] = t.Result }),
-                CancellationToken.None, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
+            pendingOpinions[opinion] = new PendingOpinion(sessionId, reclaim);
             var feed = Feed(sessionId);
             if (feed.CurrentOpinion is null) feed.BeginOpinionTurn(opinion);
         }
@@ -4169,10 +4169,26 @@ public sealed class Conductor : IAsyncDisposable
             ?? request.Options.FirstOrDefault(o => o.Kind.Value.StartsWith("allow", StringComparison.Ordinal)))?.OptionId;
     }
 
-    sealed class PendingOpinion(string sessionId)
+    /// <summary>
+    /// An opinion request answered in a turn, by its <c>message_id</c>: one this service asked, or one an
+    /// earlier service asked, taken back with its host (<paramref name="reclaim"/>, its question by askId).
+    /// </summary>
+    sealed class PendingOpinion(string sessionId, Reclaim? reclaim = null)
     {
         public string SessionId { get; } = sessionId;
         public TaskCompletionSource<string> Reply { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>
+        /// The agent's reply, once. A question taken back has it as its answer before this returns: its
+        /// turn may end right after, and that end gives the turn's own text unless the reply came first.
+        /// A reply that came after that end reached no one.
+        /// </summary>
+        public bool Deliver(string text)
+        {
+            if (!Reply.TrySetResult(text)) return false;
+            return reclaim?.Give(new JsonObject { ["text"] = text }) ?? true;
+        }
+
         public string? TurnText { get; set; }
         public Exception? TurnError { get; set; }
     }

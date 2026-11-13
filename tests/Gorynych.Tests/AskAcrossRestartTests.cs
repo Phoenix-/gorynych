@@ -170,6 +170,54 @@ public sealed class AskAcrossRestartTests
         Assert.AreEqual(1, channel ? rig.Asked.Opinions.Count : rig.OpinionPrompts(), "and a reclaim never asks it");
     }
 
+    /// <summary>
+    /// A reply the next service delivered is the answer, even when the turn it came in ends at once:
+    /// the turn's end gives its own text, so the reply must be the question's answer by the time
+    /// <c>delivered</c> is said. Checked synchronously, as the turn's end may come right after.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AReplyToTheNextService_IsTheAnswer_AsSoonAsItIsDelivered()
+    {
+        await using var rig = new Rig(channel: false);
+        await rig.StartAsync();
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        rig.Asked.BeforePrompt = async id =>
+        {
+            if (id == rig.AskedId && rig.OpinionPrompts() > 0) await hold.Task;
+        };
+        string asked;
+        await using (var peers = await TestClient.ConnectAsync(rig.Service, "peers"))
+        {
+            var asking = peers.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-1"));
+            await LinkHarness.Until(() => rig.OpinionPrompts() == 1, "the question in the session");
+            asked = rig.Asked.Prompts.Last(p => p.SessionId == rig.AskedId).Text;
+            await rig.RestartAsync();
+            await Assert.ThrowsAsync<Exception>(() => asking.WaitAsync(Wait), "its asker lost the service");
+        }
+        var messageId = System.Text.RegularExpressions.Regex.Match(asked, "message_id (m[^\\]\\s]+)").Groups[1].Value;
+
+        rig.Service = rig.Next();
+        await using var back = await TestClient.ConnectAsync(rig.Service, "peers-again");
+        var reclaiming = back.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, rig.Ask("ask-1", reclaim: true));
+        await LinkHarness.Until(() => rig.Service.Feed(rig.AskedId).CurrentOpinion == messageId, "the question taken back with its host");
+        Assert.IsFalse(rig.Service.QuestionEnded("ask-1"), "it is still being answered");
+
+        // The reply waits for nothing now, so it is delivered within this call.
+        var replying = rig.Service.ReplyAsync(new JsonRpcRequest(1, GorynychProtocol.MethodReply, new JsonObject
+        {
+            ["messageId"] = messageId, ["text"] = "SQLite, for one user.", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = rig.Token(rig.AskedId) },
+        }), CancellationToken.None);
+        Assert.IsTrue(replying.IsCompletedSuccessfully, "delivered at once");
+        var ended = rig.Service.QuestionEnded("ask-1");
+        Assert.IsTrue((bool)replying.Result["delivered"]!, "the reply reached the next service");
+        Assert.IsTrue(ended, "a delivered reply is the question's answer at once, before its turn can end");
+
+        hold.SetResult();
+        Assert.AreEqual("SQLite, for one user.", (string?)(await reclaiming.WaitAsync(Wait))!["text"], "the reply, not the turn's own text");
+        Assert.AreEqual(1, rig.OpinionPrompts(), "the session was asked once");
+    }
+
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
     public async Task AQuestionThatLivedOnlyInTheService_IsLost_AndSaysToAskAgain()
