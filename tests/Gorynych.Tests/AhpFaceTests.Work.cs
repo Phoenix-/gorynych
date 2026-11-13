@@ -147,8 +147,10 @@ public sealed partial class AhpFaceTests
         withdraw.Cancel();
         await withdrawn.Task.WaitAsync(Wait);
         await LinkHarness.Until(() => vscode.Of<SessionInputNeededRemovedAction>(sessionUri).Length == 2, "the withdrawn approval left inputNeeded");
-        await LinkHarness.Until(() => vscode.Of<ChatToolCallReadyAction>(chatUri).Any(r => r.ToolCallId == "w2" && r.Confirmed == ToolCallConfirmationReason.NotNeeded),
-            "its tool call no longer waits");
+        // Its tool call no longer waits: back to running, or cancelled by the turn's end, when the agent's end of its
+        // turn (it goes on at once) reaches the face before the withdrawal does.
+        await LinkHarness.Until(() => vscode.Of<ChatToolCallReadyAction>(chatUri).Any(r => r.ToolCallId == "w2" && r.Confirmed == ToolCallConfirmationReason.NotNeeded)
+            || vscode.Of<ChatTurnCompleteAction>(chatUri).Any(a => a.TurnId == "t1"), "its tool call no longer waits");
         await TurnEndedAsync(vscode, chatUri, "t1");
         // A confirmation of nothing that waits is refused.
         await vscode.Client.DispatchAsync(chatUri, new StateAction(new ChatToolCallConfirmedAction { TurnId = "t1", ToolCallId = "w2", Approved = true }), null, CancellationToken.None);
