@@ -23,6 +23,9 @@ internal sealed class AhpFaceOptions
     /// </summary>
     public string? StateFile { get; init; }
 
+    /// <summary>How long after a change the state file is written, so that changes close together are written once.</summary>
+    public TimeSpan StateWriteDelay { get; init; } = TimeSpan.FromSeconds(1);
+
     /// <summary>How long a new terminal is kept whatever the limit: its client subscribes once its creation is answered.</summary>
     public TimeSpan TerminalYoung { get; init; } = TimeSpan.FromSeconds(30);
 
@@ -425,7 +428,6 @@ internal sealed partial class AhpFace : IAsyncDisposable
         public string? ReadOnlyReason;
         public List<(string Name, string? Description)> Commands = []; // its agent's commands, for completions
         public string? Offered; // the session's model as the face last put it in the chat's draft
-        public string? PreviousOffer; // the one it offered before that: a client's draft that says it was built before the offer
         public readonly Dictionary<string, string?> QueuedOn = new(StringComparer.Ordinal); // a waiting message -> the session's model when it came
     }
 
@@ -576,6 +578,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
         if (chatsById.TryGetValue(chat.SessionId, out var byId) && ReferenceEquals(byId, chat)) chatsById.Remove(chat.SessionId);
         // What the agent asked of it here can no longer be shown: it is answered as cancelled, as by a client that goes.
         foreach (var ask in requests.Values.Where(r => r.Chat == chat || (r.Chat is null && r.SessionId == chat.SessionId)).ToList()) Resolve(ask, ask.Cancelled());
+        chat.QueuedOn.Clear(); // the face's queue goes with its chat model
         if (chat.Model is not { } model) return;
         chat.Model = null;
         if (close && chat.SessionId.Length > 0) LetGo(chat.SessionId, model);
@@ -1541,7 +1544,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
                     return;
                 case ChatDraftChangedAction when chat.Model is not null:
                     ApplyChat(chat, action, origin);
-                    OfferModel(chat); // a draft cleared, or one with a model offered before: the session's again
+                    OfferModel(chat); // a draft cleared (VS Code clears it on a send): the session's model in a new one
                     return;
                 case ChatIsArchivedChangedAction archive when chat.IsChild && chat.Model is not null:
                     ArchiveAsync(p.Channel, p.Action, origin, chat.Session, chat, archive.IsArchived);
@@ -1649,6 +1652,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
         stopping.Cancel();
         lock (gate) all = [.. connections];
         foreach (var c in all) c.Abort();
+        try { await stateWriter.WaitAsync(TimeSpan.FromSeconds(2)); } catch { } // what changed last is written
         if (acp is not null) await acp.DisposeAsync();
         if (serving is not null) try { await serving.WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
     }

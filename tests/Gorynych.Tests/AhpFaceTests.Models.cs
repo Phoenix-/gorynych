@@ -136,7 +136,7 @@ public sealed partial class AhpFaceTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task AClientsDraftWithTheModelOfferedBefore_GetsTheSessionsModelAgain()
+    public async Task TheModelOfferedBefore_PickedAgainInADraft_IsAPick()
     {
         await using var rig = await Rig.StartAsync();
         rig.Kimi.ReportsModes = true;
@@ -153,11 +153,79 @@ public sealed partial class AhpFaceTests
             new JsonObject { ["sessionId"] = id, ["configId"] = "model", ["value"] = "large" }).WaitAsync(Wait);
         await LinkHarness.Until(() => Draft()?.Model?.Id == "large", "offered again");
 
-        // A draft the window built before it took the new offer: its text kept, the session's model again.
+        // Its user picks the model of before again: the draft keeps the pick, and the message sets it.
         await vscode.Client.DispatchAsync(chatUri, new StateAction(new ChatDraftChangedAction
         {
             Draft = UserMessage("half a thought", new ModelSelection { Id = "small" }),
         }), null, CancellationToken.None);
-        await LinkHarness.Until(() => Draft() is { Text: "half a thought", Model.Id: "large" }, "the session's model, the client's text");
+        await Task.Delay(300);
+        Assert.AreEqual("small", Draft()?.Model?.Id, "the pick stays");
+        await Send(vscode, chatUri, "t1", "Smaller", new ModelSelection { Id = "small" });
+        await TurnEndedAsync(vscode, chatUri, "t1");
+        lock (rig.Kimi.ModelsChosen) Assert.AreEqual("small", rig.Kimi.ModelsChosen[id]);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task TheModelANewSessionsAnswerSaid_StaysPickableAfterItsAgentReportedAnother()
+    {
+        await using var rig = await Rig.StartAsync();
+        rig.Kimi.ReportsModes = true;
+        rig.Kimi.ReportsModels = true;
+        // As Claude's "default" before it reports "opus": the answer says "small", the agent "large" right after.
+        rig.Kimi.BeforeNew = id =>
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                lock (rig.Kimi.ModelsChosen) rig.Kimi.ModelsChosen[id] = "large";
+                await rig.Kimi.Adapter.Current!.Update(id, new ConfigOptionUpdate { ConfigOptions = [ModelOption("large"), ModeOption("ask")] });
+            });
+            return Task.CompletedTask;
+        };
+        await using var vscode = await rig.ConnectAsync();
+        var (_, chatUri, id) = await CreateAsync(rig, vscode, "kimi");
+        Message? Draft() => vscode.Of<ChatDraftChangedAction>(chatUri).LastOrDefault()?.Draft;
+        await LinkHarness.Until(() => Draft()?.Model?.Id == "large", "the model reported");
+
+        await vscode.Client.DispatchAsync(chatUri, new StateAction(new ChatDraftChangedAction
+        {
+            Draft = UserMessage("", new ModelSelection { Id = "small" }),
+        }), null, CancellationToken.None);
+        await Task.Delay(300);
+        Assert.AreEqual("small", Draft()?.Model?.Id, "the pick stays");
+        await Send(vscode, chatUri, "t1", "Hello", new ModelSelection { Id = "small" });
+        await TurnEndedAsync(vscode, chatUri, "t1");
+        lock (rig.Kimi.ModelsChosen) Assert.AreEqual("small", rig.Kimi.ModelsChosen[id]);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AStateFileTheFaceCannotRead_IsNone_AndIsWrittenAnew()
+    {
+        foreach (var broken in new[]
+        {
+            "not json",
+            """{"version":1,"agents":{"kimi":{"models":[{"id":"small"}]},"kimi":{"models":[]}}}""",
+            """{"version":1,"agents":{"kimi":{"models":[{"id":"small","name":"Small"}],"schema":{"type":"object","properties":null}}}}""",
+            """{"version":1,"agents":{"kimi":{"models":[{"name":"No ID"}]}}}""",
+        })
+        {
+            var state = Path.Combine(TestDirs.New(), "ahp-face.json");
+            File.WriteAllText(state, broken);
+            await using var rig = await Rig.StartAsync(new AhpFaceOptions { StateFile = state, StateWriteDelay = TimeSpan.Zero });
+            rig.Kimi.ReportsModes = true;
+            rig.Kimi.ReportsModels = true;
+            await using var vscode = await rig.ConnectAsync();
+            var kimi = vscode.Initialized!.Snapshots[0].State.Root!.Agents.Single(a => a.Provider == "kimi");
+            Assert.AreEqual(AhpFace.AgentDefault, kimi.Models.Single().Id, broken);
+            var config = await vscode.Client.RequestAsync<ResolveSessionConfigParams, ResolveSessionConfigResult>("resolveSessionConfig",
+                new ResolveSessionConfigParams { Channel = AhpNames.Root, Provider = "kimi" }, CancellationToken.None).WaitAsync(Wait);
+            Assert.AreEqual(0, config!.Schema.Properties.Count, broken);
+
+            await CreateAsync(rig, vscode, "kimi");
+            await LinkHarness.Until(() => File.ReadAllText(state).Contains("\"large\""), "written anew");
+            Assert.IsNotNull(System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(state))?["agents"]?["kimi"]?["schema"], broken);
+        }
     }
 }

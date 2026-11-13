@@ -18,36 +18,56 @@ internal sealed partial class AhpFace
     internal const string AgentDefault = "gorynych/agent-default";
 
     readonly Dictionary<string, string> savedSchemas = new(StringComparer.Ordinal); // agent -> its schema as last saved
+    string? stateToWrite; // the state to write next, under the gate
+    Task stateWriter = Task.CompletedTask; // the writer, while it runs
 
-    /// <summary>Under the gate: what the face kept of each agent last time, if anything.</summary>
+    /// <summary>
+    /// Under the gate: what the face kept of each agent last time, if anything. A file it cannot read, or that is not
+    /// as it writes one, is none: the face starts as if fresh, and writes it anew on the next change.
+    /// </summary>
     void LoadState()
     {
         if (options.StateFile is not { } file || !File.Exists(file)) return;
+        var models = new Dictionary<string, List<AhpConfig.Choice>>(StringComparer.Ordinal);
+        var configs = new Dictionary<string, SessionConfigState>(StringComparer.Ordinal);
         try
         {
-            foreach (var (agent, node) in JsonNode.Parse(File.ReadAllText(file))?["agents"] as JsonObject ?? [])
+            foreach (var (agent, node) in JsonNode.Parse(File.ReadAllText(file))?["agents"] as JsonObject ?? throw new FormatException("no agents"))
             {
-                if (node is not JsonObject kept) continue;
-                if (kept["models"] is JsonArray models)
-                    agentModels[agent] = [.. models.OfType<JsonObject>().Where(m => Text(m["id"]) is { Length: > 0 })
-                        .Select(m => new AhpConfig.Choice(Text(m["id"])!, Text(m["name"]) ?? Text(m["id"])!, Text(m["description"])))];
-                if (kept["schema"] is JsonObject schema && Json.Deserialize<SessionConfigSchema>(AhpNames.Element(schema)) is { } parsed)
-                {
-                    agentConfigs[agent] = new SessionConfigState { Schema = parsed, Values = new(StringComparer.Ordinal) };
-                    savedSchemas[agent] = Json.SerializeToElement(parsed).GetRawText();
-                }
+                if (node is not JsonObject kept) throw new FormatException($"{agent}: not an object");
+                if (kept["models"] is JsonArray seen)
+                    models[agent] = [.. seen.Select(m => m as JsonObject is { } o && Text(o["id"]) is { Length: > 0 } id
+                        ? new AhpConfig.Choice(id, Text(o["name"]) ?? id, Text(o["description"]))
+                        : throw new FormatException($"{agent}: a model with no ID"))];
+                if (kept["schema"] is not JsonObject schema) continue;
+                var parsed = Json.Deserialize<SessionConfigSchema>(AhpNames.Element(schema));
+                if (parsed?.Properties is not { } properties || properties.Values.Any(p => p is null || p.Type is null))
+                    throw new FormatException($"{agent}: an options schema the face does not write");
+                configs[agent] = new SessionConfigState { Schema = parsed, Values = new(StringComparer.Ordinal) };
             }
         }
-        catch (Exception e) when (e is IOException or JsonException or UnauthorizedAccessException or InvalidOperationException)
+        catch (Exception e)
         {
-            ServiceLog.Warn($"ahp: {file} could not be read: {e.Message}");
+            // Whatever it is (not JSON, a key twice, a field missing), it is no state of the face's: none is.
+            ServiceLog.Warn($"ahp: {file} is not one the face can read; it starts without it: {e.Message}");
+            return;
+        }
+        foreach (var (agent, seen) in models) agentModels[agent] = seen;
+        foreach (var (agent, config) in configs)
+        {
+            agentConfigs[agent] = config;
+            savedSchemas[agent] = Json.SerializeToElement(config.Schema).GetRawText();
         }
     }
 
-    /// <summary>Under the gate: each agent's models and options schema, written for the next start.</summary>
+    /// <summary>
+    /// Under the gate: each agent's models and options schema, to be written for the next start, off the gate and at
+    /// most every <see cref="AhpFaceOptions.StateWriteDelay"/>: Claude's options change with its model, so a model
+    /// switch changes them each time.
+    /// </summary>
     void SaveState()
     {
-        if (options.StateFile is not { } file) return;
+        if (options.StateFile is null) return;
         var agents = new JsonObject();
         foreach (var agent in agentModels.Keys.Union(agentConfigs.Keys).Order(StringComparer.Ordinal))
         {
@@ -57,15 +77,36 @@ internal sealed partial class AhpFace
             if (agentConfigs.TryGetValue(agent, out var config)) kept["schema"] = JsonNode.Parse(Json.SerializeToElement(config.Schema).GetRawText());
             agents[agent] = kept;
         }
-        try
+        var first = stateToWrite is null && stateWriter.IsCompleted;
+        stateToWrite = new JsonObject { ["version"] = 1, ["agents"] = agents }.ToJsonString();
+        if (first) stateWriter = Task.Run(WriteStateAsync);
+    }
+
+    /// <summary>Writes the latest state, a while after the first change, then any that came while it wrote.</summary>
+    async Task WriteStateAsync()
+    {
+        var file = options.StateFile!;
+        try { await Task.Delay(options.StateWriteDelay, stopping.Token); }
+        catch (OperationCanceledException) { } // stopping: written now
+        while (true)
         {
-            var written = file + ".tmp";
-            File.WriteAllText(written, new JsonObject { ["version"] = 1, ["agents"] = agents }.ToJsonString());
-            File.Move(written, file, overwrite: true);
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            ServiceLog.Warn($"ahp: {file} could not be written: {e.Message}");
+            string? json;
+            lock (gate)
+            {
+                json = stateToWrite;
+                stateToWrite = null;
+            }
+            if (json is null) return;
+            try
+            {
+                var written = file + ".tmp";
+                File.WriteAllText(written, json);
+                File.Move(written, file, overwrite: true);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                ServiceLog.Warn($"ahp: {file} could not be written: {e.Message}");
+            }
         }
     }
 

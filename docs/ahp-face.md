@@ -271,7 +271,7 @@ Client actions on a session:
 
 | Action | What the face does |
 | --- | --- |
-| `session/isArchivedChanged` | echoed at once, then `_gorynych/archive {sessionId, archived}` in the session's write order (an archive and an unarchive reach the service as they came); one the service refuses goes back by the host (see below) |
+| `session/isArchivedChanged` | echoed at once, then `_gorynych/archive {sessionId, archived}` in an order of the session's archives own (an archive and an unarchive reach the service as they came, and no prompt or cancel waits for one), its session's ID taken then; one the service refuses goes back by the host (see below) |
 | `session/isReadChanged` | applied in memory |
 | `session/titleChanged` | refused (`Renaming is not supported yet`) until renaming reaches the native side ([design.md](design.md#sessions-catalog-titles-archive), planned) |
 | `session/activeClientSet`, `session/activeClientRemoved` | applied |
@@ -446,7 +446,8 @@ the review's items below; an approved tool call VS Code no longer shows once don
 way, explained under "Limits". A re-check and a third review (13 November) found the rest fixed in a
 third round: the model choice, the terminal limit, file URIs, asks tied to their turn, a new session's
 early updates. A fourth round: agents never seen selectable (L5), a new session's later updates after
-its answer, a queued message's and a stale draft's model, and smaller items.
+its answer, a queued message's model, and smaller items. A fifth: a client's draft model is its user's
+pick (the fourth round's re-offer of a "stale" one went), a state file it cannot read, smaller items.
 
 - **Creating and deleting.** `createSession`: the session at the URI its client chose, `creating` at
   once, with its own chat (`ahp-chat:/<id>`, the same `<id>`) open from the start; `session/new` in the
@@ -492,7 +493,9 @@ its answer, a queued message's and a stale draft's model, and smaller items.
   - **Never none.** VS Code disables an agent whose `models` is empty ("No models are available for this
     agent"; live check, right after a start, for every agent but the one the window had made a draft
     of). So the face keeps each agent's models, and its options' schema, in its own state file in the
-    data folder (`ahp-face.json`), written when they change and read at its start; and an agent it knows
+    data folder (`ahp-face.json`), written a second after they change (off the face's lock; changes close
+    together are written once: Claude's options change with its model) and read at its start, where a
+    file it cannot read, or not as it writes one, is none and is written anew; and an agent it knows
     nothing of has one model, `gorynych/agent-default` ("Agent's default"), which is no value of any
     agent's model option, so the face never sets it on a session: the agent keeps its own default.
     ACP has no way to learn an agent's models without a session, and a session made only to ask would
@@ -512,10 +515,13 @@ its answer, a queued message's and a stale draft's model, and smaller items.
     pick. Nothing is remembered of a pick: once set it is the session's model, which the draft offers
     again; a set that failed leaves the session's, so the same pick again is set again. A window that
     reloads, or a second window, reads the same draft.
-  - A client's draft (`chat/draftChanged`) that carries the model the face offered before the current
-    one was built before the client took the offer: the face offers the session's model in it again,
-    its text kept. A cleared draft gets the session's model again.
-  - **Before a session exists** (the open question of this step): `resolveSessionConfig` answers the
+  - A client's draft (`chat/draftChanged`) keeps the model in it: AHP's draft carries what its user
+    picked, the model offered before among the rest (a user who picks it again after a change elsewhere,
+    or Claude's "Default" after Claude reported its model). A cleared draft (VS Code clears it on a send)
+    gets the session's model again. Accepted: a draft a client built in the milliseconds before it took a
+    new offer of the face's carries the model before; a message sent from it sets that model back.
+  - **Before a session exists** (the open question of this step; where an agent's options depend on its
+    model, as Claude's modes do, the schema of the last session seen, whatever its model): `resolveSessionConfig` answers the
     options of the latest session of that agent the face has seen (kept across restarts; none before
     it has ever seen one), with only the values the client gave that those options take. A new session gets
     its agent's own defaults, and the values the client chose are set on it after `session/new`, before
@@ -616,8 +622,10 @@ its answer, a queued message's and a stale draft's model, and smaller items.
   new session right after its answer; a file URI's `%` escaped; a real path through links. From the
   fourth: an agent never seen has its default as its one model, never set; models and options kept across
   a restart; options said right after a new session's answer win over the answer's; a queued message's
-  model against the model when it was queued; a client's stale draft given the session's model again;
-  no file URI for a drive-relative or device path.
+  model against the model when it was queued;
+  no file URI for a drive-relative or device path. From the fifth: the model offered before, picked again
+  in a draft, is a pick; the model a new session's answer said stays pickable after its agent reported
+  another; a state file the face cannot read is none and is written anew.
 - **Live check.** In VS Code: a Claude session in a folder picked through the host; a prompt; a Write
   approved; a turn cancelled; a Kimi session with its model picked; each visible in Zed; no terminal
   toast.

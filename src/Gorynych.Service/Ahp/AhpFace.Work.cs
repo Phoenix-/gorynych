@@ -127,7 +127,7 @@ internal sealed partial class AhpFace
         try { Show(ask); }
         catch
         {
-            requests.Remove(ask.Id);
+            Withdraw(ask); // whatever Show had put in the chat and the session goes with it
             throw;
         }
         return ask;
@@ -543,6 +543,8 @@ internal sealed partial class AhpFace
             Broadcast(chat.Uri, raw, origin, why, c);
             return;
         }
+        // A steering message replaces the one before it.
+        if (x.Kind == PendingMessageKind.Steering && chat.Model?.State.SteeringMessage is { } replaced && replaced.Id != x.Id) chat.QueuedOn.Remove(replaced.Id);
         ApplyChat(chat, x, origin);
         chat.QueuedOn[x.Id] = CurrentModel(chat.Session); // what its picker's model is a pick against, when it starts later
         ConsumeQueued(chat);
@@ -632,9 +634,9 @@ internal sealed partial class AhpFace
     {
         if (chat.IsChild || chat.Model is not { } model || CurrentModel(chat.Session) is not { } current) return;
         var draft = model.State.Draft;
-        // A client's draft with the model offered before this one was built before it saw the offer: offered again.
-        var stale = draft?.Model?.Id is { } drafted && drafted != current && drafted == chat.PreviousOffer;
-        if (draft is not null && !stale && (chat.Offered == current || draft.Model?.Id == current))
+        // A client's draft keeps the model in it: AHP's draft carries what its user picked. Only a change of the
+        // session's model, or no draft at all, puts the session's there.
+        if (draft is not null && (chat.Offered == current || draft.Model?.Id == current))
         {
             chat.Offered = current;
             return;
@@ -642,7 +644,6 @@ internal sealed partial class AhpFace
         var offered = draft is null ? new Message { Text = "", Origin = new MessageOrigin { Kind = MessageKind.User } } : Clone(draft);
         offered.Model = new ModelSelection { Id = current };
         ApplyChat(chat, new ChatDraftChangedAction { Draft = offered });
-        if (chat.Offered != current) chat.PreviousOffer = chat.Offered;
         chat.Offered = current;
     }
 
