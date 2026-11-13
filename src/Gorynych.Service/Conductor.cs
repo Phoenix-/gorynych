@@ -112,6 +112,9 @@ public sealed class ConductorOptions
 
     /// <summary>For tests: awaited, with the question's askId, when its asker's wait for the answer is cancelled.</summary>
     internal Func<string, Task>? AskWaitEnded { get; init; }
+
+    /// <summary>For tests: awaited, with the host's ID, when a host that connected is through its handshake, just before it is taken.</summary>
+    internal Func<string, Task>? TakingHost { get; init; }
 }
 
 /// <summary>
@@ -186,6 +189,8 @@ public sealed class Conductor : IAsyncDisposable
 
     /// <summary>Starts the adapter hosts; null when the adapters run in this process.</summary>
     internal IHostLauncher? Hosts => options.Hosts;
+
+    internal Func<string, Task>? TakingHost => options.TakingHost;
 
     internal HostGeneration? ExpectedGeneration(string adapter) => options.HostGeneration?.Invoke(adapter);
 
@@ -4385,6 +4390,9 @@ public sealed class Conductor : IAsyncDisposable
         Volatile.Read(ref reclaimSweep)?.Dispose();
         try { await Task.WhenAll(cleanups.Keys).WaitAsync(TimeSpan.FromSeconds(5)); }
         catch (Exception e) { ServiceLog.Warn($"cleanup at exit: {e.Message}"); }
+        // No host is taken from now on, and those in the middle of their handshake are taken or not
+        // first: one taken after the instances are let go of would stay connected to this conductor.
+        await Task.WhenAll(agents.Values.Select(h => h.CloseAsync()));
         // Where each session is open, before the instances are let go of.
         var openIn = new Dictionary<string, HostLink>(StringComparer.Ordinal);
         foreach (var host in agents.Values)

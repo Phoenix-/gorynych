@@ -41,6 +41,9 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
     /// <summary>The adapters with a host per session, for a conductor made now.</summary>
     public HashSet<string> SessionHosts { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>For a conductor made now: awaited as it is about to take a host that connected (<see cref="ConductorOptions.TakingHost"/>).</summary>
+    public Func<string, Task>? TakingHost { get; set; }
+
     public sealed record Running(string Adapter, string Slot, string Build, AdapterHost Host, Task<int> Run, AgentInstance Agent);
 
     /// <summary>The adapter's host started last.</summary>
@@ -150,6 +153,7 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
             DataDirectory = data, ServiceId = "test-service", Hosts = this, HostToken = Token,
             HostGeneration = Generations ? a => new HostGeneration(build, options(a)) : null,
             SessionHosts = new HashSet<string>(SessionHosts, StringComparer.Ordinal),
+            TakingHost = TakingHost,
         }, names);
     }
 }
