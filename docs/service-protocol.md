@@ -1809,7 +1809,9 @@ again:
    the answer still gets it.
 3. The next service takes the questions back with the host: a turn's question is awaited under its
    `message_id` again, so the agent's `reply` reaches it, and its turn's own text answers when no
-   reply came (from the journal: the earlier service journaled the start of the turn). A `reply` to
+   reply came (from the journal: the earlier service journaled the start of the turn). A `reply`
+   that says `delivered: true` is the answer by then, so a turn end that follows it does not
+   replace it; one that comes after the turn's end says `delivered: false`. A `reply` to
    a question of an earlier run waits up to 15 seconds for the host that answers it, in the first
    minute after the service starts.
 4. The asker that lost the service sends the question again with `gorynych/reclaim: true`: the
