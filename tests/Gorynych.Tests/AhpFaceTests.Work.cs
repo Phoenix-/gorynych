@@ -59,6 +59,10 @@ public sealed partial class AhpFaceTests
         Assert.IsTrue(record.Draft, "not prompted yet");
         Assert.IsTrue(vscode.Events().Any(e => e.Event is SubscriptionEventSessionAdded added && added.Params.Summary.Resource == sessionUri),
             "the root says it once it is ready");
+        // A draft no list has: the face keeps it when the list changes meanwhile.
+        var other = await rig.NewPromptedAsync("kimi", "Review the notes");
+        await LinkHarness.Until(() => vscode.ListAsync().Result.Items.Any(i => i.Resource == AhpNames.SessionUri(other)), "the list read again");
+        Assert.IsFalse(vscode.Events().Any(e => e.Event is SubscriptionEventSessionRemoved removed && removed.Params.Session == sessionUri), "the draft stays");
 
         await Send(vscode, chatUri, "t1", "Port the parser");
         await TurnEndedAsync(vscode, chatUri, "t1");
@@ -212,11 +216,38 @@ public sealed partial class AhpFaceTests
         await vscode.Client.DispatchAsync(chatUri, new StateAction(new ChatTurnCancelledAction { TurnId = "t1", Duration = 1 }), null, CancellationToken.None);
         await TurnEndedAsync(vscode, chatUri, "t1");
         Assert.IsNull(vscode.Actions(chatUri).Single(a => a.Action.Value is ChatTurnCancelledAction).RejectionReason);
+        await LinkHarness.Until(() => { lock (rig.Claude.Adapter.Methods) return rig.Claude.Adapter.Methods.Contains(AcpMethods.Agent.SessionCancel); }, "session/cancel reached the agent");
         // The agent's answer after the cancel (the test agent's "ok") is the cancelled turn's tail.
         await LinkHarness.Until(() => !rig.Face.Settling(id), "the turn's end mark came");
         Assert.IsFalse(vscode.Of<ChatDeltaAction>(chatUri).Any(), "nothing of the tail reached the chat");
         Assert.AreEqual(1, vscode.Of<ChatResponsePartAction>(chatUri).Length);
         Assert.AreEqual(0, vscode.Of<ChatTurnStartedAction>(chatUri).Count(t => t.TurnId != "t1"), "nor began a turn");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ACancelRightAfterAMessageWithAModel_ReachesTheConductorAfterItsPrompt()
+    {
+        await using var rig = await Rig.StartAsync();
+        rig.Kimi.ReportsModes = true;
+        rig.Kimi.ReportsModels = true;
+        await using var vscode = await rig.ConnectAsync();
+        var (_, chatUri, id) = await CreateAsync(rig, vscode, "kimi");
+        bool Cancelled() { lock (rig.Kimi.Adapter.Methods) return rig.Kimi.Adapter.Methods.Contains(AcpMethods.Agent.SessionCancel); }
+        rig.Kimi.DuringPrompt = (_, _) => LinkHarness.Until(Cancelled, "the cancel reached the agent");
+
+        // The model is set first, a round trip: a cancel sent meanwhile must not overtake the prompt, or the
+        // conductor, which cancels only the prompts that came before a cancel, would run the prompt after it.
+        await Send(vscode, chatUri, "t1", "Go big", new ModelSelection { Id = "large" });
+        await vscode.Client.DispatchAsync(chatUri, new StateAction(new ChatTurnCancelledAction { TurnId = "t1", Duration = 0 }), null, CancellationToken.None);
+        await TurnEndedAsync(vscode, chatUri, "t1");
+        await LinkHarness.Until(() => !rig.Face.Settling(id), "the cancelled turn ended in its agent too");
+        string[] methods;
+        lock (rig.Kimi.Adapter.Methods) methods = [.. rig.Kimi.Adapter.Methods];
+        var prompt = Array.LastIndexOf(methods, AcpMethods.Agent.SessionPrompt);
+        var cancel = Array.LastIndexOf(methods, AcpMethods.Agent.SessionCancel);
+        Assert.IsTrue(cancel >= 0, string.Join(", ", methods));
+        Assert.IsTrue(prompt < cancel, $"a prompt the agent got came before the cancel: {string.Join(", ", methods)}");
     }
 
     [TestMethod]

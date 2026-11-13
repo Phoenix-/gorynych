@@ -149,7 +149,7 @@ describes: a host speaks AHP to its clients and ACP to its agents.
   to one of its chats, or to the session's own channel (so that the session's snapshot has its agent's
   options), builds the chat state from the replay, and answers the subscription when the load answers. It closes the session (`session/close`) when no AHP client has subscribed to
   any of its chats for two minutes, so a reconnect finds it still open and gets a replay, and
-  never while any turn of the session runs. When the face is the session's last client, a close
+  never while any turn of the session runs, nor while its agent waits for an answer here. When the face is the session's last client, a close
   cancels whatever client's turn runs ([service-protocol.md](service-protocol.md#standard-methods)),
   Zed's too, if Zed has quit meanwhile; so the face waits for the turn's end. Its own chat state
   says whether a turn runs, since it sees every start and end ([Turns](#chats)). The same holds for
@@ -469,7 +469,10 @@ Built on 13 November 2026; its live check is to come.
     refuses it) ends its turn with the error. The prompt is the message's text, a `resource` attachment
     as a `resource_link`, and a `simple` one's `modelRepresentation`; other attachments are left out.
   - `chat/turnCancelled` is applied, and becomes `session/cancel`; what the agent still asks of the face
-    is answered as cancelled, as ACP has a client do when it cancels. The turn is over for its clients at
+    is answered as cancelled, as ACP has a client do when it cancels. What the face sends the conductor
+    for a session goes in the order it decided it (prompts, cancels, option changes), so a cancel never
+    overtakes the prompt it follows (one waiting for its session to be made, or for its model to be set),
+    which the conductor would then run: it cancels only the prompts that came before a cancel. The turn is over for its clients at
     once; what its agent still sends of it is left out until the end mark of its prompt comes (or
     another turn's user message, or 10 s of quiet).
   - Queued and steering messages (`chat/pendingMessageSet`) stay in the chat, and the face starts the
@@ -500,7 +503,9 @@ Built on 13 November 2026; its live check is to come.
     session, is declined.
   - A request the agent withdraws is withdrawn here too: a tool call back to running
     (`confirmed: "not-needed"`), a form completed as `cancel`, and out of `inputNeeded`. What the agent
-    asked about a session the face lets go of is answered as cancelled.
+    asks about a session the face does not show (it let it go, or could not open it) is answered as
+    cancelled, so the agent never waits for nobody; one that comes while the face opens the session is
+    shown once it is open. The face does not close a session whose agent waits for an answer here.
   - Routing, until step 3: a request goes, as the conductor routes any, to the client attached to the
     session last: VS Code only when the face opened (or created) the session after any ACP client did,
     else Zed. Neither sees the other's approvals.
@@ -517,7 +522,8 @@ Built on 13 November 2026; its live check is to come.
   AHP's, modes as `mode`. End to end (`AhpFaceTests`), with `AhpClient` over a WebSocket: a session
   created in a folder, prompted, its answer streamed, and listed by Zed under its URI; an approval
   answered from AHP and one the agent withdraws; a form answered (refused without its required
-  answer); a cancel and its tail; a queued message; options, a change Zed sees, a message's model;
+  answer); a cancel and its tail; a cancel right after a message with another model, after its prompt;
+  a draft kept while the list changes; a queued message; options, a change Zed sees, a message's model;
   options chosen before a session exists; a session disposed; slash commands; the terminal (made, its
   line, input taken, disposed); the folder methods and those refused.
 - **Live check.** In VS Code: a Claude session in a folder picked through the host; a prompt; a Write

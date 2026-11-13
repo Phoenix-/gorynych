@@ -20,7 +20,6 @@ internal sealed partial class AhpFace
     readonly Dictionary<string, FaceAsk> requests = new(StringComparer.Ordinal); // what agents ask of the face, by its ID
     readonly Dictionary<string, SessionConfigState> agentConfigs = new(StringComparer.Ordinal); // agent -> the options of its latest session seen
     readonly Dictionary<string, List<AhpConfig.Choice>> agentModels = new(StringComparer.Ordinal); // agent -> its models, as last seen
-    Task written = Task.CompletedTask; // the last message to the conductor queued to be written in order
     long asks;
 
     static T Clone<T>(T value) => Json.Deserialize<T>(Json.SerializeToElement(value))!;
@@ -28,21 +27,17 @@ internal sealed partial class AhpFace
     static string? Text(JsonNode? node) => AhpNames.Text(node);
 
     /// <summary>
-    /// Under the gate: writes a message to the conductor after those queued before it, so that a cancel the face
-    /// decided before a prompt reaches the conductor before it (which would otherwise cancel that prompt too).
+    /// Under the gate: runs a step that writes to the conductor for the session after the steps the face decided for
+    /// it before, in that order. A prompt's step writes the prompt (after the session exists, and its model is set);
+    /// a cancel decided after it then reaches the conductor after it, as it must: a cancel cancels only the prompts
+    /// that came before it. Option changes go so too, so that their echoes come in the order the agent took them.
     /// </summary>
-    Task<T> Write<T>(Func<Task<T>> write)
+    Task<T> Write<T>(FaceSession s, Func<Task<T>> step)
     {
-        var task = written.ContinueWith(_ => write(), CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default).Unwrap();
-        written = task.ContinueWith(_ => { }, TaskScheduler.Default);
+        var task = s.Written.ContinueWith(_ => step(), CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default).Unwrap();
+        s.Written = task.ContinueWith(_ => { }, TaskScheduler.Default);
         return task;
     }
-
-    Task Write(Func<Task> write) => Write(async () =>
-    {
-        await write();
-        return true;
-    });
 
     // ---------------------------------------------------------------- approvals and forms
 
@@ -97,7 +92,13 @@ internal sealed partial class AhpFace
     /// <summary>Under the gate: shows what the agent asks in its session's chat, once the face has that open.</summary>
     void Show(FaceAsk ask)
     {
-        if (!chatsById.TryGetValue(ask.SessionId, out var chat) || chat.Model is not { } model) return; // shown when it opens
+        if (!chatsById.TryGetValue(ask.SessionId, out var chat) || chat.Model is not { } model)
+        {
+            // Shown once the face has the session open, if it is opening it (an approval waiting for a client comes right
+            // after the replay); otherwise nobody here will see it (the face let the session go): answered as cancelled.
+            if (chat?.Loading is null) Resolve(ask, ask.Cancelled());
+            return;
+        }
         ask.Chat = chat;
         SessionInputRequest needed;
         if (ask.Form)
@@ -141,6 +142,7 @@ internal sealed partial class AhpFace
         }
         ask.Needed = true;
         ApplySession(chat.Session, new SessionInputNeededSetAction { Request = needed });
+        if (model.Unmarked) ScheduleQuiet(chat); // a turn it opened ends once the session goes quiet after the answer
         Sync(chat.Session);
     }
 
@@ -355,14 +357,15 @@ internal sealed partial class AhpFace
     }
 
     /// <summary>
-    /// Sends a turn's message to the conductor: the model the message names first, when it is another than the
-    /// session's; then the prompt, with the turn's ID as its <c>gorynych/promptId</c>, whose end mark ends the turn.
-    /// A prompt that fails before its agent could mark its end (a restart refused it) ends its turn with the error.
+    /// Under the gate: sends a turn's message to the conductor, in the session's order (<see cref="Write{T}"/>), decided
+    /// now: once the session exists, the model the message names first, when it is another than the session's; then the
+    /// prompt, with the turn's ID as its <c>gorynych/promptId</c>, whose end mark ends the turn. A prompt that fails
+    /// before its agent could mark its end (a restart refused it) ends its turn with the error.
     /// </summary>
-    void Prompt(FaceChat chat, string turnId, Message message) => _ = Task.Run(async () =>
+    void Prompt(FaceChat chat, string turnId, Message message)
     {
         var s = chat.Session;
-        try
+        var started = Write(s, async () =>
         {
             await s.Created; // a session still being made: its first prompt waits for it
             if (s.SessionId.Length == 0) throw new JsonRpcException(JsonRpcException.InternalError, "The session could not be created");
@@ -372,23 +375,26 @@ internal sealed partial class AhpFace
                 ["sessionId"] = s.SessionId, ["prompt"] = Blocks(message),
                 ["_meta"] = new JsonObject { [GorynychProtocol.MetaPromptId] = turnId },
             };
-            Task<Task<JsonNode?>> start;
-            lock (gate) start = Write(() => acp!.StartRequestAsync(AcpMethods.Agent.SessionPrompt, @params, stopping.Token));
-            var response = await start;
-            await response;
-        }
-        catch (Exception) when (stopping.IsCancellationRequested) { }
-        catch (Exception e)
+            var response = await acp!.StartRequestAsync(AcpMethods.Agent.SessionPrompt, @params, stopping.Token);
+            lock (gate) s.Draft = false; // prompted: the conductor keeps it now, and lists it
+            return response;
+        });
+        _ = Task.Run(async () =>
         {
-            lock (gate)
+            try { await await started; }
+            catch (Exception) when (stopping.IsCancellationRequested) { }
+            catch (Exception e)
             {
-                if (chat.Model is not { } model) return;
-                model.FailTurn(turnId, e is JsonRpcException j ? j.Code : JsonRpcErrorCodes.InternalError, e.Message);
-                ConsumeQueued(chat);
-                Sync(s);
+                lock (gate)
+                {
+                    if (chat.Model is not { } model) return;
+                    model.FailTurn(turnId, e is JsonRpcException j ? j.Code : JsonRpcErrorCodes.InternalError, e.Message);
+                    ConsumeQueued(chat);
+                    Sync(s);
+                }
             }
-        }
-    });
+        });
+    }
 
     /// <summary>A message's ACP prompt: its text, and its attachments a prompt can carry (a file as a resource link, a client's own text).</summary>
     static JsonArray Blocks(Message message)
@@ -421,7 +427,17 @@ internal sealed partial class AhpFace
         }
         var answer = await acp!.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
             new JsonObject { ["sessionId"] = s.SessionId, ["configId"] = configId, ["value"] = model }, stopping.Token);
-        lock (gate) OptionsChanged(s, answer?["configOptions"]?.DeepClone() as JsonArray ?? s.AcpOptions, s.AcpModes);
+        lock (gate)
+        {
+            var options = answer?["configOptions"]?.DeepClone() as JsonArray;
+            if (options is null && s.AcpOptions?.DeepClone() is JsonArray kept)
+            {
+                // An answer that says no options: the model is the one set all the same.
+                foreach (var option in kept.OfType<JsonObject>()) if (Text(option["id"]) == configId) option["currentValue"] = model;
+                options = kept;
+            }
+            OptionsChanged(s, options, s.AcpModes);
+        }
     }
 
     /// <summary>
@@ -442,11 +458,14 @@ internal sealed partial class AhpFace
         ApplyChat(chat, x, origin);
         model.ClientTurnCancelled();
         foreach (var ask in requests.Values.Where(r => r.Chat == chat).ToList()) Resolve(ask, ask.Cancelled());
-        var sessionId = chat.SessionId;
-        _ = Write(async () =>
+        var s = chat.Session;
+        _ = Write(s, async () =>
         {
-            try { await acp!.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId }); }
-            catch (Exception e) when (e is IOException or ObjectDisposedException) { ServiceLog.Info($"ahp: cancelling {sessionId}: {e.Message}"); }
+            await s.Created;
+            if (s.SessionId.Length == 0) return false;
+            try { await acp!.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = s.SessionId }); }
+            catch (Exception e) when (e is IOException or ObjectDisposedException) { ServiceLog.Info($"ahp: cancelling {s.SessionId}: {e.Message}"); }
+            return true;
         });
         ScheduleQuiet(chat);
         ConsumeQueued(chat);
@@ -523,6 +542,12 @@ internal sealed partial class AhpFace
             return;
         }
         had.Schema = config.Schema;
+        // An option that went takes its value with it (all values replaced); otherwise the changed ones.
+        if (had.Values.Keys.Any(k => !config.Values.ContainsKey(k)))
+        {
+            ApplySession(s, new SessionConfigChangedAction { Config = new(config.Values, StringComparer.Ordinal), Replace = true });
+            return;
+        }
         var changed = config.Values.Where(v => !had.Values.TryGetValue(v.Key, out var was) || !AhpConfig.Same(was, v.Value))
             .ToDictionary(v => v.Key, v => v.Value, StringComparer.Ordinal);
         if (changed.Count > 0) ApplySession(s, new SessionConfigChangedAction { Config = changed });
@@ -573,7 +598,7 @@ internal sealed partial class AhpFace
             return;
         }
         var changes = x.Config.ToList();
-        _ = Task.Run(async () =>
+        _ = Write(s, async () =>
         {
             string? failed = null;
             JsonArray? options = null;
@@ -581,14 +606,15 @@ internal sealed partial class AhpFace
             catch (Exception e) when (e is IOException or JsonRpcException or OperationCanceledException or ObjectDisposedException) { failed = e.Message; }
             lock (gate)
             {
-                if (!sessions.TryGetValue(s.Uri, out var now) || now != s) return;
+                if (!sessions.TryGetValue(s.Uri, out var now) || now != s) return false;
                 if (failed is not null)
                 {
                     Broadcast(s.Uri, raw, origin, failed, c);
-                    return;
+                    return false;
                 }
                 ApplySession(s, x, origin);
                 if (options is not null) OptionsChanged(s, options, s.AcpModes);
+                return true;
             }
         });
     }
@@ -725,14 +751,24 @@ internal sealed partial class AhpFace
                         });
                 return;
             }
-            var id = Text(answer?["sessionId"]) ?? "";
+            if (Text(answer?["sessionId"]) is not { Length: > 0 } id)
+            {
+                lock (gate)
+                    if (sessions.TryGetValue(s.Uri, out var now) && now == s)
+                        ApplySession(s, new SessionCreationFailedAction { Error = new ErrorInfo { ErrorType = "error", Message = "The agent made no session" } });
+                return;
+            }
             List<KeyValuePair<string, JsonElement>> changes;
             lock (gate)
             {
                 if (!sessions.TryGetValue(s.Uri, out var now) || now != s)
                 {
                     // Disposed while it was being made: it goes in its agent too.
-                    _ = Task.Run(() => acp!.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = id }, stopping.Token));
+                    _ = Task.Run(async () =>
+                    {
+                        try { await acp!.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = id }, stopping.Token); }
+                        catch (Exception e) { ServiceLog.Info($"ahp: deleting {id}, disposed while it was made: {e.Message}"); }
+                    });
                     return;
                 }
                 s.SessionId = own.SessionId = id;

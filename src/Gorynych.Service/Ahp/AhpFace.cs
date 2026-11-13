@@ -351,6 +351,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
         public string SessionId { get; set; } = sessionId; // "" while a session an AHP client created is being made
         public bool Draft; // created through the face and not prompted yet: no list has it
         public Task Created = Task.CompletedTask; // its session/new, for one created through the face
+        public Task Written = Task.CompletedTask; // the last step the face queued to write to the conductor for it
         public JsonArray? AcpOptions; // its agent's config options, as it last said them
         public JsonObject? AcpModes; // its agent's modes, as it last said them
         public bool ModesAsMode; // its modes are the config property "mode"
@@ -536,7 +537,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
         if (chats.TryGetValue(chat.Uri, out var now) && ReferenceEquals(now, chat)) chats.Remove(chat.Uri);
         if (chatsById.TryGetValue(chat.SessionId, out var byId) && ReferenceEquals(byId, chat)) chatsById.Remove(chat.SessionId);
         // What the agent asked of it here can no longer be shown: it is answered as cancelled, as by a client that goes.
-        foreach (var ask in requests.Values.Where(r => r.Chat == chat).ToList()) Resolve(ask, ask.Cancelled());
+        foreach (var ask in requests.Values.Where(r => r.Chat == chat || (r.Chat is null && r.SessionId == chat.SessionId)).ToList()) Resolve(ask, ask.Cancelled());
         if (chat.Model is not { } model) return;
         chat.Model = null;
         if (close && chat.SessionId.Length > 0) LetGo(chat.SessionId, model);
@@ -809,6 +810,8 @@ internal sealed partial class AhpFace : IAsyncDisposable
             {
                 chat.Buffer = null;
                 chat.Loading = null;
+                // What its agent asked while it opened can be shown nowhere.
+                foreach (var ask in requests.Values.Where(r => r.Chat is null && r.SessionId == chat.SessionId).ToList()) Resolve(ask, ask.Cancelled());
             }
             throw new AhpError(JsonRpcErrorCodes.InternalError, $"Session {chat.SessionId} could not be opened: {e.Message}");
         }
@@ -886,14 +889,14 @@ internal sealed partial class AhpFace : IAsyncDisposable
             var now = DateTimeOffset.UtcNow;
             foreach (var chat in chats.Values.ToList())
             {
-                if (chat.Model is not { } model) continue;
+                if (chat.Model is not { } model || chat.SessionId.Length == 0) continue;
                 if (connections.Any(c => c.Subscriptions.Contains(chat.Uri) || c.Pending.ContainsKey(chat.Uri)))
                 {
                     chat.Unwatched = null;
                     continue;
                 }
                 chat.Unwatched ??= now;
-                if (now - chat.Unwatched < options.CloseAfter || Running(model)) continue;
+                if (now - chat.Unwatched < options.CloseAfter || Running(model) || requests.Values.Any(r => r.Chat == chat)) continue;
                 chat.IsRead = (model.State.Status & SessionStatus.IsRead) != 0;
                 chat.Model = null;
                 Close(chat.SessionId);
