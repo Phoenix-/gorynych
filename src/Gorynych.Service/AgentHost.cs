@@ -77,6 +77,10 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     readonly HashSet<string> claimed = new(StringComparer.Ordinal);                                // slots started for an open; under linksGate
     readonly Dictionary<string, HostLink> pinned = new(StringComparer.Ordinal);                    // session -> the host whose close of it failed; under linksGate
     readonly Dictionary<string, HostFailure> failures = new(StringComparer.Ordinal);               // FailureKey(slot) -> its last failure; under linksGate
+    bool closing;                                  // the conductor exits: a host that connects now is not taken (CloseAsync); under linksGate
+    bool closed;                                   // the conductor let go of its hosts (DisposeAsync): none is taken after; under linksGate
+    int attaching;                                 // hosts in the middle of their handshake; under linksGate
+    TaskCompletionSource? handshakesEnded;         // what CloseAsync waits for while some are; under linksGate
     AgentInstance? instance;
 
     public string Name => adapter.Name;
@@ -425,19 +429,41 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// its agent said the first time), and if it comes back, takes its report (open sessions, running
     /// turns), adopts its turns, and has it send what the journal lacks after each session's cursor.
     /// Then its sessions' requests go to it, and, if it is of the current generation, new ones. False
-    /// when it is refused: a second host of the same slot, or one this conductor already saw go.
+    /// when it is refused: a second host of the same slot, one this conductor already saw go, or one
+    /// that connects or ends its handshake as the conductor exits (<see cref="CloseAsync"/>).
     /// </summary>
     internal async Task<bool> AttachAsync(JsonRpcConnection rpc, HostHello hello, CancellationToken ct)
     {
-        // A host before that closed and is not handled yet is now, so a host that comes back after its
-        // link broke is known as gone.
+        bool exiting;
+        lock (linksGate)
+        {
+            exiting = closing;
+            if (!exiting) attaching++;
+        }
+        if (exiting) return await NotTakenAsync(rpc, hello);
+        try
+        {
+            return await TakeAsync(rpc, hello, ct);
+        }
+        finally
+        {
+            lock (linksGate)
+                if (--attaching == 0) handshakesEnded?.TrySetResult();
+        }
+    }
+
+    async Task<bool> TakeAsync(JsonRpcConnection rpc, HostHello hello, CancellationToken ct)
+    {
+        // A host before that closed and is not handled yet is now, so another host may have its slot.
         HandleClosed();
         bool gone;
         HostLink? serving;
         lock (linksGate)
         {
-            gone = goneHosts.Contains(hello.HostId);
-            serving = links.FirstOrDefault(l => l.Slot == hello.Slot && !l.Rpc.IsClosed);
+            // A host has one connection at a time: one that says hello again lost the one this conductor
+            // took, which ends its turns as it closes (OnClosed), whether or not that is handled yet.
+            gone = goneHosts.Contains(hello.HostId) || links.Any(l => l.HostId == hello.HostId);
+            serving = links.FirstOrDefault(l => l.Slot == hello.Slot && l.HostId != hello.HostId && !l.Rpc.IsClosed);
         }
         if (serving is not null)
         {
@@ -494,17 +520,26 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         // The turns a service before left to a host that no longer has them (it died, or exited
         // alone) never ended anywhere: they end here, cancelled.
         await conductor.SettleAsync(this, link, reattached ? report : null);
-        TaskCompletionSource<HostLink>? arrival;
+        if (conductor.TakingHost is { } taking) await taking(hello.HostId);
+        TaskCompletionSource<HostLink>? arrival = null;
+        bool late;
         lock (linksGate)
         {
-            links.Add(link);
-            foreach (var s in sessions)
-                if (route.TryAdd(s, link)) link.Sessions.Add(s);
-                else ServiceLog.Warn($"{Name}: host {hello.HostId} has {s} open, which host {route[s].HostId} has too; it goes on there");
-            // Started for an open: it is not stopped as empty before the session is opened in it.
-            if (link.ForSession && claimed.Remove(link.Slot)) link.Opening++;
-            arriving.Remove(link.Slot, out arrival);
+            // The conductor let go of its hosts meanwhile (CloseAsync stopped waiting for this one):
+            // taken now, it would stay connected to a conductor that is gone.
+            late = closed;
+            if (!late)
+            {
+                links.Add(link);
+                foreach (var s in sessions)
+                    if (route.TryAdd(s, link)) link.Sessions.Add(s);
+                    else ServiceLog.Warn($"{Name}: host {hello.HostId} has {s} open, which host {route[s].HostId} has too; it goes on there");
+                // Started for an open: it is not stopped as empty before the session is opened in it.
+                if (link.ForSession && claimed.Remove(link.Slot)) link.Opening++;
+                arriving.Remove(link.Slot, out arrival);
+            }
         }
+        if (late) return await NotTakenAsync(rpc, hello);
         _ = rpc.Completion.ContinueWith(_ => OnClosed(link), TaskScheduler.Default);
         conductor.HostTaken(this, link);
         ServiceLog.Info($"{Name}: host {hello.HostId} ({SlotName(link.Slot)}, {(link.Current ? "current" : "stale")}, {hello.Generation?.ToString() ?? "no generation"}) " +
@@ -771,15 +806,56 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     }
 
     /// <summary>
+    /// The conductor exits: a host that connects from now on is not taken, and those in the middle of
+    /// their handshake end it first, taken or not, so that where each session is open is known before
+    /// the conductor lets go of its hosts (<see cref="DisposeAsync"/>), which closes the connections of
+    /// all it took. One that takes longer than <see cref="HandshakesAtExit"/> is not taken.
+    /// </summary>
+    internal async Task CloseAsync()
+    {
+        Task? handshakes;
+        lock (linksGate)
+        {
+            closing = true;
+            handshakes = attaching == 0 ? null : (handshakesEnded ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        }
+        if (handshakes is null) return;
+        try { await handshakes.WaitAsync(HandshakesAtExit); }
+        catch (TimeoutException) { ServiceLog.Warn($"{Name}: a host still in its handshake after {HandshakesAtExit.TotalSeconds:0} s is not taken"); }
+    }
+
+    /// <summary>How long the exit waits for the hosts in the middle of their handshake (<see cref="CloseAsync"/>).</summary>
+    internal static readonly TimeSpan HandshakesAtExit = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// A host that connected, or ended its handshake, as the conductor exits is not taken: its
+    /// connection closes, and it comes back to the next service with its turns; or, when the
+    /// service shuts down, it stops, as the hosts it took do (<see cref="DisposeAsync"/>).
+    /// </summary>
+    async Task<bool> NotTakenAsync(JsonRpcConnection rpc, HostHello hello)
+    {
+        if (!conductor.StopHostsOnExit)
+        {
+            ServiceLog.Info($"{Name}: host {hello.HostId} is not taken, since this service exits; it goes on to the next one");
+            return false;
+        }
+        ServiceLog.Info($"{Name}: host {hello.HostId} is not taken, since this service shuts down; stopped");
+        try { await rpc.SendRequestAsync(GorynychProtocol.MethodHostStop, new JsonObject()).WaitAsync(TimeSpan.FromSeconds(5)); }
+        catch (Exception e) when (e is IOException or JsonRpcException or TimeoutException) { }
+        return false;
+    }
+
+    /// <summary>
     /// Stops the adapter. A host is stopped only when the service shuts down
     /// (<see cref="Conductor.StopHostsOnExit"/>); for a restart the hosts keep their agents and come
-    /// back to the next conductor.
+    /// back to the next conductor. No host is taken after this (<see cref="CloseAsync"/>).
     /// </summary>
     public async ValueTask DisposeAsync()
     {
         List<HostLink> all;
         lock (linksGate)
         {
+            closing = closed = true;
             all = [.. links];
             links.Clear();
             route.Clear();

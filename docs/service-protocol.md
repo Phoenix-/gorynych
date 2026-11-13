@@ -1760,12 +1760,16 @@ is mapped both ways.
    prompts on their way to their agent, 10 seconds at most.
 3. It answers `{restarted: true, processId, waitedSeconds, cancelledTurns: 0, turnsInHosts}` and
    exits, and leaves its hosts running. A prompt that goes on in its host gets no answer from this
-   service: its client takes the exit for a lost connection, and the bridge resumes.
+   service: its client takes the exit for a lost connection, and the bridge resumes. A host in the
+   middle of its handshake as the service exits ends it first (5 seconds at most), and is let go
+   with the others; one that connects then, or takes longer, is not taken. So each goes on to the
+   next service, and none stays connected to one that is gone.
 4. The next service takes the hosts back as they connect, after 0.2 and 0.5 seconds and then every
    second.
 
 `--timeout`, the call-off and `--force` are for a service without hosts. `shutdown` stops the
-hosts with the service (`_gorynych/host_stop`), and so their agents.
+hosts with the service (`_gorynych/host_stop`), and so their agents, and a host that connects as
+it exits too.
 
 **What a restart still cuts**, because it lives in the conductor:
 
@@ -1850,7 +1854,8 @@ ends its turns cancelled, as a dead host's.
 request starts a new host. So does a host that goes in the middle of its handshake, with the
 turns it brought back; but not one whose handshake the service's own exit cut off, which lives on
 with its turns for the next service. A host whose link broke while it lived is stopped when it
-comes back (`_gorynych/host_stop`): its turns were ended already. A host that dies while no
+comes back (`_gorynych/host_stop`): its turns were ended already, or are as soon as the conductor
+reads the end of that link, since a host has one connection at a time. A host that dies while no
 service runs takes the ends of its turns with it: so a service keeps in the overlay, at its exit,
 the prompts that reached its hosts and have no end in the journal, with those it was left and
 could not settle (`hostPrompts`), and the next one, once the adapter's host is taken, ends

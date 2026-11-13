@@ -173,6 +173,60 @@ public sealed class HostTests
         NoBreakSeen(zed);
     }
 
+    /// <summary>
+    /// A service that exits while a host that came back is in the middle of its handshake: the host is
+    /// taken before the exit lets go of the hosts, or not at all, and either way it goes on to the next
+    /// service with its turn. Taken after the exit let go of the hosts, it would stay connected to a
+    /// service that is gone, and never come to the next one.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    [DataRow(false, DisplayName = "the handshake ends while the service exits")]
+    [DataRow(true, DisplayName = "the handshake ends after the service is gone")]
+    public async Task AHostTakenAsItsServiceExits_GoesOnToTheNextService(bool afterGone)
+    {
+        var data = TestDirs.New();
+        var agent = new TurnAgent("turns") { Hold = true };
+        var hosts = new InProcessHosts(_ => agent);
+        var service = hosts.Conductor(data, agent);
+        hosts.Service = service;
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+        await RestartAsync(service);
+        await GoneAsync(service, zed, hosts);
+
+        // The next service has taken the turn back, and is about to take the host, when it restarts.
+        var taking = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var go = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        hosts.TakingHost = async _ =>
+        {
+            taking.TrySetResult();
+            await go.Task;
+        };
+        var next = Next(data, hosts, zed, agent);
+        hosts.TakingHost = null;
+        await taking.Task.WaitAsync(Wait);
+        Assert.IsNotNull(next.Feed(sid).Adopted, "the turn taken back");
+        Assert.AreEqual(1, (int)(await RestartAsync(next))["turnsInHosts"]!);
+        var gone = GoneAsync(next, zed, hosts);
+        if (afterGone) await gone.WaitAsync(Wait);
+        else await Task.Delay(100);
+        go.SetResult();
+        await gone.WaitAsync(Wait);
+
+        await using var third = Next(data, hosts, zed, agent);
+        await LinkHarness.Until(() => third.Feed(sid).Adopted is not null, "the turn taken back by the third service");
+        agent.Release();
+        Assert.AreEqual("end_turn", (string?)(await prompt.WaitAsync(Wait))!["stopReason"]);
+        Assert.AreEqual("started:one done:one ", zed.Text());
+        Assert.AreEqual(1, EndMarks(third, sid));
+        Assert.AreEqual(1, hosts.Launches, "the same host throughout");
+        NoBreakSeen(zed);
+    }
+
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
     public async Task AnAnswerTheOldConductorNeverRead_IsMarkedByTheNextOne()
@@ -387,6 +441,44 @@ public sealed class HostTests
         {
             await current.DisposeAsync();
         }
+    }
+
+    /// <summary>
+    /// A host whose link broke may say hello again before the conductor has read the end of that link:
+    /// it is stopped all the same, not taken back, since the conductor ends its turns as it reads the end.
+    /// </summary>
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AHostThatComesBack_BeforeItsConductorSawItGo_IsStoppedAllTheSame()
+    {
+        var data = TestDirs.New();
+        var agent = new TurnAgent("turns") { Hold = true };
+        var hosts = new InProcessHosts(_ => agent);
+        await using var service = hosts.Conductor(data, agent);
+        hosts.Service = service;
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+
+        var first = hosts["turns"];
+        var old = hosts.WireOf(first);
+        old.PauseService();
+        old.BreakLinkEnd();
+        try { Assert.AreEqual(0, await first.Run.WaitAsync(Wait)); }
+        catch (TimeoutException) { Assert.Fail("the host still runs:\n" + hosts.Log()); }
+        Assert.IsFalse(prompt.IsCompleted, "the conductor has not read the end of the link yet");
+        old.Go();
+        Assert.AreEqual("cancelled", (string?)(await prompt.WaitAsync(Wait))!["stopReason"], "its turn died with it");
+        Assert.AreEqual(1, EndMarks(service, sid));
+        await LinkHarness.Until(() => !service.Feed(sid).TurnRunning, "the session free again");
+
+        agent.Release();
+        Assert.AreEqual("end_turn", (string?)(await zed.PromptAsync(sid, "two").WaitAsync(Wait))!["stopReason"], "in a new host");
+        Assert.AreEqual(2, hosts.Launches);
+        StringAssert.EndsWith(zed.Text(), "started:two done:two ");
+        NoBreakSeen(zed);
     }
 
     [TestMethod]

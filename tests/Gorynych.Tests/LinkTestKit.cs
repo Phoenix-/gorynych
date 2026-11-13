@@ -241,6 +241,16 @@ sealed class Wire
         foreach (var end in ends) end.Break();
     }
 
+    /// <summary>
+    /// Only the link's end breaks, as when the process there loses the pipe: the service reads the
+    /// end once it reads on, which <see cref="PauseService"/> holds back until <see cref="Go"/>.
+    /// </summary>
+    public void BreakLinkEnd()
+    {
+        linkIn.Break();
+        linkOut.Break();
+    }
+
     /// <summary>A stream that, once broken, fails every write and ends every read.</summary>
     sealed class BrokenOnce(Stream inner, bool reads = false) : Stream
     {
@@ -350,7 +360,9 @@ sealed class Wire
 sealed class LinkHarness : IAsyncDisposable
 {
     readonly DuplexLink zedLink = new();
-    Wire? wire;
+    readonly Lock pipe = new(); // Service, and making a connection to it
+    Conductor? service;         // under pipe
+    Wire? wire;                 // under pipe
     int connects;
 
     public LinkHarness(Conductor service, ResumableLinkOptions? options = null)
@@ -387,8 +399,16 @@ sealed class LinkHarness : IAsyncDisposable
     public ResumableLink Link { get; }
     public Task<int> Running { get; }
 
-    /// <summary>The conductor a connection reaches now; null: there is no pipe.</summary>
-    public Conductor? Service { get; set; }
+    /// <summary>
+    /// The conductor a connection reaches now; null: there is no pipe. Once it is set, no connection
+    /// reaches the one before: a connection made as a test takes a conductor away reached it before,
+    /// and is the current one, which <see cref="Break"/> ends, as its process would when it exits.
+    /// </summary>
+    public Conductor? Service
+    {
+        get { lock (pipe) return service; }
+        set { lock (pipe) service = value; }
+    }
 
     /// <summary>While set, a new connection waits for it.</summary>
     public TaskCompletionSource? ConnectGate { get; set; }
@@ -422,13 +442,19 @@ sealed class LinkHarness : IAsyncDisposable
     (Stream, Stream) Connect()
     {
         var n = Interlocked.Increment(ref connects);
-        var to = Service ?? throw new IOException("no service on the pipe");
-        wire = new Wire(to, $"link-{n}", s => { lock (ServiceSaid) ServiceSaid.Append(s); }, s => { lock (LinkSent) LinkSent.Append(s); });
-        return wire.LinkEnd;
+        lock (pipe)
+        {
+            var to = service ?? throw new IOException("no service on the pipe");
+            wire = new Wire(to, $"link-{n}", s => { lock (ServiceSaid) ServiceSaid.Append(s); }, s => { lock (LinkSent) LinkSent.Append(s); });
+            return wire.LinkEnd;
+        }
     }
 
     /// <summary>The current connection, for pausing one direction.</summary>
-    public Wire Current => wire!;
+    public Wire Current
+    {
+        get { lock (pipe) return wire!; }
+    }
 
     async Task<(Stream, Stream)> ConnectAsync(CancellationToken ct)
     {
@@ -437,7 +463,12 @@ sealed class LinkHarness : IAsyncDisposable
     }
 
     /// <summary>The current connection drops.</summary>
-    public void Break() => wire?.Break();
+    public void Break()
+    {
+        Wire? current;
+        lock (pipe) current = wire;
+        current?.Break();
+    }
 
     public Task<JsonNode?> InitializeAsync() =>
         Zed.SendRequestAsync(AcpMethods.Agent.Initialize, new JsonObject { ["protocolVersion"] = 1, ["clientCapabilities"] = new JsonObject() });
