@@ -158,6 +158,63 @@ public static class AcpBridge
     /// hosts: of the current build or stale, their options, sessions and running turns, and what still
     /// waits to move after an update. 0, or 1 when no service runs on the pipe or it could not be asked.
     /// </summary>
+    /// <summary>
+    /// <c>ahp address</c>: the entry for VS Code's user setting <c>chat.remoteAgentHosts</c>, with the port the running
+    /// service's AHP face listens on and its token from the data folder. Changing VS Code's settings is the user's step.
+    /// </summary>
+    public static async Task<int> AhpAddressAsync(string pipe)
+    {
+        NamedPipeClientStream? stream;
+        try { stream = await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(1)); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"gorynych ahp: cannot reach the service on pipe {pipe}: {e.Message}{Hint(e)}");
+            return 1;
+        }
+        if (stream is null)
+        {
+            Console.Error.WriteLine($"gorynych ahp: no service is running on pipe {pipe}");
+            return 1;
+        }
+        await using var rpc = new JsonRpcConnection(stream, stream, "ahp address");
+        rpc.Start();
+        JsonNode? status;
+        try
+        {
+            await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
+            {
+                ProtocolVersion = AcpMethods.ProtocolVersion,
+                ClientInfo = new Implementation { Name = "gorynych-ahp-address", Version = AgentHost.Version },
+            });
+            status = await rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject());
+        }
+        catch (Exception e) when (e is IOException or JsonRpcException)
+        {
+            Console.Error.WriteLine($"gorynych ahp: the service on pipe {pipe} did not answer: {e.Message}");
+            return 1;
+        }
+        if (status?["ahp"] is not JsonObject ahp)
+        {
+            Console.Error.WriteLine($"gorynych ahp: the service on pipe {pipe} runs without the AHP face; start it with --ahp on (or a port)");
+            return 1;
+        }
+        if ((string?)ahp["error"] is { } off || (int?)ahp["port"] is not { } port)
+        {
+            Console.Error.WriteLine($"gorynych ahp: {(string?)ahp["error"] ?? "the AHP face has no port"}");
+            return 1;
+        }
+        string token;
+        try { token = File.ReadAllText(Path.Combine((string?)status["dataDirectory"] ?? "", Ahp.AhpEndpoint.TokenFile)).Trim(); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"gorynych ahp: cannot read the face's token: {e.Message}");
+            return 1;
+        }
+        var entry = new JsonObject { ["name"] = "Gorynych", ["address"] = $"127.0.0.1:{port}/ahp", ["connectionToken"] = token };
+        Console.WriteLine(entry.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true, TypeInfoResolver = AcpJson.TextOptions.TypeInfoResolver }));
+        return 0;
+    }
+
     public static async Task<int> StatusAsync(string pipe)
     {
         NamedPipeClientStream? stream;
@@ -197,6 +254,9 @@ public static class AcpBridge
             (hosted ? $", build {(string?)status?["build"]}, adapters in hosts" : ", adapters in its own process") +
             $", {(int?)status?["clients"] ?? 0} clients, {(int?)status?["sessions"] ?? 0} sessions");
         if ((string?)status?["dataFolderOpen"] is { } open) Console.WriteLine($"warning: {open}");
+        if (status?["ahp"] is JsonObject ahp)
+            Console.WriteLine((string?)ahp["error"] is { } off ? $"ahp: {off}"
+                : $"ahp: the face listens on 127.0.0.1:{(int?)ahp["port"]}/ahp, {(int?)ahp["clients"] ?? 0} clients, {(int?)ahp["open"] ?? 0} sessions open for them");
         foreach (var row in HostRows(status)) Console.WriteLine("  " + row);
         if (hosted)
         {

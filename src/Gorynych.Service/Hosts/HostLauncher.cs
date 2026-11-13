@@ -142,9 +142,11 @@ public static class HostNames
     /// from its creation on. A token an earlier version wrote gets those rights now. It keeps other
     /// users out; a process of the same user can read it, as it can the rest of the user's files.
     /// </summary>
-    public static string EnsureToken(string dataDirectory)
+    public static string EnsureToken(string dataDirectory) => EnsureTokenFile(TokenPath(dataDirectory));
+
+    /// <summary>A token file as <see cref="EnsureToken"/> keeps one (the AHP face's <c>ahp.token</c> too): 32 random bytes in hex, the user's alone.</summary>
+    internal static string EnsureTokenFile(string path)
     {
-        var path = TokenPath(dataDirectory);
         if (File.Exists(path))
         {
             Protect(path);

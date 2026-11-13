@@ -576,7 +576,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
                 lock (clientsGate)
                 {
                     if (retired) throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Session {SessionId} was deleted");
-                    var open = clients.Where(c => !c.Rpc.IsClosed).ToList();
+                    // A client that takes no requests (gorynych/requests: false) is as none.
+                    var open = clients.Where(c => !c.Rpc.IsClosed && c.TakesRequests).ToList();
                     var live = open.LastOrDefault(prefer) ?? open.LastOrDefault();
                     if (live is not null) return live;
                     wait = clientAttached.Task;

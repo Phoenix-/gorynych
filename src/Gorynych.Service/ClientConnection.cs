@@ -61,6 +61,13 @@ internal sealed class ClientConnection
     /// </summary>
     public bool OnLink => Init?.Meta?[GorynychProtocol.CapLink] is JsonValue v && v.TryGetValue<int>(out var version) && version >= 1;
 
+    /// <summary>
+    /// Whether the agents' requests (approvals, forms) may go to this client: not when its
+    /// <c>initialize</c> <c>_meta</c> says <c>gorynych/requests: false</c> (the AHP face before it answers
+    /// them), which then waits for another client to attach, as with none.
+    /// </summary>
+    public bool TakesRequests => !(Init?.Meta?[GorynychProtocol.MetaRequests] is JsonValue v && v.TryGetValue<bool>(out var takes) && !takes);
+
     /// <summary>The client shows ACP's <c>notice</c> session updates (<c>clientCapabilities.session.notices</c>); none is sent to another.</summary>
     public bool TakesNotices => Init?.ClientCapabilities?.Session?.Notices is not null;
 

@@ -761,9 +761,9 @@ internal sealed class DshRouter
                 if (open is not null && open.Lane == lane) open.ConfigOptions = OwnOptions(result);
                 DshModes.AddTo(result, lane.Mode, open?.Lane == lane ? open.Pin : null);
                 break;
-            case AcpMethods.Agent.SessionList when (result?["sessions"]) is JsonArray sessions
-                && (request.Params?["cursor"]) is null && (result?["nextCursor"]) is null:
-                MergeOthers(sessions, Str(request.Params?["cwd"]));
+            case AcpMethods.Agent.SessionList when (result?["sessions"]) is JsonArray sessions:
+                if ((request.Params?["cursor"]) is null && (result?["nextCursor"]) is null) MergeOthers(sessions, Str(request.Params?["cwd"]));
+                StampTimes(sessions);
                 break;
         }
         if (request.SessionId is { } ended
@@ -776,6 +776,18 @@ internal sealed class DshRouter
             StopIfIdle(lane);
         }
         await ToServiceAsync(message);
+    }
+
+    /// <summary>
+    /// DSH lists no <c>updatedAt</c>: each session gets the time DSH last wrote it (<see cref="DshPins.LastWrite"/>),
+    /// so an old session does not look new; one DSH has no files of says none.
+    /// </summary>
+    void StampTimes(JsonArray sessions)
+    {
+        var projects = pins.Projects();
+        foreach (var session in sessions.OfType<JsonObject>())
+            if (session["updatedAt"] is null && Str(session["sessionId"]) is { } id && pins.LastWrite(id, projects) is { } at)
+                session["updatedAt"] = at.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
     }
 
     /// <summary>

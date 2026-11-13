@@ -40,6 +40,9 @@ switch (line.Command)
     // The Windows logon task that starts the service in this user's session (docs/external-clients.md).
     case "task":
         return TaskCommand(line);
+    // ahp address: the entry for VS Code's chat.remoteAgentHosts, with the running service's port and token.
+    case "ahp":
+        return await AcpBridge.AhpAddressAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName);
     // An adapter host, which the service starts: one adapter and its agents, outliving a restart of the service.
     case "host":
         return await HostCommand(line);
@@ -123,6 +126,9 @@ await using var conductor = new Conductor(new ConductorOptions
     DataFolderOpen = closed is { Failed: true } ? closed.Value.Said : null,
 }, adapters);
 
+// The AHP face (docs/ahp-face.md), for VS Code's Agents window: off unless --ahp on or a port.
+await using var ahp = await AhpFaceStart(line, dataDirectory, conductor);
+
 // Drafts a client left behind in an earlier run (Zed quits without closing them), once the bridges
 // that come back after a restart had the time to resume theirs.
 _ = Task.Run(() => conductor.SweepDraftsAsync(ConductorOptions.DefaultComeBackGrace));
@@ -149,6 +155,31 @@ if (!hostListener.IsFaulted) await PipeListener.RunAsync(conductor, pipeName, st
 try { await hostListener; } catch { hostPipeFailed = true; }
 ServiceLog.Info(conductor.StopHostsOnExit ? "service stopping" : "service stopping; its hosts keep their agents for the next one");
 return hostPipeFailed ? 1 : 0;
+
+// --ahp off|on|<port>: the face on that port, its token in the data folder. A port another process holds
+// leaves the face off, said in the log and in status; the ACP side runs on.
+static async Task<AhpFaceRun?> AhpFaceStart(CommandLine line, string dataDirectory, Conductor conductor)
+{
+    if (CommandLine.AhpPortOf(line.Value("--ahp")) is not { } port) return null;
+    var face = new Gorynych.Service.Ahp.AhpFace(conductor);
+    conductor.AhpStatus = face.Status;
+    try
+    {
+        var token = Gorynych.Service.Ahp.AhpEndpoint.EnsureToken(dataDirectory);
+        var endpoint = await Gorynych.Service.Ahp.AhpEndpoint.StartAsync(face, port, token);
+        face.Port = endpoint.Port;
+        _ = face.StartAsync();
+        ServiceLog.Info($"ahp: the face listens on ws://127.0.0.1:{endpoint.Port}/ahp; `ahp address` prints the entry for VS Code");
+        return new AhpFaceRun(face, endpoint);
+    }
+    catch (Exception e)
+    {
+        // Whatever stops the face, the ACP side runs on.
+        face.Error = $"the AHP face is off: it could not start on port {port} ({e.GetBaseException().Message})";
+        ServiceLog.Warn($"ahp: {face.Error}");
+        return new AhpFaceRun(face, null);
+    }
+}
 
 static string DataDirectory(CommandLine line) => line.Value("--data") is { } data ? Path.GetFullPath(data) : DataFolder.DefaultPath();
 
@@ -337,4 +368,20 @@ static TimeSpan UnloadAfter(string? minutes)
     if (double.TryParse(minutes, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var m) && m >= 0)
         return TimeSpan.FromMinutes(m);
     throw new ArgumentException($"--unload-after takes a number of minutes, 0 or more; got '{minutes}'");
+}
+
+/// <summary>
+/// The AHP face and its endpoint, stopped with the service: the face first, which closes its clients' sockets,
+/// so that the endpoint has no WebSocket left to wait for. Neither stops the service's exit.
+/// </summary>
+sealed record AhpFaceRun(Gorynych.Service.Ahp.AhpFace Face, Gorynych.Service.Ahp.AhpEndpoint? Endpoint) : IAsyncDisposable
+{
+    public async ValueTask DisposeAsync()
+    {
+        try { await Face.DisposeAsync(); }
+        catch (Exception e) { ServiceLog.Warn($"ahp: the face stopping: {e.Message}"); }
+        if (Endpoint is null) return;
+        try { await Endpoint.DisposeAsync(); }
+        catch (Exception e) { ServiceLog.Warn($"ahp: the endpoint stopping: {e.Message}"); }
+    }
 }

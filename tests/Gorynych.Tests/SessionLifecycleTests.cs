@@ -732,6 +732,7 @@ sealed class LifecycleAgent
                     await agent.Update(id, new AvailableCommandsUpdate { AvailableCommands = [] });
                     return WithModes(AcpJson.ToNode(new NewSessionResponse { SessionId = id })!.AsObject(), id);
                 case AcpMethods.Agent.SessionList:
+                    if (BeforeList is { } beforeList) await beforeList();
                     lock (sessions)
                         return AcpJson.ToNode(new ListSessionsResponse
                         {
@@ -743,6 +744,7 @@ sealed class LifecycleAgent
                     var text = string.Join("\n\n", blocks);
                     lock (Prompts) { Prompts.Add((sessionId!, text)); firstBlocks.TryAdd(sessionId!, blocks); }
                     if (BeforePrompt is { } beforePrompt) await beforePrompt(sessionId!);
+                    if (DuringPrompt is { } during) await during(agent, sessionId!);
                     lock (sessions) this.titles.TryAdd(sessionId!, blocks[0]);
                     var turn = KeepsHistory || LoadsWithoutIds ? $"t{Interlocked.Increment(ref nativeTurns)}" : null;
                     if (AnswerUpdates is { } updates)
@@ -903,6 +905,12 @@ sealed class LifecycleAgent
     public Func<string, Task>? BeforeNew { get; set; }
 
     public Func<string, Task>? BeforePrompt { get; set; }
+
+    /// <summary>Runs in a prompt's turn, with the agent's side of the connection: to ask its client something.</summary>
+    public Func<ScriptedAgent, string, Task>? DuringPrompt { get; set; }
+
+    /// <summary>Runs before each <c>session/list</c> is answered: a slow agent's list.</summary>
+    public Func<Task>? BeforeList { get; set; }
     public Func<string, Task>? BeforeResume { get; set; }
     public Func<string, Task>? BeforeDelete { get; set; }
 

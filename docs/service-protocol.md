@@ -85,7 +85,11 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
 
 Command line: `Gorynych.Service [serve] [--pipe <name>] [--data <dir>] [--default-agent claude|kimi|codex|dsh]
 [--claude-model <model>] [--unload-after <minutes>] [--claude-transport headless|tui]
-[--claude-channels ask|accept|decline] [--hosts on|off] [--no-channel] [--no-peers] [--console]`.
+[--claude-channels ask|accept|decline] [--hosts on|off] [--ahp off|on|<port>] [--no-channel] [--no-peers] [--console]`.
+`--ahp` turns on the [AHP face](ahp-face.md) for VS Code's Agents window, on `ws://127.0.0.1:<port>/ahp`
+(`on` is port 8766): off by default while it is built. Its token is `ahp.token` in the data
+folder, made at its first start. A port another process holds leaves the face off, said in the
+log and in `status`; the ACP side runs on.
 `--hosts` runs each adapter in an [adapter host](#adapter-hosts) of its own, which a restart leaves
 running with its agents: on by default on Windows and Linux, off on macOS, where hosts are not tried yet.
 `--unload-after` is how long a session stays loaded in its agent once it is idle with no
@@ -108,6 +112,10 @@ it still runs), `restart [--pipe …] [--timeout <minutes>] [--no-wait] [--force
 ran after the wait, so the restart was called off and the service goes on
 ([The resumable link](#the-resumable-link)), `host --adapter claude|kimi|codex|dsh [--pipe …] [--data …] [adapter options]`,
 which the service runs for each [adapter host](#adapter-hosts) and nobody else needs to, and
+`ahp address [--pipe …]`, which prints the entry for VS Code's user setting
+`chat.remoteAgentHosts` (`{"name": "Gorynych", "address": "127.0.0.1:<port>/ahp",
+"connectionToken": "<token>"}`) with the port the running service's face listens on (exit code 1
+when no service runs on the pipe or it runs without the face), and
 `task install [--pipe …] [service options]` / `task uninstall [--pipe …]`.
 `task install` registers the logon task `Gorynych.Service.<pipe>` for the current user, or
 replaces it, with `schtasks /Create /XML`. How a remote machine is set up with it is in
@@ -185,7 +193,9 @@ differ (Kimi may report `C:/Users/x` for the folder Zed calls `C:\Users\x`), and
 that compares folders as text would see two projects. Other casing is kept as the agent gave
 it.
 
-Agent → client requests go to the most recently attached client of the session:
+Agent → client requests go to the most recently attached client of the session that takes
+them (a client whose `initialize` `_meta` says `gorynych/requests: false` takes none, and a request
+waits for another client as if none were attached):
 `session/request_permission` (an approval) to any client; `elicitation/create` (a form,
 such as Claude's questions) preferably to a client that declared
 `clientCapabilities.elicitation.form`. A client without forms gets each choice field as a
@@ -228,7 +238,8 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/position` | `_meta` of every `session/update` the service journals; `session/load` and `session/resume` result `_meta` | the update's position in the session's journal, an opaque string; in a result, the position the client is at once the answer is written |
 | `gorynych/turn` | `session/load` and `session/resume` result `_meta` | `running` while a turn of the session runs or a client's prompt waits for one, else `idle` |
 | `gorynych/prompts` | `session/load` and `session/resume` result `_meta` | the `gorynych/promptId`s of the session's prompts still in progress |
-| `gorynych/promptId` | `session/prompt` params `_meta`, client → service; the `_meta` of the prompt's `user_message_chunk`; the mark of its end | the ID a client on the link gives its prompt |
+| `gorynych/promptId` | `session/prompt` params `_meta`, client → service; the `_meta` of the prompt's `user_message_chunk`; the mark of its end | the ID a client on the link gives its prompt; a prompt without one gets `prompt-<uuid>`, the service's own, also in the prompt the agent gets; for a turn the service starts itself (an opinion request, a report, a spawned session's first prompt delivered as a turn), `service-<messageId>`; so every turn's end is marked |
+| `gorynych/requests` | a client's `initialize` params `_meta` | `false`: the client takes no agent → client request (approval, form); the service routes none to it (the AHP face in its [step 1](ahp-face.md#step-1-reading)) |
 | `gorynych/stopReason` | the `_meta` of the mark that ends a prompt's turn (`gorynych/agentTurn: "ended"` with `gorynych/promptId`) | the turn's ACP stop reason |
 | `gorynych/error` | the `_meta` of the mark that ends a prompt's turn | `{code, message}`: the prompt failed so |
 | `gorynych/restarting` | the `data` of an error | `true`: the service did not carry the request out because it is restarting; it may go again, as it is, to the next service, or to this one once the restart is called off |
@@ -252,7 +263,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/open_elsewhere` | method, service → adapter, `{sessionIds}` → `{sessions: {"<id>": "<holder>"}}` | which of these sessions another app has open now, the held ones only; for the lists agents see |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
-| `_gorynych/status` | method | service ID, process, data folder, `dataFolderOpen` (why the data folder, or an item in it, could not be closed to other accounts at this start; null when it is closed), clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
+| `_gorynych/status` | method | service ID, process, data folder, `ahp` (with the [AHP face](ahp-face.md): `{port, error, clients, sessions, open}`; null without it), `dataFolderOpen` (why the data folder, or an item in it, could not be closed to other accounts at this start; null when it is closed), clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/restart` | method, `{wait?, timeoutSeconds?, force?}` → `{restarted: true, processId, waitedSeconds, cancelledTurns}` or `{restarted: false, processId, waitedSeconds, running: [{sessionId, agent, title}]}`; with hosts always `{restarted: true, processId, waitedSeconds, cancelledTurns: 0, turnsInHosts}` | asks the service to exit for an update without breaking its clients' work; without hosts, called off when turns outlast the wait, unless `force` ([The resumable link](#the-resumable-link)); with hosts, it waits for no turn ([Adapter hosts](#adapter-hosts)) |
 | `_gorynych/restarting` | notification to clients, `{restart}` | the service has begun restart number `restart`: a client on the link holds its new prompts |
@@ -1513,6 +1524,16 @@ draft.
   written whether or not the client still seems there, since a connection may be gone before the
   service notices. A client whose answer is lost so finds out how its prompt ended: from the mark
   it got before the connection went, or from the replay or live when it comes back.
+- **The service's own turns are marked too.** An opinion request, a report and a spawned
+  session's first prompt delivered as a turn carry a prompt ID of the service's own,
+  `service-<messageId>`, on their `user_message_chunk` and their `session/prompt`, and their end is
+  marked with it as a client's prompt's is (also by the next service, from the host's
+  `_gorynych/turn_ended`, when one ends while no service runs; one whose prompt went on in a host
+  when this service exited for a restart is marked only so, never `cancelled` here). A client's
+  prompt without an ID (a client not on the link) gets one of the service's own, `prompt-<uuid>`,
+  on its `user_message_chunk`, the prompt the agent gets and the mark of its end; a client on the
+  link drops the marks of prompts it did not send. A client that shows turns (the AHP face) so
+  sees the end of each turn it saw begin.
 - **Questions asked again.** An approval or a form waiting for a client goes to the next one
   that attaches ([Standard methods](#standard-methods)), so a client that resumes the session is
   asked again, under a new request ID.
