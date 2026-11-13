@@ -71,7 +71,8 @@ public sealed partial class ClaudeHeadlessTests
         while (!condition() && DateTime.UtcNow < deadline) await Task.Delay(50);
     }
 
-    static string? Mark(JsonObject u) => (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn];
+    /// <summary>The mark of a turn of Claude's own; the service's mark of a prompt's end, which carries the prompt's ID, is not one.</summary>
+    static string? Mark(JsonObject u) => u["_meta"]?[GorynychProtocol.MetaPromptId] is null ? (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn] : null;
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]

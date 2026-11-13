@@ -172,9 +172,10 @@ static async Task<AhpFaceRun?> AhpFaceStart(CommandLine line, string dataDirecto
         ServiceLog.Info($"ahp: the face listens on ws://127.0.0.1:{endpoint.Port}/ahp; `ahp address` prints the entry for VS Code");
         return new AhpFaceRun(face, endpoint);
     }
-    catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException)
+    catch (Exception e)
     {
-        face.Error = $"the AHP face is off: port {port} could not be taken ({e.GetBaseException().Message})";
+        // Whatever stops the face, the ACP side runs on.
+        face.Error = $"the AHP face is off: it could not start on port {port} ({e.GetBaseException().Message})";
         ServiceLog.Warn($"ahp: {face.Error}");
         return new AhpFaceRun(face, null);
     }
@@ -369,12 +370,18 @@ static TimeSpan UnloadAfter(string? minutes)
     throw new ArgumentException($"--unload-after takes a number of minutes, 0 or more; got '{minutes}'");
 }
 
-/// <summary>The AHP face and its endpoint, stopped with the service: the endpoint first.</summary>
+/// <summary>
+/// The AHP face and its endpoint, stopped with the service: the face first, which closes its clients' sockets,
+/// so that the endpoint has no WebSocket left to wait for. Neither stops the service's exit.
+/// </summary>
 sealed record AhpFaceRun(Gorynych.Service.Ahp.AhpFace Face, Gorynych.Service.Ahp.AhpEndpoint? Endpoint) : IAsyncDisposable
 {
     public async ValueTask DisposeAsync()
     {
-        if (Endpoint is not null) await Endpoint.DisposeAsync();
-        await Face.DisposeAsync();
+        try { await Face.DisposeAsync(); }
+        catch (Exception e) { ServiceLog.Warn($"ahp: the face stopping: {e.Message}"); }
+        if (Endpoint is null) return;
+        try { await Endpoint.DisposeAsync(); }
+        catch (Exception e) { ServiceLog.Warn($"ahp: the endpoint stopping: {e.Message}"); }
     }
 }

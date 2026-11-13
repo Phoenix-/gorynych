@@ -108,9 +108,53 @@ internal sealed class DshPins(string? home)
             ? home
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
 
+    static bool IsId(string sessionId) => sessionId.Length > 0 && sessionId.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_');
+
+    /// <summary>
+    /// When DSH last wrote the session: the newest file of its folder in DSH's session store
+    /// (<c>sessions/&lt;project&gt;/&lt;id&gt;/</c>), else its projection cache; null when DSH has neither.
+    /// DSH lists no time of its own, and the moment the service first sees a session is not one.
+    /// </summary>
+    /// <param name="projects">The store's project folders, listed once for a whole list of sessions.</param>
+    public DateTimeOffset? LastWrite(string sessionId, IReadOnlyList<string>? projects = null)
+    {
+        if (home is null || !IsId(sessionId)) return null;
+        try
+        {
+            foreach (var project in projects ?? Projects())
+            {
+                var folder = new DirectoryInfo(Path.Combine(project, sessionId));
+                if (!folder.Exists) continue;
+                var newest = folder.EnumerateFiles().Select(f => (DateTime?)f.LastWriteTimeUtc).Max();
+                if (newest is { } at) return new DateTimeOffset(at, TimeSpan.Zero);
+            }
+            var cache = new FileInfo(Path.Combine(home, "storages", "session_projcache", "sessions", sessionId + ".json"));
+            return cache.Exists ? new DateTimeOffset(cache.LastWriteTimeUtc, TimeSpan.Zero) : null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>The project folders of DSH's session store; none when it has none.</summary>
+    public IReadOnlyList<string> Projects()
+    {
+        if (home is null) return [];
+        try
+        {
+            var sessions = Path.Combine(home, "sessions");
+            return Directory.Exists(sessions) ? Directory.GetDirectories(sessions) : [];
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return [];
+        }
+    }
+
     public DshPin? Read(string sessionId)
     {
-        if (home is null || sessionId.Length == 0 || sessionId.Any(c => !(char.IsAsciiLetterOrDigit(c) || c is '-' or '_'))) return null;
+        if (home is null || !IsId(sessionId)) return null;
         var file = Path.Combine(home, "storages", "session_projcache", "sessions", sessionId + ".json");
         try
         {

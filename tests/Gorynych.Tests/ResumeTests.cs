@@ -74,15 +74,16 @@ public sealed class ResumeTests
 
         await using var b = await TestClient.ConnectAsync(conductor, "b");
         var resumed = await Resume(b, sid, After(SessionJournal.PositionOf(started)));
-        CollectionAssert.AreEqual(new[] { "done:one " }, b.Snapshot().Select(u => (string?)u["content"]?["text"]).ToArray(), "what followed it, and only that");
+        CollectionAssert.AreEqual(new[] { "done:one " }, b.Snapshot().Select(u => (string?)u["content"]?["text"]).OfType<string>().ToArray(), "what followed it, and only that");
+        Assert.AreEqual("ended", (string?)b.Snapshot()[^1]["_meta"]?[GorynychProtocol.MetaAgentTurn], "the end of the turn, last");
         Assert.AreEqual(SessionJournal.FormatPosition(positions[^1]), (string?)resumed["_meta"]![GorynychProtocol.MetaPosition]);
         Assert.AreEqual("idle", (string?)resumed["_meta"]![GorynychProtocol.MetaTurn]);
         Assert.AreEqual(0, resumed["_meta"]![GorynychProtocol.MetaPrompts]!.AsArray().Count);
 
         await using var c = await TestClient.ConnectAsync(conductor, "c");
         await Resume(c, sid, new JsonObject { ["type"] = GorynychProtocol.ReplayFromStart });
-        CollectionAssert.AreEqual(new[] { "user_message_chunk", "session_info_update", "agent_message_chunk", "agent_message_chunk" }, c.Kinds(),
-            "from the start: the whole journal, the prompt with it");
+        CollectionAssert.AreEqual(new[] { "user_message_chunk", "session_info_update", "agent_message_chunk", "agent_message_chunk", "session_info_update" }, c.Kinds(),
+            "from the start: the whole journal, the prompt and the mark of its end with it");
 
         await using var d = await TestClient.ConnectAsync(conductor, "d");
         var plain = await d.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = sid, ["cwd"] = Path.GetTempPath() }).WaitAsync(Wait);
@@ -136,14 +137,19 @@ public sealed class ResumeTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task APromptWithAnId_LeavesTheMarkOfItsEnd_BeforeItsAnswer_EvenWithItsClientThere_AndOneWithoutAnIdNone()
+    public async Task APrompt_LeavesTheMarkOfItsEnd_BeforeItsAnswer_EvenWithItsClientThere_AndOneWithoutAnId_GetsOneOfTheServicesOwn()
     {
         var agent = new TurnAgent("turns");
         await using var conductor = TestDirs.Conductor(TestDirs.New(), agent);
         await using var a = await TestClient.ConnectAsync(conductor, "a");
         var sid = (await a.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest { Cwd = Path.GetTempPath() })).SessionId;
         await Prompt(a, sid, "plain");
-        Assert.IsFalse(conductor.Feed(sid).Journal.ReadAll().Any(e => (string?)e["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended"), "a plain client's answer says how it ended");
+        // A client not on the link gives no ID: the service gives one, on the prompt's message and on the mark of its end,
+        // so that a client that shows turns (the AHP face) sees this one end too.
+        var plainEnd = conductor.Feed(sid).Journal.ReadAll().Single(e => (string?)e["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended");
+        var given = (string?)plainEnd["_meta"]?[GorynychProtocol.MetaPromptId];
+        StringAssert.StartsWith(given, "prompt-");
+        Assert.AreEqual(given, (string?)conductor.Feed(sid).Journal.ReadAll().Single(e => (string?)e["sessionUpdate"] == "user_message_chunk")["_meta"]?[GorynychProtocol.MetaPromptId]);
 
         var result = await a.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, PromptParams(sid, "one", promptId: "p1")).WaitAsync(Wait);
 
@@ -152,7 +158,7 @@ public sealed class ResumeTests
         var mark = a.Snapshot().Last();
         Assert.AreEqual("p1", (string?)mark["_meta"]?[GorynychProtocol.MetaPromptId], "the client got it before the answer");
         Assert.AreEqual("end_turn", (string?)mark["_meta"]?[GorynychProtocol.MetaStopReason]);
-        Assert.AreEqual(1, conductor.Feed(sid).Journal.ReadAll().Count(e => (string?)e["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended"));
+        Assert.AreEqual(2, conductor.Feed(sid).Journal.ReadAll().Count(e => (string?)e["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended"));
     }
 
     [TestMethod]

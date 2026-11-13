@@ -59,7 +59,7 @@ public sealed class ConductorTests
         Assert.AreEqual(JsonRpcException.AuthRequired, error.Code);
         StringAssert.Contains(error.Message, "403");
         // The service shows the shortened first prompt at once; Kimi's own title then replaces it.
-        var titles = client.Snapshot().Where(u => (string?)u["sessionUpdate"] == "session_info_update").Select(u => (string?)u["title"]).ToList();
+        var titles = client.Snapshot().Where(u => (string?)u["sessionUpdate"] == "session_info_update").Select(u => (string?)u["title"]).OfType<string>().ToList();
         Assert.AreEqual(2, titles.Count);
         StringAssert.EndsWith(titles[0], "…");
         Assert.AreEqual("Create a file named hello.txt in the current directory containing the word hi, using your file writing tool. Then reply with exactly DONE.", titles[1]);
@@ -115,13 +115,14 @@ public sealed class ConductorTests
         {
             sessionId = (await first.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("fake"))).SessionId;
             await first.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt, Prompt(sessionId, "hello"));
-            CollectionAssert.AreEqual(new[] { "session_info_update", "agent_message_chunk" }, first.Kinds(), "the sender does not get its own prompt back");
+            // The title, the answer and the mark of the turn's end.
+            CollectionAssert.AreEqual(new[] { "session_info_update", "agent_message_chunk", "session_info_update" }, first.Kinds(), "the sender does not get its own prompt back");
         }
 
         await using var second = await TestClient.ConnectAsync(conductor, "second");
         await second.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad,
             AcpJson.ToNode(new LoadSessionRequest { SessionId = sessionId, Cwd = Path.GetTempPath(), McpServers = [] }));
-        CollectionAssert.AreEqual(new[] { "user_message_chunk", "session_info_update", "agent_message_chunk" }, second.Kinds());
+        CollectionAssert.AreEqual(new[] { "user_message_chunk", "session_info_update", "agent_message_chunk", "session_info_update" }, second.Kinds());
         Assert.AreEqual("hello", second.Text("user_message_chunk"));
         Assert.AreEqual("echo:hello", second.Text());
 

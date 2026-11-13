@@ -23,10 +23,16 @@ internal sealed class AhpFaceOptions
     /// <summary>How often at most the face reads the list again after <c>_gorynych/sessions_changed</c>.</summary>
     public TimeSpan ListEvery { get; init; } = TimeSpan.FromMilliseconds(250);
 
+    /// <summary>How long a <c>listSessions</c> or a subscription to a channel not known yet waits for the first list.</summary>
+    public TimeSpan FirstListWait { get; init; } = TimeSpan.FromSeconds(30);
+
     /// <summary>How long the chunks of a live user message are held for the rest of the message.</summary>
     public TimeSpan HoldFor { get; init; } = TimeSpan.FromMilliseconds(100);
 
-    /// <summary>How many action envelopes the replay log keeps.</summary>
+    /// <summary>How long a turn no mark will end (<see cref="ChatModel.Unmarked"/>) stays open after the session's last update.</summary>
+    public TimeSpan QuietFor { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>How many action envelopes the replay log keeps, and as many root notifications.</summary>
     public int LogSize { get; init; } = 10_000;
 
     /// <summary>A client that takes nothing for this long is disconnected.</summary>
@@ -37,7 +43,8 @@ internal sealed class AhpFaceOptions
 /// The AHP face (docs/ahp-face.md): toward AHP clients (VS Code's Agents window) a host that keeps AHP's state
 /// tree, numbers actions, serves snapshots and replays; toward the conductor one more ACP client, on an in-process
 /// connection. Step 1: reading. All state is reduced under one lock, with the package's reducers, and every
-/// message a client gets is serialized under it; each client has its own queue to send from.
+/// message a client gets is queued under it, a reply that carries state too, so that nothing a client gets is
+/// older than what it got before; each client has its own queue to send from.
 /// </summary>
 internal sealed class AhpFace : IAsyncDisposable
 {
@@ -48,14 +55,20 @@ internal sealed class AhpFace : IAsyncDisposable
     readonly AhpFaceOptions options;
     readonly Lock gate = new();
     readonly CancellationTokenSource stopping = new();
-    readonly TaskCompletionSource ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    readonly TaskCompletionSource agentsReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    readonly TaskCompletionSource listed = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     // under gate
     long serverSeq;
     RootState root = new() { Agents = [] };
+    readonly Dictionary<string, string> agentNames = new(StringComparer.Ordinal); // agent -> its display name
     readonly Dictionary<string, FaceSession> sessions = new(StringComparer.Ordinal); // ahp-session URI -> session
     readonly Dictionary<string, FaceChat> chats = new(StringComparer.Ordinal); // ahp-chat URI -> chat
     readonly LinkedList<(long Seq, string Channel, JsonElement Envelope)> log = new();
+    readonly LinkedList<(long Seq, TransportMessage Message)> rootLog = new(); // root notifications, stamped with the serverSeq they came after
+    long rootTrimmed = -1; // the newest stamp among the root notifications no longer kept
+    readonly Dictionary<string, ChatModel> closing = new(StringComparer.Ordinal); // sessions let go of under a turn: closed when it ends
+    readonly Dictionary<string, Task> sessionWork = new(StringComparer.Ordinal); // the last load or close of each session in the conductor
     readonly HashSet<string> knownClients = new(StringComparer.Ordinal);
     readonly HashSet<Connection> connections = [];
     bool listing, listAgain;
@@ -77,7 +90,10 @@ internal sealed class AhpFace : IAsyncDisposable
 
     // ---------------------------------------------------------------- the internal client
 
-    /// <summary>Connects to the conductor as an ACP client, reads the agents and the list, and starts serving.</summary>
+    /// <summary>
+    /// Connects to the conductor as an ACP client and reads the agents: from then on it answers <c>initialize</c>.
+    /// The list follows, as slow as the slowest agent's: a session it brings is said to the clients as it comes.
+    /// </summary>
     public async Task StartAsync()
     {
         try
@@ -103,29 +119,31 @@ internal sealed class AhpFace : IAsyncDisposable
             var agents = (init?["_meta"]?[GorynychProtocol.MetaAgents] as JsonArray ?? []).OfType<JsonObject>()
                 .Select(a => (Name: AhpNames.Text(a["name"]) ?? "", Display: AhpNames.Text(a["displayName"]) ?? AhpNames.Text(a["name"]) ?? ""))
                 .Where(a => a.Name.Length > 0).ToList();
-            var list = await ReadListAsync(stopping.Token);
             lock (gate)
             {
+                foreach (var (name, display) in agents) agentNames[name] = display;
                 root = new RootState
                 {
                     Agents = [.. agents.Select(a => new AgentInfo
                     {
                         Provider = a.Name, DisplayName = a.Display, Description = $"{a.Display} through Gorynych", Models = [],
+                        // Without it VS Code shows a session's chats that came from a tool or a side chat only, so not its children (docs/ahp-face.md).
                         Capabilities = new AgentCapabilities { MultipleChats = new MultipleChatsCapability() },
                     })],
                     Config = new RootConfigState { Schema = new ConfigSchema { Type = "object", Properties = [] }, Values = [] },
                 };
-                ApplyList(list, live: false);
             }
-            ready.TrySetResult();
+            agentsReady.TrySetResult();
             _ = Task.Run(SweepAsync);
-            ServiceLog.Info($"ahp: the face serves {sessions.Count} sessions");
+            ListChanged(now: true);
+            ServiceLog.Info($"ahp: the face serves {agents.Count} agents and reads their sessions");
         }
         catch (Exception e)
         {
             Error = $"the AHP face did not start: {e.Message}";
             ServiceLog.Warn($"ahp: {Error}");
-            ready.TrySetException(e);
+            agentsReady.TrySetException(e);
+            listed.TrySetResult();
         }
     }
 
@@ -146,7 +164,9 @@ internal sealed class AhpFace : IAsyncDisposable
                 if (AhpNames.Text(info["sessionId"]) is not { Length: > 0 } id) continue;
                 var meta = info["_meta"] as JsonObject;
                 listed.Add(new Listed(id, AhpNames.Text(meta?[GorynychProtocol.MetaAgent]) ?? "", AhpNames.Text(info["title"]) ?? "",
-                    AhpNames.Text(info["cwd"]) ?? "", AhpNames.Time(AhpNames.Text(info["updatedAt"])) ?? AhpNames.Time(DateTimeOffset.UtcNow),
+                    AhpNames.Text(info["cwd"]) ?? "",
+                    // No time said is the oldest, never now: an old session must not look new.
+                    AhpNames.Time(AhpNames.Text(info["updatedAt"])) ?? AhpNames.Time(DateTimeOffset.UnixEpoch),
                     meta?[GorynychProtocol.MetaArchived] is JsonValue a && a.TryGetValue<bool>(out var archived) && archived,
                     AhpNames.Text(meta?[GorynychProtocol.MetaParentSessionId])));
             }
@@ -156,8 +176,8 @@ internal sealed class AhpFace : IAsyncDisposable
         return listed;
     }
 
-    /// <summary>The list changed: it is read again, at most every <see cref="AhpFaceOptions.ListEvery"/>.</summary>
-    void ListChanged()
+    /// <summary>The list changed: it is read again, at most every <see cref="AhpFaceOptions.ListEvery"/>; <paramref name="now"/> for the first.</summary>
+    void ListChanged(bool now = false)
     {
         lock (gate)
         {
@@ -168,30 +188,51 @@ internal sealed class AhpFace : IAsyncDisposable
             }
             listing = true;
         }
-        _ = Task.Run(async () =>
+        _ = Task.Run(() => ListLoopAsync(now));
+    }
+
+    async Task ListLoopAsync(bool now)
+    {
+        var done = false;
+        try
         {
             while (true)
             {
+                if (!now) await Task.Delay(options.ListEvery, stopping.Token);
+                now = false;
+                lock (gate) listAgain = false;
                 try
                 {
-                    await Task.Delay(options.ListEvery, stopping.Token);
-                    lock (gate) listAgain = false;
                     var list = await ReadListAsync(stopping.Token);
-                    lock (gate) ApplyList(list, live: true);
+                    lock (gate) ApplyList(list);
                 }
-                catch (OperationCanceledException) { return; }
-                catch (Exception e) when (e is IOException or JsonRpcException)
+                catch (OperationCanceledException) when (stopping.IsCancellationRequested)
                 {
-                    ServiceLog.Warn($"ahp: the list could not be read again: {e.Message}");
+                    return;
+                }
+                catch (Exception e)
+                {
+                    ServiceLog.Warn($"ahp: the list could not be read: {e.Message}");
+                }
+                finally
+                {
+                    listed.TrySetResult(); // the first list is read, or will not be: what waits for it goes on
                 }
                 lock (gate)
                     if (!listAgain)
                     {
                         listing = false;
+                        done = true;
                         return;
                     }
             }
-        });
+        }
+        catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
+        finally
+        {
+            // However it ended, a later change reads the list again.
+            if (!done) lock (gate) listing = false;
+        }
     }
 
     Task OnAcpNotificationAsync(string method, JsonNode? @params)
@@ -205,6 +246,17 @@ internal sealed class AhpFace : IAsyncDisposable
             return Task.CompletedTask;
         lock (gate)
         {
+            if (closing.TryGetValue(sessionId, out var leaving))
+            {
+                // A session the face let go of under its turn: closed once that turn is over.
+                leaving.Take(update, live: true);
+                leaving.Flush(live: true);
+                if (!Running(leaving))
+                {
+                    closing.Remove(sessionId);
+                    Close(sessionId);
+                }
+            }
             if (!chats.TryGetValue(AhpNames.ChatUri(sessionId), out var chat)) return Task.CompletedTask;
             if (AhpNames.Text(update["sessionUpdate"]) == "session_info_update")
             {
@@ -218,8 +270,10 @@ internal sealed class AhpFace : IAsyncDisposable
                 return Task.CompletedTask;
             }
             if (chat.Model is not { } model) return Task.CompletedTask;
+            chat.Updates++;
             model.Take(update, live: true);
             if (model.Holding) ScheduleFlush(chat);
+            if (model.Unmarked) ScheduleQuiet(chat);
             Sync(chat.Session);
         }
         return Task.CompletedTask;
@@ -231,9 +285,29 @@ internal sealed class AhpFace : IAsyncDisposable
         {
             if (chat.Model is not { Holding: true } model) return;
             model.Flush(live: true);
+            if (model.Unmarked) ScheduleQuiet(chat);
             Sync(chat.Session);
         }
     }, TaskScheduler.Default);
+
+    /// <summary>A turn no mark will end: ended once <see cref="AhpFaceOptions.QuietFor"/> passes with no update of its session.</summary>
+    void ScheduleQuiet(FaceChat chat)
+    {
+        var seen = chat.Updates;
+        _ = Task.Delay(options.QuietFor, stopping.Token).ContinueWith(t =>
+        {
+            if (t.IsCanceled) return;
+            lock (gate)
+            {
+                if (chat.Updates != seen || chat.Model is not { Unmarked: true } model) return;
+                model.EndUnmarked(live: true);
+                Sync(chat.Session);
+            }
+        }, TaskScheduler.Default);
+    }
+
+    /// <summary>A turn runs in the session, one a close would cancel: not one only quiet will end.</summary>
+    static bool Running(ChatModel model) => model.Busy && !model.Unmarked;
 
     // ---------------------------------------------------------------- sessions and chats
 
@@ -260,6 +334,7 @@ internal sealed class AhpFace : IAsyncDisposable
         public string SessionId { get; } = sessionId;
         public FaceSession Session { get; set; } = session;
         public bool IsChild => SessionId != Session.SessionId;
+        public string Agent = "";
         public string Title = "";
         public string Cwd = "";
         public string UpdatedAt = "";
@@ -270,10 +345,11 @@ internal sealed class AhpFace : IAsyncDisposable
         public List<JsonObject>? Buffer;
         public long BaseSeq;
         public DateTimeOffset? Unwatched;
+        public long Updates; // live updates taken, for the quiet check
     }
 
-    /// <summary>Takes the conductor's list: sessions and children that came, went or changed, said to the clients when <paramref name="live"/>.</summary>
-    void ApplyList(List<Listed> list, bool live)
+    /// <summary>Takes the conductor's list: sessions and children that came, went or changed, said to the clients.</summary>
+    void ApplyList(List<Listed> list)
     {
         var byId = new Dictionary<string, Listed>(StringComparer.Ordinal);
         foreach (var l in list) byId.TryAdd(l.Id, l);
@@ -288,7 +364,7 @@ internal sealed class AhpFace : IAsyncDisposable
         // Sessions that went, or became children.
         foreach (var s in sessions.Values.ToList())
             if (!byId.ContainsKey(s.SessionId) || RootOf(s.SessionId) != s.SessionId)
-                RemoveSession(s, live);
+                RemoveSession(s);
         var added = new List<FaceSession>();
         foreach (var l in byId.Values.Where(l => RootOf(l.Id) == l.Id))
         {
@@ -308,18 +384,39 @@ internal sealed class AhpFace : IAsyncDisposable
         foreach (var s in added)
         {
             s.Sent = Summary(s);
-            if (live) NotifyRoot("root/sessionAdded", Json.SerializeToElement(new SessionAddedParams { Channel = AhpNames.Root, Summary = s.Sent }));
+            NotifyRoot("root/sessionAdded", Json.SerializeToElement(new SessionAddedParams { Channel = AhpNames.Root, Summary = s.Sent }));
         }
-        foreach (var s in sessions.Values) Sync(s, live);
+        foreach (var s in sessions.Values) Sync(s);
+    }
+
+    /// <summary>
+    /// A session's title, never empty: an untitled one (DSH lists none, a Kimi session before its first prompt)
+    /// is named for its agent and ID, the same each time, since VS Code shows an empty title as a blank row.
+    /// </summary>
+    string TitleOf(Listed l) => l.Title.Length > 0 ? l.Title : Untitled(l.Agent, l.Id);
+
+    string Untitled(string agent, string id)
+    {
+        var name = agentNames.GetValueOrDefault(agent) is { Length: > 0 } display ? display : agent;
+        return name.Length > 0 ? $"{name} session {ShortId(id)}" : $"Session {ShortId(id)}";
+    }
+
+    /// <summary>The first eight characters of a session ID, after a word that only names its kind (Kimi's <c>session_</c>).</summary>
+    internal static string ShortId(string id)
+    {
+        var cut = id.IndexOf('_');
+        var rest = cut > 0 && cut + 1 < id.Length && id[..cut].All(char.IsAsciiLetter) ? id[(cut + 1)..] : id;
+        return rest.Length > 8 ? rest[..8] : rest;
     }
 
     FaceSession AddSession(Listed l)
     {
+        var title = TitleOf(l);
         var s = new FaceSession(AhpNames.SessionUri(l.Id), l.Id)
         {
-            Agent = l.Agent, Title = l.Title, Cwd = l.Cwd, UpdatedAt = l.UpdatedAt, CreatedAt = l.UpdatedAt, Archived = l.Archived, BaseSeq = serverSeq,
+            Agent = l.Agent, Title = title, Cwd = l.Cwd, UpdatedAt = l.UpdatedAt, CreatedAt = l.UpdatedAt, Archived = l.Archived, BaseSeq = serverSeq,
         };
-        var own = new FaceChat(AhpNames.ChatUri(l.Id), l.Id, s) { Title = l.Title, Cwd = l.Cwd, UpdatedAt = l.UpdatedAt };
+        var own = new FaceChat(AhpNames.ChatUri(l.Id), l.Id, s) { Agent = l.Agent, Title = title, Cwd = l.Cwd, UpdatedAt = l.UpdatedAt };
         s.Chats.Add(own);
         chats[own.Uri] = own;
         s.State = new SessionState
@@ -339,20 +436,20 @@ internal sealed class AhpFace : IAsyncDisposable
         s.UpdatedAt = l.UpdatedAt;
         s.Chats[0].UpdatedAt = l.UpdatedAt;
         s.Cwd = l.Cwd;
-        if (l.Title != s.Title) SetTitle(s.Chats[0], l.Title);
+        if (TitleOf(l) is var title && title != s.Title) SetTitle(s.Chats[0], title);
         if (l.Archived != s.Archived) SetArchived(s.Chats[0], l.Archived);
     }
 
-    void RemoveSession(FaceSession s, bool live)
+    void RemoveSession(FaceSession s)
     {
         sessions.Remove(s.Uri);
         foreach (var chat in s.Chats) Drop(chat);
-        if (live) NotifyRoot("root/sessionRemoved", Json.SerializeToElement(new SessionRemovedParams { Channel = AhpNames.Root, Session = s.Uri }));
+        NotifyRoot("root/sessionRemoved", Json.SerializeToElement(new SessionRemovedParams { Channel = AhpNames.Root, Session = s.Uri }));
     }
 
     void AddChild(FaceSession s, Listed l, bool quiet)
     {
-        var chat = new FaceChat(AhpNames.ChatUri(l.Id), l.Id, s) { Title = l.Title, Cwd = l.Cwd, UpdatedAt = l.UpdatedAt, Archived = l.Archived };
+        var chat = new FaceChat(AhpNames.ChatUri(l.Id), l.Id, s) { Agent = l.Agent, Title = TitleOf(l), Cwd = l.Cwd, UpdatedAt = l.UpdatedAt, Archived = l.Archived };
         chats[chat.Uri] = chat;
         s.Chats.Add(chat);
         if (quiet) s.State.Chats.Add(ChatSummaryOf(chat));
@@ -363,7 +460,7 @@ internal sealed class AhpFace : IAsyncDisposable
     {
         chat.UpdatedAt = l.UpdatedAt;
         chat.Cwd = l.Cwd;
-        if (l.Title != chat.Title) SetTitle(chat, l.Title);
+        if (TitleOf(l) is var title && title != chat.Title) SetTitle(chat, title);
         if (l.Archived != chat.Archived) SetArchived(chat, l.Archived);
     }
 
@@ -375,13 +472,28 @@ internal sealed class AhpFace : IAsyncDisposable
         Drop(chat);
     }
 
-    /// <summary>A chat that went: forgotten, and its session closed in the conductor if the face had it open.</summary>
+    /// <summary>A chat that went: forgotten, and its session let go of in the conductor if the face had it open.</summary>
     void Drop(FaceChat chat)
     {
-        chats.Remove(chat.Uri);
-        if (chat.Model is null) return;
+        if (chats.TryGetValue(chat.Uri, out var now) && ReferenceEquals(now, chat)) chats.Remove(chat.Uri);
+        if (chat.Model is not { } model) return;
         chat.Model = null;
-        Close(chat.SessionId);
+        LetGo(chat.SessionId, model);
+    }
+
+    /// <summary>
+    /// The face is done with a session it had open: closed in the conductor, but never under a turn that runs,
+    /// since a close from the session's last client cancels its turn. Such a session is closed when the turn ends.
+    /// </summary>
+    void LetGo(string sessionId, ChatModel model)
+    {
+        if (Running(model))
+        {
+            model.Emit = null; // its chat is gone: nobody sees it
+            closing[sessionId] = model;
+            return;
+        }
+        Close(sessionId);
     }
 
     void SetTitle(FaceChat chat, string title)
@@ -413,8 +525,6 @@ internal sealed class AhpFace : IAsyncDisposable
     };
 
     // ---------------------------------------------------------------- the catalog
-
-    const SessionStatus Activity = SessionStatus.Idle | SessionStatus.Error | SessionStatus.InProgress | SessionStatus.InputNeeded;
 
     SessionStatus StatusOf(FaceChat chat) => chat.Model is { } model
         ? model.State.Status
@@ -463,7 +573,7 @@ internal sealed class AhpFace : IAsyncDisposable
     /// Keeps the session's chat catalog in step with its chats (<c>session/chatUpdated</c>), and its summary on the
     /// root channel (<c>root/sessionSummaryChanged</c>, the changed fields only), as AHP requires of a host.
     /// </summary>
-    void Sync(FaceSession s, bool live = true)
+    void Sync(FaceSession s)
     {
         if (!sessions.ContainsKey(s.Uri)) return;
         foreach (var chat in s.Chats)
@@ -480,7 +590,7 @@ internal sealed class AhpFace : IAsyncDisposable
             if (changed) ApplySession(s, new SessionChatUpdatedAction { Chat = chat.Uri, Changes = changes });
         }
         var summary = Summary(s);
-        if (s.Sent is not { } sent || !live)
+        if (s.Sent is not { } sent)
         {
             s.Sent = summary;
             return;
@@ -540,14 +650,44 @@ internal sealed class AhpFace : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// A root notification: sent to the root's subscribers, and kept, stamped with the number of the last action
+    /// before it, so that a reconnect's replay sends again those a client may have missed (they carry no number).
+    /// </summary>
     void NotifyRoot(string method, JsonElement @params)
     {
         var message = Notification(method, @params);
+        rootLog.AddLast((serverSeq, message));
+        while (rootLog.Count > options.LogSize)
+        {
+            rootTrimmed = Math.Max(rootTrimmed, rootLog.First!.Value.Seq);
+            rootLog.RemoveFirst();
+        }
         foreach (var c in connections)
             if (c.Initialized && c.Subscriptions.Contains(AhpNames.Root)) c.Send(message);
     }
 
     // ---------------------------------------------------------------- loading and closing
+
+    /// <summary>
+    /// Runs a load or close of the session in the conductor after the face's earlier ones: they reach it in the
+    /// order the face decided them, so a quick reload never comes before the close it follows.
+    /// </summary>
+    Task InTurn(string sessionId, Func<Task> work)
+    {
+        lock (gate)
+        {
+            var before = sessionWork.GetValueOrDefault(sessionId) ?? Task.CompletedTask;
+            var task = before.ContinueWith(_ => work(), CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default).Unwrap();
+            sessionWork[sessionId] = task;
+            _ = task.ContinueWith(_ =>
+            {
+                lock (gate)
+                    if (sessionWork.TryGetValue(sessionId, out var last) && last == task) sessionWork.Remove(sessionId);
+            }, TaskScheduler.Default);
+            return task;
+        }
+    }
 
     /// <summary>Opens the chat's session in the conductor and builds its state from the replay, once.</summary>
     async Task EnsureLoadedAsync(FaceChat chat)
@@ -558,6 +698,8 @@ internal sealed class AhpFace : IAsyncDisposable
             if (chat.Model is not null) return;
             if (chat.Loading is null)
             {
+                // A session the face let go of under a turn is its own again: no close for it.
+                closing.Remove(chat.SessionId);
                 chat.Buffer = [];
                 chat.Loading = LoadAsync(chat);
             }
@@ -569,11 +711,11 @@ internal sealed class AhpFace : IAsyncDisposable
     async Task LoadAsync(FaceChat chat)
     {
         await Task.Yield();
-        JsonNode? answer;
+        JsonNode? answer = null;
         try
         {
-            answer = await acp!.SendRequestAsync(Gorynych.Acp.AcpMethods.Agent.SessionLoad,
-                new JsonObject { ["sessionId"] = chat.SessionId, ["cwd"] = chat.Cwd, ["mcpServers"] = new JsonArray() }, stopping.Token);
+            await InTurn(chat.SessionId, async () => answer = await acp!.SendRequestAsync(Gorynych.Acp.AcpMethods.Agent.SessionLoad,
+                new JsonObject { ["sessionId"] = chat.SessionId, ["cwd"] = chat.Cwd, ["mcpServers"] = new JsonArray() }, stopping.Token));
         }
         catch (Exception e)
         {
@@ -593,19 +735,18 @@ internal sealed class AhpFace : IAsyncDisposable
             // A replay clears the read bit for every past turn: it is set back to what it was.
             if (chat.IsRead && (model.State.Status & SessionStatus.IsRead) == 0)
                 Reducers.ApplyToChat(model.State, new StateAction(new ChatIsReadChangedAction { IsRead = true }));
-            model.Emit = action => EmitChat(chat, action);
-            chat.Model = model;
             chat.Buffer = null;
             chat.Loading = null;
-            chat.BaseSeq = serverSeq;
-            chat.Unwatched = DateTimeOffset.UtcNow;
-            if (!chats.ContainsKey(chat.Uri))
+            if (!chats.TryGetValue(chat.Uri, out var now) || !ReferenceEquals(now, chat))
             {
-                // It went while it loaded.
-                chat.Model = null;
-                Close(chat.SessionId);
+                // It went while it loaded (and may have come back as another chat of the same session).
+                LetGo(chat.SessionId, model);
                 return;
             }
+            model.Emit = action => EmitChat(chat, action);
+            chat.Model = model;
+            chat.BaseSeq = serverSeq;
+            chat.Unwatched = DateTimeOffset.UtcNow;
             Sync(chat.Session);
         }
     }
@@ -618,10 +759,10 @@ internal sealed class AhpFace : IAsyncDisposable
         WorkingDirectories = AhpNames.FileUri(chat.Cwd) is { } folder ? [folder] : null,
     };
 
-    void Close(string sessionId) => _ = Task.Run(async () =>
+    void Close(string sessionId) => _ = InTurn(sessionId, async () =>
     {
         try { await acp!.SendRequestAsync(Gorynych.Acp.AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = sessionId }, stopping.Token); }
-        catch (Exception e) when (e is IOException or JsonRpcException or OperationCanceledException)
+        catch (Exception e) when (e is IOException or JsonRpcException or OperationCanceledException or ObjectDisposedException)
         {
             ServiceLog.Info($"ahp: closing {sessionId}: {e.Message}");
         }
@@ -649,13 +790,13 @@ internal sealed class AhpFace : IAsyncDisposable
             foreach (var chat in chats.Values)
             {
                 if (chat.Model is not { } model) continue;
-                if (connections.Any(c => c.Subscriptions.Contains(chat.Uri)))
+                if (connections.Any(c => c.Subscriptions.Contains(chat.Uri) || c.Pending.ContainsKey(chat.Uri)))
                 {
                     chat.Unwatched = null;
                     continue;
                 }
                 chat.Unwatched ??= now;
-                if (now - chat.Unwatched < options.CloseAfter || model.Busy) continue;
+                if (now - chat.Unwatched < options.CloseAfter || Running(model)) continue;
                 chat.IsRead = (model.State.Status & SessionStatus.IsRead) != 0;
                 chat.Model = null;
                 Close(chat.SessionId);
@@ -665,10 +806,10 @@ internal sealed class AhpFace : IAsyncDisposable
         }
     }
 
-    /// <summary>Whether the face has the session open in the conductor now; for tests.</summary>
+    /// <summary>Whether the face has the session open in the conductor now, its own chat's or one it let go of under a turn; for tests.</summary>
     internal bool HasOpen(string sessionId)
     {
-        lock (gate) return chats.TryGetValue(AhpNames.ChatUri(sessionId), out var chat) && chat.Model is not null;
+        lock (gate) return (chats.TryGetValue(AhpNames.ChatUri(sessionId), out var chat) && chat.Model is not null) || closing.ContainsKey(sessionId);
     }
 
     /// <summary>For <c>_gorynych/status</c>.</summary>
@@ -694,14 +835,25 @@ internal sealed class AhpFace : IAsyncDisposable
         public ITransport Transport { get; } = transport;
         public string? ClientId;
         public bool Initialized;
+        public Task Sending = Task.CompletedTask;
+        public readonly CancellationTokenSource Ended = new(); // its reading stops
         public readonly HashSet<string> Subscriptions = new(StringComparer.Ordinal); // under the face's gate
+        public readonly Dictionary<string, object> Pending = new(StringComparer.Ordinal); // subscriptions asked for, waiting for their session to open; under the gate
 
         public void Send(TransportMessage message) => outbox.Writer.TryWrite(message);
 
         public void Complete() => outbox.Writer.TryComplete();
 
-        /// <summary>Sends what was queued, in order; a client that takes nothing for the send timeout is let go.</summary>
-        public async Task SendLoopAsync()
+        /// <summary>Ends the connection at once: its queue, its reading, and its socket, so what waits on it fails.</summary>
+        public void Abort()
+        {
+            Complete();
+            try { Ended.Cancel(); } catch (ObjectDisposedException) { }
+            if (Transport is WebSocketServerTransport socket) socket.Abort();
+        }
+
+        /// <summary>Sends what was queued, in order, until the queue is completed; false when the client stopped taking it.</summary>
+        public async Task<bool> SendLoopAsync()
         {
             await foreach (var message in outbox.Reader.ReadAllAsync())
             {
@@ -712,30 +864,41 @@ internal sealed class AhpFace : IAsyncDisposable
                 catch (TimeoutException)
                 {
                     ServiceLog.Warn($"ahp: a client ({ClientId}) took nothing for {sendTimeout.TotalSeconds:0} s; it is disconnected");
-                    try { await Transport.CloseAsync(CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
-                    return;
+                    return false;
                 }
                 catch (Exception)
                 {
-                    return; // gone
+                    return false; // gone
                 }
             }
+            return true;
         }
     }
 
-    /// <summary>Serves one AHP client over <paramref name="transport"/> until it goes.</summary>
+    /// <summary>Serves one AHP client over <paramref name="transport"/> until it goes, or the face stops.</summary>
     public async Task ServeAsync(ITransport transport, CancellationToken ct)
     {
         var c = new Connection(transport, options.SendTimeout);
-        var sending = Task.Run(c.SendLoopAsync);
-        lock (gate) connections.Add(c);
+        using var ended = CancellationTokenSource.CreateLinkedTokenSource(ct, stopping.Token, c.Ended.Token);
+        lock (gate)
+        {
+            if (stopping.IsCancellationRequested) return;
+            connections.Add(c);
+        }
+        c.Sending = Task.Run(async () =>
+        {
+            // A client that takes nothing more is let go of at once: forgotten, so nothing more is queued for
+            // it and it watches no session, and its socket ended, so its reading here ends too.
+            if (!await c.SendLoopAsync()) Drop(c);
+        });
         try
         {
-            while (!ct.IsCancellationRequested && !stopping.IsCancellationRequested)
+            while (!ended.IsCancellationRequested)
             {
                 TransportMessage frame;
-                try { frame = await transport.ReceiveAsync(ct); }
-                catch (Exception e) when (e is TransportClosedException or OperationCanceledException or IOException or System.Net.WebSockets.WebSocketException) { break; }
+                try { frame = await transport.ReceiveAsync(ended.Token); }
+                catch (Exception e) when (e is TransportClosedException or OperationCanceledException or IOException or ObjectDisposedException
+                    or System.Net.WebSockets.WebSocketException) { break; }
                 JsonRpcMessage message;
                 try { message = Json.DecodeMessage(frame); }
                 catch (Exception e) when (e is JsonException or InvalidOperationException or FormatException or NotSupportedException)
@@ -745,9 +908,11 @@ internal sealed class AhpFace : IAsyncDisposable
                 }
                 if (message.Request is { } request)
                 {
-                    // A subscription may wait for its session to open: it does not hold up what follows it.
-                    if (request.Method == "subscribe") _ = Task.Run(() => AnswerAsync(c, request));
-                    else await AnswerAsync(c, request);
+                    if (request.Method == "subscribe" && c.Initialized) Subscribe(c, request);
+                    // The first list may take a while: it does not hold up what follows it.
+                    else if (request.Method == "listSessions" && c.Initialized && !listed.Task.IsCompleted)
+                        _ = Task.Run(() => AnswerAsync(c, request, () => ListSessionsAsync(c, request)));
+                    else await AnswerAsync(c, request, () => CommandAsync(c, request));
                 }
                 else if (message.Notification is { } notification) Notified(c, notification);
             }
@@ -756,8 +921,14 @@ internal sealed class AhpFace : IAsyncDisposable
         {
             lock (gate) connections.Remove(c);
             c.Complete();
-            try { await sending.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
+            try { await c.Sending.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
         }
+    }
+
+    void Drop(Connection c)
+    {
+        lock (gate) connections.Remove(c);
+        c.Abort();
     }
 
     sealed class AhpError(int code, string message, JsonElement? data = null) : Exception(message)
@@ -766,25 +937,29 @@ internal sealed class AhpFace : IAsyncDisposable
         public JsonElement? ErrorData { get; } = data;
     }
 
-    async Task AnswerAsync(Connection c, AhpJsonRpcRequest request)
+    /// <summary>
+    /// Runs a request and answers it. A command whose answer carries state (a snapshot, the list) queues the answer
+    /// itself, under the gate with that state, and gives null; the others' answers are queued here.
+    /// </summary>
+    async Task AnswerAsync(Connection c, AhpJsonRpcRequest request, Func<Task<JsonElement?>> run)
     {
-        TransportMessage reply;
         try
         {
-            var result = await CommandAsync(c, request.Method, request.Params);
-            reply = Json.EncodeMessage(new JsonRpcMessage { SuccessResponse = new JsonRpcSuccessResponse { JsonRpcVersion = "2.0", Id = request.Id, Result = result } });
+            if (await run() is { } result) c.Send(Success(request, result));
         }
         catch (Exception e)
         {
             var (code, text, data) = e is AhpError a ? (a.Code, a.Message, a.ErrorData) : (JsonRpcErrorCodes.InternalError, e.Message, null);
             if (e is not AhpError) ServiceLog.Warn($"ahp: {request.Method} failed: {e}");
-            reply = Json.EncodeMessage(new JsonRpcMessage
+            c.Send(Json.EncodeMessage(new JsonRpcMessage
             {
                 ErrorResponse = new JsonRpcErrorResponse { JsonRpcVersion = "2.0", Id = request.Id, Error = new JsonRpcErrorObject { Code = code, Message = text, Data = data } },
-            });
+            }));
         }
-        c.Send(reply);
     }
+
+    static TransportMessage Success(AhpJsonRpcRequest request, JsonElement result) =>
+        Json.EncodeMessage(new JsonRpcMessage { SuccessResponse = new JsonRpcSuccessResponse { JsonRpcVersion = "2.0", Id = request.Id, Result = result } });
 
     static TransportMessage Notification(string method, JsonElement @params) =>
         Json.EncodeMessage(new JsonRpcMessage { Notification = new JsonRpcNotification { JsonRpcVersion = "2.0", Method = method, Params = @params } });
@@ -796,26 +971,26 @@ internal sealed class AhpFace : IAsyncDisposable
         catch (JsonException e) { throw new AhpError(JsonRpcErrorCodes.InvalidParams, $"params: {e.Message}"); }
     }
 
-    async Task<JsonElement> CommandAsync(Connection c, string method, JsonElement? @params)
+    async Task<JsonElement?> CommandAsync(Connection c, AhpJsonRpcRequest request)
     {
+        var method = request.Method;
+        var @params = request.Params;
         switch (method)
         {
             case "ping":
                 return Empty;
             case "initialize":
-                return await InitializeAsync(c, Params<InitializeParams>(@params));
+                return await InitializeAsync(c, request, Params<InitializeParams>(@params));
             case "reconnect":
-                return await ReconnectAsync(c, Params<ReconnectParams>(@params));
+                return await ReconnectAsync(c, request, Params<ReconnectParams>(@params));
         }
         if (!c.Initialized) throw new AhpError(JsonRpcErrorCodes.InvalidRequest, "Send initialize or reconnect first");
         switch (method)
         {
             case "listSessions":
-                return ListSessions(Params<ListSessionsParams>(@params));
-            case "subscribe":
-                return await SubscribeAsync(c, Params<SubscribeParams>(@params).Channel);
+                return await ListSessionsAsync(c, request);
             case "unsubscribe":
-                lock (gate) c.Subscriptions.Remove(Params<UnsubscribeParams>(@params).Channel);
+                Unsubscribe(c, Params<UnsubscribeParams>(@params).Channel);
                 return Empty;
             case "dispatchAction":
                 Dispatch(c, Params<DispatchActionParams>(@params));
@@ -856,7 +1031,7 @@ internal sealed class AhpFace : IAsyncDisposable
                     Dispatch(c, Params<DispatchActionParams>(notification.Params));
                     break;
                 case "unsubscribe" when c.Initialized:
-                    lock (gate) c.Subscriptions.Remove(Params<UnsubscribeParams>(notification.Params).Channel);
+                    Unsubscribe(c, Params<UnsubscribeParams>(notification.Params).Channel);
                     break;
                 // setClientManagedSettingsPermissions (VS Code's, not AHP) and anything else: nothing to do.
             }
@@ -869,12 +1044,27 @@ internal sealed class AhpFace : IAsyncDisposable
 
     // ---------------------------------------------------------------- commands
 
-    async Task<JsonElement> InitializeAsync(Connection c, InitializeParams p)
+    /// <summary>The agents are known; or why the face cannot serve.</summary>
+    async Task AgentsReadyAsync()
+    {
+        try { await agentsReady.Task; }
+        catch (Exception e) { throw new AhpError(JsonRpcErrorCodes.InternalError, $"This host did not start: {e.Message}"); }
+    }
+
+    /// <summary>Waits for the first list, as long as <see cref="AhpFaceOptions.FirstListWait"/> at most.</summary>
+    async Task FirstListAsync()
+    {
+        try { await listed.Task.WaitAsync(options.FirstListWait, stopping.Token); }
+        catch (TimeoutException) { }
+    }
+
+    async Task<JsonElement?> InitializeAsync(Connection c, AhpJsonRpcRequest request, InitializeParams p)
     {
         if (!p.ProtocolVersions.Contains(AhpNames.Version))
             throw new AhpError(AhpErrorCodes.UnsupportedProtocolVersion, $"This host speaks AHP {AhpNames.Version} only",
                 Json.SerializeToElement(new UnsupportedProtocolVersionErrorData { SupportedVersions = [AhpNames.Version] }));
-        await ready.Task;
+        // Not the list: the sessions follow as they come, and listSessions waits for them.
+        await AgentsReadyAsync();
         var wanted = p.InitialSubscriptions ?? [];
         await LoadAsync(wanted);
         lock (gate)
@@ -889,14 +1079,15 @@ internal sealed class AhpFace : IAsyncDisposable
                     c.Subscriptions.Add(channel);
                     snapshots.Add(snapshot);
                 }
-            return Json.SerializeToElement(new InitializeResult
+            c.Send(Success(request, Json.SerializeToElement(new InitializeResult
             {
                 ProtocolVersion = AhpNames.Version, ServerSeq = serverSeq,
                 ServerInfo = new Implementation { Name = "gorynych", Title = "Gorynych", Version = AgentHost.Version },
                 Meta = new Dictionary<string, JsonElement> { [GorynychProtocol.MetaServiceId] = AhpNames.Element(JsonValue.Create(serviceId)) },
                 Snapshots = snapshots,
                 DefaultDirectory = AhpNames.FileUri(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)),
-            });
+            })));
+            return null;
         }
     }
 
@@ -910,9 +1101,9 @@ internal sealed class AhpFace : IAsyncDisposable
             catch (AhpError e) { ServiceLog.Warn($"ahp: {e.Message}"); }
     }
 
-    async Task<JsonElement> ReconnectAsync(Connection c, ReconnectParams p)
+    async Task<JsonElement?> ReconnectAsync(Connection c, AhpJsonRpcRequest request, ReconnectParams p)
     {
-        await ready.Task;
+        await AgentsReadyAsync();
         lock (gate)
             if (!knownClients.Contains(p.ClientId))
                 throw new AhpError(AhpErrorCodes.NotFound, $"Unknown client {p.ClientId}: this host does not know it (it restarted); initialize afresh");
@@ -925,15 +1116,19 @@ internal sealed class AhpFace : IAsyncDisposable
             var missing = p.Subscriptions.Where(ch => !Exists(ch)).ToList();
             c.Subscriptions.Clear();
             foreach (var channel in present) c.Subscriptions.Add(channel);
-            // A replay only when the log has everything after what the client saw, and no channel's state was made afresh since.
-            var replay = p.LastSeenServerSeq <= serverSeq
-                && (log.First is null || log.First.Value.Seq <= p.LastSeenServerSeq + 1)
-                && present.All(ch => BaseSeqOf(ch) is { } since && since <= p.LastSeenServerSeq);
+            var seen = p.LastSeenServerSeq;
+            var rootToo = c.Subscriptions.Contains(AhpNames.Root);
+            // A replay only when the log has everything after what the client saw, its root notifications too,
+            // and no channel's state was made afresh since.
+            var replay = seen <= serverSeq
+                && (log.First is null || log.First.Value.Seq <= seen + 1)
+                && (!rootToo || rootTrimmed < seen)
+                && present.All(ch => BaseSeqOf(ch) is { } since && since <= seen);
             ReconnectResult result = replay
                 ? new ReconnectResult(new ReconnectReplayResult
                 {
                     Type = ReconnectResultType.Replay,
-                    Actions = [.. log.Where(e => e.Seq > p.LastSeenServerSeq && c.Subscriptions.Contains(e.Channel)).Select(e => Json.Deserialize<ActionEnvelope>(e.Envelope)!)],
+                    Actions = [.. log.Where(e => e.Seq > seen && c.Subscriptions.Contains(e.Channel)).Select(e => Json.Deserialize<ActionEnvelope>(e.Envelope)!)],
                     Missing = missing,
                 })
                 : new ReconnectResult(new ReconnectSnapshotResult
@@ -941,7 +1136,13 @@ internal sealed class AhpFace : IAsyncDisposable
                     Type = ReconnectResultType.Snapshot,
                     Snapshots = [.. present.Select(SnapshotOf).OfType<Snapshot>()],
                 });
-            return Json.SerializeToElement(result);
+            c.Send(Success(request, Json.SerializeToElement(result)));
+            // The root notifications it may have missed, again: they carry no number, and each says how a session is
+            // now, so one it had already does no harm.
+            if (replay && rootToo)
+                foreach (var (stamp, message) in rootLog)
+                    if (stamp >= seen) c.Send(message);
+            return null;
         }
     }
 
@@ -966,8 +1167,11 @@ internal sealed class AhpFace : IAsyncDisposable
         return new Snapshot { Resource = channel, State = state, FromSeq = serverSeq };
     }
 
-    JsonElement ListSessions(ListSessionsParams p)
+    /// <summary>The sessions, a page of them; once the first list is read, or as many as came before it waited too long.</summary>
+    async Task<JsonElement?> ListSessionsAsync(Connection c, AhpJsonRpcRequest request)
     {
+        var p = Params<ListSessionsParams>(request.Params);
+        await FirstListAsync();
         lock (gate)
         {
             var all = sessions.Values.Select(s => s.Sent ?? Summary(s))
@@ -983,11 +1187,12 @@ internal sealed class AhpFace : IAsyncDisposable
             var limit = p.Limit is > 0 and var l ? (int)Math.Min(l, 200) : int.MaxValue;
             var page = all.Skip(start).Take(limit).ToList();
             var more = start + page.Count < all.Count;
-            return Json.SerializeToElement(new ListSessionsResult
+            c.Send(Success(request, Json.SerializeToElement(new ListSessionsResult
             {
                 Items = page,
                 NextCursor = more ? Convert.ToBase64String(Encoding.UTF8.GetBytes($"{page[^1].ModifiedAt}\n{page[^1].Resource}")) : null,
-            });
+            })));
+            return null;
         }
     }
 
@@ -1002,27 +1207,80 @@ internal sealed class AhpFace : IAsyncDisposable
         throw new AhpError(JsonRpcErrorCodes.InvalidParams, "cursor: not one this host gave");
     }
 
-    async Task<JsonElement> SubscribeAsync(Connection c, string channel)
+    /// <summary>
+    /// A subscription, taken in the connection's order when it arrives: an <c>unsubscribe</c> after it, even one that
+    /// comes while its session opens, takes it back. Answered once the channel has its state.
+    /// </summary>
+    void Subscribe(Connection c, AhpJsonRpcRequest request)
     {
-        FaceChat? chat;
+        string channel;
+        try { channel = Params<SubscribeParams>(request.Params).Channel; }
+        catch (AhpError e)
+        {
+            _ = AnswerAsync(c, request, () => Task.FromException<JsonElement?>(e));
+            return;
+        }
+        var pending = new object();
+        lock (gate) c.Pending[channel] = pending;
+        _ = Task.Run(() => AnswerAsync(c, request, () => SubscribeAsync(c, request, channel, pending)));
+    }
+
+    void Unsubscribe(Connection c, string channel)
+    {
         lock (gate)
         {
-            if (!chats.TryGetValue(channel, out chat))
+            c.Subscriptions.Remove(channel);
+            c.Pending.Remove(channel);
+        }
+    }
+
+    async Task<JsonElement?> SubscribeAsync(Connection c, AhpJsonRpcRequest request, string channel, object pending)
+    {
+        try
+        {
+            // A channel the first list has not brought yet may come with it (VS Code subscribes again to what it
+            // had open, right after a restart).
+            bool known;
+            lock (gate) known = Exists(channel);
+            if (!known) await FirstListAsync();
+            FaceChat? chat;
+            lock (gate)
             {
-                if (SnapshotOf(channel) is not { } snapshot)
-                    throw new AhpError(AhpErrorCodes.SessionNotFound, $"No channel {channel} on this host");
-                c.Subscriptions.Add(channel);
-                return Json.SerializeToElement(new SubscribeResult { Snapshot = snapshot });
+                if (!chats.TryGetValue(channel, out chat))
+                {
+                    if (!Subscribed(c, request, channel, pending)) throw NoChannel(channel);
+                    return null;
+                }
             }
+            await EnsureLoadedAsync(chat);
+            lock (gate)
+                if (!Subscribed(c, request, channel, pending)) throw NoChannel(channel);
+            return null;
         }
-        await EnsureLoadedAsync(chat);
-        lock (gate)
+        finally
         {
-            if (SnapshotOf(channel) is not { } snapshot) throw new AhpError(AhpErrorCodes.SessionNotFound, $"No channel {channel} on this host");
-            c.Subscriptions.Add(channel);
-            chat.Unwatched = null;
-            return Json.SerializeToElement(new SubscribeResult { Snapshot = snapshot });
+            lock (gate)
+                if (c.Pending.TryGetValue(channel, out var still) && still == pending) c.Pending.Remove(channel);
         }
+    }
+
+    static AhpError NoChannel(string channel) => new(AhpErrorCodes.SessionNotFound, $"No channel {channel} on this host");
+
+    /// <summary>
+    /// Under the gate: answers a subscription with the channel's state now, queued with it, and keeps the
+    /// subscription unless the client took it back meanwhile; false for a channel with no state.
+    /// </summary>
+    bool Subscribed(Connection c, AhpJsonRpcRequest request, string channel, object pending)
+    {
+        if (SnapshotOf(channel) is not { } snapshot) return false;
+        if (c.Pending.TryGetValue(channel, out var still) && still == pending)
+        {
+            c.Pending.Remove(channel);
+            c.Subscriptions.Add(channel);
+            if (chats.TryGetValue(channel, out var chat)) chat.Unwatched = null;
+        }
+        c.Send(Success(request, Json.SerializeToElement(new SubscribeResult { Snapshot = snapshot })));
+        return true;
     }
 
     // ---------------------------------------------------------------- client actions
@@ -1131,16 +1389,23 @@ internal sealed class AhpFace : IAsyncDisposable
         }
     });
 
+    /// <summary>
+    /// Stops: each client's queue is sent out and its socket closed, then ended, before the endpoint stops, which
+    /// would otherwise wait out its shutdown timeout for every open WebSocket.
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
-        stopping.Cancel();
         List<Connection> all;
         lock (gate) all = [.. connections];
-        foreach (var c in all)
+        await Task.WhenAll(all.Select(async c =>
         {
             c.Complete();
-            try { await c.Transport.CloseAsync(CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
-        }
+            try { await c.Sending.WaitAsync(TimeSpan.FromSeconds(1)); } catch { }
+            try { await c.Transport.CloseAsync(CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(1)); } catch { }
+        }));
+        stopping.Cancel();
+        lock (gate) all = [.. connections];
+        foreach (var c in all) c.Abort();
         if (acp is not null) await acp.DisposeAsync();
         if (serving is not null) try { await serving.WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
     }

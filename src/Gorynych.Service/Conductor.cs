@@ -1239,6 +1239,10 @@ public sealed class Conductor : IAsyncDisposable
                             rec.Cwd = FolderPath.Normalize(s.Cwd);
                             if (s.Title is { Length: > 0 } t && rec.TitleSource != SpawnTitle) { rec.Title = t; rec.TitleSource = "agent"; }
                             if (ParseTime(s.UpdatedAt) is { } at && (discovered || at > rec.UpdatedAt)) rec.UpdatedAt = at;
+                            // An agent that says no time: the oldest one, not the moment the service first
+                            // saw the session, which would make every old session look new; a turn the
+                            // service sees moves it on.
+                            else if (discovered) rec.UpdatedAt = DateTimeOffset.UnixEpoch;
                         });
                         if (record is not null && (includeArchived || !record.Archived)) found[s.SessionId] = Describe(record, s);
                     }
@@ -1679,15 +1683,26 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
-    /// <c>session/prompt</c>. A prompt with <c>_meta["gorynych/promptId"]</c> (a client on the
-    /// resumable link) leaves a mark of its turn's end in the journal, so its client finds out how it
-    /// ended should its answer be lost (<see cref="MarkPromptEndAsync"/>).
+    /// <c>session/prompt</c>. A prompt leaves a mark of its turn's end in the journal, with its
+    /// <c>_meta["gorynych/promptId"]</c> (a client on the resumable link gives one; the service gives
+    /// the others one of its own), so its client finds out how it ended should its answer be lost
+    /// (<see cref="MarkPromptEndAsync"/>), and every client that shows turns sees it end.
     /// </summary>
     internal async Task<JsonNode?> PromptAsync(ClientConnection client, JsonRpcRequest request, CancellationToken ct)
     {
         if (Draining) throw Restarting();
         var prompt = request.ParamsAs<PromptRequest>();
         var promptId = PromptIdOf(prompt);
+        if (promptId is null)
+        {
+            // A client not on the link gives its prompt no ID: it gets one of the service's own, on its
+            // user message, its prompt to the agent and its end's mark, so that every turn's end is
+            // marked and a client that shows turns (the AHP face) sees each one end.
+            promptId = "prompt-" + SessionFeed.NewMessageId();
+            prompt.Meta ??= [];
+            prompt.Meta[GorynychProtocol.MetaPromptId] = promptId;
+            if (request.Params is JsonObject forwarded) forwarded["_meta"] = prompt.Meta.DeepClone();
+        }
         using var use = await UseAsync(prompt.SessionId, ct);
         var key = use.Feed.BeginPrompt(promptId);
         // A restart that began while this prompt found its session saw nothing in progress: refused
@@ -1705,7 +1720,7 @@ public sealed class Conductor : IAsyncDisposable
         {
             return result = await PromptInProgressAsync(client, request, prompt, use, () => use.Feed.Handed(key), ct);
         }
-        catch (IOException e) when (options.Hosts is not null && !StopHostsOnExit)
+        catch (IOException e) when (LivesOnInHost(e))
         {
             // This service exits for a restart and leaves the hosts running.
             if (!use.Feed.WasHanded(key))
@@ -1739,11 +1754,19 @@ public sealed class Conductor : IAsyncDisposable
             // ended nowhere: it goes again, as it is. A turn that goes on in a host this service leaves
             // running for a restart is not over: the next service marks its end when the host reports
             // it. One its host reported the end of is marked already (OnTurnEndedAsync), and is marked no more.
-            if (promptId is not null && !IsRestartingRefusal(failure) && !livesOn)
+            if (!IsRestartingRefusal(failure) && !livesOn)
                 await MarkPromptEndAsync(use.Feed, promptId, result, failure);
             use.Feed.EndPrompt(key);
         }
     }
+
+    /// <summary>
+    /// A turn whose prompt reached the agent goes on in its host when this service exits for a
+    /// restart and leaves the hosts running: the prompt's call fails here with the connection, and
+    /// the next service marks the turn's end when the host reports it. No end is marked for it here,
+    /// or the host's report of its real end would come second and be dropped as marked already.
+    /// </summary>
+    bool LivesOnInHost(Exception? failure) => failure is IOException && options.Hosts is not null && !StopHostsOnExit;
 
     static bool IsRestartingRefusal(Exception? failure) =>
         failure is JsonRpcException j && j.ErrorData?[GorynychProtocol.MetaRestarting] is JsonValue v && v.TryGetValue<bool>(out var restarting) && restarting;
@@ -1862,8 +1885,8 @@ public sealed class Conductor : IAsyncDisposable
         // Journal the user's message, show it to the session's other clients, and use the
         // first prompt as the title until the harness provides one.
         var messageId = SessionFeed.NewMessageId(); // one message, however many blocks
-        // The prompt's ID, if its client gave one, goes with its text: that client never gets the
-        // text live, and drops it when a resume after a reconnect sends it from the journal.
+        // The prompt's ID goes with its text: a client on the link never gets its own text live, and
+        // drops it when a resume after a reconnect sends it from the journal; the others learn its turn.
         var promptId = PromptIdOf(prompt);
         foreach (var block in prompt.Prompt)
         {
@@ -2789,6 +2812,7 @@ public sealed class Conductor : IAsyncDisposable
     async Task SpawnedTurnAsync(SessionFeed feed, SessionRecord record, SessionRecord parent, string prompt, bool approved)
     {
         string? promptId = null; // once its user message is out
+        var handed = false; // its prompt went to the agent
         try
         {
             using var use = await UseAsync(record.SessionId, CancellationToken.None);
@@ -2827,6 +2851,7 @@ public sealed class Conductor : IAsyncDisposable
                         Meta = new JsonObject { [GorynychProtocol.MetaPromptId] = id },
                     }), messageId),
                     CancellationToken.None);
+                handed = true;
             }
             finally
             {
@@ -2840,7 +2865,7 @@ public sealed class Conductor : IAsyncDisposable
         catch (Exception e)
         {
             ServiceLog.Warn($"{record.Agent} {record.SessionId}: the spawned session's first turn failed: {e.Message}");
-            if (promptId is not null) await MarkPromptEndAsync(feed, promptId, null, e);
+            if (promptId is not null && !(handed && LivesOnInHost(e))) await MarkPromptEndAsync(feed, promptId, null, e);
             // The parent holds the child's ID and may wait for news of it, so a turn that never got going is reported too.
             ReportTurnEnd(record.SessionId, $"failed: {e.Message}", feed.EndTurnText());
         }
@@ -3085,6 +3110,7 @@ public sealed class Conductor : IAsyncDisposable
                 Content = block, MessageId = messageId, Meta = meta,
             })!.AsObject();
             await feed.PublishAsync(told, except: null, () => store.Touch(use.Record.SessionId));
+            var handed = false;
             try
             {
                 Task<JsonNode?> response;
@@ -3097,6 +3123,7 @@ public sealed class Conductor : IAsyncDisposable
                         Prompt = [block],
                         Meta = meta.DeepClone().AsObject(),
                     }), messageId), CancellationToken.None);
+                    handed = true;
                 }
                 finally
                 {
@@ -3108,8 +3135,9 @@ public sealed class Conductor : IAsyncDisposable
             }
             catch (Exception e)
             {
-                // Its message is out: a prompt that never reached the agent ends its turn too.
-                await MarkPromptEndAsync(feed, promptId, null, e);
+                // Its message is out: a prompt that never reached the agent ends its turn too; one that
+                // goes on in a host a restart leaves running is marked by the next service.
+                if (!(handed && LivesOnInHost(e))) await MarkPromptEndAsync(feed, promptId, null, e);
                 throw;
             }
         }
@@ -3815,8 +3843,10 @@ public sealed class Conductor : IAsyncDisposable
                     try
                     {
                         if (t.IsCompletedSuccessfully) KeepMark(feed, t.Result);
-                        // The end of its turn, before the session takes the next one.
-                        await MarkPromptEndAsync(feed, promptId, t.IsCompletedSuccessfully ? t.Result : null, t.Exception?.InnerException);
+                        // The end of its turn, before the session takes the next one; one that goes on in a
+                        // host a restart leaves running is marked by the next service.
+                        var failure = t.Exception?.InnerException;
+                        if (!LivesOnInHost(failure)) await MarkPromptEndAsync(feed, promptId, t.IsCompletedSuccessfully ? t.Result : null, failure);
                     }
                     finally
                     {

@@ -238,7 +238,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/position` | `_meta` of every `session/update` the service journals; `session/load` and `session/resume` result `_meta` | the update's position in the session's journal, an opaque string; in a result, the position the client is at once the answer is written |
 | `gorynych/turn` | `session/load` and `session/resume` result `_meta` | `running` while a turn of the session runs or a client's prompt waits for one, else `idle` |
 | `gorynych/prompts` | `session/load` and `session/resume` result `_meta` | the `gorynych/promptId`s of the session's prompts still in progress |
-| `gorynych/promptId` | `session/prompt` params `_meta`, client → service; the `_meta` of the prompt's `user_message_chunk`; the mark of its end | the ID a client on the link gives its prompt; for a turn the service starts itself (an opinion request, a report, a spawned session's first prompt delivered as a turn), `service-<messageId>`, the service's own, so that every such turn's end is marked too |
+| `gorynych/promptId` | `session/prompt` params `_meta`, client → service; the `_meta` of the prompt's `user_message_chunk`; the mark of its end | the ID a client on the link gives its prompt; a prompt without one gets `prompt-<uuid>`, the service's own, also in the prompt the agent gets; for a turn the service starts itself (an opinion request, a report, a spawned session's first prompt delivered as a turn), `service-<messageId>`; so every turn's end is marked |
 | `gorynych/requests` | a client's `initialize` params `_meta` | `false`: the client takes no agent → client request (approval, form); the service routes none to it (the AHP face in its [step 1](ahp-face.md#step-1-reading)) |
 | `gorynych/stopReason` | the `_meta` of the mark that ends a prompt's turn (`gorynych/agentTurn: "ended"` with `gorynych/promptId`) | the turn's ACP stop reason |
 | `gorynych/error` | the `_meta` of the mark that ends a prompt's turn | `{code, message}`: the prompt failed so |
@@ -1528,9 +1528,12 @@ draft.
   session's first prompt delivered as a turn carry a prompt ID of the service's own,
   `service-<messageId>`, on their `user_message_chunk` and their `session/prompt`, and their end is
   marked with it as a client's prompt's is (also by the next service, from the host's
-  `_gorynych/turn_ended`, when one ends while no service runs). A client that shows turns (the AHP
-  face) so sees the end of each turn it saw begin. A client's prompt without an ID (a client not on
-  the link) still has no mark.
+  `_gorynych/turn_ended`, when one ends while no service runs; one whose prompt went on in a host
+  when this service exited for a restart is marked only so, never `cancelled` here). A client's
+  prompt without an ID (a client not on the link) gets one of the service's own, `prompt-<uuid>`,
+  on its `user_message_chunk`, the prompt the agent gets and the mark of its end; a client on the
+  link drops the marks of prompts it did not send. A client that shows turns (the AHP face) so
+  sees the end of each turn it saw begin.
 - **Questions asked again.** An approval or a form waiting for a client goes to the next one
   that attaches ([Standard methods](#standard-methods)), so a client that resumes the session is
   asked again, under a new request ID.

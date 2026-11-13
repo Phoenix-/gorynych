@@ -418,6 +418,52 @@ public sealed partial class DshAdapterTests
     }
 
     [TestMethod]
+    public void TheLastWrite_IsWhenDshWroteTheSession_ItsStoreFirst_ThenItsCache()
+    {
+        var home = TestDirs.New();
+        var log = Path.Combine(home, "sessions", "a-project", "logged");
+        Directory.CreateDirectory(log);
+        File.WriteAllText(Path.Combine(log, "session.v4.jsonl.zstd"), "");
+        File.WriteAllText(Path.Combine(log, "older"), "");
+        var at = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(Path.Combine(log, "session.v4.jsonl.zstd"), at);
+        File.SetLastWriteTimeUtc(Path.Combine(log, "older"), at.AddDays(-3));
+        var cache = Path.Combine(home, "storages", "session_projcache", "sessions");
+        Directory.CreateDirectory(cache);
+        File.WriteAllText(Path.Combine(cache, "cached.json"), "{}");
+        File.SetLastWriteTimeUtc(Path.Combine(cache, "cached.json"), at.AddDays(-1));
+        var pins = new DshPins(home);
+
+        Assert.AreEqual(at, pins.LastWrite("logged")!.Value.UtcDateTime, "the newest file of its folder in DSH's store");
+        Assert.AreEqual(at.AddDays(-1), pins.LastWrite("cached")!.Value.UtcDateTime, "else its projection cache");
+        Assert.IsNull(pins.LastWrite("missing"));
+        Assert.IsNull(pins.LastWrite("../a-project"), "a session ID is never a path");
+        Assert.IsNull(new DshPins(null).LastWrite("logged"));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task TheList_SaysWhenDshLastWroteEachSession_AndNothingForOneItHasNoFilesOf()
+    {
+        var home = TestDirs.New();
+        var (service, _, _) = await StartModesAsync(dshHome: home);
+        await using var _ = service;
+        var written = await NewAsync(service, Work);
+        var unwritten = await NewAsync(service, Work);
+        var folder = Path.Combine(home, "sessions", "a-project", written);
+        Directory.CreateDirectory(folder);
+        File.WriteAllText(Path.Combine(folder, "session.v4.jsonl.zstd"), "");
+        var at = new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(Path.Combine(folder, "session.v4.jsonl.zstd"), at);
+
+        var listed = (await service.Rpc.SendRequestAsync(AcpMethods.Agent.SessionList, new JsonObject()).WaitAsync(Bound))!["sessions"]!.AsArray();
+
+        var stamped = listed.Single(s => (string?)s!["sessionId"] == written)!["updatedAt"];
+        Assert.AreEqual(at, DateTimeOffset.Parse((string)stamped!, System.Globalization.CultureInfo.InvariantCulture).UtcDateTime);
+        Assert.IsNull(listed.Single(s => (string?)s!["sessionId"] == unwritten)!["updatedAt"], "DSH lists no time, and has no files of it: none");
+    }
+
+    [TestMethod]
     public void TheModeStore_KeepsOnlyFullAccess_AndStartsReadOnlyFromABrokenFile()
     {
         var data = TestDirs.New();

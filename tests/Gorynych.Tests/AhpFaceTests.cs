@@ -16,7 +16,7 @@ namespace Gorynych.Tests;
 /// against a service with the test agents, next to an ACP client (Zed's part) on the same conductor.
 /// </summary>
 [TestClass]
-public sealed class AhpFaceTests
+public sealed partial class AhpFaceTests
 {
     internal static readonly TimeSpan Wait = TimeSpan.FromSeconds(20);
 
@@ -24,7 +24,7 @@ public sealed class AhpFaceTests
     internal sealed class Rig : IAsyncDisposable
     {
         public readonly LifecycleAgent Claude = new("claude", canDelete: false);
-        public readonly LifecycleAgent Kimi = new("kimi", canDelete: true);
+        public LifecycleAgent Kimi = new("kimi", canDelete: true);
         public readonly string Data = TestDirs.New();
         public readonly string Token = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
         public Conductor Service = null!;
@@ -32,9 +32,13 @@ public sealed class AhpFaceTests
         public AhpEndpoint Endpoint = null!;
         public TestClient Zed = null!;
 
-        public static async Task<Rig> StartAsync(AhpFaceOptions? options = null, Func<Rig, Task>? before = null)
+        bool faceStopped;
+
+        /// <param name="kimi">Kimi with sessions of its own, say: the service did not make them.</param>
+        public static async Task<Rig> StartAsync(AhpFaceOptions? options = null, Func<Rig, Task>? before = null, LifecycleAgent? kimi = null)
         {
             var rig = new Rig();
+            if (kimi is not null) rig.Kimi = kimi;
             rig.Service = new Conductor(new ConductorOptions { DataDirectory = rig.Data, ServiceId = "ahp-test" }, [rig.Claude.Adapter, rig.Kimi.Adapter]);
             rig.Zed = await TestClient.ConnectAsync(rig.Service, "zed");
             if (before is not null) await before(rig);
@@ -49,12 +53,15 @@ public sealed class AhpFaceTests
             Endpoint = await AhpEndpoint.StartAsync(Face, 0, Token);
             Face.Port = Endpoint.Port;
             await Face.StartAsync();
+            faceStopped = false;
         }
 
+        /// <summary>Stops the face as the service does when it exits.</summary>
         public async Task StopFaceAsync()
         {
-            await Endpoint.DisposeAsync();
-            await Face.DisposeAsync();
+            if (faceStopped) return;
+            faceStopped = true;
+            await new AhpFaceRun(Face, Endpoint).DisposeAsync();
         }
 
         public Task<Peer> ConnectAsync(string clientId = "vscode", bool initialize = true) => Peer.ConnectAsync(this, clientId, initialize);
@@ -72,7 +79,7 @@ public sealed class AhpFaceTests
 
         int prompts;
 
-        /// <summary>A prompt from Zed, with its ID as Zed's bridge gives it (a prompt without one has no end mark).</summary>
+        /// <summary>A prompt from Zed, with its ID as Zed's bridge gives it.</summary>
         public Task<JsonNode?> PromptAsync(string sessionId, string text) => Zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject
         {
             ["sessionId"] = sessionId, ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),

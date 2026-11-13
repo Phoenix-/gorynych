@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace Gorynych.Service.Ahp;
@@ -45,6 +46,8 @@ internal sealed class AhpEndpoint : IAsyncDisposable
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
+        // The face closes its sockets before the endpoint stops; what is left gets no 30 s grace.
+        builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = ShutdownTimeout);
         builder.WebHost.UseKestrel(o => o.Listen(IPAddress.Loopback, port));
         var app = builder.Build();
         app.UseWebSockets();
@@ -82,9 +85,13 @@ internal sealed class AhpEndpoint : IAsyncDisposable
         return new AhpEndpoint(app, new Uri(address).Port);
     }
 
+    /// <summary>How long the endpoint waits for the requests still running when it stops (its WebSockets).</summary>
+    static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(2);
+
     public async ValueTask DisposeAsync()
     {
-        try { await app.StopAsync().WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
+        using var hurry = new CancellationTokenSource(ShutdownTimeout);
+        try { await app.StopAsync(hurry.Token); } catch (Exception e) { ServiceLog.Info($"ahp: the endpoint stopping: {e.Message}"); }
         await app.DisposeAsync();
     }
 }
@@ -122,6 +129,9 @@ internal sealed class WebSocketServerTransport(WebSocket socket) : ITransport
         try { await socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "", cancellationToken); }
         catch (Exception e) when (e is WebSocketException or ObjectDisposedException or InvalidOperationException) { }
     }
+
+    /// <summary>Ends the connection at once: a client that takes nothing more, or the face stopping.</summary>
+    public void Abort() => socket.Abort();
 
     /// <summary>The socket is Kestrel's, disposed when its request ends.</summary>
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;

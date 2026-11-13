@@ -419,7 +419,8 @@ public sealed class ClaudeAdapterTests
         // The fake follows this turn with one of its own, as for a message through its channel.
         await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
             new PromptRequest { SessionId = created.SessionId, Prompt = [new TextContent { Text = "answer, then go on on your own" }] });
-        static string? Mark(System.Text.Json.Nodes.JsonObject u) => (string?)u["_meta"]?["gorynych/agentTurn"];
+        // The marks of Claude's own turns: the service's mark of a prompt's end carries the prompt's ID.
+        static string? Mark(System.Text.Json.Nodes.JsonObject u) => u["_meta"]?["gorynych/promptId"] is null ? (string?)u["_meta"]?["gorynych/agentTurn"] : null;
         var deadline = DateTime.UtcNow.AddSeconds(15);
         while (DateTime.UtcNow < deadline && !client.Snapshot().Any(u => Mark(u) == "ended")) await Task.Delay(100);
 
@@ -427,7 +428,7 @@ public sealed class ClaudeAdapterTests
         var started = updates.FindIndex(u => Mark(u) == "started");
         var ended = updates.FindIndex(u => Mark(u) == "ended");
         Assert.IsTrue(started >= 0 && ended > started, "the turn of Claude's own is marked from its prompt to its Stop");
-        Assert.AreEqual(1, updates.Count(u => Mark(u) is not null) / 2, "one turn of its own; the client's prompt is not marked");
+        Assert.AreEqual(1, updates.Count(u => Mark(u) is not null) / 2, "one turn of its own; the client's prompt is not one");
         Assert.AreEqual(("user_message_chunk", "channel"), ((string?)updates[started]["sessionUpdate"], (string?)updates[started]["_meta"]!["gorynych/origin"]));
         Assert.AreEqual("session_info_update", (string?)updates[ended]["sessionUpdate"]);
         Assert.AreEqual(0, conductor.Feed(created.SessionId).Users, "the service holds the session no longer");

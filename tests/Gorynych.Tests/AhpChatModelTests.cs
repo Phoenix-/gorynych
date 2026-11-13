@@ -97,6 +97,51 @@ public sealed class AhpChatModelTests
     }
 
     [TestMethod]
+    public void AnEndMark_EndsOnlyTheTurnItIsFor()
+    {
+        var model = Model();
+        model.Take(User("One", "u1", new JsonObject { [GorynychProtocol.MetaPromptId] = "p1" }), live: true);
+        model.Take(Agent("Working", "a1"), live: true);
+
+        model.Take(End("p0"), live: true);
+        Assert.AreEqual("p1", model.OpenTurn, "the late mark of an earlier prompt ends nothing");
+        model.Take(End(), live: true);
+        Assert.AreEqual("p1", model.OpenTurn, "the end of a turn of the agent's own is not the end of a prompt's");
+        model.Take(End("p1"), live: true);
+        Assert.IsNull(model.OpenTurn);
+        Assert.AreEqual(TurnState.Complete, model.State.Turns.Single().State);
+
+        // The agent's own turn, begun by its mark, is ended by its mark, not by a prompt's.
+        model.Take(new JsonObject { ["sessionUpdate"] = "session_info_update", ["_meta"] = new JsonObject { [GorynychProtocol.MetaAgentTurn] = "started" } }, live: true);
+        model.Take(End("p1"), live: true);
+        Assert.IsNotNull(model.OpenTurn);
+        Assert.IsFalse(model.Unmarked, "a marked turn: its mark ends it");
+        model.EndUnmarked(live: true);
+        Assert.IsNotNull(model.OpenTurn, "quiet does not end it");
+        model.Take(End(), live: true);
+        Assert.IsNull(model.OpenTurn);
+    }
+
+    [TestMethod]
+    public void ALateUpdate_AfterItsTurnEnded_BeginsATurnNoMarkEnds_WhichQuietEnds()
+    {
+        var model = Model();
+        model.Take(User("One", "u1", new JsonObject { [GorynychProtocol.MetaPromptId] = "p1" }), live: true);
+        model.Take(Agent("Done", "a1"), live: true);
+        model.Take(End("p1"), live: true);
+
+        model.Take(Agent(" and one more thing", "a1"), live: true);
+        Assert.IsTrue(model.Unmarked, "an update outside any turn, with no mark of its start");
+        Assert.IsTrue(model.Busy);
+        model.Take(End("p1"), live: true);
+        Assert.IsTrue(model.Unmarked, "the prompt's mark again is not its end");
+        model.EndUnmarked(live: true);
+        Assert.IsFalse(model.Busy);
+        Assert.AreEqual(2, model.State.Turns.Count);
+        Assert.IsTrue(model.State.Turns.All(t => t.State == TurnState.Complete));
+    }
+
+    [TestMethod]
     public void AnUpdateOfTheAgentWithNoTurnOpen_BeginsATurnOfItsOwn()
     {
         var model = Model();

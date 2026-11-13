@@ -16,7 +16,9 @@ namespace Gorynych.Service.Ahp;
 /// Turns: a user message with a new <c>messageId</c> begins one (its ID the message's <c>gorynych/promptId</c>,
 /// else its <c>messageId</c>); an agent's update with no turn open, or the mark <c>gorynych/agentTurn: "started"</c>,
 /// begins one of the agent's own (<c>agent-&lt;position&gt;</c>); the mark <c>"ended"</c> ends it by its stop reason
-/// or error. AHP cannot add to a message once its turn started, so the chunks of one user message are held
+/// or error, when it is that turn's: the same <c>gorynych/promptId</c>, or none for the agent's own. A turn an
+/// unmarked update began has no mark to end it: the face ends it when the session goes quiet
+/// (<see cref="Unmarked"/>). AHP cannot add to a message once its turn started, so the chunks of one user message are held
 /// until another update comes, <see cref="Flush"/> is called (the replay ended, or 100 ms passed live).
 /// Not thread-safe: the face calls it under its lock.
 /// </remarks>
@@ -62,6 +64,8 @@ internal sealed class ChatModel(ChatState state)
 
     Held? held;
     string? turn;
+    string? turnPromptId; // the prompt the open turn answers, by the ID its end will be marked with; null for the agent's own
+    bool turnUnmarked;    // opened by an update outside any turn, with no mark of its start: no mark will end it
     DateTimeOffset turnStart;
     bool turnLive;
     string? partId;
@@ -73,6 +77,18 @@ internal sealed class ChatModel(ChatState state)
 
     /// <summary>The ID of the turn open now; null for none.</summary>
     public string? OpenTurn => turn;
+
+    /// <summary>
+    /// The turn open now began with an update that came outside any turn, unmarked (a late chunk, the
+    /// agent's work after a cancel): no mark ends it, so the face ends it once the session goes quiet.
+    /// </summary>
+    public bool Unmarked => turn is not null && turnUnmarked;
+
+    /// <summary>Ends an <see cref="Unmarked"/> turn: the session went quiet.</summary>
+    public void EndUnmarked(bool live)
+    {
+        if (Unmarked) EndTurn(null, null, live);
+    }
 
     /// <summary>Takes one ACP update of the session. <paramref name="live"/>: it came now, not in a load's replay.</summary>
     public void Take(JsonObject update, bool live)
@@ -122,7 +138,8 @@ internal sealed class ChatModel(ChatState state)
         if (held is not { } h) return;
         held = null;
         if (turn is not null) EndTurn(null, null, live); // a new message ends the turn before it
-        StartTurn(h.TurnId, Message(h.Text.ToString(), h.Meta), h.StartedAt, h.Start, live);
+        StartTurn(h.TurnId, Message(h.Text.ToString(), h.Meta), h.StartedAt, h.Start, live,
+            AhpNames.Text(h.Meta?[GorynychProtocol.MetaPromptId]), unmarked: false);
     }
 
     /// <summary>A load said no turn runs: one the replay left open is over.</summary>
@@ -134,12 +151,14 @@ internal sealed class ChatModel(ChatState state)
 
     // ---------------------------------------------------------------- turns
 
-    void StartTurn(string id, Message message, string startedAt, DateTimeOffset start, bool live)
+    void StartTurn(string id, Message message, string startedAt, DateTimeOffset start, bool live, string? promptId, bool unmarked)
     {
         var unique = id;
         for (var n = 2; Used(unique); n++) unique = $"{id}#{n}";
         Apply(new ChatTurnStartedAction { TurnId = unique, StartedAt = startedAt, Message = message });
         turn = unique;
+        turnPromptId = promptId;
+        turnUnmarked = unmarked;
         turnStart = start;
         turnLive = live;
         partId = partKind = partMessage = null;
@@ -149,15 +168,15 @@ internal sealed class ChatModel(ChatState state)
 
     bool Used(string id) => State.ActiveTurn?.Id == id || State.Turns.Any(t => t.Id == id);
 
-    /// <summary>A turn of the agent's own, for an update that came with no turn open.</summary>
-    void EnsureTurn(JsonObject update, bool live)
+    /// <summary>A turn of the agent's own, for an update that came with no turn open, or for the mark of its start.</summary>
+    void EnsureTurn(JsonObject update, bool live, bool marked = false)
     {
         if (turn is not null) return;
         var position = AhpNames.Text((update["_meta"] as JsonObject)?[GorynychProtocol.MetaPosition]);
         var now = Now();
         StartTurn(position is null ? $"agent-{++unnamed}" : $"agent-{position}",
             new Message { Text = "", Origin = new MessageOrigin { Kind = MessageKind.Agent } },
-            live ? AhpNames.Time(now) : ReplayTime, now, live);
+            live ? AhpNames.Time(now) : ReplayTime, now, live, promptId: null, unmarked: !marked);
     }
 
     /// <param name="stopReason">ACP's stop reason; null for a turn that simply ended (complete).</param>
@@ -183,6 +202,8 @@ internal sealed class ChatModel(ChatState state)
         else Apply(new ChatTurnCompleteAction { TurnId = id, Duration = duration });
         if (State.Activity is not null) Apply(new ChatActivityChangedAction { Activity = null });
         turn = null;
+        turnPromptId = null;
+        turnUnmarked = false;
         partId = partKind = partMessage = null;
         partUses.Clear();
         tools.Clear();
@@ -194,10 +215,12 @@ internal sealed class ChatModel(ChatState state)
         {
             case "started":
                 if (turn is not null) EndTurn(null, null, live);
-                EnsureTurn(update, live);
+                EnsureTurn(update, live, marked: true);
                 break;
-            case "ended" when turn is not null:
-                EndTurn(AhpNames.Text(meta![GorynychProtocol.MetaStopReason]), meta[GorynychProtocol.MetaError] as JsonObject, live);
+            // A mark ends the turn it is for: a prompt's by the prompt's ID, the agent's own without one.
+            // The late mark of a turn a newer one ended already ends nothing.
+            case "ended" when turn is not null && AhpNames.Text(meta![GorynychProtocol.MetaPromptId]) == turnPromptId:
+                EndTurn(AhpNames.Text(meta[GorynychProtocol.MetaStopReason]), meta[GorynychProtocol.MetaError] as JsonObject, live);
                 break;
         }
     }

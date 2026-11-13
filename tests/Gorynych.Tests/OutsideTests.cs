@@ -382,7 +382,8 @@ public sealed class OutsideTests
     public async Task Read_KnowsATurnInProgress_AndATrimmedJournal()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);
-        await using var conductor = Conductor(TimeSpan.FromSeconds(60), journal: 16, kimi.Adapter);
+        // Each prompt takes three entries: its message, the answer and the mark of its end.
+        await using var conductor = Conductor(TimeSpan.FromSeconds(60), journal: 24, kimi.Adapter);
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var id = await NewPromptedAsync(zed, "kimi", "Prompt 0");
         for (var i = 1; i < 10; i++) await PromptAsync(zed, id, $"Prompt {i}");
@@ -393,7 +394,7 @@ public sealed class OutsideTests
 
         var read = await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodRead, new JsonObject { ["sessionId"] = id, ["limit"] = 3 });
         Assert.AreEqual(true, (bool?)read!["inProgress"]);
-        Assert.AreEqual(true, (bool?)read["trimmed"], "16 entries at most: the oldest were dropped");
+        Assert.AreEqual(true, (bool?)read["trimmed"], "24 entries at most: the oldest were dropped");
         Assert.AreEqual(3, read["updates"]!.AsArray().Count(u => ((string?)u!["sessionUpdate"])!.EndsWith("message_chunk", StringComparison.Ordinal)));
         Assert.IsNotNull(read["nextCursor"]);
         var text = ToolText(await McpAsync(zed, "tools/call", Call("read_session", new JsonObject { ["session_id"] = id }))).Text;
