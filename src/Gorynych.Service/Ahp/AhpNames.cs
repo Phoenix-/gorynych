@@ -46,12 +46,28 @@ internal static class AhpNames
         catch (UriFormatException) { return null; }
     }
 
-    /// <summary>A folder as a <c>file:</c> URI (<c>file:///C:/Users/x</c> for <c>C:\Users\x</c>); null for none.</summary>
+    /// <summary>
+    /// A local path as a <c>file:</c> URI (RFC 8089): <c>file:///C:/Users/x</c> for <c>C:\Users\x</c>, <c>file:///home/x</c>
+    /// for <c>/home/x</c>, <c>file://host/share/x</c> for <c>\\host\share\x</c>; each segment percent-encoded as UTF-8 but
+    /// its unreserved characters, <c>%</c> among the rest (.NET's <see cref="Uri"/> leaves a <c>%41</c> in a path as it is,
+    /// which a reader takes for <c>A</c>). Null for none, or a path that is not absolute.
+    /// </summary>
     public static string? FileUri(string? path)
     {
         if (string.IsNullOrEmpty(path)) return null;
-        try { return new Uri(path).AbsoluteUri; }
-        catch (UriFormatException) { return null; }
+        // Windows takes either slash between folders; elsewhere a backslash is a character of a name.
+        string Segments(string rest) => string.Join('/', rest.Split(OperatingSystem.IsWindows() ? ['/', '\\'] : ['/']).Select(Uri.EscapeDataString));
+        if (OperatingSystem.IsWindows())
+        {
+            if (path.StartsWith(@"\\", StringComparison.Ordinal) && path.Length > 2) // another machine's share
+            {
+                var host = path[2..].Split('\\', 2);
+                return $"file://{Uri.EscapeDataString(host[0])}/{(host.Length > 1 ? Segments(host[1]) : "")}";
+            }
+            if (path.Length < 2 || !char.IsAsciiLetter(path[0]) || path[1] != ':') return null;
+            return $"file:///{char.ToUpperInvariant(path[0])}:/{Segments(path[2..].TrimStart('\\', '/'))}";
+        }
+        return path.StartsWith('/') ? $"file:///{Segments(path[1..])}" : null;
     }
 
     /// <summary>

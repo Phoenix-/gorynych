@@ -75,9 +75,27 @@ public sealed class AhpNamesTests
     }
 
     [TestMethod]
+    public void TheFacesUri_EscapesWhatAPathHas_APercentSignAmongTheRest()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.AreEqual("file:///C:/x/100%2541%20a%23b", AhpNames.FileUri(@"C:\x\100%41 a#b"));
+            Assert.AreEqual("file:///C:/", AhpNames.FileUri(@"C:\"));
+            Assert.AreEqual("file://server/share/x", AhpNames.FileUri(@"\\server\share\x"));
+        }
+        else
+        {
+            Assert.AreEqual("file:///x/100%2541%20a%23b", AhpNames.FileUri("/x/100%41 a#b"));
+            Assert.AreEqual("file:///x/a%5Cb", AhpNames.FileUri(@"/x/a\b"), "a backslash is a name's");
+            Assert.AreEqual("file:///", AhpNames.FileUri("/"));
+        }
+        Assert.IsNull(AhpNames.FileUri("relative"));
+    }
+
+    [TestMethod]
     public void APath_ComesBackFromVsCodesUriAndFromTheFacesOwn()
     {
-        foreach (var name in new[] { "plain", "a b", "#1 100% Дима", "x;y[z]&(w)+=@'!$,~" })
+        foreach (var name in new[] { "plain", "a b", "#1 100% Дима", "100%41", "x;y[z]&(w)+=@'!$,~" })
         {
             var path = Path.Combine(Path.GetTempPath(), "gorynych-uri", name);
             Assert.AreEqual(path, AhpNames.FilePath(VsCodeUri(path)), VsCodeUri(path));

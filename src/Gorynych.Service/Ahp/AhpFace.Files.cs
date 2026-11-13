@@ -21,7 +21,9 @@ internal sealed partial class AhpFace
         public string Uri { get; } = uri;
         public TerminalState State { get; } = state;
         public long BaseSeq { get; } = baseSeq;
+        public DateTimeOffset Made { get; } = DateTimeOffset.UtcNow;
     }
+
 
     // under gate
     readonly Dictionary<string, FaceTerminal> terminals = new(StringComparer.Ordinal);
@@ -52,9 +54,12 @@ internal sealed partial class AhpFace
             };
             terminals[p.Channel] = new FaceTerminal(p.Channel, state, serverSeq);
             terminalOrder.Add(p.Channel);
-            // Past the limit the oldest a client does not show goes; one shown stays until it is disposed.
+            // Past the limit the oldest a client does not show goes; one shown stays until it is disposed, and a young one
+            // (this one above all) until its client could subscribe.
+            var now = DateTimeOffset.UtcNow;
             while (terminalOrder.Count > TerminalsKept
-                && terminalOrder.FirstOrDefault(t => !connections.Any(c => c.Subscriptions.Contains(t))) is { } unseen)
+                && terminalOrder.FirstOrDefault(t => t != p.Channel && now - terminals[t].Made >= options.TerminalYoung
+                    && !connections.Any(c => c.Subscriptions.Contains(t))) is { } unseen)
             {
                 terminals.Remove(unseen);
                 terminalOrder.Remove(unseen);
@@ -159,19 +164,28 @@ internal sealed partial class AhpFace
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Security.SecurityException) { throw Failure(p.Uri, e); }
     }
 
-    /// <summary>A path with every link on it resolved (<c>realpath</c>), from its root down; at most 40 links, as a cycle has more.</summary>
+    /// <summary>
+    /// A path with every link on it resolved (<c>realpath</c>), from its root down; a link's target is resolved so too,
+    /// its parents with it (<c>/tmp</c> to <c>/private/tmp</c>). At most 40 links, as a cycle has more.
+    /// </summary>
     static string RealPath(string path)
+    {
+        var hops = 0;
+        return RealPath(path, ref hops);
+    }
+
+    static string RealPath(string path, ref int hops)
     {
         var root = Path.GetPathRoot(path) ?? "";
         var current = root;
-        var hops = 0;
         foreach (var part in path[root.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
         {
             current = Path.Combine(current, part);
             FileSystemInfo info = Directory.Exists(current) ? new DirectoryInfo(current) : new FileInfo(current);
-            if (info.LinkTarget is null) continue;
+            if (info.LinkTarget is not { } target) continue;
             if (++hops > 40) throw new IOException($"{path}: too many links");
-            if (info.ResolveLinkTarget(returnFinalTarget: true) is { } target) current = Path.TrimEndingDirectorySeparator(target.FullName);
+            // One hop: the target, relative to the link's folder, resolved in its turn from its root.
+            current = RealPath(Path.TrimEndingDirectorySeparator(Path.GetFullPath(target, Path.GetDirectoryName(current) ?? root)), ref hops);
         }
         return current;
     }

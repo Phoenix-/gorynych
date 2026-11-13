@@ -97,9 +97,10 @@ describes: a host speaks AHP to its clients and ACP to its agents.
   being the `gorynych/position` of its first update.
 - **Folders** are `file:` URIs (RFC 8089; AHP 1.0.0 says nothing more of them). (AHP's
   `environment.pathStyle` is newer than 1.0.0.)
-  - The face writes the service's `C:\Users\x` as `file:///C:/Users/x`, percent-encoded as .NET
-    encodes a path. VS Code parses a host's URI and compares URIs as URIs, its drive letter and
-    encoding normalized, so this matches its own form.
+  - The face writes the service's `C:\Users\x` as `file:///C:/Users/x` (`/home/x` as `file:///home/x`),
+    each segment percent-encoded as UTF-8 but its unreserved characters, `%` among the rest: .NET's `Uri`
+    leaves a `%41` in a path as it is, which a reader takes for `A`. VS Code parses a host's URI and
+    compares URIs as URIs, its drive letter and encoding normalized, so this matches its own form.
   - It reads a client's URI by RFC 8089 itself, not with .NET's `Uri`, which sees no drive in VS
     Code's `c%3A`. `file:///c%3A/Users/x` (VS Code's form) and `file:///C:/Users/x` are both
     `C:\Users\x`: the path percent-decoded as UTF-8, the drive letter upper-cased as Windows writes
@@ -206,8 +207,9 @@ describes: a host speaks AHP to its clients and ACP to its agents.
     `isPty: false`, and the client's claim. `root/terminalsChanged` adds it to the catalog (and says a
     title or claim a client changes), `disposeTerminal` takes it out (`NotFound` for one the face does
     not have); a terminal with no URI is `InvalidParams`. Past 32 terminals the oldest no client
-    subscribes to goes; one a client shows stays until it is disposed. A client's terminal actions go
-    through the reducer; `terminal/input` reaches nothing.
+    subscribes to goes, but never one younger than 30 s (its client subscribes only once its creation
+    is answered), the one being made above all; one a client shows stays until it is disposed. A
+    client's terminal actions go through the reducer; `terminal/input` reaches nothing.
   - What VS Code makes of it (its bundle's `AgentHostPty`): it creates the terminal, subscribes, writes
     the content and signals ready. It ends a terminal on a `terminal/exited` action, not on the state
     it subscribed to, so the tab stays with the line and no toast; an exit with no code (or 0) never
@@ -269,7 +271,7 @@ Client actions on a session:
 
 | Action | What the face does |
 | --- | --- |
-| `session/isArchivedChanged` | echoed at once, then `_gorynych/archive {sessionId, archived}`; one the service refuses goes back by the host (see below) |
+| `session/isArchivedChanged` | echoed at once, then `_gorynych/archive {sessionId, archived}` in the session's write order (an archive and an unarchive reach the service as they came); one the service refuses goes back by the host (see below) |
 | `session/isReadChanged` | applied in memory |
 | `session/titleChanged` | refused (`Renaming is not supported yet`) until renaming reaches the native side ([design.md](design.md#sessions-catalog-titles-archive), planned) |
 | `session/activeClientSet`, `session/activeClientRemoved` | applied |
@@ -441,7 +443,9 @@ face on its own port and data folder) before the next one starts.
 Built on 13 November 2026. Its live check (VS Code 1.145.2, the same day) and an independent review
 found what the second round fixed: VS Code's form of a `file:` URI (L1), the model picker (L3), and
 the review's items below; an approved tool call VS Code no longer shows once done (L2) is VS Code's
-way, explained under "Limits".
+way, explained under "Limits". A re-check and a third review (13 November) found the rest fixed in a
+third round: the model choice, the terminal limit, file URIs, asks tied to their turn, a new session's
+early updates.
 
 - **Creating and deleting.** `createSession`: the session at the URI its client chose, `creating` at
   once, with its own chat (`ahp-chat:/<id>`, the same `<id>`) open from the start; `session/new` in the
@@ -454,15 +458,17 @@ way, explained under "Limits".
   conductor lists it the session is a draft: the face keeps it. The conductor lists it once its first
   prompt has made it a session (its promotion); a list read before that does not take it away, nor its
   chat, nor what its agent asks. Closing a draft never prompted (two minutes with no AHP client on it)
-  discards it, as a draft Zed made. The commands an agent says of a new session before its
-  `session/new` answer reaches the face are kept for it. `disposeSession` is `session/delete`, which
+  discards it, as a draft Zed made. What the conductor passes on of a new session before its
+  `session/new` answer reaches the face (its commands, its title, its options) is kept for it, and taken
+  once the face has its ID, before the answer's own options. `disposeSession` is `session/delete`, which
   deletes the session in its agent where the agent can, as a delete from Zed does, then
   `root/sessionRemoved`; the children the face had open, which a delete leaves, are closed.
 - **Folders.** On `file:` URIs: `resourceList` (folders first, then files, each by name),
   `resourceResolve` (a file, a folder, or a link when asked not to follow it; followed, the real path,
-  each link on the way resolved, is its URI), `resourceRead` (UTF-8 text when the file is valid UTF-8
+  each link on the way resolved, a link's target and its parents too, is its URI), `resourceRead` (UTF-8 text when the file is valid UTF-8
   and base64 was not asked for, else base64; at most 16 MB) and `resourceMkdir` (with its parents). They
-  run off the client's connection loop, so a slow disk holds up none of its other messages. A `file:`
+  run off the client's connection loop, at most four at once for a client, so a slow disk holds up none
+  of its other messages. A `file:`
   URI the face does not serve (see "Identifiers"; on Windows a path must be a drive's, never a device's
   or another machine's) is `PermissionDenied`; another scheme is `NotFound`.
   `resourceWrite`, `resourceCopy`, `resourceMove`, `resourceDelete`, `resourceRequest` and
@@ -485,12 +491,16 @@ way, explained under "Limits".
     VS Code's model picker takes a chat's model from its draft (else from its last turn's message, else
     its own default, its first model: "Default (recommended)" for Claude). The face puts it there when the
     chat has no draft and when the model changes, from any client.
-  - VS Code's picker takes the draft's model once, does not follow a later change made elsewhere, and
-    sends its model with every message. So a message's `model` is a choice only when it is another than
-    the one the chat's clients sent last (at first, the one the face offered): only then is it set, with
-    `session/set_config_option` before its prompt (when it is one of the session's models and not its
-    current one); a set that fails ends the turn with the error. The same model again leaves the
-    session's as it is, a change made in Zed among others.
+  - VS Code's picker shows the draft's model and follows it live (its live check: a change made in Zed
+    showed in the window at once), and it sends its model with every message: the session's own, unless
+    its user picked another. A message's `model` is set with `session/set_config_option` before its
+    prompt when it is one of the session's models and not its current one; a set that fails ends the turn
+    with the error. Nothing is remembered of a pick, for a client or a chat: once set it is the session's
+    model, which the draft offers again; a set that failed leaves the session's, so the same pick again is
+    set again. A window that reloads, or a second window, reads the same draft. (The second round also
+    counted as a pick only a model other than the one the chat's clients sent last; with the draft
+    followed live that is the session's model, so the rule added nothing, and its memory per chat broke
+    the cases the third review named.)
   - **Before a session exists** (the open question of this step): `resolveSessionConfig` answers the
     options of the latest session of that agent the face has seen while the service runs (none before
     it has seen one), with only the values the client gave that those options take. A new session gets
@@ -546,7 +556,9 @@ way, explained under "Limits".
     asks about a session the face does not show (it let it go, or could not open it) is answered as
     cancelled, so the agent never waits for nobody; one that comes while the face opens the session is
     shown once it is open. What the agent asks while a turn a client cancelled settles is answered as
-    cancelled at once, as ACP has a cancelling client do; no turn opens for it. The face does not close a
+    cancelled at once, as ACP has a cancelling client do; no turn opens for it. An ask is shown as it
+    arrives, on the internal connection's read loop and in the order of its stream (`RequestArrived`), not
+    when its handler runs on the thread pool: it belongs to the turn it came in. The face does not close a
     session whose agent waits for an answer here.
   - Routing, until step 3: a request goes, as the conductor routes any, to the client attached to the
     session last: VS Code only when the face opened (or created) the session after any ACP client did,
@@ -583,7 +595,10 @@ way, explained under "Limits".
   asked while a cancelled turn settles; an approval making a read session unread; a deleted root's
   open children closed; a new session's early commands; a session being made on no list; a client's
   changes echoed in order, a refused one going back; the terminal's title in the catalog, a shown one
-  kept past 32, one with no URI refused.
+  kept past 32, one with no URI refused. From the third round: a model picked again after a change
+  elsewhere, after a failed set, and a second window's followed model; an ask whose handler runs after
+  its cancelled turn ended; a new terminal kept though every older one is shown; what an agent says of a
+  new session right after its answer; a file URI's `%` escaped; a real path through links.
 - **Live check.** In VS Code: a Claude session in a folder picked through the host; a prompt; a Write
   approved; a turn cancelled; a Kimi session with its model picked; each visible in Zed; no terminal
   toast.

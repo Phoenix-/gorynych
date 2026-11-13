@@ -17,6 +17,9 @@ internal sealed class AhpFaceOptions
     /// <summary>How long a session the face loaded stays open with no AHP client on its chat.</summary>
     public TimeSpan CloseAfter { get; init; } = TimeSpan.FromMinutes(2);
 
+    /// <summary>How long a new terminal is kept whatever the limit: its client subscribes once its creation is answered.</summary>
+    public TimeSpan TerminalYoung { get; init; } = TimeSpan.FromSeconds(30);
+
     /// <summary>How often the face looks for sessions to close.</summary>
     public TimeSpan SweepEvery { get; init; } = TimeSpan.FromSeconds(15);
 
@@ -107,6 +110,11 @@ internal sealed partial class AhpFace : IAsyncDisposable
             acp = new JsonRpcConnection(faceIn, faceOut, "ahp face") { Log = m => ServiceLog.Warn(m) };
             acp.NotificationHandler = OnAcpNotificationAsync;
             acp.RequestHandler = OnAcpRequestAsync;
+            acp.RequestArrived = OnAcpRequestArrived;
+            acp.RequestDone = request =>
+            {
+                lock (gate) arrived.Remove(request);
+            };
             acp.Start();
             var init = await acp.SendRequestAsync(Gorynych.Acp.AcpMethods.Agent.Initialize, new JsonObject
             {
@@ -272,47 +280,52 @@ internal sealed partial class AhpFace : IAsyncDisposable
                     Close(sessionId);
                 }
             }
-            if (!chatsById.TryGetValue(sessionId, out var chat))
+            if (chatsById.TryGetValue(sessionId, out var chat)) TakeUpdate(chat, update);
+            else if (making > 0)
             {
-                // The commands of a session the face is making, said before its session/new answer reached it: kept for it.
-                if (making > 0 && AhpNames.Text(update["sessionUpdate"]) == "available_commands_update")
-                    unclaimedCommands[sessionId] = Commands(update);
-                return Task.CompletedTask;
+                // Of a session the face is making, said before its session/new answer reached it: kept, and taken once it has it.
+                if (!unclaimed.TryGetValue(sessionId, out var early)) unclaimed[sessionId] = early = [];
+                if (early.Count < UnclaimedKept) early.Add((JsonObject)update.DeepClone());
             }
-            switch (AhpNames.Text(update["sessionUpdate"]))
-            {
-                case "session_info_update":
-                    // Title, archive and interactivity go to the catalog whether or not the chat is open; the list says them too.
-                    if (AhpNames.Text(update["title"]) is { Length: > 0 } title) SetTitle(chat, title);
-                    if (update["_meta"]?[GorynychProtocol.MetaArchived] is JsonValue v && v.TryGetValue<bool>(out var archived)) SetArchived(chat, archived);
-                    if (AhpNames.Text(update["_meta"]?[GorynychProtocol.MetaInteractivity]) is { } interactivity)
-                        SetReadOnly(chat, interactivity == GorynychProtocol.InteractivityReadOnly, AhpNames.Text(update["_meta"]?[GorynychProtocol.MetaInteractivityReason]));
-                    break;
-                // The session's state, not its history: kept by the face, for its config and its commands.
-                case "config_option_update" when !chat.IsChild:
-                    OptionsChanged(chat.Session, update["configOptions"] as JsonArray, chat.Session.AcpModes);
-                    return Task.CompletedTask;
-                case "current_mode_update" when !chat.IsChild:
-                    ModeChanged(chat.Session, AhpNames.Text(update["currentModeId"]));
-                    return Task.CompletedTask;
-                case "available_commands_update":
-                    chat.Commands = Commands(update);
-                    return Task.CompletedTask;
-            }
-            if (chat.Buffer is { } buffer)
-            {
-                buffer.Add((JsonObject)update.DeepClone());
-                return Task.CompletedTask;
-            }
-            if (chat.Model is not { } model) return Task.CompletedTask;
-            chat.Updates++;
-            model.Take(update, live: true);
-            if (model.Holding) ScheduleFlush(chat);
-            if (model.Unmarked || model.Settling) ScheduleQuiet(chat);
-            ConsumeQueued(chat);
-            Sync(chat.Session);
         }
         return Task.CompletedTask;
+    }
+
+    /// <summary>Under the gate: an update of a session the face has.</summary>
+    void TakeUpdate(FaceChat chat, JsonObject update)
+    {
+        switch (AhpNames.Text(update["sessionUpdate"]))
+        {
+            case "session_info_update":
+                // Title, archive and interactivity go to the catalog whether or not the chat is open; the list says them too.
+                if (AhpNames.Text(update["title"]) is { Length: > 0 } title) SetTitle(chat, title);
+                if (update["_meta"]?[GorynychProtocol.MetaArchived] is JsonValue v && v.TryGetValue<bool>(out var archived)) SetArchived(chat, archived);
+                if (AhpNames.Text(update["_meta"]?[GorynychProtocol.MetaInteractivity]) is { } interactivity)
+                    SetReadOnly(chat, interactivity == GorynychProtocol.InteractivityReadOnly, AhpNames.Text(update["_meta"]?[GorynychProtocol.MetaInteractivityReason]));
+                break;
+            // The session's state, not its history: kept by the face, for its config and its commands.
+            case "config_option_update" when !chat.IsChild:
+                OptionsChanged(chat.Session, update["configOptions"] as JsonArray, chat.Session.AcpModes);
+                return;
+            case "current_mode_update" when !chat.IsChild:
+                ModeChanged(chat.Session, AhpNames.Text(update["currentModeId"]));
+                return;
+            case "available_commands_update":
+                chat.Commands = Commands(update);
+                return;
+        }
+        if (chat.Buffer is { } buffer)
+        {
+            buffer.Add((JsonObject)update.DeepClone());
+            return;
+        }
+        if (chat.Model is not { } model) return;
+        chat.Updates++;
+        model.Take(update, live: true);
+        if (model.Holding) ScheduleFlush(chat);
+        if (model.Unmarked || model.Settling) ScheduleQuiet(chat);
+        ConsumeQueued(chat);
+        Sync(chat.Session);
     }
 
     void ScheduleFlush(FaceChat chat) => _ = Task.Delay(options.HoldFor).ContinueWith(_ =>
@@ -403,7 +416,6 @@ internal sealed partial class AhpFace : IAsyncDisposable
         public string? ReadOnlyReason;
         public List<(string Name, string? Description)> Commands = []; // its agent's commands, for completions
         public string? Offered; // the session's model as the face last put it in the chat's draft
-        public string? ClientModel; // the model its clients' picker holds: the one they sent last, else the one offered
     }
 
     /// <summary>Takes the conductor's list: sessions and children that came, went or changed, said to the clients.</summary>
@@ -959,6 +971,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
         readonly Channel<TransportMessage> outbox = System.Threading.Channels.Channel.CreateUnbounded<TransportMessage>(new UnboundedChannelOptions { SingleReader = true });
 
         public ITransport Transport { get; } = transport;
+        public readonly SemaphoreSlim Files = new(4); // its resource methods running
         public string? ClientId;
         public bool Initialized;
         public Task Sending = Task.CompletedTask;
@@ -1039,8 +1052,16 @@ internal sealed partial class AhpFace : IAsyncDisposable
                     else if (request.Method == "listSessions" && c.Initialized && !listed.Task.IsCompleted)
                         _ = Task.Run(() => AnswerAsync(c, request, () => ListSessionsAsync(c, request)));
                     // A delete waits for its agent, a file for its disk: neither holds up what follows it.
-                    else if (request.Method is "disposeSession" or "resourceList" or "resourceResolve" or "resourceRead" or "resourceMkdir" && c.Initialized)
+                    else if (request.Method == "disposeSession" && c.Initialized)
                         _ = Task.Run(() => AnswerAsync(c, request, () => CommandAsync(c, request)));
+                    // At most four at once for a client: the rest wait their turn, not the connection.
+                    else if (request.Method is "resourceList" or "resourceResolve" or "resourceRead" or "resourceMkdir" && c.Initialized)
+                        _ = Task.Run(async () =>
+                        {
+                            await c.Files.WaitAsync();
+                            try { await AnswerAsync(c, request, () => CommandAsync(c, request)); }
+                            finally { c.Files.Release(); }
+                        });
                     else await AnswerAsync(c, request, () => CommandAsync(c, request));
                 }
                 else if (message.Notification is { } notification) Notified(c, notification);
@@ -1551,11 +1572,14 @@ internal sealed partial class AhpFace : IAsyncDisposable
     void ArchiveAsync(Connection c, string channel, StateAction action, ActionOrigin origin, string sessionId, bool archived)
     {
         SetArchivedHere(channel, archived, action.Value!, origin);
-        _ = Task.Run(async () =>
+        var s = sessions.TryGetValue(channel, out var session) ? session : chats[channel].Session;
+        // In the session's write order, so an archive and an unarchive reach the service in the order they came.
+        _ = Write(s, async () =>
         {
             try
             {
                 await acp!.SendRequestAsync(GorynychProtocol.MethodArchive, new JsonObject { ["sessionId"] = sessionId, ["archived"] = archived }, stopping.Token);
+                return true;
             }
             catch (Exception e) when (e is IOException or JsonRpcException or OperationCanceledException)
             {
@@ -1567,6 +1591,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
                         : new ChatIsArchivedChangedAction { IsArchived = !archived };
                     SetArchivedHere(channel, !archived, back, null, only: archived);
                 }
+                return false;
             }
         });
     }

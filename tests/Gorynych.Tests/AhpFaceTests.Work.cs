@@ -57,7 +57,7 @@ public sealed partial class AhpFaceTests
         // A folder VS Code names with its drive as c%3A, its space, '#' and the rest percent-encoded.
         var folder = Path.Combine(TestDirs.New(), "My Project #2 Дима");
         Directory.CreateDirectory(folder);
-        var notes = Path.Combine(folder, "notes 1.md");
+        var notes = Path.Combine(folder, "notes 100%41.md"); // a "%41" a reader must not take for "A"
         var (sessionUri, chatUri, id) = await CreateAsync(rig, vscode, "claude", folder);
 
         var record = rig.Service.Store.Get(id)!;
@@ -71,10 +71,11 @@ public sealed partial class AhpFaceTests
         Assert.IsFalse(vscode.Events().Any(e => e.Event is SubscriptionEventSessionRemoved removed && removed.Params.Session == sessionUri), "the draft stays");
 
         await Send(vscode, chatUri, "t1", "Port the parser", attachments:
-            [new MessageAttachment(new MessageResourceAttachment { Uri = AhpNamesTests.VsCodeUri(notes), Label = "notes 1.md" })]);
+            [new MessageAttachment(new MessageResourceAttachment { Uri = AhpNamesTests.VsCodeUri(notes), Label = "notes 100%41.md" })]);
         await TurnEndedAsync(vscode, chatUri, "t1");
         Assert.AreEqual($"Port the parser\n\n@{AhpNames.FileUri(notes)}", rig.Claude.Prompts.Single(p => p.SessionId == id).Text,
             "a file attached as the agents see one");
+        StringAssert.Contains(rig.Claude.Prompts.Single(p => p.SessionId == id).Text, "notes%20100%2541.md", "its '%' escaped");
         Assert.IsTrue(vscode.Of<ChatTurnCompleteAction>(chatUri).Any(a => a.TurnId == "t1"));
         Assert.AreEqual("ok", string.Concat(vscode.Of<ChatResponsePartAction>(chatUri).Select(p => p.Part.Value).OfType<MarkdownResponsePart>().Select(p => p.Content))
             + string.Concat(vscode.Of<ChatDeltaAction>(chatUri).Select(d => d.Content)));
@@ -421,7 +422,7 @@ public sealed partial class AhpFaceTests
     [Timeout(60_000, CooperativeCancellation = true)]
     public async Task TheTerminal_SaysThisHostHasNoShell_AndGoesWhenDisposed()
     {
-        await using var rig = await Rig.StartAsync();
+        await using var rig = await Rig.StartAsync(new AhpFaceOptions { TerminalYoung = TimeSpan.Zero }); // no terminal kept for its youth
         await using var vscode = await rig.ConnectAsync();
         const string terminal = "agenthost-terminal:/t1"; // VS Code's own name for the terminals it makes
         var claim = new TerminalClaim(new TerminalClientClaim { Kind = TerminalClaimKind.Client, ClientId = "vscode" });
