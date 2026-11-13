@@ -63,7 +63,8 @@ public sealed partial class AhpFaceTests
         var record = rig.Service.Store.Get(id)!;
         Assert.AreEqual(Path.GetFullPath(folder), record.Cwd, "the folder picked through the host");
         Assert.IsTrue(record.Draft, "not prompted yet");
-        Assert.IsTrue(vscode.Events().Any(e => e.Event is SubscriptionEventSessionAdded added && added.Params.Summary.Resource == sessionUri),
+        // Said on the root right after its session/ready, which the test waited for.
+        await LinkHarness.Until(() => vscode.Events().Any(e => e.Event is SubscriptionEventSessionAdded added && added.Params.Summary.Resource == sessionUri),
             "the root says it once it is ready");
         // A draft no list has: the face keeps it when the list changes meanwhile.
         var other = await rig.NewPromptedAsync("kimi", "Review the notes");
