@@ -177,6 +177,7 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 | `user` with `tool_result` | `tool_call_update` `completed` / `failed`, `rawOutput` = `tool_use_result`, Bash output or the error as content |
 | replay of the client's own prompt | nothing (ACP does not echo) |
 | replay of a live note | `user_message_chunk`, `messageId` = the note's `uuid`, the note's `_meta`, `gorynych/origin: "live"` |
+| replay of Claude's record of a command it ran (`<command-…>`, `<local-command-…>`) under a `uuid` the adapter did not write | nothing, and no turn starts: no `result` follows it ([below](#mode-model-and-effort-selectors)) |
 | `system` `init` | the current model and mode (`config_option_update` when they change) |
 | `result` | ends the turn; a turn of Claude's own ends with `_meta["gorynych/agentTurn"]: "ended"` |
 | a subagent's messages (`parent_tool_use_id`) | not shown yet; the `Task` tool call shows until its result |
@@ -257,6 +258,13 @@ ACP config options, like Codex's:
   `apply_flag_settings {effortLevel}`), is kept in the session's record in `claude/sessions.json`,
   and is passed to later launches (`--permission-mode`, `--model`, `--effort`). Nothing the
   person did not change is sent. Full access is the exception below.
+- `set_model` runs `/model` in Claude. In a session that has a conversation (a turn taken, or
+  resumed) and for a model other than the current one, Claude replays the command's output
+  before it answers: a user message `<local-command-stdout>Set model to …</local-command-stdout>`
+  under a `uuid` of its own, with no turn and no `result` (probed with 2.1.302;
+  `set_permission_mode` and `apply_flag_settings` replay nothing). The adapter shows nothing for
+  it and counts no turn; counted as one, it would hold every later prompt of the session. It
+  can come while a prompt waits in Claude's queue, so that turn stays the client's.
 
 #### Full access mode
 
