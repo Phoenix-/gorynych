@@ -885,7 +885,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
             if (AhpNames.Text(answer?["_meta"]?[GorynychProtocol.MetaInteractivity]) is { } interactivity)
                 SetReadOnly(chat, interactivity == GorynychProtocol.InteractivityReadOnly, AhpNames.Text(answer?["_meta"]?[GorynychProtocol.MetaInteractivityReason]));
             // What the agent asked while the session opened (an approval waiting for a client comes right after the replay).
-            foreach (var ask in requests.Values.Where(r => r.Chat is null && r.SessionId == chat.SessionId).ToList()) Show(ask);
+            foreach (var ask in requests.Values.Where(r => r.Chat is null && r.SessionId == chat.SessionId).ToList()) ShowOrCancel(ask);
             Sync(chat.Session);
         }
     }
@@ -943,6 +943,7 @@ internal sealed partial class AhpFace : IAsyncDisposable
                 if (now - chat.Unwatched < options.CloseAfter || Running(model) || requests.Values.Any(r => r.Chat == chat)) continue;
                 chat.IsRead = (model.State.Status & SessionStatus.IsRead) != 0;
                 chat.Model = null;
+                chat.QueuedOn.Clear();
                 Close(chat.SessionId);
                 ServiceLog.Info($"ahp: closed {chat.SessionId}, which no AHP client had open");
                 // A session created here and never prompted is a draft: the conductor discards it on its close.

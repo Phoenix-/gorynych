@@ -400,4 +400,30 @@ public sealed partial class AhpFaceTests
         Assert.AreEqual(file, Path_(await Resolve("link", "inner", "a.txt")));
         Assert.AreEqual(file, Path_(await Resolve("real", "up", "real", "inner", "a.txt")));
     }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AFormWithASchemaTheFaceReadsOddly_IsShownAsText_AndAnswered()
+    {
+        await using var rig = await Rig.StartAsync();
+        await using var vscode = await rig.ConnectAsync();
+        var (_, chatUri, _) = await CreateAsync(rig, vscode, "claude");
+        var content = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // "items" a string where an object belongs, "oneOf" of strings where objects belong.
+        rig.Claude.DuringPrompt = async (agent, sid) => content.TrySetResult(await agent.Rpc.SendRequestAsync(AcpMethods.Client.ElicitationCreate, JsonNode.Parse("""
+            {"sessionId":"SID","mode":"form","message":"Odd",
+             "requestedSchema":{"type":"object","properties":{
+               "tags":{"type":"array","items":"x"},
+               "way":{"type":"string","oneOf":["fast","careful"]}}}}
+            """.Replace("SID", sid))));
+
+        await Send(vscode, chatUri, "t1", "Plan it");
+        await LinkHarness.Until(() => vscode.Of<ChatInputRequestedAction>(chatUri).Length == 1, "the form is shown");
+        var request = vscode.Of<ChatInputRequestedAction>(chatUri)[0].Request;
+        Assert.AreEqual(2, request.Questions!.Count);
+        await vscode.Client.DispatchAsync(chatUri, new StateAction(new ChatInputCompletedAction { RequestId = request.Id, Response = ChatInputResponseKind.Cancel }),
+            null, CancellationToken.None);
+        Assert.AreEqual("cancel", (string?)(await content.Task.WaitAsync(Wait))?["action"]);
+        await TurnEndedAsync(vscode, chatUri, "t1");
+    }
 }

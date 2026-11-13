@@ -19,7 +19,8 @@ internal sealed partial class AhpFace
 
     readonly Dictionary<string, string> savedSchemas = new(StringComparer.Ordinal); // agent -> its schema as last saved
     string? stateToWrite; // the state to write next, under the gate
-    Task stateWriter = Task.CompletedTask; // the writer, while it runs
+    bool stateWriting; // a writer runs, or is about to: set and cleared under the gate
+    Task stateWriter = Task.CompletedTask; // the latest writer
 
     /// <summary>
     /// Under the gate: what the face kept of each agent last time, if anything. A file it cannot read, or that is not
@@ -77,15 +78,30 @@ internal sealed partial class AhpFace
             if (agentConfigs.TryGetValue(agent, out var config)) kept["schema"] = JsonNode.Parse(Json.SerializeToElement(config.Schema).GetRawText());
             agents[agent] = kept;
         }
-        var first = stateToWrite is null && stateWriter.IsCompleted;
         stateToWrite = new JsonObject { ["version"] = 1, ["agents"] = agents }.ToJsonString();
-        if (first) stateWriter = Task.Run(WriteStateAsync);
+        if (stateWriting) return; // the writer that runs takes it
+        stateWriting = true;
+        stateWriter = Task.Run(WriteStateAsync);
     }
 
-    /// <summary>Writes the latest state, a while after the first change, then any that came while it wrote.</summary>
+    /// <summary>For tests: runs as the writer ends, having found nothing more to write: a save may come just then.</summary>
+    internal Func<Task>? StateWriterEnding;
+
+    /// <summary>For tests: an agent's models seen, as a session would show them, so that the state is saved.</summary>
+    internal void ModelsSeenForTests(string agent, params string[] models)
+    {
+        lock (gate) ModelsSeen(agent, [.. models.Select(m => new AhpConfig.Choice(m, m, null))]);
+    }
+
+    /// <summary>
+    /// Writes the latest state, a while after the first change, then any that came while it wrote; it is done when it
+    /// finds none, in the same hold of the gate that says so (<see cref="stateWriting"/>), so a save that comes after
+    /// starts a writer of its own. Whatever goes wrong in a write is logged, and the next save writes again.
+    /// </summary>
     async Task WriteStateAsync()
     {
         var file = options.StateFile!;
+        var failures = 0;
         try { await Task.Delay(options.StateWriteDelay, stopping.Token); }
         catch (OperationCanceledException) { } // stopping: written now
         while (true)
@@ -95,20 +111,39 @@ internal sealed partial class AhpFace
             {
                 json = stateToWrite;
                 stateToWrite = null;
+                if (json is null) stateWriting = false;
             }
-            if (json is null) return;
+            if (json is null)
+            {
+                if (StateWriterEnding is { } ending) await ending();
+                return;
+            }
             try
             {
                 var written = file + ".tmp";
                 File.WriteAllText(written, json);
                 File.Move(written, file, overwrite: true);
+                failures = 0;
             }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            catch (Exception e)
             {
-                ServiceLog.Warn($"ahp: {file} could not be written: {e.Message}");
+                // Another process may hold the file a moment (a reader, an antivirus): tried again, unless a newer state
+                // came meanwhile, a few times, then left for the next change.
+                if (++failures > StateWriteTries)
+                {
+                    ServiceLog.Warn($"ahp: {file} could not be written: {e.Message}");
+                    failures = 0;
+                    continue;
+                }
+                lock (gate) stateToWrite ??= json;
+                try { await Task.Delay(StateRetryAfter, stopping.Token); }
+                catch (OperationCanceledException) { }
             }
         }
     }
+
+    const int StateWriteTries = 5;
+    static readonly TimeSpan StateRetryAfter = TimeSpan.FromMilliseconds(200);
 
     /// <summary>Under the gate: an agent's options schema seen in a session; saved when it is another than the one saved.</summary>
     void SchemaSeen(string agent, SessionConfigSchema schema)

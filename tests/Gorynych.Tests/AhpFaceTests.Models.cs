@@ -121,9 +121,14 @@ public sealed partial class AhpFaceTests
             Kind = PendingMessageKind.Queued, Id = "q1", Message = UserMessage("Then the tests", new ModelSelection { Id = "small" }),
         }), null, CancellationToken.None);
         await LinkHarness.Until(() => vscode.Actions(chatUri).Any(a => a.Action.Value is ChatPendingMessageSetAction), "queued");
-        // Changed elsewhere meanwhile.
+        // Changed elsewhere meanwhile; then the queued message is edited, its picker's model as it was.
         await rig.Zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
             new JsonObject { ["sessionId"] = id, ["configId"] = "model", ["value"] = "large" }).WaitAsync(Wait);
+        await vscode.Client.DispatchAsync(chatUri, new StateAction(new ChatPendingMessageSetAction
+        {
+            Kind = PendingMessageKind.Queued, Id = "q1", Message = UserMessage("Then the tests, all of them", new ModelSelection { Id = "small" }),
+        }), null, CancellationToken.None);
+        await LinkHarness.Until(() => vscode.Actions(chatUri).Count(a => a.Action.Value is ChatPendingMessageSetAction) == 2, "edited");
         var sets = rig.Kimi.CallsFor(id).Count(c => c == AcpMethods.Agent.SessionSetConfigOption);
 
         release.SetResult();
@@ -199,6 +204,51 @@ public sealed partial class AhpFaceTests
         lock (rig.Kimi.ModelsChosen) Assert.AreEqual("small", rig.Kimi.ModelsChosen[id]);
     }
 
+    /// <summary>A file's text, read as another process may write it meanwhile; null while it cannot be read.</summary>
+    static string? ReadShared(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream);
+            return reader.ReadToEnd();
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task TheStateFile_IsWritten_HoweverSavesFallAcrossItsWritersEnd()
+    {
+        var state = Path.Combine(TestDirs.New(), "ahp-face.json");
+        await using var rig = await Rig.StartAsync(new AhpFaceOptions { StateFile = state, StateWriteDelay = TimeSpan.Zero });
+        // A save just as the writer ends, having found nothing more: written all the same.
+        rig.Face.StateWriterEnding = () =>
+        {
+            rig.Face.StateWriterEnding = null;
+            rig.Face.ModelsSeenForTests("kimi", "in-the-gap");
+            return Task.CompletedTask;
+        };
+        rig.Face.ModelsSeenForTests("kimi", "first");
+        await LinkHarness.Until(() => ReadShared(state)?.Contains("in-the-gap") == true, "the save in the gap written", ms: 5_000);
+        // Saves from many threads, many of them just as a writer finds nothing more and ends: the last one is written.
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(t => Task.Run(async () =>
+        {
+            for (var i = 0; i < 300; i++)
+            {
+                rig.Face.ModelsSeenForTests("kimi", $"t{t}-{i}");
+                if (i % 3 == 0) await Task.Yield();
+            }
+        })));
+        for (var round = 0; round < 20; round++)
+        {
+            rig.Face.ModelsSeenForTests("kimi", $"final-{round}");
+            await LinkHarness.Until(() => ReadShared(state)?.Contains($"\"final-{round}\"") == true, $"round {round} written", ms: 5_000);
+            await Task.Delay(round % 4); // around the writer's end
+        }
+    }
+
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
     public async Task AStateFileTheFaceCannotRead_IsNone_AndIsWrittenAnew()
@@ -224,8 +274,8 @@ public sealed partial class AhpFaceTests
             Assert.AreEqual(0, config!.Schema.Properties.Count, broken);
 
             await CreateAsync(rig, vscode, "kimi");
-            await LinkHarness.Until(() => File.ReadAllText(state).Contains("\"large\""), "written anew");
-            Assert.IsNotNull(System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(state))?["agents"]?["kimi"]?["schema"], broken);
+            await LinkHarness.Until(() => ReadShared(state)?.Contains("\"large\"") == true, "written anew");
+            Assert.IsNotNull(System.Text.Json.Nodes.JsonNode.Parse(ReadShared(state)!)?["agents"]?["kimi"]?["schema"], broken);
         }
     }
 }

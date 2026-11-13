@@ -124,12 +124,7 @@ internal sealed partial class AhpFace
     {
         var ask = new FaceAsk($"ask-{++asks}", form, Text(@params["sessionId"])!, (JsonObject)@params.DeepClone());
         requests[ask.Id] = ask;
-        try { Show(ask); }
-        catch
-        {
-            Withdraw(ask); // whatever Show had put in the chat and the session goes with it
-            throw;
-        }
+        ShowOrCancel(ask);
         return ask;
     }
 
@@ -214,9 +209,11 @@ internal sealed partial class AhpFace
         var message = Text(field["description"]) ?? title ?? key;
         static long? Whole(JsonNode? n) => n is JsonValue v && v.TryGetValue<long>(out var x) ? x : null;
         static double? Number(JsonNode? n) => n is JsonValue v && v.TryGetValue<double>(out var x) ? x : null;
+        // A field of an object, none of anything else: a schema may say a string where an object belongs.
+        static JsonNode? Of(JsonNode? n, string key) => n is JsonObject o ? o[key] : null;
         List<ChatInputOption>? Choices(JsonNode? list, bool titled) => list is JsonArray items
             ? [.. items.Select(i => titled
-                ? (Text(i?["const"]), Text(i?["title"]))
+                ? (Text(Of(i, "const")), Text(Of(i, "title")))
                 : (Text(i), Text(i))).Where(c => c.Item1 is not null).Select(c => new ChatInputOption { Id = c.Item1!, Label = c.Item2 ?? c.Item1! })]
             : null;
         switch (Text(field["type"]))
@@ -239,7 +236,7 @@ internal sealed partial class AhpFace
                     Id = key, Title = title, Message = message, Required = required, Kind = ChatInputQuestionKind.Boolean,
                     DefaultValue = field["default"] is JsonValue d && d.TryGetValue<bool>(out var b) ? b : null,
                 });
-            case "array" when (Choices(field["items"]?["anyOf"], titled: true) ?? Choices(field["items"]?["enum"], titled: false)) is { Count: > 0 } many:
+            case "array" when (Choices(Of(field["items"], "anyOf"), titled: true) ?? Choices(Of(field["items"], "enum"), titled: false)) is { Count: > 0 } many:
                 return new ChatInputQuestion(new ChatInputMultiSelectQuestion
                 {
                     Id = key, Title = title, Message = message, Required = required, Kind = ChatInputQuestionKind.MultiSelect, Options = many,
@@ -263,7 +260,8 @@ internal sealed partial class AhpFace
     }
 
     /// <summary>Under the gate: the agent withdrew what it asked; withdrawn here too.</summary>
-    void Withdraw(FaceAsk ask)
+    /// <param name="answer">The answer the agent gets; none when it withdrew the ask itself.</param>
+    void Withdraw(FaceAsk ask, JsonNode? answer = null)
     {
         if (!requests.Remove(ask.Id)) return;
         if (ask.Chat?.Model is { } model)
@@ -272,7 +270,22 @@ internal sealed partial class AhpFace
             else if (ask.TurnId is { } turn && ask.ToolCallId is { } toolCallId) model.Withdraw(turn, toolCallId);
         }
         NoLongerNeeded(ask);
-        ask.Answer.TrySetCanceled();
+        if (answer is null) ask.Answer.TrySetCanceled();
+        else ask.Answer.TrySetResult(answer);
+    }
+
+    /// <summary>
+    /// Under the gate: <see cref="Show"/>, and an ask it could not show (a form whose schema it cannot read) answered as
+    /// cancelled, with whatever it had shown taken back: what comes after it, and what waits for it, go on.
+    /// </summary>
+    void ShowOrCancel(FaceAsk ask)
+    {
+        try { Show(ask); }
+        catch (Exception e)
+        {
+            ServiceLog.Warn($"ahp: what {ask.SessionId} asked could not be shown, and is answered as cancelled: {e.Message}");
+            Withdraw(ask, ask.Cancelled());
+        }
     }
 
     void NoLongerNeeded(FaceAsk ask)
@@ -546,7 +559,8 @@ internal sealed partial class AhpFace
         // A steering message replaces the one before it.
         if (x.Kind == PendingMessageKind.Steering && chat.Model?.State.SteeringMessage is { } replaced && replaced.Id != x.Id) chat.QueuedOn.Remove(replaced.Id);
         ApplyChat(chat, x, origin);
-        chat.QueuedOn[x.Id] = CurrentModel(chat.Session); // what its picker's model is a pick against, when it starts later
+        // What its picker's model is a pick against when it starts: the session's when it came, kept when it is edited.
+        chat.QueuedOn.TryAdd(x.Id, CurrentModel(chat.Session));
         ConsumeQueued(chat);
         Sync(chat.Session);
     }
@@ -902,7 +916,7 @@ internal sealed partial class AhpFace
                 if (unclaimed.Remove(id, out var later)) foreach (var update in later) TakeUpdate(own, update);
                 var config = s.State.Config;
                 changes = config is null ? [] : [.. wanted.Where(w => AhpConfig.Takes(config, w.Key, w.Value) && !AhpConfig.Same(config.Values.GetValueOrDefault(w.Key), w.Value))];
-                foreach (var ask in requests.Values.Where(r => r.Chat is null && r.SessionId == id).ToList()) Show(ask);
+                foreach (var ask in requests.Values.Where(r => r.Chat is null && r.SessionId == id).ToList()) ShowOrCancel(ask);
             }
             // The options its client chose before it existed, before it is ready (and before its first prompt).
             if (changes.Count > 0)

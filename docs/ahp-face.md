@@ -494,7 +494,8 @@ pick (the fourth round's re-offer of a "stale" one went), a state file it cannot
     agent"; live check, right after a start, for every agent but the one the window had made a draft
     of). So the face keeps each agent's models, and its options' schema, in its own state file in the
     data folder (`ahp-face.json`), written a second after they change (off the face's lock; changes close
-    together are written once: Claude's options change with its model) and read at its start, where a
+    together are written once: Claude's options change with its model; a write another process blocks a
+    moment is tried again a few times) and read at its start, where a
     file it cannot read, or not as it writes one, is none and is written anew; and an agent it knows
     nothing of has one model, `gorynych/agent-default` ("Agent's default"), which is no value of any
     agent's model option, so the face never sets it on a session: the agent keeps its own default.
@@ -508,8 +509,8 @@ pick (the fourth round's re-offer of a "stale" one went), a state file it cannot
     showed in the window at once), and it sends its model with every message: the session's own, unless
     its user picked another. A message's `model` is a pick when it is another than the session's model
     when the message was written: sent (`chat/turnStarted`), or queued (`chat/pendingMessageSet`, whose
-    model is compared with the session's then, not when it starts, so a change made elsewhere while it
-    waits stands). A pick is set with `session/set_config_option` before its prompt when it is one of
+    model is compared with the session's then, not when it starts, nor when it is edited, so a change
+    made elsewhere while it waits stands). A pick is set with `session/set_config_option` before its prompt when it is one of
     the session's models and not its current one; a set that fails ends the turn with the error. While
     the session's model is not known (its agent said none) no model is set: the window's fallback is no
     pick. Nothing is remembered of a pick: once set it is the session's model, which the draft offers
