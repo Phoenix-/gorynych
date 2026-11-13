@@ -624,6 +624,5 @@ internal static class TranscriptHistory
 
     /// <summary>Text in a user entry that the person did not type: a slash command's echo or output, an interruption.</summary>
     static bool IsNotTyped(string text) =>
-        text.StartsWith("<command-", StringComparison.Ordinal) || text.StartsWith("<local-command-", StringComparison.Ordinal)
-        || text.StartsWith("[Request interrupted by user", StringComparison.Ordinal);
+        StreamJson.IsCommandRecord(text) || text.StartsWith("[Request interrupted by user", StringComparison.Ordinal);
 }

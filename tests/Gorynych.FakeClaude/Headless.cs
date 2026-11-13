@@ -1,7 +1,9 @@
 // The headless face of the fake: `claude -p --input-format stream-json --output-format stream-json`,
 // shaped like Claude Code 2.1.302's stream (see research/claude-headless-spec.md). It answers
 // `initialize` and the other control requests, replays every user message it takes, and runs a
-// turn per prompt. A message that arrives during a "slow" turn joins it. Prompts:
+// turn per prompt; a `set_model` that changes the model of a session with a conversation also
+// replays its `<local-command-stdout>` record, in no turn. A message that arrives during a "slow"
+// turn joins it. Prompts:
 //   "write"     asks can_use_tool for Write;           "pick a color" asks AskUserQuestion;
 //   "peers"     asks for list_agents and ask_agent;     "think"    streams a thought first;
 //   "slow"      runs a Bash call that waits for an interrupt or 1.5 s ("hold": messages that arrive
@@ -144,9 +146,16 @@ static partial class FakeHeadless
                 });
                 break;
             case "set_model":
-                model = (string?)request["model"] == "fast" ? "claude-fake-2" : "claude-fake-1";
+            {
+                var value = (string?)request["model"] ?? "default";
+                var next = value == "fast" ? "claude-fake-2" : "claude-fake-1";
+                // As 2.1.302: a change in a session that has a conversation runs /model and replays its
+                // output under a uuid of Claude's own, before the answer, with no turn and no result.
+                if (next != model && lastUuid is not null) await CommandRecordAsync(sessionId, "model", value, $"Set model to `{value} ({next})`");
+                model = next;
                 await RespondAsync(id, []);
                 break;
+            }
             case "set_permission_mode":
                 if ((mode == "bypassPermissions" && (string?)request["mode"] != "bypassPermissions" && File.Exists(Path.Combine(cwd, "no-leave")))
                     || ((string?)request["mode"] == "bypassPermissions" && !canBypass))
@@ -309,6 +318,39 @@ static partial class FakeHeadless
         }
     }
 
+    /// <summary>
+    /// What Claude 2.1.302 leaves for a slash command it runs on a control request: in the transcript a
+    /// caveat (<c>isMeta</c>) and the command's echo, then its output, which alone is also replayed.
+    /// </summary>
+    static async Task CommandRecordAsync(string sessionId, string command, string args, string output)
+    {
+        await WriteGate.WaitAsync();
+        try
+        {
+            Transcribe(new JsonObject
+            {
+                ["type"] = "user", ["session_id"] = sessionId, ["isMeta"] = true,
+                ["message"] = new JsonObject { ["role"] = "user", ["content"] = "<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>" },
+            });
+            Transcribe(new JsonObject
+            {
+                ["type"] = "user", ["session_id"] = sessionId,
+                ["message"] = new JsonObject
+                {
+                    ["role"] = "user",
+                    ["content"] = $"<command-name>/{command}</command-name>\n            <command-message>{command}</command-message>\n            <command-args>{args}</command-args>",
+                },
+            });
+        }
+        finally { WriteGate.Release(); }
+        await WriteAsync(new JsonObject
+        {
+            ["type"] = "user", ["session_id"] = sessionId, ["parent_tool_use_id"] = null, ["uuid"] = Guid.NewGuid().ToString(),
+            ["message"] = new JsonObject { ["role"] = "user", ["content"] = $"<local-command-stdout>{output}</local-command-stdout>" },
+            ["timestamp"] = DateTimeOffset.UtcNow.ToString("O"), ["isReplay"] = true,
+        });
+    }
+
     static Task ReplayAsync(JsonObject user, string sessionId)
     {
         var replay = (JsonObject)user.DeepClone();
@@ -431,6 +473,7 @@ static partial class FakeHeadless
             ["sessionId"] = (string?)m["session_id"], ["message"] = m["message"]?.DeepClone(),
         };
         if (m["tool_use_result"] is { } result) entry["toolUseResult"] = result.DeepClone();
+        if ((bool?)m["isMeta"] == true) entry["isMeta"] = true;
         File.AppendAllText(transcriptPath, entry.ToJsonString() + "\n");
         lastUuid = uuid;
     }

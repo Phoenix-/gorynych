@@ -223,6 +223,15 @@ public static class StreamJson
     /// <summary>True for the echo of a user message the adapter wrote (<c>--replay-user-messages</c>).</summary>
     public static bool IsReplay(JsonObject user) => (bool?)user["isReplay"] == true;
 
+    /// <summary>
+    /// True for a user message Claude Code writes itself about a slash command it ran: the command's
+    /// echo (<c>&lt;command-…&gt;</c>) or its output (<c>&lt;local-command-…&gt;</c>). <c>set_model</c>
+    /// replays one in a session that has a conversation (<c>&lt;local-command-stdout&gt;Set model to …</c>,
+    /// a <c>uuid</c> of Claude's own; probed with 2.1.302), and no turn or <c>result</c> follows it.
+    /// </summary>
+    public static bool IsCommandRecord(string text) =>
+        text.StartsWith("<command-", StringComparison.Ordinal) || text.StartsWith("<local-command-", StringComparison.Ordinal);
+
     /// <summary>How a <c>result</c> ends the ACP turn.</summary>
     /// <param name="cancelled">The client cancelled this turn.</param>
     public static StopReason StopReasonOf(JsonObject result, bool cancelled)

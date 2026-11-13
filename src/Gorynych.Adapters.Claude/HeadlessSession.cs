@@ -715,6 +715,9 @@ internal sealed class HeadlessSession : IClaudeSession
         var mark = false;
         lock (stateGate)
         {
+            // Claude's record of a command it ran (set_model's "Set model to …"): no message it takes,
+            // so no turn starts and no result comes. Counted as a turn, it would hold every later prompt.
+            if (!pending.Contains(uuid) && StreamJson.UserText(m) is { } text && StreamJson.IsCommandRecord(text)) return;
             pending.Remove(uuid);
             notes.Remove(uuid, out note);
             if (!active) BeginTurn(own: turn?.Uuid != uuid);
