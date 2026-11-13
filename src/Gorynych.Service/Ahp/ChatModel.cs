@@ -66,6 +66,8 @@ internal sealed class ChatModel(ChatState state)
     string? turn;
     string? turnPromptId; // the prompt the open turn answers, by the ID its end will be marked with; null for the agent's own
     bool turnUnmarked;    // opened by an update outside any turn, with no mark of its start: no mark will end it
+    bool settling;        // a client cancelled the turn; its agent has not marked its end yet
+    string? settlingPrompt; // that turn's prompt ID; null for the agent's own
     DateTimeOffset turnStart;
     bool turnLive;
     string? partId;
@@ -90,6 +92,123 @@ internal sealed class ChatModel(ChatState state)
         if (Unmarked) EndTurn(null, null, live);
     }
 
+    /// <summary>
+    /// A client cancelled the turn, and its agent has not marked its end yet: what the agent still sends is that turn's
+    /// tail, which the chat leaves out (the turn is over for its clients), until the end mark comes, another turn's
+    /// user message, or the session goes quiet. A turn that starts meanwhile waits for it in the conductor, so its
+    /// own updates come only after that end.
+    /// </summary>
+    public bool Settling => settling;
+
+    /// <summary>The cancelled turn's end mark never came: it is over all the same.</summary>
+    public void Settled(bool live)
+    {
+        settling = false;
+        settlingPrompt = null;
+        EndUnmarked(live);
+    }
+
+    // ---------------------------------------------------------------- a client's turns (step 2)
+
+    /// <summary>
+    /// A client began a turn (<c>chat/turnStarted</c>, which the face applied and echoed): the model takes it as the
+    /// turn of a prompt whose ID is the turn's, whose end mark ends it.
+    /// </summary>
+    public void ClientTurnStarted(string turnId)
+    {
+        turn = turnId;
+        turnPromptId = turnId;
+        turnUnmarked = false;
+        turnStart = Now();
+        turnLive = true;
+        partId = partKind = partMessage = null;
+        partUses.Clear();
+        tools.Clear();
+    }
+
+    /// <summary>A client cancelled the open turn (<c>chat/turnCancelled</c>, applied and echoed): over here, settling in the agent.</summary>
+    public void ClientTurnCancelled()
+    {
+        settling = true;
+        settlingPrompt = turnPromptId;
+        turn = null;
+        turnPromptId = null;
+        turnUnmarked = false;
+        partId = partKind = partMessage = null;
+        partUses.Clear();
+        tools.Clear();
+    }
+
+    /// <summary>The prompt of a client's turn failed before its agent could mark its end (a restart refused it): the turn ends with the error.</summary>
+    public void FailTurn(string turnId, int code, string message)
+    {
+        if (turn != turnId) return;
+        EndTurn(null, new JsonObject { ["code"] = code, ["message"] = message }, live: true);
+    }
+
+    /// <summary>
+    /// An approval the agent asks of the face (<c>session/request_permission</c>): its tool call, started if the agent
+    /// had not said it yet, goes back to waiting for confirmation, with the agent's options. Returns the turn it is in;
+    /// null when the tool call cannot wait for one any more (it finished).
+    /// </summary>
+    public string? Approval(string toolCallId, string? title, string? kind, JsonNode? rawInput, List<ConfirmationOption> options)
+    {
+        EnsureTurn(new JsonObject(), live: true);
+        partId = partKind = partMessage = null;
+        if (!tools.TryGetValue(toolCallId, out var tool))
+        {
+            tool = new Tool(title ?? kind ?? "Tool", kind ?? "other");
+            tools[toolCallId] = tool;
+            Apply(new ChatToolCallStartAction { TurnId = turn!, ToolCallId = toolCallId, ToolName = tool.Kind, DisplayName = tool.Title });
+        }
+        else if (title is not null) tool.Title = title;
+        Apply(new ChatToolCallReadyAction
+        {
+            TurnId = turn!, ToolCallId = toolCallId,
+            InvocationMessage = StringOrMarkdown.FromPlain(tool.Title),
+            ToolInput = rawInput is null ? null : new ToolInput { Inline = rawInput.ToJsonString() },
+            Options = options,
+        });
+        return Pending(turn!, toolCallId) is null ? null : turn;
+    }
+
+    /// <summary>The tool call waiting for confirmation, by its turn and ID; null for none.</summary>
+    public ToolCallPendingConfirmationState? Pending(string turnId, string toolCallId) =>
+        State.ActiveTurn is { } active && active.Id == turnId
+            ? active.ResponseParts.Select(p => p.Value).OfType<ToolCallResponsePart>().Select(p => p.ToolCall.Value)
+                .OfType<ToolCallPendingConfirmationState>().FirstOrDefault(t => t.ToolCallId == toolCallId)
+            : null;
+
+    /// <summary>The agent withdrew its approval: the tool call no longer waits for one, and runs as far as the face knows.</summary>
+    public void Withdraw(string turnId, string toolCallId)
+    {
+        if (Pending(turnId, toolCallId) is not { } pending) return;
+        Apply(new ChatToolCallReadyAction
+        {
+            TurnId = turnId, ToolCallId = toolCallId, InvocationMessage = pending.InvocationMessage, Confirmed = ToolCallConfirmationReason.NotNeeded,
+        });
+    }
+
+    /// <summary>A form the agent asks the face (<c>elicitation/create</c>): an input request in the open turn. Returns the turn.</summary>
+    public string InputRequest(ChatInputRequest request)
+    {
+        EnsureTurn(new JsonObject(), live: true);
+        partId = partKind = partMessage = null;
+        Apply(new ChatInputRequestedAction { Request = request });
+        return turn!;
+    }
+
+    /// <summary>The input request still waiting for its answer, by its ID; null for none.</summary>
+    public InputRequestResponsePart? OpenInput(string requestId) =>
+        State.ActiveTurn?.ResponseParts.Select(p => p.Value).OfType<InputRequestResponsePart>()
+            .FirstOrDefault(p => p.Request.Id == requestId && p.Response is null);
+
+    /// <summary>The agent withdrew its form: closed as cancelled, if still open.</summary>
+    public void CancelInput(string requestId)
+    {
+        if (OpenInput(requestId) is not null) Apply(new ChatInputCompletedAction { RequestId = requestId, Response = ChatInputResponseKind.Cancel });
+    }
+
     /// <summary>Takes one ACP update of the session. <paramref name="live"/>: it came now, not in a load's replay.</summary>
     public void Take(JsonObject update, bool live)
     {
@@ -112,6 +231,8 @@ internal sealed class ChatModel(ChatState state)
             return;
         }
         Flush(live);
+        // The tail of a turn a client cancelled: over for its clients, so left out.
+        if (settling && kind is "agent_message_chunk" or "agent_thought_chunk" or "tool_call" or "tool_call_update" or "plan" or "usage_update") return;
         switch (kind)
         {
             case "agent_message_chunk":
@@ -129,7 +250,31 @@ internal sealed class ChatModel(ChatState state)
             case "session_info_update":
                 Mark(update, meta, live);
                 break;
+            case "usage_update" when turn is not null:
+                Usage(update);
+                break;
         }
+    }
+
+    /// <summary>
+    /// ACP's <c>usage_update</c> (how much of its context the agent's model holds; Codex sends it) as the turn's usage:
+    /// the tokens in context as its input tokens, the context's size and the cost in <c>_meta</c>.
+    /// </summary>
+    void Usage(JsonObject update)
+    {
+        var meta = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        if (update["size"] is JsonValue size) meta["gorynych/contextSize"] = AhpNames.Element(size);
+        if (update["cost"] is JsonObject cost) meta["gorynych/cost"] = AhpNames.Element(cost);
+        Apply(new ChatUsageAction
+        {
+            TurnId = turn!,
+            Usage = new UsageInfo
+            {
+                InputTokens = update["used"] is JsonValue used && double.TryParse(used.ToJsonString(), System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var tokens) ? (long)tokens : null,
+                Meta = meta.Count > 0 ? meta : null,
+            },
+        });
     }
 
     /// <summary>Begins the turn of a held user message: another update came, the replay ended, or 100 ms passed.</summary>
@@ -137,6 +282,8 @@ internal sealed class ChatModel(ChatState state)
     {
         if (held is not { } h) return;
         held = null;
+        settling = false; // the session runs one turn at a time: a cancelled one before it is over
+        settlingPrompt = null;
         if (turn is not null) EndTurn(null, null, live); // a new message ends the turn before it
         StartTurn(h.TurnId, Message(h.Text.ToString(), h.Meta), h.StartedAt, h.Start, live,
             AhpNames.Text(h.Meta?[GorynychProtocol.MetaPromptId]), unmarked: false);
@@ -214,8 +361,16 @@ internal sealed class ChatModel(ChatState state)
         switch (AhpNames.Text(meta?[GorynychProtocol.MetaAgentTurn]))
         {
             case "started":
+                settling = false;
+                settlingPrompt = null;
                 if (turn is not null) EndTurn(null, null, live);
                 EnsureTurn(update, live, marked: true);
+                break;
+            // The end of a turn a client cancelled: it is over in its agent too, and so is its tail.
+            case "ended" when settling && AhpNames.Text(meta![GorynychProtocol.MetaPromptId]) == settlingPrompt:
+                settling = false;
+                settlingPrompt = null;
+                if (Unmarked) EndTurn("cancelled", null, live);
                 break;
             // A mark ends the turn it is for: a prompt's by the prompt's ID, the agent's own without one.
             // The late mark of a turn a newer one ended already ends nothing.

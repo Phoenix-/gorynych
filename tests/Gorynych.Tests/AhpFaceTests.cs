@@ -170,7 +170,7 @@ public sealed partial class AhpFaceTests
         Assert.AreEqual("Port the parser", item.Title);
         Assert.AreEqual(AhpNames.ChatUri(claude), item.DefaultChat);
         Assert.AreEqual(AhpNames.ChatUri(claude), item.Chats!.Single().Resource);
-        Assert.AreEqual(ChatInteractivity.ReadOnly, item.Chats![0].Interactivity);
+        Assert.AreEqual(ChatInteractivity.Full, item.Chats![0].Interactivity, "a client may prompt a session (step 2)");
         Assert.IsTrue(item.Status.HasFlag(SessionStatus.IsRead));
         Assert.AreEqual(claude, item.Meta![GorynychProtocol.MetaSessionId].GetString());
         Assert.AreEqual(AhpNames.FileUri(Path.GetTempPath().TrimEnd('\\', '/')), item.WorkingDirectories!.Single());
@@ -201,7 +201,7 @@ public sealed partial class AhpFaceTests
         Assert.AreEqual("ok", ((MarkdownResponsePart)turn.ResponseParts.Single().Value!).Content);
         Assert.AreEqual(TurnState.Complete, turn.State);
         Assert.IsTrue(chat.Status.HasFlag(SessionStatus.IsRead), "everything is read when the face starts: the replay does not make it unread");
-        Assert.AreEqual(ChatInteractivity.ReadOnly, chat.Interactivity);
+        Assert.AreEqual(ChatInteractivity.Full, chat.Interactivity);
         Assert.IsTrue(rig.Face.HasOpen(id), "open in the conductor while a client looks at it");
         var session = (await vscode.SubscribeAsync(AhpNames.SessionUri(id))).State.Session!;
         Assert.AreEqual("claude", session.Provider);
@@ -398,20 +398,17 @@ public sealed partial class AhpFaceTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task CommandsOfLaterSteps_AreAnsweredAsStepOneSays()
+    public async Task CommandsTheFaceDoesNotCarryOut_AreRefused_AndTheRestAnswered()
     {
         await using var rig = await Rig.StartAsync();
         await using var vscode = await rig.ConnectAsync();
 
         async Task<int> Code(Func<Task> call) => (await Assert.ThrowsExactlyAsync<AhpRpcException>(call)).Code;
-        Assert.AreEqual(AhpErrorCodes.PermissionDenied, await Code(() => vscode.Client.RequestAsync<CreateSessionParams, ListSessionsResult>("createSession",
-            new CreateSessionParams { Channel = "ahp-session:/new", Provider = "claude" }, CancellationToken.None)));
         Assert.AreEqual(AhpErrorCodes.PermissionDenied, await Code(() => vscode.Client.RequestAsync<CreateChatParams, ListSessionsResult>("createChat",
             new CreateChatParams { Channel = "ahp-session:/x", Chat = "ahp-chat:/y" }, CancellationToken.None)));
-        Assert.AreEqual(AhpErrorCodes.PermissionDenied, await Code(() => vscode.Client.RequestAsync<ResourceListParams, ResourceListResult>("resourceList",
-            new ResourceListParams { Channel = AhpNames.Root, Uri = "file:///C:/" }, CancellationToken.None)));
         Assert.AreEqual(JsonRpcErrorCodes.MethodNotFound, await Code(() => vscode.Client.RequestAsync<ListSessionsParams, ListSessionsResult>("terminalCreate",
             new ListSessionsParams { Channel = AhpNames.Root }, CancellationToken.None)));
+        // No session of the agent seen yet: no options to describe.
         var config = await vscode.Client.RequestAsync<ResolveSessionConfigParams, ResolveSessionConfigResult>("resolveSessionConfig",
             new ResolveSessionConfigParams { Channel = AhpNames.Root, Provider = "claude" }, CancellationToken.None) ?? throw new InvalidOperationException("no answer");
         Assert.AreEqual(0, config.Schema.Properties.Count);
@@ -427,7 +424,7 @@ public sealed partial class AhpFaceTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task ClientActions_AreAppliedOrRefused_AsStepOneSays()
+    public async Task ClientActions_AreAppliedOrRefused_AsTheFaceSays()
     {
         await using var rig = await Rig.StartAsync(before: async r => await r.NewPromptedAsync("claude", "Port the parser"));
         var id = rig.Service.Store.All().Single().SessionId;
@@ -441,7 +438,7 @@ public sealed partial class AhpFaceTests
         await vscode.Client.DispatchAsync(chatUri, new StateAction(new ChatDraftChangedAction { Draft = new Message { Text = "half", Origin = new MessageOrigin { Kind = MessageKind.User } } }), null, CancellationToken.None);
         await vscode.Client.DispatchAsync(chatUri, new StateAction(new ChatTurnStartedAction
         {
-            TurnId = "t1", StartedAt = "2026-11-13T10:00:00.000Z", Message = new Message { Text = "Hi", Origin = new MessageOrigin { Kind = MessageKind.User } },
+            TurnId = "t1", StartedAt = "2026-11-13T10:00:00.000Z", Message = new Message { Text = "Hi", Origin = new MessageOrigin { Kind = MessageKind.Agent } },
         }), null, CancellationToken.None);
         await vscode.Client.DispatchAsync(sessionUri, new StateAction(new SessionTitleChangedAction { Title = "Mine" }), null, CancellationToken.None);
         await vscode.Client.DispatchAsync(AhpNames.Root, new StateAction(new RootConfigChangedAction { Config = [] }), null, CancellationToken.None);
@@ -451,7 +448,7 @@ public sealed partial class AhpFaceTests
         Assert.IsNull(read.RejectionReason);
         Assert.AreEqual("vscode", read.Origin!.ClientId);
         Assert.IsNull(vscode.Actions(chatUri).Single(a => a.Action.Value is ChatDraftChangedAction).RejectionReason);
-        Assert.AreEqual("This chat is read-only in this version", vscode.Actions(chatUri).Single(a => a.Action.Value is ChatTurnStartedAction).RejectionReason);
+        Assert.AreEqual("A client sends user messages only", vscode.Actions(chatUri).Single(a => a.Action.Value is ChatTurnStartedAction).RejectionReason);
         Assert.AreEqual("Renaming is not supported yet", vscode.Actions(sessionUri).Single(a => a.Action.Value is SessionTitleChangedAction).RejectionReason);
         Assert.AreEqual(1, rig.Claude.Prompts.Count, "nothing reached the agent");
         await LinkHarness.Until(() => vscode.Events().Select(e => e.Event).OfType<SubscriptionEventSessionSummaryChanged>()

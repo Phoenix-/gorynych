@@ -17,6 +17,18 @@ internal sealed class AhpFaceOptions
     /// <summary>How long a session the face loaded stays open with no AHP client on its chat.</summary>
     public TimeSpan CloseAfter { get; init; } = TimeSpan.FromMinutes(2);
 
+    /// <summary>
+    /// The face's own state file (each agent's models and options schema, kept across restarts); none in tests that
+    /// do not ask for one.
+    /// </summary>
+    public string? StateFile { get; init; }
+
+    /// <summary>How long after a change the state file is written, so that changes close together are written once.</summary>
+    public TimeSpan StateWriteDelay { get; init; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>How long a new terminal is kept whatever the limit: its client subscribes once its creation is answered.</summary>
+    public TimeSpan TerminalYoung { get; init; } = TimeSpan.FromSeconds(30);
+
     /// <summary>How often the face looks for sessions to close.</summary>
     public TimeSpan SweepEvery { get; init; } = TimeSpan.FromSeconds(15);
 
@@ -42,11 +54,11 @@ internal sealed class AhpFaceOptions
 /// <summary>
 /// The AHP face (docs/ahp-face.md): toward AHP clients (VS Code's Agents window) a host that keeps AHP's state
 /// tree, numbers actions, serves snapshots and replays; toward the conductor one more ACP client, on an in-process
-/// connection. Step 1: reading. All state is reduced under one lock, with the package's reducers, and every
-/// message a client gets is queued under it, a reply that carries state too, so that nothing a client gets is
-/// older than what it got before; each client has its own queue to send from.
+/// connection. Steps 1 and 2: reading, and working in sessions. All state is reduced under one lock, with the
+/// package's reducers, and every message a client gets is queued under it, a reply that carries state too, so that
+/// nothing a client gets is older than what it got before; each client has its own queue to send from.
 /// </summary>
-internal sealed class AhpFace : IAsyncDisposable
+internal sealed partial class AhpFace : IAsyncDisposable
 {
     static readonly SystemTextJsonAhpSerializer Json = SystemTextJsonAhpSerializer.Default;
     static readonly JsonElement Empty = AhpNames.Element(new JsonObject());
@@ -64,6 +76,8 @@ internal sealed class AhpFace : IAsyncDisposable
     readonly Dictionary<string, string> agentNames = new(StringComparer.Ordinal); // agent -> its display name
     readonly Dictionary<string, FaceSession> sessions = new(StringComparer.Ordinal); // ahp-session URI -> session
     readonly Dictionary<string, FaceChat> chats = new(StringComparer.Ordinal); // ahp-chat URI -> chat
+    readonly Dictionary<string, FaceSession> sessionsById = new(StringComparer.Ordinal); // Gorynych session ID -> root session
+    readonly Dictionary<string, FaceChat> chatsById = new(StringComparer.Ordinal); // Gorynych session ID -> the chat that shows it
     readonly LinkedList<(long Seq, string Channel, JsonElement Envelope)> log = new();
     readonly LinkedList<(long Seq, TransportMessage Message)> rootLog = new(); // root notifications, stamped with the serverSeq they came after
     long rootTrimmed = -1; // the newest stamp among the root notifications no longer kept
@@ -104,16 +118,25 @@ internal sealed class AhpFace : IAsyncDisposable
             var (faceIn, faceOut) = duplex.ClientEnd;
             acp = new JsonRpcConnection(faceIn, faceOut, "ahp face") { Log = m => ServiceLog.Warn(m) };
             acp.NotificationHandler = OnAcpNotificationAsync;
-            acp.RequestHandler = (request, _) => throw new JsonRpcException(JsonRpcException.MethodNotFound,
-                $"{request.Method}: the AHP face takes no requests in this version");
+            acp.RequestHandler = OnAcpRequestAsync;
+            acp.RequestArrived = OnAcpRequestArrived;
+            acp.RequestDone = request =>
+            {
+                lock (gate) arrived.Remove(request);
+            };
             acp.Start();
             var init = await acp.SendRequestAsync(Gorynych.Acp.AcpMethods.Agent.Initialize, new JsonObject
             {
                 ["protocolVersion"] = (int)Gorynych.Acp.AcpMethods.ProtocolVersion,
                 ["clientInfo"] = new JsonObject { ["name"] = "gorynych-ahp", ["title"] = "Gorynych's AHP face", ["version"] = AgentHost.Version },
-                ["clientCapabilities"] = new JsonObject(),
-                // On the link, so its prompts' ends are marked; and no approvals or forms, which it cannot answer yet.
-                ["_meta"] = new JsonObject { [GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion, [GorynychProtocol.MetaRequests] = false },
+                // Approvals and forms, shown as AHP's tool confirmations and input requests.
+                ["clientCapabilities"] = new JsonObject
+                {
+                    ["elicitation"] = new JsonObject { ["form"] = new JsonObject() },
+                    ["session"] = new JsonObject { ["configOptions"] = new JsonObject { ["boolean"] = new JsonObject() } },
+                },
+                // On the link, so its prompts' ends are marked.
+                ["_meta"] = new JsonObject { [GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion },
             }, stopping.Token);
             serviceId = AhpNames.Text(init?["_meta"]?[GorynychProtocol.MetaServiceId]) ?? "";
             var agents = (init?["_meta"]?[GorynychProtocol.MetaAgents] as JsonArray ?? []).OfType<JsonObject>()
@@ -122,15 +145,18 @@ internal sealed class AhpFace : IAsyncDisposable
             lock (gate)
             {
                 foreach (var (name, display) in agents) agentNames[name] = display;
+                LoadState();
                 root = new RootState
                 {
                     Agents = [.. agents.Select(a => new AgentInfo
                     {
-                        Provider = a.Name, DisplayName = a.Display, Description = $"{a.Display} through Gorynych", Models = [],
+                        // Never none: VS Code disables an agent with no models.
+                        Provider = a.Name, DisplayName = a.Display, Description = $"{a.Display} through Gorynych", Models = ModelInfos(a.Name),
                         // Without it VS Code shows a session's chats that came from a tool or a side chat only, so not its children (docs/ahp-face.md).
                         Capabilities = new AgentCapabilities { MultipleChats = new MultipleChatsCapability() },
                     })],
                     Config = new RootConfigState { Schema = new ConfigSchema { Type = "object", Properties = [] }, Values = [] },
+                    Terminals = [],
                 };
             }
             agentsReady.TrySetResult();
@@ -147,7 +173,8 @@ internal sealed class AhpFace : IAsyncDisposable
         }
     }
 
-    sealed record Listed(string Id, string Agent, string Title, string Cwd, string UpdatedAt, bool Archived, string? Parent);
+    sealed record Listed(string Id, string Agent, string Title, string Cwd, string UpdatedAt, bool Archived, string? Parent,
+        string? AhpUri = null, bool ReadOnly = false, string? Reason = null);
 
     /// <summary>Every session of every agent, archived ones too, every page.</summary>
     async Task<List<Listed>> ReadListAsync(CancellationToken ct)
@@ -168,13 +195,19 @@ internal sealed class AhpFace : IAsyncDisposable
                     // No time said is the oldest, never now: an old session must not look new.
                     AhpNames.Time(AhpNames.Text(info["updatedAt"])) ?? AhpNames.Time(DateTimeOffset.UnixEpoch),
                     meta?[GorynychProtocol.MetaArchived] is JsonValue a && a.TryGetValue<bool>(out var archived) && archived,
-                    AhpNames.Text(meta?[GorynychProtocol.MetaParentSessionId])));
+                    AhpNames.Text(meta?[GorynychProtocol.MetaParentSessionId]),
+                    AhpNames.Text(meta?[GorynychProtocol.MetaAhpUri]) is { } uri && AhpNames.IsSessionUri(uri) ? uri : null,
+                    AhpNames.Text(meta?[GorynychProtocol.MetaInteractivity]) == GorynychProtocol.InteractivityReadOnly,
+                    AhpNames.Text(meta?[GorynychProtocol.MetaInteractivityReason])));
             }
             cursor = AhpNames.Text(answer?["nextCursor"]);
             if (cursor is null) break;
         }
         return listed;
     }
+
+    /// <summary>For tests: runs between reading the list and taking it, as a slow read would.</summary>
+    internal Func<Task>? ListRead;
 
     /// <summary>The list changed: it is read again, at most every <see cref="AhpFaceOptions.ListEvery"/>; <paramref name="now"/> for the first.</summary>
     void ListChanged(bool now = false)
@@ -204,6 +237,7 @@ internal sealed class AhpFace : IAsyncDisposable
                 try
                 {
                     var list = await ReadListAsync(stopping.Token);
+                    if (ListRead is { } read) await read();
                     lock (gate) ApplyList(list);
                 }
                 catch (OperationCanceledException) when (stopping.IsCancellationRequested)
@@ -257,26 +291,52 @@ internal sealed class AhpFace : IAsyncDisposable
                     Close(sessionId);
                 }
             }
-            if (!chats.TryGetValue(AhpNames.ChatUri(sessionId), out var chat)) return Task.CompletedTask;
-            if (AhpNames.Text(update["sessionUpdate"]) == "session_info_update")
+            if (chatsById.TryGetValue(sessionId, out var chat)) TakeUpdate(chat, update);
+            else if (making > 0)
             {
-                // Title and archive go to the catalog whether or not the chat is open; the list says them too.
-                if (AhpNames.Text(update["title"]) is { Length: > 0 } title) SetTitle(chat, title);
-                if (update["_meta"]?[GorynychProtocol.MetaArchived] is JsonValue v && v.TryGetValue<bool>(out var archived)) SetArchived(chat, archived);
+                // Of a session the face is making, said before its session/new answer reached it: kept, and taken once it has it.
+                if (!unclaimed.TryGetValue(sessionId, out var early)) unclaimed[sessionId] = early = [];
+                if (early.Count < UnclaimedKept) early.Add((JsonObject)update.DeepClone());
             }
-            if (chat.Buffer is { } buffer)
-            {
-                buffer.Add((JsonObject)update.DeepClone());
-                return Task.CompletedTask;
-            }
-            if (chat.Model is not { } model) return Task.CompletedTask;
-            chat.Updates++;
-            model.Take(update, live: true);
-            if (model.Holding) ScheduleFlush(chat);
-            if (model.Unmarked) ScheduleQuiet(chat);
-            Sync(chat.Session);
         }
         return Task.CompletedTask;
+    }
+
+    /// <summary>Under the gate: an update of a session the face has.</summary>
+    void TakeUpdate(FaceChat chat, JsonObject update)
+    {
+        switch (AhpNames.Text(update["sessionUpdate"]))
+        {
+            case "session_info_update":
+                // Title, archive and interactivity go to the catalog whether or not the chat is open; the list says them too.
+                if (AhpNames.Text(update["title"]) is { Length: > 0 } title) SetTitle(chat, title);
+                if (update["_meta"]?[GorynychProtocol.MetaArchived] is JsonValue v && v.TryGetValue<bool>(out var archived)) SetArchived(chat, archived);
+                if (AhpNames.Text(update["_meta"]?[GorynychProtocol.MetaInteractivity]) is { } interactivity)
+                    SetReadOnly(chat, interactivity == GorynychProtocol.InteractivityReadOnly, AhpNames.Text(update["_meta"]?[GorynychProtocol.MetaInteractivityReason]));
+                break;
+            // The session's state, not its history: kept by the face, for its config and its commands.
+            case "config_option_update" when !chat.IsChild:
+                OptionsChanged(chat.Session, update["configOptions"] as JsonArray, chat.Session.AcpModes);
+                return;
+            case "current_mode_update" when !chat.IsChild:
+                ModeChanged(chat.Session, AhpNames.Text(update["currentModeId"]));
+                return;
+            case "available_commands_update":
+                chat.Commands = Commands(update);
+                return;
+        }
+        if (chat.Buffer is { } buffer)
+        {
+            buffer.Add((JsonObject)update.DeepClone());
+            return;
+        }
+        if (chat.Model is not { } model) return;
+        chat.Updates++;
+        model.Take(update, live: true);
+        if (model.Holding) ScheduleFlush(chat);
+        if (model.Unmarked || model.Settling) ScheduleQuiet(chat);
+        ConsumeQueued(chat);
+        Sync(chat.Session);
     }
 
     void ScheduleFlush(FaceChat chat) => _ = Task.Delay(options.HoldFor).ContinueWith(_ =>
@@ -286,11 +346,15 @@ internal sealed class AhpFace : IAsyncDisposable
             if (chat.Model is not { Holding: true } model) return;
             model.Flush(live: true);
             if (model.Unmarked) ScheduleQuiet(chat);
+            ConsumeQueued(chat);
             Sync(chat.Session);
         }
     }, TaskScheduler.Default);
 
-    /// <summary>A turn no mark will end: ended once <see cref="AhpFaceOptions.QuietFor"/> passes with no update of its session.</summary>
+    /// <summary>
+    /// A turn no mark will end, or a cancelled turn whose end mark has not come: over once
+    /// <see cref="AhpFaceOptions.QuietFor"/> passes with no update of its session, unless it waits for an answer here.
+    /// </summary>
     void ScheduleQuiet(FaceChat chat)
     {
         var seen = chat.Updates;
@@ -299,8 +363,14 @@ internal sealed class AhpFace : IAsyncDisposable
             if (t.IsCanceled) return;
             lock (gate)
             {
-                if (chat.Updates != seen || chat.Model is not { Unmarked: true } model) return;
-                model.EndUnmarked(live: true);
+                if (chat.Updates != seen || chat.Model is not { } model || !(model.Unmarked || model.Settling)) return;
+                if (requests.Values.Any(r => r.Chat == chat))
+                {
+                    ScheduleQuiet(chat); // the agent waits for an answer here: its turn is not over
+                    return;
+                }
+                model.Settled(live: true);
+                ConsumeQueued(chat);
                 Sync(chat.Session);
             }
         }, TaskScheduler.Default);
@@ -314,7 +384,15 @@ internal sealed class AhpFace : IAsyncDisposable
     sealed class FaceSession(string uri, string sessionId)
     {
         public string Uri { get; } = uri;
-        public string SessionId { get; } = sessionId;
+        public string SessionId { get; set; } = sessionId; // "" while a session an AHP client created is being made
+        public bool Draft; // created through the face: no list has it yet
+        public bool Prompted; // a draft whose first prompt went to the conductor, which lists it once it has promoted it
+        public Task Created = Task.CompletedTask; // its session/new, for one created through the face
+        public Task Written = Task.CompletedTask; // the last step the face queued to write to the conductor for it
+        public Task Archives = Task.CompletedTask; // the last archive or unarchive the face queued for it
+        public JsonArray? AcpOptions; // its agent's config options, as it last said them
+        public JsonObject? AcpModes; // its agent's modes, as it last said them
+        public bool ModesAsMode; // its modes are the config property "mode"
         public string Agent = "";
         public string Title = "";
         public string Cwd = "";
@@ -331,7 +409,7 @@ internal sealed class AhpFace : IAsyncDisposable
     sealed class FaceChat(string uri, string sessionId, FaceSession session)
     {
         public string Uri { get; } = uri;
-        public string SessionId { get; } = sessionId;
+        public string SessionId { get; set; } = sessionId;
         public FaceSession Session { get; set; } = session;
         public bool IsChild => SessionId != Session.SessionId;
         public string Agent = "";
@@ -346,6 +424,11 @@ internal sealed class AhpFace : IAsyncDisposable
         public long BaseSeq;
         public DateTimeOffset? Unwatched;
         public long Updates; // live updates taken, for the quiet check
+        public bool ReadOnly; // gorynych/interactivity says so
+        public string? ReadOnlyReason;
+        public List<(string Name, string? Description)> Commands = []; // its agent's commands, for completions
+        public string? Offered; // the session's model as the face last put it in the chat's draft
+        public readonly Dictionary<string, string?> QueuedOn = new(StringComparer.Ordinal); // a waiting message -> the session's model when it came
     }
 
     /// <summary>Takes the conductor's list: sessions and children that came, went or changed, said to the clients.</summary>
@@ -361,24 +444,28 @@ internal sealed class AhpFace : IAsyncDisposable
             return at.Id;
         }
 
-        // Sessions that went, or became children.
+        // Sessions that went, or became children; not one created here that no list has yet (a draft until its first prompt).
         foreach (var s in sessions.Values.ToList())
-            if (!byId.ContainsKey(s.SessionId) || RootOf(s.SessionId) != s.SessionId)
+            if (s.SessionId.Length > 0 && !s.Draft && (!byId.ContainsKey(s.SessionId) || RootOf(s.SessionId) != s.SessionId))
                 RemoveSession(s);
         var added = new List<FaceSession>();
         foreach (var l in byId.Values.Where(l => RootOf(l.Id) == l.Id))
         {
-            if (sessions.TryGetValue(AhpNames.SessionUri(l.Id), out var s)) UpdateSession(s, l);
-            else added.Add(AddSession(l));
+            if (sessionsById.TryGetValue(l.Id, out var s))
+            {
+                s.Draft = false;
+                UpdateSession(s, l);
+            }
+            else if (!sessions.ContainsKey(l.AhpUri ?? AhpNames.SessionUri(l.Id))) added.Add(AddSession(l));
         }
         // Children that went, or moved to another root.
         foreach (var chat in chats.Values.Where(c => c.IsChild).ToList())
-            if (!byId.ContainsKey(chat.SessionId) || AhpNames.SessionUri(RootOf(chat.SessionId)) != chat.Session.Uri)
+            if (!byId.ContainsKey(chat.SessionId) || !sessionsById.TryGetValue(RootOf(chat.SessionId), out var root) || root != chat.Session)
                 RemoveChild(chat, quiet: added.Contains(chat.Session));
         foreach (var l in byId.Values.Where(l => RootOf(l.Id) != l.Id))
         {
-            var s = sessions[AhpNames.SessionUri(RootOf(l.Id))];
-            if (chats.TryGetValue(AhpNames.ChatUri(l.Id), out var chat)) UpdateChat(chat, l);
+            if (!sessionsById.TryGetValue(RootOf(l.Id), out var s)) continue;
+            if (chatsById.TryGetValue(l.Id, out var chat)) UpdateChat(chat, l);
             else AddChild(s, l, quiet: added.Contains(s));
         }
         foreach (var s in added)
@@ -412,13 +499,19 @@ internal sealed class AhpFace : IAsyncDisposable
     FaceSession AddSession(Listed l)
     {
         var title = TitleOf(l);
-        var s = new FaceSession(AhpNames.SessionUri(l.Id), l.Id)
+        // A session an AHP client created goes by the URI it chose.
+        var s = new FaceSession(l.AhpUri ?? AhpNames.SessionUri(l.Id), l.Id)
         {
             Agent = l.Agent, Title = title, Cwd = l.Cwd, UpdatedAt = l.UpdatedAt, CreatedAt = l.UpdatedAt, Archived = l.Archived, BaseSeq = serverSeq,
         };
-        var own = new FaceChat(AhpNames.ChatUri(l.Id), l.Id, s) { Agent = l.Agent, Title = title, Cwd = l.Cwd, UpdatedAt = l.UpdatedAt };
+        var own = new FaceChat(AhpNames.ChatOf(s.Uri), l.Id, s)
+        {
+            Agent = l.Agent, Title = title, Cwd = l.Cwd, UpdatedAt = l.UpdatedAt, ReadOnly = l.ReadOnly, ReadOnlyReason = l.Reason,
+        };
         s.Chats.Add(own);
         chats[own.Uri] = own;
+        chatsById[l.Id] = own;
+        sessionsById[l.Id] = s;
         s.State = new SessionState
         {
             Provider = s.Agent, Title = s.Title, Status = SessionStatus.Idle | SessionStatus.IsRead | (s.Archived ? SessionStatus.IsArchived : 0),
@@ -438,12 +531,17 @@ internal sealed class AhpFace : IAsyncDisposable
         s.Cwd = l.Cwd;
         if (TitleOf(l) is var title && title != s.Title) SetTitle(s.Chats[0], title);
         if (l.Archived != s.Archived) SetArchived(s.Chats[0], l.Archived);
+        // The list says a read-only session so, and nothing of one that is not: an open one learns a change from its updates.
+        if (l.ReadOnly) SetReadOnly(s.Chats[0], true, l.Reason);
+        else if (s.Chats[0].Model is null) SetReadOnly(s.Chats[0], false, null);
     }
 
-    void RemoveSession(FaceSession s)
+    /// <param name="deleted">Deleted in the conductor already: nothing to close there but its children, which a delete leaves.</param>
+    void RemoveSession(FaceSession s, bool deleted = false)
     {
         sessions.Remove(s.Uri);
-        foreach (var chat in s.Chats) Drop(chat);
+        if (sessionsById.TryGetValue(s.SessionId, out var known) && known == s) sessionsById.Remove(s.SessionId);
+        foreach (var chat in s.Chats) Drop(chat, close: !deleted || chat.IsChild);
         NotifyRoot("root/sessionRemoved", Json.SerializeToElement(new SessionRemovedParams { Channel = AhpNames.Root, Session = s.Uri }));
     }
 
@@ -451,6 +549,7 @@ internal sealed class AhpFace : IAsyncDisposable
     {
         var chat = new FaceChat(AhpNames.ChatUri(l.Id), l.Id, s) { Agent = l.Agent, Title = TitleOf(l), Cwd = l.Cwd, UpdatedAt = l.UpdatedAt, Archived = l.Archived };
         chats[chat.Uri] = chat;
+        chatsById[l.Id] = chat;
         s.Chats.Add(chat);
         if (quiet) s.State.Chats.Add(ChatSummaryOf(chat));
         else ApplySession(s, new SessionChatAddedAction { Summary = ChatSummaryOf(chat) });
@@ -473,12 +572,16 @@ internal sealed class AhpFace : IAsyncDisposable
     }
 
     /// <summary>A chat that went: forgotten, and its session let go of in the conductor if the face had it open.</summary>
-    void Drop(FaceChat chat)
+    void Drop(FaceChat chat, bool close = true)
     {
         if (chats.TryGetValue(chat.Uri, out var now) && ReferenceEquals(now, chat)) chats.Remove(chat.Uri);
+        if (chatsById.TryGetValue(chat.SessionId, out var byId) && ReferenceEquals(byId, chat)) chatsById.Remove(chat.SessionId);
+        // What the agent asked of it here can no longer be shown: it is answered as cancelled, as by a client that goes.
+        foreach (var ask in requests.Values.Where(r => r.Chat == chat || (r.Chat is null && r.SessionId == chat.SessionId)).ToList()) Resolve(ask, ask.Cancelled());
+        chat.QueuedOn.Clear(); // the face's queue goes with its chat model
         if (chat.Model is not { } model) return;
         chat.Model = null;
-        LetGo(chat.SessionId, model);
+        if (close && chat.SessionId.Length > 0) LetGo(chat.SessionId, model);
     }
 
     /// <summary>
@@ -503,6 +606,34 @@ internal sealed class AhpFace : IAsyncDisposable
         chat.Session.Title = title;
         ApplySession(chat.Session, new SessionTitleChangedAction { Title = title });
     }
+
+    /// <summary>
+    /// Whether a client may prompt the chat (<c>gorynych/interactivity</c>). AHP 1.0.0 has no chat action for it: the
+    /// catalog says it (<c>session/chatUpdated</c>), and the chat's state for later snapshots, with the reason in its
+    /// <c>_meta</c>, since a catalog entry has none.
+    /// </summary>
+    void SetReadOnly(FaceChat chat, bool readOnly, string? reason)
+    {
+        if (chat.ReadOnly == readOnly && chat.ReadOnlyReason == reason) return;
+        chat.ReadOnly = readOnly;
+        chat.ReadOnlyReason = readOnly ? reason : null;
+        if (chat.Model is { } model) Interactive(chat, model.State);
+        Sync(chat.Session);
+    }
+
+    static void Interactive(FaceChat chat, ChatState state)
+    {
+        state.Interactivity = InteractivityOf(chat);
+        state.Meta?.Remove(GorynychProtocol.MetaInteractivityReason);
+        if (chat.ReadOnlyReason is { } why)
+        {
+            state.Meta ??= new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+            state.Meta[GorynychProtocol.MetaInteractivityReason] = AhpNames.Element(JsonValue.Create(why));
+        }
+    }
+
+    /// <summary>A chat a client may prompt (<c>full</c>), or watch only: a child until step 4, and a session its agent opened for reading only.</summary>
+    static ChatInteractivity InteractivityOf(FaceChat chat) => chat.IsChild || chat.ReadOnly ? ChatInteractivity.ReadOnly : ChatInteractivity.Full;
 
     void SetArchived(FaceChat chat, bool archived)
     {
@@ -535,7 +666,7 @@ internal sealed class AhpFace : IAsyncDisposable
     ChatSummary ChatSummaryOf(FaceChat chat) => new()
     {
         Resource = chat.Uri, Title = chat.Title, Status = StatusOf(chat), Activity = chat.Model?.State.Activity, ModifiedAt = ModifiedOf(chat),
-        Origin = UserOrigin(), Interactivity = ChatInteractivity.ReadOnly,
+        Origin = UserOrigin(), Interactivity = InteractivityOf(chat),
         WorkingDirectories = AhpNames.FileUri(chat.Cwd) is { } folder ? [folder] : null,
     };
 
@@ -563,7 +694,7 @@ internal sealed class AhpFace : IAsyncDisposable
         CreatedAt = s.CreatedAt, ModifiedAt = s.Chats.Select(ModifiedOf).Aggregate(s.UpdatedAt, Later),
         Chats = [.. s.Chats.Select(c => new SessionChatSummary
         {
-            Resource = c.Uri, Title = c.Title, Origin = UserOrigin(), Interactivity = ChatInteractivity.ReadOnly, Status = StatusOf(c),
+            Resource = c.Uri, Title = c.Title, Origin = UserOrigin(), Interactivity = InteractivityOf(c), Status = StatusOf(c),
         })],
         DefaultChat = s.Chats[0].Uri,
         Meta = MetaOf(s),
@@ -576,6 +707,7 @@ internal sealed class AhpFace : IAsyncDisposable
     void Sync(FaceSession s)
     {
         if (!sessions.ContainsKey(s.Uri)) return;
+        OfferModel(s.Chats[0]);
         foreach (var chat in s.Chats)
         {
             var now = ChatSummaryOf(chat);
@@ -587,8 +719,11 @@ internal sealed class AhpFace : IAsyncDisposable
             // A partial change cannot remove a field: an activity cleared is the empty string.
             if ((had.Activity ?? "") != (now.Activity ?? "")) { changes = changes with { Activity = now.Activity ?? "" }; changed = true; }
             if (had.ModifiedAt != now.ModifiedAt) { changes = changes with { ModifiedAt = now.ModifiedAt }; changed = true; }
+            if (had.Interactivity != now.Interactivity) { changes = changes with { Interactivity = now.Interactivity }; changed = true; }
             if (changed) ApplySession(s, new SessionChatUpdatedAction { Chat = chat.Uri, Changes = changes });
         }
+        // A session being made, or that could not be, is not on the root yet: root/sessionAdded says it once it is ready.
+        if (s.State.Lifecycle != SessionLifecycle.Ready) return;
         var summary = Summary(s);
         if (s.Sent is not { } sent)
         {
@@ -643,11 +778,7 @@ internal sealed class AhpFace : IAsyncDisposable
     void EmitChat(FaceChat chat, StateAction action)
     {
         Broadcast(chat.Uri, action);
-        if (action.Value is ChatTurnStartedAction && chat.Session.IsRead)
-        {
-            chat.Session.IsRead = false;
-            ApplySession(chat.Session, new SessionIsReadChangedAction { IsRead = false });
-        }
+        if (action.Value is ChatTurnStartedAction) Unread(chat.Session);
     }
 
     /// <summary>
@@ -723,6 +854,8 @@ internal sealed class AhpFace : IAsyncDisposable
             {
                 chat.Buffer = null;
                 chat.Loading = null;
+                // What its agent asked while it opened can be shown nowhere.
+                foreach (var ask in requests.Values.Where(r => r.Chat is null && r.SessionId == chat.SessionId).ToList()) Resolve(ask, ask.Cancelled());
             }
             throw new AhpError(JsonRpcErrorCodes.InternalError, $"Session {chat.SessionId} could not be opened: {e.Message}");
         }
@@ -747,17 +880,28 @@ internal sealed class AhpFace : IAsyncDisposable
             chat.Model = model;
             chat.BaseSeq = serverSeq;
             chat.Unwatched = DateTimeOffset.UtcNow;
+            // The session's state: its agent's options, and whether a client may prompt it.
+            if (!chat.IsChild) OptionsChanged(chat.Session, answer?["configOptions"]?.DeepClone() as JsonArray, answer?["modes"]?.DeepClone() as JsonObject);
+            if (AhpNames.Text(answer?["_meta"]?[GorynychProtocol.MetaInteractivity]) is { } interactivity)
+                SetReadOnly(chat, interactivity == GorynychProtocol.InteractivityReadOnly, AhpNames.Text(answer?["_meta"]?[GorynychProtocol.MetaInteractivityReason]));
+            // What the agent asked while the session opened (an approval waiting for a client comes right after the replay).
+            foreach (var ask in requests.Values.Where(r => r.Chat is null && r.SessionId == chat.SessionId).ToList()) ShowOrCancel(ask);
             Sync(chat.Session);
         }
     }
 
-    static ChatState NewChatState(FaceChat chat) => new()
+    static ChatState NewChatState(FaceChat chat)
     {
-        Resource = chat.Uri, Title = chat.Title,
-        Status = SessionStatus.Idle | (chat.IsRead ? SessionStatus.IsRead : 0) | (chat.IsChild && chat.Archived ? SessionStatus.IsArchived : 0),
-        ModifiedAt = chat.UpdatedAt, Origin = UserOrigin(), Interactivity = ChatInteractivity.ReadOnly, Turns = [],
-        WorkingDirectories = AhpNames.FileUri(chat.Cwd) is { } folder ? [folder] : null,
-    };
+        var state = new ChatState
+        {
+            Resource = chat.Uri, Title = chat.Title,
+            Status = SessionStatus.Idle | (chat.IsRead ? SessionStatus.IsRead : 0) | (chat.IsChild && chat.Archived ? SessionStatus.IsArchived : 0),
+            ModifiedAt = chat.UpdatedAt, Origin = UserOrigin(), Turns = [],
+            WorkingDirectories = AhpNames.FileUri(chat.Cwd) is { } folder ? [folder] : null,
+        };
+        Interactive(chat, state);
+        return state;
+    }
 
     void Close(string sessionId) => _ = InTurn(sessionId, async () =>
     {
@@ -787,21 +931,24 @@ internal sealed class AhpFace : IAsyncDisposable
         lock (gate)
         {
             var now = DateTimeOffset.UtcNow;
-            foreach (var chat in chats.Values)
+            foreach (var chat in chats.Values.ToList())
             {
-                if (chat.Model is not { } model) continue;
+                if (chat.Model is not { } model || chat.SessionId.Length == 0) continue;
                 if (connections.Any(c => c.Subscriptions.Contains(chat.Uri) || c.Pending.ContainsKey(chat.Uri)))
                 {
                     chat.Unwatched = null;
                     continue;
                 }
                 chat.Unwatched ??= now;
-                if (now - chat.Unwatched < options.CloseAfter || Running(model)) continue;
+                if (now - chat.Unwatched < options.CloseAfter || Running(model) || requests.Values.Any(r => r.Chat == chat)) continue;
                 chat.IsRead = (model.State.Status & SessionStatus.IsRead) != 0;
                 chat.Model = null;
+                chat.QueuedOn.Clear();
                 Close(chat.SessionId);
                 ServiceLog.Info($"ahp: closed {chat.SessionId}, which no AHP client had open");
-                Sync(chat.Session);
+                // A session created here and never prompted is a draft: the conductor discards it on its close.
+                if (chat.Session.Draft && !chat.Session.Prompted && !chat.IsChild) RemoveSession(chat.Session);
+                else Sync(chat.Session);
             }
         }
     }
@@ -809,7 +956,13 @@ internal sealed class AhpFace : IAsyncDisposable
     /// <summary>Whether the face has the session open in the conductor now, its own chat's or one it let go of under a turn; for tests.</summary>
     internal bool HasOpen(string sessionId)
     {
-        lock (gate) return (chats.TryGetValue(AhpNames.ChatUri(sessionId), out var chat) && chat.Model is not null) || closing.ContainsKey(sessionId);
+        lock (gate) return (chatsById.TryGetValue(sessionId, out var chat) && chat.Model is not null) || closing.ContainsKey(sessionId);
+    }
+
+    /// <summary>Whether a turn a client cancelled in the session has not ended in its agent yet; for tests.</summary>
+    internal bool Settling(string sessionId)
+    {
+        lock (gate) return chatsById.TryGetValue(sessionId, out var chat) && chat.Model is { Settling: true };
     }
 
     /// <summary>For <c>_gorynych/status</c>.</summary>
@@ -833,6 +986,7 @@ internal sealed class AhpFace : IAsyncDisposable
         readonly Channel<TransportMessage> outbox = System.Threading.Channels.Channel.CreateUnbounded<TransportMessage>(new UnboundedChannelOptions { SingleReader = true });
 
         public ITransport Transport { get; } = transport;
+        public readonly SemaphoreSlim Files = new(4); // its resource methods running
         public string? ClientId;
         public bool Initialized;
         public Task Sending = Task.CompletedTask;
@@ -912,6 +1066,18 @@ internal sealed class AhpFace : IAsyncDisposable
                     // The first list may take a while: it does not hold up what follows it.
                     else if (request.Method == "listSessions" && c.Initialized && !listed.Task.IsCompleted)
                         _ = Task.Run(() => AnswerAsync(c, request, () => ListSessionsAsync(c, request)));
+                    // A delete waits for its agent, a file for its disk: neither holds up what follows it.
+                    else if (request.Method == "disposeSession" && c.Initialized)
+                        _ = Task.Run(() => AnswerAsync(c, request, () => CommandAsync(c, request)));
+                    // At most four at once for a client: the rest wait their turn, not the connection.
+                    else if (request.Method is "resourceList" or "resourceResolve" or "resourceRead" or "resourceMkdir" && c.Initialized)
+                        _ = Task.Run(async () =>
+                        {
+                            try { await c.Files.WaitAsync(c.Ended.Token); }
+                            catch (OperationCanceledException) { return; } // its client went while it waited
+                            try { await AnswerAsync(c, request, () => CommandAsync(c, request)); }
+                            finally { c.Files.Release(); }
+                        });
                     else await AnswerAsync(c, request, () => CommandAsync(c, request));
                 }
                 else if (message.Notification is { } notification) Notified(c, notification);
@@ -921,6 +1087,7 @@ internal sealed class AhpFace : IAsyncDisposable
         {
             lock (gate) connections.Remove(c);
             c.Complete();
+            try { c.Ended.Cancel(); } catch (ObjectDisposedException) { } // what it asked and still waits goes
             try { await c.Sending.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
         }
     }
@@ -995,27 +1162,37 @@ internal sealed class AhpFace : IAsyncDisposable
             case "dispatchAction":
                 Dispatch(c, Params<DispatchActionParams>(@params));
                 return Empty;
-            case "createSession" or "disposeSession":
-                throw new AhpError(AhpErrorCodes.PermissionDenied, "Creating and deleting sessions comes in a later version");
+            case "createSession":
+                return await CreateSessionAsync(Params<CreateSessionParams>(@params));
+            case "disposeSession":
+                return await DisposeSessionAsync(Params<DisposeSessionParams>(@params));
             case "createChat" or "disposeChat" or "moveChat":
                 throw new AhpError(AhpErrorCodes.PermissionDenied, "This host has one chat per session and its children");
             case "resolveSessionConfig":
-                return Json.SerializeToElement(new ResolveSessionConfigResult
-                {
-                    Schema = new SessionConfigSchema { Type = "object", Properties = [] },
-                    Values = Params<ResolveSessionConfigParams>(@params).Config ?? [],
-                });
+                return ResolveSessionConfig(Params<ResolveSessionConfigParams>(@params));
             case "completions":
-                return Json.SerializeToElement(new CompletionsResult { Items = [] });
+                return Completions(Params<CompletionsParams>(@params));
             case "sessionConfigCompletions":
                 return Json.SerializeToElement(new SessionConfigCompletionsResult { Items = [] });
             case "fetchTurns":
                 return Json.SerializeToElement(new FetchTurnsResult());
             case "authenticate":
                 return Empty;
+            case "createTerminal":
+                return CreateTerminal(Params<CreateTerminalParams>(@params));
+            case "disposeTerminal":
+                return DisposeTerminal(Params<DisposeTerminalParams>(@params));
+            case "resourceList":
+                return ResourceList(Params<ResourceListParams>(@params));
+            case "resourceResolve":
+                return ResourceResolve(Params<ResourceResolveParams>(@params));
+            case "resourceRead":
+                return ResourceRead(Params<ResourceReadParams>(@params));
+            case "resourceMkdir":
+                return ResourceMkdir(Params<ResourceMkdirParams>(@params));
             case "createResourceWatch":
             case var resource when resource.StartsWith("resource", StringComparison.Ordinal):
-                throw new AhpError(AhpErrorCodes.PermissionDenied, "Reading and writing files through this host comes in a later version");
+                throw new AhpError(AhpErrorCodes.PermissionDenied, "This host lists and reads files and makes folders; it writes, copies, moves, deletes and watches none");
             default:
                 throw new AhpError(JsonRpcErrorCodes.MethodNotFound, $"Method not found: {method}");
         }
@@ -1095,7 +1272,9 @@ internal sealed class AhpFace : IAsyncDisposable
     async Task LoadAsync(IEnumerable<string> channels)
     {
         List<FaceChat> load;
-        lock (gate) load = [.. channels.Select(ch => chats.GetValueOrDefault(ch)).OfType<FaceChat>().Where(ch => ch.Model is null)];
+        // A session's own chat too: its snapshot has its agent's options once the face has it open.
+        lock (gate) load = [.. channels.Select(ch => chats.GetValueOrDefault(ch) ?? sessions.GetValueOrDefault(ch)?.Chats[0])
+            .OfType<FaceChat>().Where(ch => ch.Model is null).Distinct()];
         foreach (var chat in load)
             try { await EnsureLoadedAsync(chat); }
             catch (AhpError e) { ServiceLog.Warn($"ahp: {e.Message}"); }
@@ -1147,13 +1326,14 @@ internal sealed class AhpFace : IAsyncDisposable
     }
 
     /// <summary>Under the gate: whether a channel exists for a client; a chat whose session the face does not have open yet does.</summary>
-    bool Exists(string channel) => channel == AhpNames.Root || sessions.ContainsKey(channel) || chats.ContainsKey(channel);
+    bool Exists(string channel) => channel == AhpNames.Root || sessions.ContainsKey(channel) || chats.ContainsKey(channel) || terminals.ContainsKey(channel);
 
     /// <summary>Under the gate: the number since which the channel's state has been as it is (built afresh then); null when it has none now.</summary>
     long? BaseSeqOf(string channel) =>
         channel == AhpNames.Root ? 0
         : sessions.TryGetValue(channel, out var s) ? s.BaseSeq
         : chats.TryGetValue(channel, out var chat) && chat.Model is not null ? chat.BaseSeq
+        : terminals.TryGetValue(channel, out var terminal) ? terminal.BaseSeq
         : null;
 
     /// <summary>Under the gate: a channel's state now; null for one with none (a chat whose session is not open).</summary>
@@ -1163,6 +1343,7 @@ internal sealed class AhpFace : IAsyncDisposable
         if (channel == AhpNames.Root) state = new SnapshotState { Root = root };
         else if (sessions.TryGetValue(channel, out var s)) state = new SnapshotState { Session = s.State };
         else if (chats.TryGetValue(channel, out var chat) && chat.Model is { } model) state = new SnapshotState { Chat = model.State };
+        else if (terminals.TryGetValue(channel, out var terminal)) state = new SnapshotState { Terminal = terminal.State };
         else return null;
         return new Snapshot { Resource = channel, State = state, FromSeq = serverSeq };
     }
@@ -1174,7 +1355,8 @@ internal sealed class AhpFace : IAsyncDisposable
         await FirstListAsync();
         lock (gate)
         {
-            var all = sessions.Values.Select(s => s.Sent ?? Summary(s))
+            // Not one still being made, or that could not be: the root says a created session once it is ready.
+            var all = sessions.Values.Where(s => s.SessionId.Length > 0 && s.State.Lifecycle == SessionLifecycle.Ready).Select(s => s.Sent ?? Summary(s))
                 .OrderByDescending(s => s.ModifiedAt, StringComparer.Ordinal).ThenBy(s => s.Resource, StringComparer.Ordinal).ToList();
             var start = 0;
             if (p.Cursor is { Length: > 0 } cursor)
@@ -1244,15 +1426,22 @@ internal sealed class AhpFace : IAsyncDisposable
             lock (gate) known = Exists(channel);
             if (!known) await FirstListAsync();
             FaceChat? chat;
+            FaceSession? session;
             lock (gate)
             {
-                if (!chats.TryGetValue(channel, out chat))
+                session = sessions.GetValueOrDefault(channel);
+                // A session's own chat is opened first, so that the session's snapshot has its agent's options.
+                if (!chats.TryGetValue(channel, out chat) && session?.Chats[0] is not { Model: null } own)
                 {
                     if (!Subscribed(c, request, channel, pending)) throw NoChannel(channel);
                     return null;
                 }
+                chat ??= session!.Chats[0];
             }
-            await EnsureLoadedAsync(chat);
+            if (session is null) await EnsureLoadedAsync(chat);
+            else
+                try { await EnsureLoadedAsync(chat); }
+                catch (AhpError e) { ServiceLog.Warn($"ahp: {e.Message}"); } // the session's snapshot goes without its options
             lock (gate)
                 if (!Subscribed(c, request, channel, pending)) throw NoChannel(channel);
             return null;
@@ -1311,12 +1500,24 @@ internal sealed class AhpFace : IAsyncDisposable
                 else Broadcast(p.Channel, p.Action, origin, "This host takes no such change", c);
                 return;
             }
+            if (terminals.TryGetValue(p.Channel, out var terminal))
+            {
+                // A terminal with no process: what a client changes in it is kept, its input goes nowhere; its title and
+                // claim are the root's catalog's too.
+                Broadcast(p.Channel, p.Action, origin);
+                Reducers.ApplyToTerminal(terminal.State, p.Action);
+                if (action is TerminalTitleChangedAction or TerminalClaimedAction) TerminalsChanged();
+                return;
+            }
             if (sessions.TryGetValue(p.Channel, out var s))
             {
                 switch (action)
                 {
+                    case SessionConfigChangedAction config:
+                        ConfigChanged(c, s, p.Action, config, origin);
+                        return;
                     case SessionIsArchivedChangedAction archive:
-                        ArchiveAsync(c, p.Channel, p.Action, origin, s.SessionId, archive.IsArchived);
+                        ArchiveAsync(p.Channel, p.Action, origin, s, null, archive.IsArchived);
                         return;
                     case SessionIsReadChangedAction read:
                         ApplySession(s, read, origin);
@@ -1344,50 +1545,96 @@ internal sealed class AhpFace : IAsyncDisposable
                     return;
                 case ChatDraftChangedAction when chat.Model is not null:
                     ApplyChat(chat, action, origin);
+                    OfferModel(chat); // a draft cleared (VS Code clears it on a send): the session's model in a new one
                     return;
                 case ChatIsArchivedChangedAction archive when chat.IsChild && chat.Model is not null:
-                    ArchiveAsync(c, p.Channel, p.Action, origin, chat.SessionId, archive.IsArchived);
+                    ArchiveAsync(p.Channel, p.Action, origin, chat.Session, chat, archive.IsArchived);
+                    return;
+                case ChatTurnStartedAction started:
+                    TurnStarted(c, chat, p.Action, started, origin);
+                    return;
+                case ChatTurnCancelledAction cancelled:
+                    TurnCancelled(c, chat, p.Action, cancelled, origin);
+                    return;
+                case ChatToolCallConfirmedAction confirmed:
+                    Confirmed(c, chat, p.Action, confirmed, origin);
+                    return;
+                case ChatInputAnswerChangedAction answer:
+                    InputAnswered(c, chat, p.Action, answer, origin);
+                    return;
+                case ChatInputCompletedAction completed:
+                    InputCompleted(c, chat, p.Action, completed, origin);
+                    return;
+                case ChatPendingMessageSetAction set:
+                    PendingSet(c, chat, p.Action, set, origin);
+                    return;
+                case ChatPendingMessageRemovedAction removed:
+                    PendingRemoved(c, chat, p.Action, removed, origin);
+                    return;
+                case ChatQueuedMessagesReorderedAction when chat.Model is not null:
+                    ApplyChat(chat, action, origin);
                     return;
                 default:
-                    Broadcast(p.Channel, p.Action, origin, "This chat is read-only in this version", c);
+                    Broadcast(p.Channel, p.Action, origin, InteractivityOf(chat) == ChatInteractivity.ReadOnly
+                        ? "This chat is read-only" : "This chat takes no such change", c);
                     return;
             }
         }
     }
 
-    /// <summary>An archive from a client: <c>_gorynych/archive</c>, then echoed when it succeeded, refused with its error when not.</summary>
-    void ArchiveAsync(Connection c, string channel, StateAction action, ActionOrigin origin, string sessionId, bool archived) => _ = Task.Run(async () =>
+    /// <summary>
+    /// Under the gate: an archive from a client, echoed at once, in the order the client sent its actions (an AHP client
+    /// matches its pending actions to the echoes in that order); then <c>_gorynych/archive</c>. One the service refuses
+    /// goes back, by the host.
+    /// </summary>
+    /// <param name="child">The child whose chat it is; null for the session itself.</param>
+    void ArchiveAsync(string channel, StateAction action, ActionOrigin origin, FaceSession s, FaceChat? child, bool archived)
     {
-        string? failed = null;
-        try
+        SetArchivedHere(channel, archived, action.Value!, origin);
+        // In an order of the session's archives own, so an archive and an unarchive reach the service in the order they
+        // came, and no prompt or cancel waits for one; the ID taken then, of a session that was being made.
+        var step = s.Archives.ContinueWith(async _ =>
         {
-            await acp!.SendRequestAsync(GorynychProtocol.MethodArchive, new JsonObject { ["sessionId"] = sessionId, ["archived"] = archived }, stopping.Token);
-        }
-        catch (Exception e) when (e is IOException or JsonRpcException or OperationCanceledException)
+            await s.Created;
+            var sessionId = child?.SessionId ?? s.SessionId;
+            try
+            {
+                if (sessionId.Length == 0) throw new IOException("the session could not be made");
+                await acp!.SendRequestAsync(GorynychProtocol.MethodArchive, new JsonObject { ["sessionId"] = sessionId, ["archived"] = archived }, stopping.Token);
+            }
+            catch (Exception e) when (e is IOException or JsonRpcException or OperationCanceledException)
+            {
+                ServiceLog.Warn($"ahp: {sessionId}: an archive was refused: {e.Message}");
+                lock (gate)
+                {
+                    object back = sessions.ContainsKey(channel)
+                        ? new SessionIsArchivedChangedAction { IsArchived = !archived }
+                        : new ChatIsArchivedChangedAction { IsArchived = !archived };
+                    SetArchivedHere(channel, !archived, back, null, only: archived);
+                }
+            }
+        }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default).Unwrap();
+        s.Archives = step.ContinueWith(_ => { }, TaskScheduler.Default);
+    }
+
+    /// <summary>Under the gate: a session's or a child's archive as the face shows it; <paramref name="only"/> when it is still so.</summary>
+    void SetArchivedHere(string channel, bool archived, object action, ActionOrigin? origin, bool? only = null)
+    {
+        if (sessions.TryGetValue(channel, out var s))
         {
-            failed = e.Message;
+            if (only is { } was && s.Archived != was) return;
+            s.Archived = archived;
+            ApplySession(s, action, origin);
+            Sync(s);
         }
-        lock (gate)
+        else if (chats.TryGetValue(channel, out var chat) && chat.Model is not null)
         {
-            if (failed is not null)
-            {
-                if (Exists(channel)) Broadcast(channel, action, origin, failed, c);
-                return;
-            }
-            if (sessions.TryGetValue(channel, out var s))
-            {
-                s.Archived = archived;
-                ApplySession(s, action.Value!, origin);
-                Sync(s);
-            }
-            else if (chats.TryGetValue(channel, out var chat) && chat.Model is not null)
-            {
-                chat.Archived = archived;
-                ApplyChat(chat, action.Value!, origin);
-                Sync(chat.Session);
-            }
+            if (only is { } was && chat.Archived != was) return;
+            chat.Archived = archived;
+            ApplyChat(chat, action, origin);
+            Sync(chat.Session);
         }
-    });
+    }
 
     /// <summary>
     /// Stops: each client's queue is sent out and its socket closed, then ended, before the endpoint stops, which
@@ -1406,6 +1653,7 @@ internal sealed class AhpFace : IAsyncDisposable
         stopping.Cancel();
         lock (gate) all = [.. connections];
         foreach (var c in all) c.Abort();
+        try { await stateWriter.WaitAsync(TimeSpan.FromSeconds(2)); } catch { } // what changed last is written
         if (acp is not null) await acp.DisposeAsync();
         if (serving is not null) try { await serving.WaitAsync(TimeSpan.FromSeconds(5)); } catch { }
     }

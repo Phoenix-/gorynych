@@ -36,6 +36,10 @@ public sealed class SessionRecord
     /// <summary>The session that started this one with <c>spawn_session</c>; null for one a client created.</summary>
     public string? ParentSessionId { get; set; }
 
+    /// <summary>The AHP URI of a session created through the AHP face (<c>gorynych/ahpUri</c>); null for any other.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? AhpUri { get; set; }
+
     /// <summary>
     /// The token of the session's peers server (<c>gorynych/peerToken</c>), kept so that the service
     /// that comes after a restart knows the agent that still holds it.
@@ -298,6 +302,6 @@ public sealed class SessionStore
         CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt, Draft = r.Draft, Deleted = r.Deleted,
         ParentSessionId = r.ParentSessionId, ReportToParent = r.ReportToParent, Archived = r.Archived, PeerToken = r.PeerToken,
         HostSeen = r.HostSeen, HostPrompts = r.HostPrompts is null ? null : [.. r.HostPrompts],
-        HostOf = r.HostOf, HostSlot = r.HostSlot,
+        HostOf = r.HostOf, HostSlot = r.HostSlot, AhpUri = r.AhpUri,
     };
 }

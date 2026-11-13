@@ -98,6 +98,13 @@ public static class GorynychProtocol
     public const string MetaParentSessionId = "gorynych/parentSessionId";
 
     /// <summary>
+    /// The AHP URI a session created through the AHP face goes by (<c>ahp-session:/&lt;id&gt;</c>, its
+    /// client's choice): in <c>session/new</c>'s <c>_meta</c>, kept in the overlay, and in
+    /// <c>SessionInfo._meta</c> of <c>session/list</c> (docs/ahp-face.md, "Identifiers").
+    /// </summary>
+    public const string MetaAhpUri = "gorynych/ahpUri";
+
+    /// <summary>
     /// Starts a child of the calling session, after asking the person:
     /// <c>{agent, prompt, cwd?, title?, report?}</c> with the caller's peer token → <c>{sessionId}</c>.
     /// </summary>

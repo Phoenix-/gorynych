@@ -729,7 +729,7 @@ sealed class LifecycleAgent
                     if (req.Params?["mcpServers"]?.AsArray().FirstOrDefault(s => (string?)s?["name"] == "gorynych")?["args"]?.AsArray() is { Count: > 0 } peerArgs)
                         lock (Tokens) Tokens[id] = (string)peerArgs[peerArgs.Count - 1]!;
                     if (BeforeNew is { } beforeNew) await beforeNew(id);
-                    await agent.Update(id, new AvailableCommandsUpdate { AvailableCommands = [] });
+                    await agent.Update(id, new AvailableCommandsUpdate { AvailableCommands = CommandsOnNew ?? [] });
                     return WithModes(AcpJson.ToNode(new NewSessionResponse { SessionId = id })!.AsObject(), id);
                 case AcpMethods.Agent.SessionList:
                     if (BeforeList is { } beforeList) await beforeList();
@@ -739,7 +739,9 @@ sealed class LifecycleAgent
                             Sessions = sessions.Select(s => new SessionInfo { SessionId = s, Cwd = ListCwd, Title = this.titles.GetValueOrDefault(s) }).ToList(),
                         });
                 case AcpMethods.Agent.SessionPrompt:
-                    var blocks = req.ParamsAs<PromptRequest>().Prompt.OfType<TextContent>().Select(t => t.Text).ToArray();
+                    // Text, and a link as the Claude adapter writes one.
+                    var blocks = req.ParamsAs<PromptRequest>().Prompt.Select(b => b switch { TextContent t => t.Text, ResourceLink l => $"@{l.Uri}", _ => null })
+                        .OfType<string>().ToArray();
                     // The blocks joined as the Claude adapter joins them; the title from the first, like Kimi's.
                     var text = string.Join("\n\n", blocks);
                     lock (Prompts) { Prompts.Add((sessionId!, text)); firstBlocks.TryAdd(sessionId!, blocks); }
@@ -785,8 +787,13 @@ sealed class LifecycleAgent
                 case AcpMethods.Agent.SessionLoad when LoadsWithoutIds:
                     foreach (var u in TurnsAfter(sessionId!, null).Turns.SelectMany(t => t.Updates)) await SendUpdateAsync(agent, sessionId!, u);
                     return WithModes([], sessionId!);
+                case AcpMethods.Agent.SessionSetConfigOption when OnSetConfig is { } onSetConfig && await onSetConfig((string)req.Params!["configId"]!, req.Params["value"]):
+                    return WithModes([], sessionId!);
                 case AcpMethods.Agent.SessionSetConfigOption when ReportsModes && Equals((string?)req.Params?["configId"], "mode"):
                     lock (Modes) Modes[sessionId!] = (string)req.Params!["value"]!;
+                    return WithModes([], sessionId!);
+                case AcpMethods.Agent.SessionSetConfigOption when ReportsModels && Equals((string?)req.Params?["configId"], "model"):
+                    lock (ModelsChosen) ModelsChosen[sessionId!] = (string)req.Params!["value"]!;
                     return WithModes([], sessionId!);
                 case AcpMethods.Agent.SessionClose:
                     return new JsonObject();
@@ -836,6 +843,12 @@ sealed class LifecycleAgent
     /// </summary>
     public bool ReportsModes { get; set; }
 
+    /// <summary>Reports a <c>model</c> config option (category model) too: <c>small</c> or <c>large</c>, kept per session in <see cref="ModelsChosen"/>.</summary>
+    public bool ReportsModels { get; set; }
+
+    /// <summary>Each session's model (<c>small</c> when absent).</summary>
+    public Dictionary<string, string> ModelsChosen { get; } = [];
+
     /// <summary>Advertises <c>gorynych/openElsewhere</c> and answers <c>_gorynych/open_elsewhere</c> from <see cref="OpenElsewhere"/>; set before the first use.</summary>
     public bool TellsOpenElsewhere { get; set; }
 
@@ -861,7 +874,24 @@ sealed class LifecycleAgent
         if (!ReportsModes) return response;
         string current;
         lock (Modes) current = Modes.GetValueOrDefault(sessionId, "ask");
-        response["configOptions"] = new JsonArray(AcpJson.ToNode<SessionConfigOption>(new SessionConfigSelect
+        var options = new JsonArray();
+        if (ReportsModels)
+        {
+            string model;
+            lock (ModelsChosen) model = ModelsChosen.GetValueOrDefault(sessionId, "small");
+            options.Add(AcpJson.ToNode<SessionConfigOption>(new SessionConfigSelect
+            {
+                Id = "model",
+                Name = "Model",
+                Category = SessionConfigOptionCategory.Model,
+                CurrentValue = model,
+                Options = new JsonArray(
+                    AcpJson.ToNode(new SessionConfigSelectOption { Value = "small", Name = "Small", Description = "Quick" }),
+                    AcpJson.ToNode(new SessionConfigSelectOption { Value = "large", Name = "Large" })),
+            }));
+        }
+        response["configOptions"] = options;
+        options.Add(AcpJson.ToNode<SessionConfigOption>(new SessionConfigSelect
         {
             Id = "mode",
             Name = "Permissions",
@@ -876,6 +906,12 @@ sealed class LifecycleAgent
 
     /// <summary>The <c>systemPrompt</c> param of every <c>session/new</c> and <c>session/resume</c>, in order.</summary>
     public List<(string Method, string SessionId, JsonNode? SystemPrompt)> SystemPrompts { get; } = [];
+
+    /// <summary>The commands it says of a new session, right after making it (none when null).</summary>
+    public List<AvailableCommand>? CommandsOnNew { get; set; }
+
+    /// <summary>Runs first on <c>session/set_config_option</c> (its option and value): may wait or throw; true answers it as is.</summary>
+    public Func<string, JsonNode?, Task<bool>>? OnSetConfig { get; set; }
 
     /// <summary>Chunks a prompt answers with instead of <see cref="Answer"/>, sent as given (so without a messageId unless they have one).</summary>
     public List<SessionUpdate>? AnswerUpdates { get; set; }

@@ -7,7 +7,7 @@ namespace Gorynych.Tests;
 
 /// <summary>The AHP face's mapping (docs/ahp-face.md, "Chats"): ACP updates in, AHP actions and the reduced chat state out.</summary>
 [TestClass]
-public sealed class AhpChatModelTests
+public sealed partial class AhpChatModelTests
 {
     static ChatModel Model(Func<DateTimeOffset>? now = null, bool live = true)
     {
