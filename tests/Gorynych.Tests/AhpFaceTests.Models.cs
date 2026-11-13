@@ -188,6 +188,8 @@ public sealed partial class AhpFaceTests
             });
             return Task.CompletedTask;
         };
+        // The face takes the answer once the window has subscribed to the chat, so the window sees the new offer come.
+        rig.Face.NewAnswered = () => Task.Delay(500);
         await using var vscode = await rig.ConnectAsync();
         var (_, chatUri, id) = await CreateAsync(rig, vscode, "kimi");
         Message? Draft() => vscode.Of<ChatDraftChangedAction>(chatUri).LastOrDefault()?.Draft;
