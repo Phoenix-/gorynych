@@ -30,7 +30,9 @@ internal static class ClaudeTitleGeneration
     public static async Task<string?> GenerateAsync(string exe, string dataDirectory, string input,
         string? model, TimeSpan timeout, int inputBytes, int maxChars, Action<string> log, CancellationToken ct)
     {
-        var folder = Path.Combine(dataDirectory, "title");
+        // Every helper gets its own scratch folder, so two sessions can be titled at once without
+        // sharing or half-writing settings.json, mcp.json or stderr.log.
+        var folder = Path.Combine(dataDirectory, "title", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(folder);
         var id = Guid.NewGuid().ToString();
         var settings = Path.Combine(folder, "settings.json");
@@ -81,9 +83,12 @@ internal static class ClaudeTitleGeneration
         }
         finally
         {
-            // A cancelled or timed-out helper is killed at once; one that already answered may close.
-            if (ct.IsCancellationRequested) claude.Kill();
+            // A one-shot helper has no work to keep: whatever it is doing after its answer (or its
+            // cancellation or timeout), it is stopped now, so no child outlives the title request.
+            if (!claude.Exited.IsCompleted) claude.Kill();
             await claude.StopAsync(TimeSpan.FromSeconds(2));
+            try { Directory.Delete(folder, recursive: true); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
         }
     }
 

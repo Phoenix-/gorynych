@@ -21,7 +21,9 @@ static class FakeTitle
         var prompt = args.LastOrDefault() ?? "";
         if (prompt.Contains("hold-title", StringComparison.OrdinalIgnoreCase))
         {
-            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-title")))
+            var current = Environment.CurrentDirectory;
+            var parent = Directory.GetParent(current)?.FullName ?? current;
+            while (!File.Exists(Path.Combine(current, "release-title")) && !File.Exists(Path.Combine(parent, "release-title")))
                 await Task.Delay(20);
         }
         if (prompt.Contains("timeout-title", StringComparison.OrdinalIgnoreCase))
