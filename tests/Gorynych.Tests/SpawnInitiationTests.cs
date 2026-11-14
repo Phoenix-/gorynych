@@ -11,7 +11,8 @@ namespace Gorynych.Tests;
 /// user asked for (<c>initiation: user_asked</c>) starts without the service's card when the
 /// caller's turn began with the user's own prompt and no question from another session is open in
 /// it; every other spawn is asked, and a <c>user_asked</c> one that is asked all the same tells the
-/// agent why. A child never takes its parent's full access.
+/// agent why. A child never inherits its parent's full access; an explicit native mode is applied
+/// before work, and full access from a restricted caller is approved with the spawn.
 /// </summary>
 [TestClass]
 public sealed class SpawnInitiationTests
@@ -42,10 +43,11 @@ public sealed class SpawnInitiationTests
             new PromptRequest { SessionId = sessionId, Prompt = [new TextContent { Text = text }] });
 
     /// <summary>What the peers MCP server sends for <c>spawn_session</c>.</summary>
-    static Task<JsonNode?> SpawnAsync(TestClient client, string token, string? initiation)
+    static Task<JsonNode?> SpawnAsync(TestClient client, string token, string? initiation, string? mode = null)
     {
         var args = new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token } };
         if (initiation is not null) args["initiation"] = initiation;
+        if (mode is not null) args["mode"] = mode;
         return client.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, args);
     }
 
@@ -335,6 +337,205 @@ public sealed class SpawnInitiationTests
     }
 
     // ---------------------------------------------------------------- the child's mode
+
+    [TestMethod]
+    [DataRow("user_asked", "ask", false, 0)]
+    [DataRow("user_asked", "full", false, 1)]
+    [DataRow("user_asked", "full", true, 0)]
+    [DataRow("proposal", "full", false, 1)]
+    [DataRow("proposal", "full", true, 1)]
+    public async Task ExplicitMode_IsAppliedBeforeWork_AndFullAccessIsConfirmedOnce(string initiation, string mode, bool parentFull, int approvals)
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false) { ReportsModes = true, HasChannel = true };
+        var kimi = new LifecycleAgent("kimi", canDelete: true) { ReportsModes = true };
+        await using var conductor = Conductor(claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
+        if (parentFull)
+            await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
+                new JsonObject { ["sessionId"] = parent, ["configId"] = "mode", ["value"] = "full" });
+        zed.Approve = request =>
+        {
+            Assert.AreEqual(0, kimi.Prompts.Count, "no work before approval");
+            Assert.AreEqual(mode, (string?)request.ToolCall.RawInput?["mode"]);
+            var card = zed.Snapshot().Last(u => (string?)u["toolCallId"] == request.ToolCall.ToolCallId && u["content"] is not null);
+            StringAssert.Contains((string?)card["content"]![0]!["content"]!["text"], "Permissions:");
+            return Start(request);
+        };
+        kimi.BeforePrompt = id =>
+        {
+            Assert.AreEqual(mode, kimi.Modes[id], "the first prompt sees the requested mode");
+            return Task.CompletedTask;
+        };
+        JsonNode? spawned = null;
+        claude.BeforePrompt = async id =>
+        {
+            if (id == parent) spawned = await SpawnAsync(zed, claude.Tokens[parent], initiation, mode);
+        };
+
+        await PromptAsync(zed, parent, "Start a Kimi coder");
+        await conductor.BackgroundTurnsIdleAsync();
+
+        var child = (string)spawned!["sessionId"]!;
+        Assert.AreEqual(approvals, SpawnCards(zed).Length);
+        CollectionAssert.AreEqual(new[] { AcpMethods.Agent.SessionSetConfigOption, AcpMethods.Agent.SessionPrompt },
+            kimi.CallsFor(child).Where(m => m != AcpMethods.Agent.SessionNew).ToArray());
+        Assert.AreEqual(mode == "full", Service.Conductor.IsFullAccess(conductor.Feed(child).State()));
+        if (initiation == "user_asked" && !parentFull && mode == "full")
+            StringAssert.Contains((string?)spawned["note"], "the child would have full access");
+    }
+
+    [TestMethod]
+    [DataRow(true, "missing")]
+    [DataRow(false, "full")]
+    public async Task UnsupportedMode_FailsWithChoices_AndDiscardsTheChild(bool reportsModes, string mode)
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true) { ReportsModes = reportsModes };
+        await using var conductor = Conductor(claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate");
+
+        var error = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => SpawnAsync(zed, claude.Tokens[parent], "proposal", mode));
+
+        StringAssert.Contains(error.Message, reportsModes ? "Available modes: ask, full" : "Available modes: none");
+        Assert.AreEqual(0, kimi.Prompts.Count);
+        Assert.AreEqual(0, zed.Approvals.Count);
+        CollectionAssert.Contains(kimi.CallsFor("kimi-1").ToArray(), AcpMethods.Agent.SessionDelete);
+    }
+
+    [TestMethod]
+    [DataRow(false, true)]
+    [DataRow(true, true)]
+    [DataRow(false, false)]
+    [DataRow(true, false)]
+    public async Task ExplicitMode_DeclinedOrCancelled_DisposesPreparedChildWithoutWork(bool cancelled, bool canDelete)
+    {
+        var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: canDelete) { ReportsModes = true };
+        await using var conductor = Conductor(claude.Adapter, kimi.Adapter);
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(zed, "claude", "Coordinate");
+        zed.Approve = _ => Task.FromResult<RequestPermissionOutcome>(cancelled
+            ? new RequestPermissionOutcomeCancelled() : new SelectedPermissionOutcome { OptionId = "decline" });
+
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => SpawnAsync(zed, claude.Tokens[parent], "proposal", "full"));
+
+        Assert.AreEqual(1, SpawnCards(zed).Length);
+        Assert.AreEqual(0, kimi.Prompts.Count);
+        if (canDelete) CollectionAssert.Contains(kimi.CallsFor("kimi-1").ToArray(), AcpMethods.Agent.SessionDelete);
+        var listed = await zed.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
+        Assert.IsFalse(listed.Sessions.Any(s => s.SessionId == "kimi-1"), "a durable child without native deletion stays hidden");
+    }
+
+    [TestMethod]
+    [DataRow("legacy")]
+    [DataRow("grouped")]
+    [DataRow("refused")]
+    [DataRow("ignored")]
+    [DataRow("missing-response")]
+    public async Task NativeModeProtocol_RequiresSuccessfulSwitchBeforePublishingOrPrompting(string behavior)
+    {
+        var switched = false;
+        var prompted = false;
+        var closed = false;
+        var legacy = behavior == "legacy";
+        JsonObject State()
+        {
+            if (legacy) return new JsonObject
+            {
+                ["modes"] = new JsonObject
+                {
+                    ["currentModeId"] = switched ? "trusted" : "ask",
+                    ["availableModes"] = new JsonArray(new JsonObject
+                    {
+                        ["id"] = "trusted", ["name"] = "Trusted", ["description"] = "Native full access",
+                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaFullAccess] = true },
+                    }),
+                },
+            };
+            return new JsonObject
+            {
+                ["configOptions"] = new JsonArray(new JsonObject
+                {
+                    ["id"] = "native-permissions", ["name"] = "Permissions", ["category"] = "mode", ["type"] = "select",
+                    ["currentValue"] = switched ? "trusted" : "ask",
+                    ["options"] = new JsonArray(new JsonObject
+                    {
+                        ["group"] = "native", ["name"] = "Native modes", ["options"] = new JsonArray(new JsonObject
+                        {
+                            ["value"] = "trusted", ["name"] = "Trusted", ["description"] = "Native full access",
+                            ["_meta"] = new JsonObject { [GorynychProtocol.MetaFullAccess] = true },
+                        }),
+                    }),
+                }),
+            };
+        }
+        JsonNode? Handle(JsonRpcRequest request)
+        {
+            switch (request.Method)
+            {
+                case AcpMethods.Agent.Initialize: return ScriptedAgent.Init(close: true);
+                case AcpMethods.Agent.SessionList: return AcpJson.ToNode(new ListSessionsResponse { Sessions = [] });
+                case AcpMethods.Agent.SessionNew:
+                    var state = State();
+                    state["sessionId"] = "native-child";
+                    return state;
+                case AcpMethods.Agent.SessionSetConfigOption:
+                case AcpMethods.Agent.SessionSetMode:
+                    Assert.AreEqual(legacy ? AcpMethods.Agent.SessionSetMode : AcpMethods.Agent.SessionSetConfigOption, request.Method);
+                    Assert.AreEqual("trusted", (string?)request.Params?[legacy ? "modeId" : "value"]);
+                    if (!legacy) Assert.AreEqual("native-permissions", (string?)request.Params?["configId"]);
+                    if (behavior == "refused") throw new JsonRpcException(JsonRpcException.InvalidRequest, "Cannot switch this session");
+                    switched = behavior != "ignored";
+                    return legacy || behavior == "missing-response" ? new JsonObject() : State();
+                case AcpMethods.Agent.SessionPrompt:
+                    Assert.IsTrue(switched);
+                    prompted = true;
+                    return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn });
+                case AcpMethods.Agent.SessionClose:
+                    closed = true;
+                    return new JsonObject();
+                default: throw new JsonRpcException(JsonRpcException.MethodNotFound, request.Method);
+            }
+        }
+        var parentAgent = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
+        var target = new ScriptedAdapter("native", (_, request, _) => Task.FromResult(Handle(request)));
+        await using var conductor = Conductor(parentAgent.Adapter, target);
+        await using var client = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(client, "claude", "Coordinate");
+        client.Approve = request =>
+        {
+            Assert.IsFalse(prompted);
+            var card = client.Snapshot().Last(u => (string?)u["toolCallId"] == request.ToolCall.ToolCallId && u["content"] is not null);
+            var text = (string?)card["content"]![0]!["content"]!["text"];
+            StringAssert.Contains(text, "Trusted (trusted)");
+            StringAssert.Contains(text, "outside this folder without approval");
+            return Start(request);
+        };
+        Task<JsonNode?> Spawn() => client.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, new JsonObject
+        {
+            ["agent"] = "native", ["prompt"] = "Build and test", ["mode"] = "trusted", ["report"] = false,
+            ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = parentAgent.Tokens[parent] },
+        });
+
+        if (behavior is "legacy" or "grouped")
+        {
+            await Spawn();
+            await conductor.BackgroundTurnsIdleAsync();
+            Assert.IsTrue(prompted);
+            Assert.IsTrue(Service.Conductor.IsFullAccess(conductor.Feed("native-child").State()));
+            Assert.AreEqual(1, client.Approvals.Count);
+        }
+        else
+        {
+            var error = await Assert.ThrowsExactlyAsync<JsonRpcException>(Spawn);
+            StringAssert.Contains(error.Message, behavior == "refused" ? "Cannot switch" : "did not confirm");
+            Assert.IsFalse(prompted);
+            Assert.IsTrue(closed, "an unused session is closed even when native deletion is unavailable");
+            Assert.AreEqual(0, client.Approvals.Count);
+        }
+    }
 
     [TestMethod]
     [DataRow("user_asked")]

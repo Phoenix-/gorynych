@@ -279,7 +279,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `status` (`open` when its agent has it loaded now, `saved` when not, the words of ACP's draft session-status RFD), `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")`, and `callerParent` the session that started it with `spawn_session`, when there is one. Without `includeArchived`, `hiddenArchived` counts the archived sessions left out (never the caller) |
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
-| `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, report?}` → `{sessionId}` | starts a child of the calling session after asking the person (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
+| `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, mode?, report?, initiation?}` → `{sessionId}` | starts a child of the calling session after asking the person where required (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
 | `_gorynych/set_title` | method, service → adapter, `{sessionId, title}` → `{}` | writes a session's native title; only for an adapter that advertises `gorynych/setTitle` (Codex), for a `spawn_session` name |
 | `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?, _meta}` → `{}` | tells a session's agent something that needs no answer (a child's report), with `gorynych/sender` and `gorynych/fromSessionId` in `_meta` for the user message the agent reports for it; the Claude adapter writes it into a running Claude (headless) or pushes it through the channel (TUI), an agent that answers method not found, or `-32600` because it is not running, gets it as a turn |
 | `_gorynych/mcp_message` | method, outside server → service, `{serverId, requestId, method, params}` → `{result}` or `{error}`; as a notification from the service, a notification of that request | an MCP request of `gorynych-outside`, in the shape of `mcp/message` from ACP's MCP-over-ACP RFD (see [`_gorynych/mcp_message`](#agents-outside-gorynych)) |
@@ -307,7 +307,7 @@ random per session and tells the service who is calling. Its tools:
   leaves out, and a last line says how many archived sessions it left out;
 - `ask_agent {session_id, question}` — starts a new question to one, by its exact
   `session_id`, and waits for the answer (`_gorynych/opinion`); archived sessions too;
-- `spawn_session {agent, prompt, cwd?, title?, report?, initiation?}` — starts a child session
+- `spawn_session {agent, prompt, cwd?, title?, mode?, report?, initiation?}` — starts a child session
   (`_gorynych/spawn`, see [Child sessions](#child-sessions)) and returns `{"session_id": …}`;
 - `archive_session {session_id}` and `restore_session {session_id}` — set or clear a
   session's archive flag (`_gorynych/archive`, see [Archive](#archive)), any session's, the
@@ -531,10 +531,33 @@ open and prompt any of them directly. ACP's subagents RFD hides a subagent from
 session that names its parent in `_meta["gorynych/parentSessionId"]`; a stock client shows
 it as one more session, a Gorynych GUI can draw the tree.
 
-The agent calls the peers server's `spawn_session {agent, prompt, cwd?, title?, report?,
+The agent calls the peers server's `spawn_session {agent, prompt, cwd?, title?, mode?, report?,
 initiation?}`, which sends `_gorynych/spawn` with its peer token. `initiation` says who wants
 the session: `user_asked` only when the user, in this turn, explicitly asked the agent to start
-it; otherwise `proposal`, the default. The service then
+it; otherwise `proposal`, the default.
+
+`mode` is an optional, non-empty native permission mode ID of the target adapter. It is never
+inherited or translated from the caller. For example, a DSH coder can request `full-access`;
+its default `read-only` permits approved file edits but no builds or tests. The tool schema
+describes the built-in adapters' modes; an unsupported value fails with the available IDs.
+Omitting `mode` keeps the agent's own defaults and the creation flow below.
+
+With an explicit `mode`, the service first prepares an unpublished draft with `session/new`,
+reads its native choices (a select config option of category `mode`, including grouped values,
+or legacy `modes`), and applies the choice through `session/set_config_option` using its actual
+config ID, or `session/set_mode`. The config-option response must confirm the selected value;
+legacy set-mode success is the protocol's acknowledgement. No prompt runs before this succeeds.
+The confirmation decision below is then made against that resulting state. Full access, as
+marked by the adapter's `gorynych/fullAccess`, requires confirmation when the caller does not
+have full access, even for `user_asked`. A caller already in full access needs no additional
+permission confirmation; the normal spawn rules still apply. One `Start` approves both the
+spawn and its selected permissions. The card shows the native mode's name, ID and description,
+and explicitly says when commands and writes outside the folder run without approval.
+On refusal, cancellation, unsupported mode or switch failure the prepared child is closed and
+deleted when supported, otherwise hidden, without running its task. Only after confirmation
+and verification that the caller still exists is the child published and prompted, as below.
+
+Without an explicit mode, the service
 
 1. decides whether to ask the person. A `user_asked` spawn starts unasked when the calling
    session's turn began with a client's `session/prompt` (the user's own, from the GUI) and no
@@ -551,7 +574,7 @@ it; otherwise `proposal`, the default. The service then
    another agent's text may have put it there; a `user_asked` spawn that is asked all the same
    is not an error;
 2. to ask, shows the spawn in the calling session as a `tool_call` (kind `other`, the prompt and
-   the folder as content, and for a `user_asked` spawn `The agent says you asked for this;
+   the folder and permissions (`Agent defaults` when mode is omitted) as content, and for a `user_asked` spawn `The agent says you asked for this;
    Gorynych asks you all the same, as <why>.`) and asks the person with
    `session/request_permission` on that session: `Start` (`allow_once`) or `Don't start`
    (`reject_once`), never "always". Without a client attached the question waits for one, like
@@ -562,7 +585,7 @@ it; otherwise `proposal`, the default. The service then
    folder is the caller's unless `cwd` names another; a relative path is taken from the
    caller's), with the peers server like any session and no mode: the child starts in its
    agent's default mode (Claude's `--permission-mode` default, DSH's `read-only`, the user's own
-   Codex defaults), never in the caller's full access;
+   Codex defaults), without inheriting the caller's full access;
 4. takes the session's turn, records the caller as its parent, journals a
    `session_info_update` with the parent in `_meta` (and the title, if given), and only then
    lists the session (`added`, with its parent) and returns `{sessionId}`, with `note` when a
@@ -580,8 +603,9 @@ it; otherwise `proposal`, the default. The service then
    when nothing was started.
 
 `<why>` is one of `this turn answers another session's question`, `this turn did not start
-with a prompt from the user` and `another session's text (a question or a report) came into
-this turn, or the turn did not start with a prompt from the user`.
+with a prompt from the user`, `another session's text (a question or a report) came into
+this turn, or the turn did not start with a prompt from the user`, and for an explicit full-access
+mode `the child would have full access and this session does not`.
 
 What follows the task in the child's first prompt:
 

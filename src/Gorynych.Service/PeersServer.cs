@@ -314,6 +314,7 @@ public static class PeersServer
                     };
                     if (args?["cwd"] is JsonValue cwd && cwd.TryGetValue<string>(out var folder) && folder.Length > 0) spawn["cwd"] = folder;
                     if (args?["title"] is JsonValue title && title.TryGetValue<string>(out var name) && name.Length > 0) spawn["title"] = name;
+                    if (args is JsonObject supplied && supplied.ContainsKey("mode")) spawn["mode"] = supplied["mode"]?.DeepClone();
                     if (args?["report"] is JsonValue report && report.TryGetValue<bool>(out var reports)) spawn["report"] = reports;
                     if (args?["initiation"] is JsonValue initiation && initiation.TryGetValue<string>(out var how) && how.Length > 0) spawn["initiation"] = how;
                     var started = await RequestAsync(route!, GorynychProtocol.MethodSpawn, spawn, ct);
@@ -509,6 +510,7 @@ public static class PeersServer
                     ["prompt"] = new JsonObject { ["type"] = "string", ["description"] = "the first prompt: the task, with the context the agent needs" },
                     ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "the folder to work in; default: this session's folder; a relative path is taken from it" },
                     ["title"] = new JsonObject { ["type"] = "string", ["description"] = "a short name for the session in the user's list" },
+                    ["mode"] = new JsonObject { ["type"] = "string", ["description"] = "the target agent's native permission mode, applied and checked before the first prompt; omitted: its own defaults, never inherited. DSH: read-only (file edits ask; no builds/tests) or full-access (commands and writes anywhere, no approvals). Codex: read-only, auto, auto-review or full-access. Claude: default, acceptEdits, plan, auto (when supported) or bypassPermissions. Unsupported values fail with the available modes. Full access from a caller without it requires confirmation even with user_asked" },
                     ["report"] = new JsonObject { ["type"] = "boolean", ["description"] = "report each finished turn of the child to this session; default true" },
                     ["initiation"] = new JsonObject
                     {

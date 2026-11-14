@@ -2481,7 +2481,7 @@ public sealed class Conductor : IAsyncDisposable
     /// the calling session, unless the user asked for the session themselves (below); then creates a
     /// session in the chosen agent with the caller as its parent and starts its first prompt in the
     /// background. Returns the new session's ID at once. A spawned session is never a draft; it
-    /// starts in its agent's default mode, whatever the caller's.
+    /// starts in the requested native mode, or its agent's default, whatever the caller's.
     /// </summary>
     internal async Task<JsonNode?> SpawnAsync(JsonRpcRequest request, CancellationToken ct)
     {
@@ -2496,6 +2496,12 @@ public sealed class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.InvalidParams,
                 (agentName is null ? "agent is required." : $"No agent \"{agentName}\".") + $" Pass one of: {string.Join(", ", agents.Keys)}.");
         var title = ((string?)request.Params?["title"])?.Trim() is { Length: > 0 } named ? Shorten(named) : null;
+        string? mode = null;
+        if (request.Params is JsonObject spawnParams && spawnParams.ContainsKey("mode"))
+        {
+            if (spawnParams["mode"] is not JsonValue modeValue || !modeValue.TryGetValue<string>(out mode) || string.IsNullOrWhiteSpace(mode))
+                throw new JsonRpcException(JsonRpcException.InvalidParams, "mode must be a non-empty native permission mode ID, or omitted for the agent's defaults.");
+        }
         var report = request.Params?["report"] is not JsonValue flag || !flag.TryGetValue<bool>(out var r) || r;
         var initiation = (string?)request.Params?["initiation"] ?? Proposal;
         if (initiation is not (UserAsked or Proposal))
@@ -2509,49 +2515,68 @@ public sealed class Conductor : IAsyncDisposable
         var askedAnyway = initiation == UserAsked ? WhyAskedAnyway(parentUse.Feed) : null;
         var asks = initiation == Proposal || askedAnyway is not null;
         string? callId = null;
-        if (asks)
+        var cardEnded = false;
+        async Task EndCardAsync(ToolCallStatus status, string text)
         {
+            if (callId is null || cardEnded) return;
+            cardEnded = true;
+            await EndSpawnCardAsync(parentUse.Feed, parent, callId, status, text);
+        }
+        async Task ConfirmAsync(JsonObject? childState)
+        {
+            if (parentUse.Feed.Retired || store.Get(parent.SessionId) is not { Deleted: false })
+                throw new JsonRpcException(JsonRpcException.InvalidRequest, "The calling session was deleted, so the session was not started.");
+            askedAnyway = initiation == UserAsked ? WhyAskedAnyway(parentUse.Feed) : null;
+            asks = initiation == Proposal || askedAnyway is not null;
+            if (childState is not null && IsFullAccess(childState) && !InFullAccess(parentId))
+            {
+                asks = true;
+                if (initiation == UserAsked) askedAnyway ??= "the child would have full access and this session does not";
+            }
+            if (!asks) return;
             callId = "gorynych-spawn-" + Interlocked.Increment(ref spawnCount);
             var what = $"Start a {host.DisplayName} session" + (title is null ? "" : $": {title}");
             var why = askedAnyway is null ? null : $"The agent says you asked for this; Gorynych asks you all the same, as {askedAnyway}.";
             RequestPermissionOutcome outcome;
             try
             {
-                outcome = await AskToSpawnAsync(parentUse.Feed, parent, callId, what, host, cwd, prompt, title, why, ct);
+                outcome = await AskToSpawnAsync(parentUse.Feed, parent, callId, what, host, cwd, prompt, title, mode, childState, why, ct);
             }
             catch (Exception e) when (e is OperationCanceledException or JsonRpcException)
             {
                 // Withdrawn (the agent's tool call was cancelled, its peers server went away) or the caller was deleted.
-                await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed,
+                await EndCardAsync(ToolCallStatus.Failed,
                     e is OperationCanceledException ? "Not started: the request was withdrawn." : $"Not started: {e.Message}");
                 throw;
             }
             if (outcome is RequestPermissionOutcomeCancelled)
             {
                 // The client cancelled the caller's turn (session/cancel), which answers its pending approvals so.
-                await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, "Not started: the turn was cancelled.");
+                await EndCardAsync(ToolCallStatus.Failed, "Not started: the turn was cancelled.");
                 throw new JsonRpcException(JsonRpcException.RequestCancelled, "The turn was cancelled, so the session was not started.");
             }
             if (outcome is not SelectedPermissionOutcome { OptionId: "start" })
             {
-                await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, "Not started: the user declined.");
+                await EndCardAsync(ToolCallStatus.Failed, "Not started: the user declined.");
                 throw new JsonRpcException(JsonRpcException.InvalidRequest, "The user declined to start the session." + AskedAnywayNote(askedAnyway));
             }
         }
+        if (mode is null) await ConfirmAsync(null);
         // The caller may have been deleted while the person decided.
         if (parentUse.Feed.Retired || store.Get(parent.SessionId) is not { Deleted: false })
             throw new JsonRpcException(JsonRpcException.InvalidRequest, "The calling session was deleted, so the session was not started.");
         string childId;
         try
         {
-            childId = await CreateChildAsync(parent, host, cwd, prompt, title, report, approved: asks, ct);
+            childId = await CreateChildAsync(parent, host, cwd, prompt, title, report, mode,
+                mode is null ? null : ConfirmAsync, () => asks, ct);
         }
         catch (Exception e)
         {
-            if (callId is not null) await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Failed, $"Not started: {e.Message}");
+            await EndCardAsync(ToolCallStatus.Failed, $"Not started: {e.Message}");
             throw;
         }
-        if (callId is not null) await EndSpawnCardAsync(parentUse.Feed, parent, callId, ToolCallStatus.Completed, $"Started {host.DisplayName} session {childId}.");
+        await EndCardAsync(ToolCallStatus.Completed, $"Started {host.DisplayName} session {childId}.");
         ServiceLog.Info($"{parent.Agent} {parent.SessionId}: spawned {host.Name} session {childId} in {cwd}" + (asks ? "" : ", as the user asked"));
         var result = new JsonObject { ["sessionId"] = childId };
         if (askedAnyway is not null) result["note"] = AskedAnywayNote(askedAnyway).TrimStart();
@@ -2575,6 +2600,60 @@ public sealed class Conductor : IAsyncDisposable
     static string AskedAnywayNote(string? why) =>
         why is null ? "" : $" The user was asked although you passed initiation user_asked, as {why}.";
 
+    /// <summary>Native permission choices, using ACP config options or its legacy modes surface.</summary>
+    static IEnumerable<(string? ConfigId, JsonObject Value)> ChildModes(JsonObject state)
+    {
+        var configs = (state["configOptions"] as JsonArray ?? []).OfType<JsonObject>()
+            .Where(o => (string?)o["category"] == "mode" && (string?)o["type"] == "select").ToArray();
+        if (configs.Length > 0)
+        {
+            foreach (var config in configs)
+                foreach (var option in (config["options"] as JsonArray ?? []).OfType<JsonObject>())
+                    foreach (var value in option["options"] is JsonArray group ? group.OfType<JsonObject>() : [option])
+                        yield return ((string?)config["id"], value);
+        }
+        else
+            foreach (var mode in (state["modes"]?["availableModes"] as JsonArray ?? []).OfType<JsonObject>())
+                yield return (null, mode);
+    }
+
+    static string NativeModeId(JsonObject value) => (string?)value["value"] ?? (string?)value["id"] ?? "";
+
+    static string ModeDescription(JsonObject state, string mode)
+    {
+        var value = ChildModes(state).First(m => NativeModeId(m.Value) == mode).Value;
+        return $"{(string?)value["name"] ?? mode} ({mode})" +
+            ((string?)value["description"] is { Length: > 0 } description ? $" — {description}" : "") +
+            (IsFullAccess(state) ? ". The child can run commands and write files outside this folder without approval." : "");
+    }
+
+    static async Task SetChildModeAsync(JsonRpcConnection rpc, string id, SessionFeed feed, string mode, CancellationToken ct)
+    {
+        var choices = ChildModes(feed.State()).ToArray();
+        var matches = choices.Where(m => NativeModeId(m.Value) == mode).ToArray();
+        if (matches.Length != 1)
+            throw new JsonRpcException(JsonRpcException.InvalidParams,
+                $"No unambiguous permission mode \"{mode}\". Available modes: " +
+                (choices.Length == 0 ? "none" : string.Join(", ", choices.Select(m => NativeModeId(m.Value)))) + ".");
+        var chosen = matches[0];
+        if (chosen.ConfigId is { } configId)
+        {
+            var response = await rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
+                new JsonObject { ["sessionId"] = id, ["configId"] = configId, ["value"] = mode }, ct);
+            feed.CaptureState(response);
+            if (!(response?["configOptions"] as JsonArray ?? []).OfType<JsonObject>()
+                .Any(o => (string?)o["id"] == configId && (string?)o["currentValue"] == mode))
+                throw new JsonRpcException(JsonRpcException.InvalidRequest, $"The agent did not confirm permission mode \"{mode}\"; the child was not started.");
+        }
+        else
+        {
+            await rpc.SendRequestAsync(AcpMethods.Agent.SessionSetMode,
+                new JsonObject { ["sessionId"] = id, ["modeId"] = mode }, ct);
+            // Legacy ACP set_mode acknowledges success without returning session state.
+            feed.SetCurrent("modes", "currentModeId", JsonValue.Create(mode));
+        }
+    }
+
     /// <summary>The spawned session's folder: the caller's by default; a relative path is taken from the caller's.</summary>
     static string ResolveFolder(string parentCwd, string? cwd)
     {
@@ -2594,11 +2673,13 @@ public sealed class Conductor : IAsyncDisposable
     /// always: every spawn is asked). Waits for a client if none is attached.
     /// </summary>
     Task<RequestPermissionOutcome> AskToSpawnAsync(SessionFeed feed, SessionRecord parent, string callId, string what, AgentHost host, string cwd,
-        string prompt, string? title, string? why, CancellationToken ct)
+        string prompt, string? title, string? mode, JsonObject? childState, string? why, CancellationToken ct)
     {
         var input = new JsonObject { ["agent"] = host.Name, ["cwd"] = cwd, ["prompt"] = prompt };
         if (title is not null) input["title"] = title;
-        return AskPersonAsync(feed, parent, callId, what, input, $"{prompt}\n\nFolder: {cwd}" + (why is null ? "" : $"\n\n{why}"),
+        if (mode is not null) input["mode"] = mode;
+        var permissions = mode is null ? "Agent defaults" : ModeDescription(childState!, mode);
+        return AskPersonAsync(feed, parent, callId, what, input, $"{prompt}\n\nFolder: {cwd}\nPermissions: {permissions}" + (why is null ? "" : $"\n\n{why}"),
             new PermissionOption { OptionId = "start", Name = "Start", Kind = PermissionOptionKind.AllowOnce },
             new PermissionOption { OptionId = "decline", Name = "Don't start", Kind = PermissionOptionKind.RejectOnce }, ct);
     }
@@ -2721,13 +2802,14 @@ public sealed class Conductor : IAsyncDisposable
     /// follows the notice runs after the spawn's. A child that fails before that is closed and
     /// deleted again, as is one whose spawn is withdrawn while its agent creates it.
     /// </summary>
-    async Task<string> CreateChildAsync(SessionRecord parent, AgentHost host, string cwd, string prompt, string? title, bool report, bool approved,
+    async Task<string> CreateChildAsync(SessionRecord parent, AgentHost host, string cwd, string prompt, string? title, bool report, string? mode,
+        Func<JsonObject?, Task>? confirm, Func<bool> approved,
         CancellationToken ct)
     {
         var rpc = await host.OpenTargetAsync(null, ct);
         var token = NewToken();
         // Not cancelled with the spawn: the agent may create the session anyway, and only its answer names it.
-        // No mode is passed: the child starts in its agent's default, never in the caller's full access.
+        // Session setup uses the agent's defaults. An explicit mode is applied before publishing or prompting it.
         var creating = await rpc.StartRequestAsync(AcpMethods.Agent.SessionNew,
             AcpJson.ToNode(new NewSessionRequest { Cwd = cwd, McpServers = WithPeers([], token), SystemPrompt = SystemPromptFor(host) }),
             CancellationToken.None);
@@ -2778,6 +2860,13 @@ public sealed class Conductor : IAsyncDisposable
                 rec.Title = title;
                 rec.TitleSource = SpawnTitle;
             });
+            if (mode is not null)
+            {
+                await SetChildModeAsync(rpc, id, feed, mode, ct);
+                await confirm!(feed.State());
+                if (store.Get(parent.SessionId) is not { Deleted: false })
+                    throw new JsonRpcException(JsonRpcException.InvalidRequest, "The calling session was deleted, so the session was not started.");
+            }
             ct.ThrowIfCancellationRequested();
             var info = new JsonObject
             {
@@ -2800,7 +2889,8 @@ public sealed class Conductor : IAsyncDisposable
             await AbandonChildAsync(host, rpc, id, cwd);
             throw;
         }
-        Track(Task.Run(() => SpawnedTurnAsync(feed, record, parent, prompt, approved)));
+        var wasApproved = approved();
+        Track(Task.Run(() => SpawnedTurnAsync(feed, record, parent, prompt, wasApproved)));
         return id;
     }
 
@@ -2843,7 +2933,9 @@ public sealed class Conductor : IAsyncDisposable
         {
             ServiceLog.Warn($"{host.Name}: the unused child {id} could not be deleted, hiding it: {e.Message}");
         }
-        Forget(Feed(id), record, tombstone: !gone && host.CanDelete);
+        // DSH persists session/new before any prompt and cannot delete it: keep it hidden on
+        // subsequent native lists too. Claude/Codex advertise when unused drafts are not durable.
+        Forget(Feed(id), record, tombstone: host.CanDelete ? !gone : !host.DraftsNotDurable);
         ServiceLog.Info($"{host.Name}: dropped the child {id}, which was never started");
     }
 
