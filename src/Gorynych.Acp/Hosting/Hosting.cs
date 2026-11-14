@@ -145,6 +145,11 @@ public static class GorynychProtocol
     /// <see cref="MethodSessionsChanged"/>. (Also in the result's own <c>_meta</c>, deprecated.)
     /// </summary>
     public const string MetaSessionsChanged = "gorynych/sessionsChanged";
+    /// <summary>Version 1 live aggregate session activity extension and snapshot key.</summary>
+    public const string MetaSessionState = "gorynych/sessionState";
+    public const string MethodSessionState = "_gorynych/session_state";
+    /// <summary>Adapter's authoritative foreground state, never inferred from a pending permission.</summary>
+    public const string MetaForegroundState = "gorynych/foregroundState";
 
     /// <summary>
     /// In <c>agentCapabilities._meta</c> of the <c>initialize</c> result: the service keeps an archive

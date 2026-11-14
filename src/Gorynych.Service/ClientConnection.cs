@@ -197,6 +197,7 @@ internal sealed class ClientConnection
     {
         var flags = DeprecatedFlags();
         flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
+        flags[GorynychProtocol.MetaSessionState] = 1;
         return flags;
     }
 

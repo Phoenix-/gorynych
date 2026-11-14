@@ -2195,3 +2195,9 @@ written slows no update down, however long a failed write took. A session remove
 recreated by a late write, and an activity stamp never creates a record: an update an agent
 sends before its `session/new` answer must not list the session ahead of time. The list of
 commands is no activity and stamps nothing.
+
+## Live session activity
+
+The service reports aggregate running, waiting, and idle state through the optional
+[ACP v1 session activity extension](session-activity.md), including work started by
+other clients or the service and activity in sessions a client has not opened.

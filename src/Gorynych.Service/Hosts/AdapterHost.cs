@@ -95,6 +95,7 @@ public sealed class AdapterHost
     readonly Dictionary<string, Asked> asked = new(StringComparer.Ordinal);
     readonly HashSet<string> live = new(StringComparer.Ordinal);
     readonly Dictionary<string, SessionConfiguration> configurations = new(StringComparer.Ordinal);
+    readonly Dictionary<string, JsonObject> activities = new(StringComparer.Ordinal);
     readonly Queue<Kept> buffer = new();
     long bufferedBytes;
     readonly Dictionary<string, long> dropped = new(StringComparer.Ordinal); // per session, the newest update the buffer let go
@@ -253,6 +254,7 @@ public sealed class AdapterHost
             case AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete when request.SessionId is { } closed:
                 live.Remove(closed);
                 configurations.Remove(closed);
+                activities.Remove(closed);
                 break;
         }
     }
@@ -367,7 +369,20 @@ public sealed class AdapterHost
         var sessionId = Text(@params?["sessionId"]);
         if (Text(message["method"]) == AcpMethods.Client.SessionUpdate && sessionId is not null
             && live.Contains(sessionId) && @params?["update"] is JsonObject update)
+        {
             Configuration(sessionId).Apply(update);
+            if (update["_meta"] is JsonObject activityMeta)
+            {
+                var foreground = Text(activityMeta[GorynychProtocol.MetaForegroundState]);
+                var turn = Text(activityMeta[GorynychProtocol.MetaAgentTurn]);
+                if (foreground is "running" or "idle" or "requires_action" || turn is "started" or "ended")
+                {
+                    if (!activities.TryGetValue(sessionId, out var activity)) activities[sessionId] = activity = [];
+                    if (foreground is "running" or "idle" or "requires_action") activity["foreground"] = foreground;
+                    if (turn is "started" or "ended") activity["agentTurn"] = turn == "started";
+                }
+            }
+        }
         var number = ++seq;
         var carrier = Text(message["method"]) == AcpMethods.Client.SessionUpdate ? @params?["update"] as JsonObject : @params;
         var kept = carrier is not null && sessionId is not null;
@@ -481,7 +496,8 @@ public sealed class AdapterHost
         TimeSpan alone;
         lock (state)
         {
-            busy = forwarded.Values.Any(f => f.Method == AcpMethods.Agent.SessionPrompt) || asked.Count > 0;
+            busy = forwarded.Values.Any(f => f.Method == AcpMethods.Agent.SessionPrompt) || asked.Count > 0
+                || activities.Values.Any(ActivityRunning);
             alone = Stopwatch.GetElapsedTime(aloneSince);
         }
         if (alone < (busy ? options.OrphanBusy : options.OrphanIdle)) return false;
@@ -632,6 +648,13 @@ public sealed class AdapterHost
         await WriteToAgentAsync(message);
     }
 
+    // Live snapshots survive eviction from the bounded notification replay buffer.
+    JsonObject SessionActivities() => new(live.Where(activities.ContainsKey)
+        .Select(id => new KeyValuePair<string, JsonNode?>(id, activities[id].DeepClone())));
+
+    static bool ActivityRunning(JsonObject activity) => (bool?)activity["agentTurn"] == true
+        || Text(activity["foreground"]) is "running" or "requires_action";
+
     internal JsonObject Report()
     {
         lock (state)
@@ -639,6 +662,7 @@ public sealed class AdapterHost
             {
                 ["sessions"] = new JsonArray(live.Select(s => (JsonNode)s).ToArray()),
                 ["sessionStates"] = SessionConfigurations(),
+                ["sessionActivities"] = SessionActivities(),
                 ["turns"] = new JsonArray(forwarded.Where(f => f.Value.Method == AcpMethods.Agent.SessionPrompt && f.Value.SessionId is not null)
                     .Select(f => (JsonNode)new JsonObject { ["sessionId"] = f.Value.SessionId, ["turn"] = f.Key, ["promptId"] = f.Value.PromptId }).ToArray()),
                 // The questions the agent is answering, by turn or by its own way in: the next conductor waits for their answers.
@@ -676,7 +700,7 @@ public sealed class AdapterHost
             // A current snapshot after history: a replayed old option update must not replace a
             // newer value returned by set_config_option while no conductor was connected.
             JsonObject snapshot;
-            lock (state) snapshot = new JsonObject { ["sessionStates"] = SessionConfigurations() };
+            lock (state) snapshot = new JsonObject { ["sessionStates"] = SessionConfigurations(), ["sessionActivities"] = SessionActivities() };
             if (!await TryWriteAsync(connection, Notification(GorynychProtocol.MethodHostState, snapshot)))
                 throw new IOException("the connection went");
             current = connection;

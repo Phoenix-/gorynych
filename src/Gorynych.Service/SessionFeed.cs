@@ -11,6 +11,23 @@ namespace Gorynych.Service;
 /// </summary>
 internal sealed class SessionFeed(string sessionId, SessionJournal journal)
 {
+    public SessionActivity Activity { get; init; } = new("standalone");
+    int nativeActivity;
+    readonly Lock nativeActivityGate = new();
+    public void BeginNativeActivity()
+    {
+        lock (nativeActivityGate)
+            if (Interlocked.Exchange(ref nativeActivity, 1) == 0) EnterUse();
+    }
+    public bool EndNativeActivity()
+    {
+        lock (nativeActivityGate)
+        {
+            if (Interlocked.Exchange(ref nativeActivity, 0) == 0) return false;
+            ExitUse();
+            return true;
+        }
+    }
     readonly SemaphoreSlim gate = new(1, 1);
     readonly Lock clientsGate = new();
     readonly List<ClientConnection> clients = [];
@@ -189,24 +206,37 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public DateTimeOffset? LastTurnEnded => Interlocked.Read(ref lastTurnEnded) is var ticks and > 0 ? new DateTimeOffset(ticks, TimeSpan.Zero) : null;
 
     int agentTurn;
+    readonly Lock agentActivityGate = new();
 
     /// <summary>
     /// Marks the start of a turn the agent runs that the service did not start; false when one was
     /// already marked, so a turn counts as one operation (<see cref="EnterUse"/>) however often
     /// its start is marked.
     /// </summary>
-    public bool BeginAgentTurn() => Interlocked.Exchange(ref agentTurn, 1) == 0;
+    public bool BeginAgentTurn()
+    {
+        lock (agentActivityGate)
+        {
+            if (Interlocked.Exchange(ref agentTurn, 1) != 0) return false;
+            Activity.Begin();
+            return true;
+        }
+    }
 
     /// <summary>Marks the end of the agent's own turn; false when none was marked.</summary>
     public bool EndAgentTurn()
     {
-        if (Interlocked.Exchange(ref agentTurn, 0) != 1) return false;
-        Quieted();
-        return true;
+        lock (agentActivityGate)
+        {
+            if (Interlocked.Exchange(ref agentTurn, 0) != 1) return false;
+            Activity.End();
+            Quieted();
+            return true;
+        }
     }
 
     /// <summary>A turn of the agent's own runs (<see cref="BeginAgentTurn"/>).</summary>
-    public bool AgentTurnRunning => Volatile.Read(ref agentTurn) != 0;
+    public bool AgentTurnRunning => Volatile.Read(ref agentTurn) != 0 || Volatile.Read(ref nativeActivity) != 0;
 
     /// <summary>Why a session is read-only, in words for a person, and who holds it, if another app does.</summary>
     public sealed record ReadOnlyState(string Reason, string? OpenElsewhere);
@@ -859,12 +889,14 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// </summary>
     public long BeginPrompt(string? promptId)
     {
+        long key;
         lock (clientsGate)
         {
-            var key = ++promptCount;
+            key = ++promptCount;
             prompts[key] = (promptId, false);
-            return key;
         }
+        Activity.Begin();
+        return key;
     }
 
     /// <summary>The prompt went to its agent: in a host, it runs on whatever happens to this service.</summary>
@@ -882,7 +914,9 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
 
     public void EndPrompt(long key)
     {
-        lock (clientsGate) prompts.Remove(key);
+        bool removed;
+        lock (clientsGate) removed = prompts.Remove(key);
+        if (removed) Activity.End();
     }
 
     /// <summary>The IDs of the client prompts in progress that reached their agent (<see cref="Handed"/>).</summary>
@@ -1022,7 +1056,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         {
             lock (clientsGate)
                 if (prompts.Count > 0) return true;
-            return TurnGate.CurrentCount == 0 || Volatile.Read(ref agentTurn) != 0;
+            return TurnGate.CurrentCount == 0 || AgentTurnRunning;
         }
     }
 

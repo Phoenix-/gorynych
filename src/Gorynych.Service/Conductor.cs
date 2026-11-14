@@ -138,6 +138,19 @@ public sealed class Conductor : IAsyncDisposable
     readonly string journalDirectory;
     readonly ConcurrentDictionary<string, SessionFeed> feeds = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<ClientConnection, byte> clients = new();
+    readonly string activityEpoch = Guid.NewGuid().ToString("N");
+
+    void ActivityChanged(string sessionId, JsonObject snapshot)
+    {
+        if (removed.ContainsKey(sessionId) || store.Get(sessionId) is not { } record) return;
+        foreach (var client in clients.Keys)
+        {
+            if (client.Init is null || (client.AgentScope is { } scope && scope != record.Agent)) continue;
+            var notification = snapshot.DeepClone().AsObject();
+            notification["sessionId"] = sessionId;
+            client.Notify(GorynychProtocol.MethodSessionState, notification);
+        }
+    }
     readonly CancellationTokenSource shutdown = new();
     readonly ConcurrentDictionary<string, string> peerTokens = new(StringComparer.Ordinal);   // token -> session
     readonly ConcurrentDictionary<string, string> sessionTokens = new(StringComparer.Ordinal); // session -> token
@@ -967,6 +980,7 @@ public sealed class Conductor : IAsyncDisposable
         if (!removed.ContainsKey(sessionId))
             return feeds.GetOrAdd(sessionId, id => new SessionFeed(id, new SessionJournal(JournalPath(id), options.JournalMaxEntries))
             {
+                Activity = new SessionActivity(activityEpoch, snapshot => ActivityChanged(id, snapshot)),
                 LastClientLeft = () => IdleFromNow(id),
                 KeptHostSeen = store.Get(id)?.HostSeen,
             });
@@ -1000,6 +1014,15 @@ public sealed class Conductor : IAsyncDisposable
                 foreach (var (id, configuration) in states)
                     if (!removed.ContainsKey(id) && store.Get(id) is { } record && record.Agent == host.Name)
                         Feed(id).CaptureState(configuration);
+            if (@params?["sessionActivities"] is JsonObject activities)
+                foreach (var (id, activity) in activities)
+                    if (!removed.ContainsKey(id) && store.Get(id) is { } record && record.Agent == host.Name && activity is JsonObject snapshot)
+                    {
+                        var restoredFeed = Feed(id);
+                        if ((string?)snapshot["foreground"] is { } foreground) NativeActivity(restoredFeed, foreground);
+                        if (snapshot["agentTurn"] is JsonValue value && value.TryGetValue<bool>(out var active))
+                            AgentTurn(restoredFeed, new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaAgentTurn] = active ? "started" : "ended" } });
+                    }
             return;
         }
         if (method == GorynychProtocol.MethodSessionsChanged)
@@ -1025,6 +1048,12 @@ public sealed class Conductor : IAsyncDisposable
             if (@params!["update"] is not JsonObject update) return;
             // From a host: taken once, though a host that comes back sends what it kept again.
             if (update["_meta"]?[GorynychProtocol.MetaHostSeq] is JsonValue s && s.TryGetValue<string>(out var hostSeq) && !feed.TakeFromHost(hostSeq)) return;
+            // Activity snapshots are live observations, never conversation history.
+            if ((string?)update["_meta"]?[GorynychProtocol.MetaForegroundState] is { } foreground)
+            {
+                NativeActivity(feed, foreground);
+                return;
+            }
             // Whether the session can be prompted now: its state, not its history, so it is not journaled.
             if (TextOf(update["sessionUpdate"]) == "session_info_update" && update["_meta"] is JsonObject said && said.ContainsKey(GorynychProtocol.MetaInteractivity))
             {
@@ -1058,6 +1087,14 @@ public sealed class Conductor : IAsyncDisposable
         }
         foreach (var c in feed.Clients())
             await feed.SendAsync(c, method, @params!.DeepClone());
+    }
+
+    void NativeActivity(SessionFeed feed, string foreground)
+    {
+        // Hold before publishing running: idle unload must not race the observation.
+        if (foreground is "running" or "requires_action") feed.BeginNativeActivity();
+        feed.Activity.Report(foreground);
+        if (foreground == "idle" && feed.EndNativeActivity()) IdleFromNow(feed.SessionId);
     }
 
     /// <summary>
@@ -1098,6 +1135,11 @@ public sealed class Conductor : IAsyncDisposable
             if (store.Get(feed.SessionId)?.Agent != host.Name) continue;
             // The adapter in this process runs all its sessions; a host, those open in it.
             var its = link.HostId is null || open.Contains(feed.SessionId);
+            if (its)
+            {
+                feed.Activity.Report("idle");
+                feed.EndNativeActivity();
+            }
             if (its && feed.EndAgentTurn())
             {
                 feed.TurnEnded();
@@ -1320,6 +1362,7 @@ public sealed class Conductor : IAsyncDisposable
             else PutInteractivity(meta, state);
         }
         meta[GorynychProtocol.MetaAgent] = r.Agent;
+        meta[GorynychProtocol.MetaSessionState] = Feed(r.SessionId).Activity.Snapshot();
         if (r.ParentSessionId is not null) meta[GorynychProtocol.MetaParentSessionId] = r.ParentSessionId;
         if (r.Archived) meta[GorynychProtocol.MetaArchived] = true;
         if (r.AhpUri is not null) meta[GorynychProtocol.MetaAhpUri] = r.AhpUri;
@@ -1392,6 +1435,7 @@ public sealed class Conductor : IAsyncDisposable
         response.Meta ??= [];
         response.Meta[GorynychProtocol.MetaAgent] = host.Name;
         if (ahpUri is not null) response.Meta[GorynychProtocol.MetaAhpUri] = ahpUri;
+        response.Meta[GorynychProtocol.MetaSessionState] = feed.Activity.Snapshot();
         ServiceLog.Info($"{host.Name}: new session {response.SessionId} in {request.Cwd}");
         return response;
     }
@@ -1874,6 +1918,12 @@ public sealed class Conductor : IAsyncDisposable
         var (_, opened) = await EnsureLiveAsync(use.Record, ct);
         var position = await use.Feed.ResumeAndAttachAsync(client, after);
         await NoticeOnOpenAsync(use.Feed, client);
+        // The bridge consumes resume responses when reconnecting its service pipe while
+        // keeping Zed's stdio alive. Send a live snapshot even without a transition so
+        // the client learns the new conductor epoch and its current state.
+        var activity = use.Feed.Activity.Snapshot();
+        activity["sessionId"] = request.SessionId;
+        client.Notify(GorynychProtocol.MethodSessionState, activity);
         // An already open session gets the state the agent last reported, so every client sees its switches.
         return WithLinkState(opened ?? use.Feed.State(), use.Feed, position);
     }
@@ -1903,6 +1953,7 @@ public sealed class Conductor : IAsyncDisposable
         var meta = result["_meta"] as JsonObject ?? [];
         meta[GorynychProtocol.MetaPosition] = SessionJournal.FormatPosition(position);
         meta[GorynychProtocol.MetaTurn] = feed.TurnRunning ? "running" : "idle";
+        meta[GorynychProtocol.MetaSessionState] = feed.Activity.Snapshot();
         meta[GorynychProtocol.MetaPrompts] = new JsonArray(feed.PromptsInProgress().Select(p => (JsonNode)p).ToArray());
         // Whether the client may prompt it, said in full: a client that showed it read-only before learns it is not.
         PutInteractivity(meta, feed.ReadOnly);
@@ -3171,6 +3222,7 @@ public sealed class Conductor : IAsyncDisposable
             await AbandonNewSessionAsync(host, rpc, id, cwd);
             throw;
         }
+        feed.Activity.Begin();
         var wasApproved = approved();
         Track(Task.Run(() => SpawnedTurnAsync(feed, record, parent, prompt, wasApproved)));
         return (id, EffectiveModelConfig(feed.State()));
@@ -3291,6 +3343,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         finally
         {
+            feed.Activity.End();
             feed.TurnEnded();
             feed.TurnGate.Release();
         }
@@ -3514,6 +3567,7 @@ public sealed class Conductor : IAsyncDisposable
     {
         var feed = use.Feed;
         await feed.TurnGate.WaitAsync(cleanupStop.Token);
+        feed.Activity.Begin();
         try
         {
             if (feed.Retired) return;
@@ -3571,6 +3625,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         finally
         {
+            feed.Activity.End();
             feed.TurnEnded();
             feed.TurnGate.Release();
         }
@@ -4224,6 +4279,7 @@ public sealed class Conductor : IAsyncDisposable
             }
             Task turnDone;
             string? askedPromptId = null; // once its message is out
+            feed.Activity.Begin();
             try
             {
                 if (feed.Retired) throw NotFound(record.SessionId);
@@ -4280,6 +4336,7 @@ public sealed class Conductor : IAsyncDisposable
                     {
                         pending.TurnText = feed.EndOpinionTurn();
                         pending.TurnError = t.Exception?.InnerException;
+                        feed.Activity.End();
                         feed.TurnEnded();
                         feed.TurnGate.Release();
                         use.Dispose(); // the turn may end after the answer: the session's idle time starts only now
@@ -4290,6 +4347,7 @@ public sealed class Conductor : IAsyncDisposable
             }
             catch (Exception e) when (!turnStarted)
             {
+                feed.Activity.End();
                 // Its message is out but the prompt never reached the agent: its turn ends too.
                 if (askedPromptId is not null) await MarkPromptEndAsync(feed, askedPromptId, null, e);
                 feed.EndOpinionTurn();

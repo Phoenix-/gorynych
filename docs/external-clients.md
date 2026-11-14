@@ -428,3 +428,9 @@ Code (an entry in `~/.kimi-code/mcp.json`), and how to undo each, are in
   because progress does not extend it.
 - To try it without changing any configuration, give the server to one run of Claude with
   `--mcp-config` (a file with `{"mcpServers": {"gorynych-outside": {"type": "stdio", "command": "<path to Gorynych.Outside.exe>"}}}`).
+
+## Live session activity
+
+The service reports aggregate running, waiting, and idle state through the optional
+[ACP v1 session activity extension](session-activity.md), including work started by
+other clients or the service and activity in sessions a client has not opened.

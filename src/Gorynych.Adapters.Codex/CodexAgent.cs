@@ -1762,6 +1762,15 @@ sealed class CodexAgent : IAsyncDisposable
             {
                 // Codex unloaded the thread: a turn still running ends, as no turn/completed comes for it.
                 var n = From(p, ctx.ThreadStatusChangedNotification);
+                var state = n.Status switch
+                {
+                    ActiveThreadStatus active when active.ActiveFlags.Any(f => f == ThreadActiveFlag.WaitingOnApproval || f == ThreadActiveFlag.WaitingOnUserInput) => "requires_action",
+                    ActiveThreadStatus => "running",
+                    IdleThreadStatus or NotLoadedThreadStatus or SystemErrorThreadStatus => "idle",
+                    _ => null,
+                };
+                if (state is not null)
+                    await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = state } });
                 if (n.Status is not NotLoadedThreadStatus) break;
                 if (unloading.TryGetValue(n.ThreadId, out var closing)) closing.TrySetResult();
                 if (Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "status notLoaded");
@@ -1770,6 +1779,7 @@ sealed class CodexAgent : IAsyncDisposable
             case CodexMethods.Notification.ThreadClosed:
             {
                 var n = From(p, ctx.ThreadClosedNotification);
+                await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = "idle" } });
                 if (unloading.TryGetValue(n.ThreadId, out var closing)) closing.TrySetResult();
                 if (Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "thread/closed");
                 break;
