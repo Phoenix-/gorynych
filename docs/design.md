@@ -426,7 +426,10 @@ parent with its final message, unless the spawn said `report: false`. A spawn is
 the agent says the user asked for it (`initiation: user_asked`) and the turn began with the
 user's own prompt, with no other session's text (a question, a report) come into it; the answer
 is never "always".
-The child starts in its agent's default mode, never in its parent's full access. Details:
+The child starts in its agent's default mode unless `spawn_session` supplies an explicit
+native `mode`; it never inherits the parent's mode. A requested mode is applied and checked
+before the first prompt. Full access from a caller without it requires confirmation even for
+`user_asked`, combined with the spawn in one card. Details:
 [service-protocol.md](service-protocol.md#child-sessions).
 
 When the scheme settles, the parent link is a candidate for its own ACP RFD (**planned**).

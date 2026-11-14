@@ -38,16 +38,28 @@ public sealed class PeersTests
         {
             AcpMethods.Agent.Initialize => ScriptedAgent.Init(),
             // The first is the session asked for opinions; later ones are spawned.
-            AcpMethods.Agent.SessionNew => AcpJson.ToNode(new NewSessionResponse
+            AcpMethods.Agent.SessionNew => WithMode(AcpJson.ToNode(new NewSessionResponse
             {
                 SessionId = Interlocked.Increment(ref created) == 1 ? "answering" : $"child-{created}",
-            }),
+            })!.AsObject(), "ask"),
+            AcpMethods.Agent.SessionSetConfigOption => WithMode(new JsonObject(), (string)req.Params!["value"]!),
             AcpMethods.Agent.SessionList => AcpJson.ToNode(new ListSessionsResponse { Sessions = [] }),
             AcpMethods.Agent.SessionPrompt => AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn }),
             GorynychProtocol.MethodOpinion => RecordOpinion(opinions, req),
             _ => throw new JsonRpcException(JsonRpcException.MethodNotFound, req.Method),
         }));
         return (asker, answerer, servers, opinions);
+
+        static JsonObject WithMode(JsonObject response, string current)
+        {
+            response["configOptions"] = new JsonArray(new JsonObject
+            {
+                ["id"] = "permission-mode", ["category"] = "mode", ["type"] = "select", ["name"] = "Permissions",
+                ["currentValue"] = current,
+                ["options"] = new JsonArray(new JsonObject { ["value"] = "ask", ["name"] = "Ask" }),
+            });
+            return response;
+        }
 
         static JsonNode? Record(List<JsonObject> into, JsonRpcRequest req, JsonNode? result)
         {
@@ -260,7 +272,7 @@ public sealed class PeersTests
             var spawned = await mcp.SendRequestAsync("tools/call", new JsonObject
             {
                 ["name"] = "spawn_session",
-                ["arguments"] = new JsonObject { ["agent"] = "answerer", ["prompt"] = "Write the tests", ["title"] = "Tests" },
+                ["arguments"] = new JsonObject { ["agent"] = "answerer", ["prompt"] = "Write the tests", ["title"] = "Tests", ["mode"] = "ask" },
             });
             var text = (string)spawned!["content"]![0]!["text"]!;
             Assert.IsFalse((bool)spawned["isError"]!, text);
@@ -268,6 +280,19 @@ public sealed class PeersTests
             var approval = client.Approvals.Single();
             Assert.AreEqual("asking", approval.SessionId, "asked on the calling session");
             StringAssert.Contains(approval.ToolCall.Title, "Tests");
+            Assert.AreEqual("ask", (string?)approval.ToolCall.RawInput?["mode"], "MCP forwards the native mode");
+            Assert.AreEqual("ask", (string?)conductor.Feed("child-2").State()["configOptions"]![0]!["currentValue"]);
+
+            foreach (var invalidMode in new JsonNode?[] { null, JsonValue.Create(42), JsonValue.Create("") })
+            {
+                var invalid = await mcp.SendRequestAsync("tools/call", new JsonObject
+                {
+                    ["name"] = "spawn_session",
+                    ["arguments"] = new JsonObject { ["agent"] = "answerer", ["prompt"] = "Write the tests", ["mode"] = invalidMode },
+                });
+                Assert.IsTrue((bool)invalid!["isError"]!, "an invalid mode must not silently use defaults");
+                StringAssert.Contains((string?)invalid["content"]![0]!["text"], "mode must be a non-empty");
+            }
 
             // Archive and restore, and list_agents with and without the archived ones.
             async Task<JsonNode> Call(string tool, JsonObject arguments)

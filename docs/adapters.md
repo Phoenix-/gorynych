@@ -961,6 +961,11 @@ with Codex's IDs and names, so a client draws one selector for both:
 - `full-access` ("Full access"): DSH asks nothing at all
   ([Full access](#full-access)). An explicit choice per session.
 
+`spawn_session` can select either mode with its `mode` argument before the child's first
+prompt. A coder that must build or test needs `full-access`; without `mode`, a child keeps
+the `read-only` default. The service combines the spawn and permission confirmation into one
+card when required ([Child sessions](service-protocol.md#child-sessions)).
+
 DSH has no auto mode that is safe on Windows: its `workspace-write` sandbox edits the
 repository's ACL. DSH 0.2.2 cannot switch a session's sandbox over ACP either: its config options
 are the model and the effort, and its `/permission` command has no ACP surface. So:
