@@ -80,7 +80,7 @@ public sealed class DshAdapter(DshAdapterOptions options) : IAgentAdapter
         var router = new DshRouter(options, link.AgentEnd, main, mode => StartLaneAsync(mode, CancellationToken.None), modes, pins);
         router.Start();
         // DSH titles itself natively; ACP carries no titles, so the cache is followed read only.
-        var titles = new DshTitleWatcher(pins, router.PublishTitleAsync, options.TitlePollInterval, options.Log);
+        var titles = new DshTitleWatcher(pins, router.KnownTitleSessions, router.PublishTitleAsync, options.TitlePollInterval, options.Log);
         titles.Start();
         _ = router.Completion.ContinueWith(_ => titles.StopAsync(), TaskScheduler.Default);
         var (input, output) = link.ClientEnd;

@@ -840,6 +840,11 @@ internal sealed class DshRouter
         return true;
     }
 
+    internal string[] KnownTitleSessions()
+    {
+        lock (gate) return known.ToArray();
+    }
+
     readonly Lock announcedTitleGate = new();
     readonly Dictionary<string, string> announcedTitles = new(StringComparer.Ordinal);
 

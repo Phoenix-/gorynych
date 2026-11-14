@@ -1149,6 +1149,106 @@ public sealed class CodexAdapterTests
 
     // ---------------------------------------------------------------- generated titles
 
+    [TestMethod]
+    public async Task Review_LateHelperCreation_IsDetachedAfterDeadline()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { HoldHelperThreadStart = release };
+        var (agent, acp) = await DirectAsync(fake, options: new CodexAdapterOptions
+        {
+            Launch = fake.StartAsync,
+            TitleTimeout = TimeSpan.FromMilliseconds(100),
+            TurnEndWait = TimeSpan.FromMilliseconds(200),
+            FindHolders = _ => new Dictionary<string, string>(),
+            LocksDirectory = Path.Combine(Path.GetTempPath(), "gorynych-no-codex-locks"),
+        });
+        await using var ownedAgent = agent;
+        await using var ownedClient = acp;
+        var id = await NewDirectAsync(acp);
+        try
+        {
+            await GenerateAsync(acp, id, "Fix the flaky login test");
+            await Until(() => fake.All("thread/start").Length == 2, "the held helper creation");
+            await Task.Delay(300);
+            release.TrySetResult();
+            await Until(() => fake.Methods().Contains("thread/unsubscribe"), "the late helper's cleanup");
+            Assert.AreEqual(0, fake.All("turn/start").Length, "No title turn starts after the deadline.");
+            Assert.IsNull(fake.Threads[id].Name);
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [TestMethod]
+    [DataRow("{}")]
+    [DataRow("{\"title\":null}")]
+    [DataRow("{\"title\":42}")]
+    [DataRow("{broken")]
+    [DataRow("I cannot do that task")]
+    public void Review_InvalidStructuredTitle_LeavesTheFallback(string output)
+    {
+        Assert.IsNull(CodexTitleGeneration.Normalize(output, 60));
+    }
+
+    [TestMethod]
+    public async Task Review_NativeRenameDuringGeneration_IsPreserved()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { HoldHelperTurn = release };
+        var (agent, acp) = await DirectAsync(fake);
+        await using var ownedAgent = agent;
+        await using var ownedClient = acp;
+        var id = await NewDirectAsync(acp);
+        var observed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        acp.NotificationHandler = (_, p) =>
+        {
+            if ((string?)p?["update"]?["title"] == "Native manual title") observed.TrySetResult();
+            return Task.CompletedTask;
+        };
+        try
+        {
+            await GenerateAsync(acp, id, "Fix the flaky login test");
+            await Until(() => fake.HelperThreadIds.Count > 0, "the held title turn");
+            fake.Threads[id].Name = "Native manual title";
+            await fake.Rpc!.SendNotificationAsync("thread/name/updated", new JsonObject
+            {
+                ["threadId"] = id, ["threadName"] = "Native manual title",
+            });
+            await observed.Task.WaitAsync(Wait);
+            release.TrySetResult();
+            await Until(() => fake.Methods().Contains("thread/unsubscribe"), "the title cleanup");
+            Assert.AreEqual("Native manual title", fake.Threads[id].Name,
+                "A native name received while the helper ran must supersede the generated result.");
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [TestMethod]
+    public async Task Review_TitleDeadlineIncludesTurnStart()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { HoldTurnStart = release };
+        var (agent, acp) = await DirectAsync(fake, options: new CodexAdapterOptions
+        {
+            Launch = fake.StartAsync,
+            TitleTimeout = TimeSpan.FromMilliseconds(100),
+            TurnEndWait = TimeSpan.FromMilliseconds(200),
+            FindHolders = _ => new Dictionary<string, string>(),
+            LocksDirectory = Path.Combine(Path.GetTempPath(), "gorynych-no-codex-locks"),
+        });
+        await using var ownedAgent = agent;
+        await using var ownedClient = acp;
+        var id = await NewDirectAsync(acp);
+        try
+        {
+            await GenerateAsync(acp, id, "Fix the flaky login test");
+            await Until(() => fake.Methods().Contains("turn/start"), "the held turn/start");
+            await Task.Delay(500);
+            Assert.IsTrue(fake.Methods().Contains("thread/unsubscribe"),
+                "The title deadline must detach the helper even when turn/start never answers.");
+        }
+        finally { release.TrySetResult(); }
+    }
+
     static Task<JsonNode?> GenerateAsync(JsonRpcConnection acp, string sessionId, string text, string title = "Fix the flaky login test") =>
         acp.SendRequestAsync(GorynychProtocol.MethodGenerateTitle, new JsonObject
         {

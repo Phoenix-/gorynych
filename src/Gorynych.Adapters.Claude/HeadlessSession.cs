@@ -41,6 +41,8 @@ internal sealed class HeadlessSession : IClaudeSession
 
     readonly SemaphoreSlim titleGate = new(1, 1);
     CancellationTokenSource? titleJob;
+    Task? titleTask;
+    readonly TaskCompletionSource<bool> titleReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     bool manualTitle;
 
     // Under stateGate.
@@ -479,9 +481,10 @@ internal sealed class HeadlessSession : IClaudeSession
             if (manualTitle || disposed) return Task.CompletedTask;
             var before = titleJob;
             var job = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            job.CancelAfter(options.TitleTimeout);
             titleJob = job;
             try { before?.Cancel(); } catch (ObjectDisposedException) { }
-            _ = Task.Run(() => GenerateTitleCoreAsync(job, input, provisional));
+            titleTask = Task.Run(() => GenerateTitleCoreAsync(job, input, provisional));
         }
         return Task.CompletedTask;
     }
@@ -490,6 +493,9 @@ internal sealed class HeadlessSession : IClaudeSession
     {
         try
         {
+            // The service can ask before the first prompt starts. Never spend a model call
+            // until the normal launch has passed its trust, subscription and permission checks.
+            if (!await titleReady.Task.WaitAsync(job.Token)) return;
             await titleGate.WaitAsync(job.Token);
             try
             {
@@ -503,8 +509,14 @@ internal sealed class HeadlessSession : IClaudeSession
                     return;
                 }
                 var model = Settings.Model ?? options.Model;
-                var title = await ClaudeTitleGeneration.GenerateAsync(exe, options.DataDirectory, input, model,
-                    options.TitleTimeout, options.TitleInputBytes, options.TitleMaxChars, agent.Log, job.Token);
+                await agent.TitleGenerationGate.WaitAsync(job.Token);
+                string? title;
+                try
+                {
+                    title = await ClaudeTitleGeneration.GenerateAsync(exe, options.DataDirectory, input, model,
+                        options.TitleTimeout, options.TitleInputBytes, options.TitleMaxChars, agent.Log, job.Token);
+                }
+                finally { agent.TitleGenerationGate.Release(); }
                 if (title is null || job.IsCancellationRequested || IsNotCurrentTitleJob(job) || ManualTitle || transcript is { Title: { Length: > 0 } })
                     return;
                 if (!await WriteTitleAsync(title, job.Token)) return;
@@ -584,10 +596,12 @@ internal sealed class HeadlessSession : IClaudeSession
                 string? title;
                 lock (stateGate) { title = pendingTitle; pendingTitle = null; }
                 if (title is not null) await RenameAsync(claude, title, ct);
+                titleReady.TrySetResult(true);
                 return claude;
             }
             catch
             {
+                titleReady.TrySetResult(false);
                 // Nothing runs that was not checked: a launch that failed, timed out or was cancelled is stopped.
                 lock (stateGate) if (ReferenceEquals(process, claude)) process = null;
                 await claude.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
@@ -1017,6 +1031,11 @@ internal sealed class HeadlessSession : IClaudeSession
             disposed = true;
             lock (stateGate) turn?.TryComplete(StopReason.Cancelled);
             lifetime.Cancel();
+            Task? finishingTitle;
+            lock (stateGate) finishingTitle = titleTask;
+            if (finishingTitle is not null)
+                try { await finishingTitle.WaitAsync(TimeSpan.FromSeconds(5)); }
+                catch (TimeoutException) { agent.Log($"claude {Id}: title helper cleanup did not finish before close"); }
             if (transcript is not null) await transcript.DisposeAsync();
             ClaudeProcess? running;
             lock (stateGate) running = process;

@@ -334,7 +334,10 @@ session still has only its provisional first-prompt title. The adapter runs an i
 folder with `--safe-mode` (no user hooks, skills, plugins or project settings; the login still
 works), `--no-session-persistence`,
 `--permission-prompts none` and `--json-schema` for `{title}`. The first task is the only input,
-cut at 2 KB; the answer is cut at 60 characters and the process is bounded by 30 s. Nothing of
+cut at 2 KB; the answer is cut at 60 characters. One helper runs at a time per adapter, and the
+30 s deadline includes waiting for that slot and for the normal session launch to pass its trust,
+subscription and permission checks. A failed launch starts no title model call. Closing the session
+waits for helper cleanup. Nothing of
 the helper appears in the session, journal, activity, approval cards or session list. The result
 is written with the existing `rename_session` control request as Claude's own `custom-title`; a
 manual rename cancels an in-flight helper, and the transcript watcher still follows a title
@@ -347,9 +350,6 @@ former writes a name through `_gorynych/set_title` (`rename_session`), the latte
 the next launch when Claude is not running). The transcript is still followed, so a title written
 elsewhere reaches the client.
 
-
-launch when Claude is not running). The transcript is still followed, so a title written
-elsewhere reaches the client.
 
 #### Folder trust
 
@@ -1188,7 +1188,8 @@ the adapter reads the `title` row of DSH's projection cache
 (`storages/session_projcache/sessions/<id>.json`, format 7, read only) and:
 
 - adds it to `session/list`, so an unloaded session and a restarted adapter show it;
-- scans the cache folder every 2 s (one bounded loop, stopped with the adapter) for writes after a
+- reads the cache records of sessions seen by this adapter every 2 s (one loop, stopped with the
+  adapter), without scanning the user's entire cache, for writes after a
   turn, atomic replacements, a folder that appears late and a cache that is missing or stale;
 - sends a standard `session_info_update` when the title changes, which the service propagates as
   its own title change. A record of another format, a missing title or an unreadable file is left

@@ -126,6 +126,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     readonly ClaudeTrust trust;
     readonly ClaudeCatalogStore catalogStore;
     readonly CancellationTokenSource lifetime = new();
+    internal SemaphoreSlim TitleGenerationGate { get; } = new(1, 1);
     Task? fetching;
     readonly ConcurrentDictionary<string, Lazy<Task>> trustQuestions = new(StringComparer.OrdinalIgnoreCase);
     readonly Lock consentGate = new();

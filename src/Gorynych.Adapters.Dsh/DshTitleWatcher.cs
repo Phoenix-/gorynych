@@ -1,5 +1,3 @@
-using System.Text.Json.Nodes;
-
 namespace Gorynych.Adapters.Dsh;
 
 /// <summary>
@@ -10,10 +8,9 @@ namespace Gorynych.Adapters.Dsh;
 /// cache folder that appears late, and sees the atomic replacement DSH writes without ever touching
 /// the cache itself. One bounded loop, stopped with the adapter.
 /// </summary>
-internal sealed class DshTitleWatcher(DshPins pins, Func<string, string, Task<bool>> onTitle, TimeSpan interval, Action<string>? log)
+internal sealed class DshTitleWatcher(DshPins pins, Func<string[]> sessionIds, Func<string, string, Task<bool>> onTitle, TimeSpan interval, Action<string>? log)
 {
     readonly CancellationTokenSource stop = new();
-    readonly Dictionary<string, string> announced = new(StringComparer.Ordinal);
     Task? loop;
     int stopped;
 
@@ -52,38 +49,17 @@ internal sealed class DshTitleWatcher(DshPins pins, Func<string, string, Task<bo
 
     async Task ScanAsync(CancellationToken ct)
     {
-        if (pins.CacheDirectory is not { } directory || !Directory.Exists(directory)) return;
-        string[] files;
-        try
-        {
-            files = Directory.GetFiles(directory, "*.json");
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            log?.Invoke($"dsh: the projection cache could not be listed: {e.Message}");
-            return;
-        }
-        foreach (var file in files)
+        // Follow only sessions the router has seen. The user's cache can contain years of
+        // unrelated sessions; reading that entire directory every two seconds is unbounded.
+        foreach (var id in sessionIds())
         {
             ct.ThrowIfCancellationRequested();
-            var id = Path.GetFileNameWithoutExtension(file);
-            if (id.Length == 0) continue;
-            string? title;
-            try
-            {
-                title = DshPins.TitleOf(JsonNode.Parse(File.ReadAllText(file)));
-            }
-            catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.Text.Json.JsonException or InvalidOperationException)
-            {
-                // A record being replaced, or one of another format: the next scan tries again.
-                continue;
-            }
+            var title = pins.ReadTitle(id);
             if (title is not { Length: > 0 }) continue;
-            lock (announced) if (announced.GetValueOrDefault(id) == title) continue;
             try
             {
-                if (!await onTitle(id, title).WaitAsync(ct)) continue; // not this adapter's session (yet): try again next scan
-                lock (announced) announced[id] = title;
+                // The router owns deduplication, including titles returned by session/list.
+                await onTitle(id, title).WaitAsync(ct);
             }
             catch (OperationCanceledException)
             {

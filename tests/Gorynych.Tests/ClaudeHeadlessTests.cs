@@ -310,6 +310,27 @@ public sealed partial class ClaudeHeadlessTests
         Assert.IsNotNull(TitleLaunch(token), "the isolated title request started");
     }
 
+    [TestMethod]
+    public async Task Review_AnOffPlanSession_DoesNotStartATitleModelCall()
+    {
+        var dir = TestDirs.New();
+        File.WriteAllText(Path.Combine(dir, "auth-token"), "");
+        var token = "off-plan-title-" + Guid.NewGuid().ToString("N");
+        var (agent, acp, _) = await DirectTitleAsync(dir);
+        await using var ownedAgent = agent;
+        await using var ownedClient = acp;
+        var id = (await acp.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+            new NewSessionRequest { Cwd = dir, McpServers = [] })).SessionId;
+        await acp.SendRequestAsync(GorynychProtocol.MethodGenerateTitle, new JsonObject
+        {
+            ["sessionId"] = id, ["input"] = token, ["title"] = "Fallback",
+        });
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => acp.RequestAsync<PromptRequest, PromptResponse>(
+            AcpMethods.Agent.SessionPrompt, new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = token }] }));
+        await Task.Delay(200);
+        Assert.IsNull(TitleLaunch(token), "Title generation must respect the main session's subscription guard.");
+    }
+
     static async Task<(AgentInstance Agent, JsonRpcConnection Acp, List<JsonObject> Updates)> DirectTitleAsync(string dir, List<string>? log = null, TimeSpan? timeout = null)
     {
         var options = Options(dir, log, autoTitle: true);

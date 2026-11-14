@@ -405,6 +405,10 @@ sealed class CodexAgent : IAsyncDisposable
     /// <summary>One generated title at a time: the requests are bounded by their own timeout.</summary>
     readonly SemaphoreSlim titleGate = new(1, 1);
 
+    // A timed-out thread/start can still return a new thread. Keep its response so the thread
+    // can be detached, and allow at most one such outstanding creation on this connection.
+    readonly SemaphoreSlim titleStartGate = new(1, 1);
+
     /// <summary>A generated title's isolated thread and turn, and what the adapter waits for.</summary>
     sealed class TitleJob(string sessionId, CodexThread thread, CancellationTokenSource stop)
     {
@@ -1296,6 +1300,7 @@ sealed class CodexAgent : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Codex has not loaded session {id}; it cannot be titled.");
         if (t.ManualTitle) return new JsonObject();
         var stop = new CancellationTokenSource();
+        stop.CancelAfter(options.TitleTimeout);
         var job = new TitleJob(id, t, stop);
         t.ReplaceTitleJob(stop);
         _ = Task.Run(() => GenerateTitleAsync(job, input, provisional, cwd is { Length: > 0 } ? cwd : t.Cwd));
@@ -1331,8 +1336,7 @@ sealed class CodexAgent : IAsyncDisposable
                 ThreadStartResponse started;
                 try
                 {
-                    started = From(await app.SendRequestAsync(CodexMethods.Client.ThreadStart, ToNode(start, CodexJsonContext.Default.ThreadStartParams),
-                        job.Stop.Token), CodexJsonContext.Default.ThreadStartResponse);
+                    started = await StartTitleHelperAsync(start, job.Stop.Token);
                 }
                 catch (Exception e) when (e is not OperationCanceledException)
                 {
@@ -1396,6 +1400,14 @@ sealed class CodexAgent : IAsyncDisposable
                 titleGate.Release();
             }
         }
+        catch (OperationCanceledException) when (job.Stop.IsCancellationRequested)
+        {
+            Log($"codex {job.SessionId}: title generation cancelled or its deadline elapsed");
+        }
+        catch (Exception e)
+        {
+            Log($"codex {job.SessionId}: title generation failed: {e.Message}");
+        }
         finally
         {
             if (job.TurnId is { } turnId && !job.TurnEnded) await InterruptAsync(job.HelperThreadId ?? "", turnId);
@@ -1407,6 +1419,42 @@ sealed class CodexAgent : IAsyncDisposable
             t.EndTitleJob(job.Stop);
             job.Stop.Dispose();
         }
+    }
+
+    async Task<ThreadStartResponse> StartTitleHelperAsync(ThreadStartParams start, CancellationToken ct)
+    {
+        await titleStartGate.WaitAsync(ct);
+        var release = true;
+        try
+        {
+            // Do not cancel away the response carrying the helper ID: app-server may already
+            // have created it. On timeout its eventual response belongs to cleanup instead.
+            var response = app.SendRequestAsync(CodexMethods.Client.ThreadStart,
+                ToNode(start, CodexJsonContext.Default.ThreadStartParams));
+            try
+            {
+                return From(await response.WaitAsync(ct), CodexJsonContext.Default.ThreadStartResponse);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                release = false;
+                _ = DiscardLateTitleHelperAsync(response);
+                throw;
+            }
+        }
+        finally { if (release) titleStartGate.Release(); }
+    }
+
+    async Task DiscardLateTitleHelperAsync(Task<JsonNode?> response)
+    {
+        try
+        {
+            var started = From(await response, CodexJsonContext.Default.ThreadStartResponse);
+            helperThreadIds[started.Thread.Id] = 0;
+            await UnsubscribeHelperAsync(started.Thread.Id);
+        }
+        catch (Exception e) { Log($"codex: late title thread cleanup: {e.Message}"); }
+        finally { titleStartGate.Release(); }
     }
 
     /// <summary>The config/read for this folder, with every effective MCP server explicitly disabled; null fails closed.</summary>
@@ -1486,6 +1534,9 @@ sealed class CodexAgent : IAsyncDisposable
         {
             switch (method)
             {
+                case CodexMethods.Notification.TurnStarted:
+                    job.Started(From(p, CodexJsonContext.Default.TurnStartedNotification).Turn.Id);
+                    break;
                 case CodexMethods.Notification.ItemCompleted:
                 {
                     var n = From(p, CodexJsonContext.Default.ItemCompletedNotification);
@@ -1686,11 +1737,16 @@ sealed class CodexAgent : IAsyncDisposable
             {
                 var n = From(p, ctx.ThreadNameUpdatedNotification);
                 if (!string.IsNullOrEmpty(n.ThreadName))
+                {
+                    // Native names are authoritative too, including a rename made outside our
+                    // _gorynych/set_title path while the isolated request was still running.
+                    Thread(n.ThreadId)?.CancelTitleJob(manual: true);
                     await Update(n.ThreadId, new SessionInfoUpdate
                     {
                         Title = n.ThreadName,
                         UpdatedAt = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture),
                     });
+                }
                 break;
             }
             case CodexMethods.Notification.ThreadSettingsUpdated:

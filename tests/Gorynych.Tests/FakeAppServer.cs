@@ -113,6 +113,8 @@ sealed class FakeAppServer
 
     /// <summary><c>account/rateLimits/read</c> fails as the backend may.</summary>
     public bool FailAccountRateLimits { get; set; }
+    public TaskCompletionSource? HoldHelperThreadStart { get; set; }
+
     /// <summary>The title an isolated structured turn returns.</summary>
     public string HelperTitle { get; set; } = "Generated title";
 
@@ -199,6 +201,8 @@ sealed class FakeAppServer
         lock (calls) calls.Add((request.Method, (JsonObject)p.DeepClone()));
         if (request.Method == "turn/start" && HoldTurnStart is { } hold) await hold.Task;
         if (request.Method == "account/rateLimits/read" && HoldAccountRateLimits is { } usage) await usage.Task;
+        if (request.Method == "thread/start" && (bool?)p["ephemeral"] == true && HoldHelperThreadStart is { } start)
+            await start.Task;
         return await AnswerAsync(request.Method, p);
     }
 

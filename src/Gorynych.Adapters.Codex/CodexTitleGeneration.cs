@@ -94,23 +94,19 @@ internal static class CodexTitleGeneration
     public static string? Normalize(string? response, int maxChars)
     {
         if (response is null) return null;
-        var text = response.Trim();
-        if (text.StartsWith('{'))
+        string text;
+        try
         {
-            try
-            {
-                if (JsonNode.Parse(text) is JsonObject json && (string?)json["title"] is { } title) text = title;
-            }
-            catch (System.Text.Json.JsonException)
-            {
-                // not the structured answer: treat it as text below
-            }
+            if (JsonNode.Parse(response) is not JsonObject json || json["title"] is not JsonValue value ||
+                !value.TryGetValue<string>(out var title)) return null;
+            text = title;
         }
+        catch (System.Text.Json.JsonException) { return null; }
         text = text.Trim().Trim('"', '\'', '`', '“', '”', '‘', '’');
         var line = string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
         line = line.TrimEnd('.', '?', '!').Trim();
         if (line.Length == 0) return null;
-        return line.Length <= maxChars ? line : Cut(line, maxChars);
+        return string.Concat(line.EnumerateRunes().Take(maxChars).Select(r => r.ToString()));
     }
 
     /// <summary>At most <paramref name="maxBytes"/> UTF-8 bytes of <paramref name="text"/>, without splitting a character.</summary>
