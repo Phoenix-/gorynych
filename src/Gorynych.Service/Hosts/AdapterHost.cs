@@ -94,6 +94,7 @@ public sealed class AdapterHost
     readonly Dictionary<long, Forwarded> forwarded = [];
     readonly Dictionary<string, Asked> asked = new(StringComparer.Ordinal);
     readonly HashSet<string> live = new(StringComparer.Ordinal);
+    readonly Dictionary<string, SessionConfiguration> configurations = new(StringComparer.Ordinal);
     readonly Queue<Kept> buffer = new();
     long bufferedBytes;
     readonly Dictionary<string, long> dropped = new(StringComparer.Ordinal); // per session, the newest update the buffer let go
@@ -234,15 +235,38 @@ public sealed class AdapterHost
                 break;
             case AcpMethods.Agent.SessionNew when Text(result?["sessionId"]) is { } created:
                 live.Add(created);
+                Configuration(created).Capture(result);
                 break;
             case AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionResume when result is not null && request.SessionId is { } opened:
                 live.Add(opened);
+                Configuration(opened).Capture(result);
+                break;
+            case AcpMethods.Agent.SessionSetConfigOption when result is not null && request.SessionId is { } configured:
+                Configuration(configured).Capture(result);
+                break;
+            case AcpMethods.Agent.SessionSetMode when result is not null && request.SessionId is { } modeSession:
+                Configuration(modeSession).SetCurrent("modes", "currentModeId", JsonValue.Create(request.ModeId));
+                break;
+            case "session/set_model" when result is not null && request.SessionId is { } modelSession:
+                Configuration(modelSession).SetCurrent("models", "currentModelId", JsonValue.Create(request.ModelId));
                 break;
             case AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete when request.SessionId is { } closed:
                 live.Remove(closed);
+                configurations.Remove(closed);
                 break;
         }
     }
+
+    // Under state. Only sessions open in this host have retained configuration.
+    SessionConfiguration Configuration(string sessionId)
+    {
+        if (!configurations.TryGetValue(sessionId, out var configuration))
+            configurations[sessionId] = configuration = new();
+        return configuration;
+    }
+
+    JsonObject SessionConfigurations() => new(live.Where(configurations.ContainsKey)
+        .Select(id => new KeyValuePair<string, JsonNode?>(id, configurations[id].Snapshot())));
 
     async Task AgentNotifiedAsync(string method, JsonObject message)
     {
@@ -341,6 +365,9 @@ public sealed class AdapterHost
     {
         var @params = message["params"] as JsonObject;
         var sessionId = Text(@params?["sessionId"]);
+        if (Text(message["method"]) == AcpMethods.Client.SessionUpdate && sessionId is not null
+            && live.Contains(sessionId) && @params?["update"] is JsonObject update)
+            Configuration(sessionId).Apply(update);
         var number = ++seq;
         var carrier = Text(message["method"]) == AcpMethods.Client.SessionUpdate ? @params?["update"] as JsonObject : @params;
         var kept = carrier is not null && sessionId is not null;
@@ -594,6 +621,8 @@ public sealed class AdapterHost
             {
                 Connection = connection, ConductorId = id.DeepClone(), Method = method, SessionId = Text(@params?["sessionId"]),
                 PromptId = Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]),
+                ModeId = method == AcpMethods.Agent.SessionSetMode ? Text(@params?["modeId"]) : null,
+                ModelId = method == "session/set_model" ? Text(@params?["modelId"]) : null,
                 AskId = Text(@params?["_meta"]?[GorynychProtocol.MetaAskId]) ?? Text(@params?["askId"]), // a prompt's _meta; _gorynych/opinion's params
                 Opinion = Text(@params?["_meta"]?[GorynychProtocol.MetaOpinion]),
                 From = Text(@params?["_meta"]?[GorynychProtocol.MetaFromSessionId]),
@@ -609,6 +638,7 @@ public sealed class AdapterHost
             return new JsonObject
             {
                 ["sessions"] = new JsonArray(live.Select(s => (JsonNode)s).ToArray()),
+                ["sessionStates"] = SessionConfigurations(),
                 ["turns"] = new JsonArray(forwarded.Where(f => f.Value.Method == AcpMethods.Agent.SessionPrompt && f.Value.SessionId is not null)
                     .Select(f => (JsonNode)new JsonObject { ["sessionId"] = f.Value.SessionId, ["turn"] = f.Key, ["promptId"] = f.Value.PromptId }).ToArray()),
                 // The questions the agent is answering, by turn or by its own way in: the next conductor waits for their answers.
@@ -643,6 +673,12 @@ public sealed class AdapterHost
             }
             foreach (var kept in replay)
                 if (!await TryWriteLineAsync(connection, kept.Line)) throw new IOException("the connection went");
+            // A current snapshot after history: a replayed old option update must not replace a
+            // newer value returned by set_config_option while no conductor was connected.
+            JsonObject snapshot;
+            lock (state) snapshot = new JsonObject { ["sessionStates"] = SessionConfigurations() };
+            if (!await TryWriteAsync(connection, Notification(GorynychProtocol.MethodHostState, snapshot)))
+                throw new IOException("the connection went");
             current = connection;
             lock (state) aloneSince = long.MaxValue;
             foreach (var question in questions) await AskAsync(connection, question);
@@ -776,6 +812,8 @@ public sealed class AdapterHost
         public required string Method { get; init; }
         public string? SessionId { get; init; }
         public string? PromptId { get; init; }
+        public string? ModeId { get; init; }
+        public string? ModelId { get; init; }
 
         /// <summary>The asker's name for the question this request carries (<c>gorynych/askId</c>): an opinion, by channel or in a turn.</summary>
         public string? AskId { get; init; }

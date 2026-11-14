@@ -356,11 +356,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         StopIdle();
     }
 
-    readonly Lock stateGate = new();
-    JsonObject state = [];
-
-    /// <summary>The fields of the agent's session state, as <c>session/new</c>, <c>session/load</c> and <c>session/resume</c> return them.</summary>
-    static readonly string[] StateKeys = ["configOptions", "modes", "models"];
+    readonly SessionConfiguration configuration = new();
 
     /// <summary>
     /// Takes the session state from an agent's response (<c>session/new</c>, <c>session/load</c>,
@@ -368,10 +364,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// </summary>
     public void CaptureState(JsonNode? response)
     {
-        if (response is not JsonObject o) return;
-        lock (stateGate)
-            foreach (var key in StateKeys)
-                if (o[key] is { } value) state[key] = value.DeepClone();
+        configuration.Capture(response);
     }
 
     /// <summary>
@@ -380,15 +373,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// </summary>
     public void ApplyStateUpdate(JsonObject update)
     {
-        switch ((string?)update["sessionUpdate"])
-        {
-            case "config_option_update":
-                CaptureState(new JsonObject { ["configOptions"] = update["configOptions"]?.DeepClone() });
-                break;
-            case "current_mode_update":
-                SetCurrent("modes", "currentModeId", update["currentModeId"]);
-                break;
-        }
+        configuration.Apply(update);
     }
 
     JsonObject? commands; // under gate
@@ -466,15 +451,13 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <summary>Sets the current value of a part of the state, such as <c>modes.currentModeId</c> after <c>session/set_mode</c>.</summary>
     public void SetCurrent(string key, string field, JsonNode? value)
     {
-        if (value is null) return;
-        lock (stateGate)
-            if (state[key] is JsonObject part) part[field] = value.DeepClone();
+        configuration.SetCurrent(key, field, value);
     }
 
     /// <summary>A copy of the session state as the agent last reported it; empty if it reported none.</summary>
     public JsonObject State()
     {
-        lock (stateGate) return state.DeepClone().AsObject();
+        return configuration.Snapshot();
     }
 
     string? opinionTurn;

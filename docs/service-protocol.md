@@ -288,7 +288,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/peerToken` | `_meta` of `_gorynych/opinion`, `_gorynych/reply`, `_gorynych/spawn` and `_gorynych/archive` | which session's `gorynych` MCP server is calling |
 | `_gorynych/host_hello` | notification, host → conductor, the first message on the host pipe, `{token, hostId, adapter, link, pid, version, slot?, build?, options?}` | an [adapter host](#adapter-hosts) proves itself and says what it runs: which host of its adapter it is (`slot`), and its generation (`build`, `options`; [Updating adapters](#updating-adapters)) |
 | `gorynych/host` | `initialize` result `_meta`, host → conductor | `{hostId, link, reattached}`: the host, its link version, and whether it answers from its agent's first `initialize` (it came back) |
-| `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, turns: [{sessionId, turn, promptId?}], asks: [{sessionId, askId, opinion?, from?}], buffered, requests, seq}` | what a host that came back has: open sessions, running prompts, the questions of other sessions its agent is answering, the sessions it keeps updates for, how many questions it asks again, its last number |
+| `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, sessionStates, turns: [{sessionId, turn, promptId?}], asks: [{sessionId, askId, opinion?, from?}], buffered, requests, seq}`; notification, host → conductor, `{sessionStates}` | what a host that came back has; `sessionStates` maps open session IDs to their latest ACP `configOptions`, `modes`, and `models`; the notification restores these after replay |
 | `_gorynych/host_replay` | method, conductor → host, `{after: {"<sessionId>": n}}` → `{replayed, trimmed}` | sends what the host kept after each session's cursor and its open questions, then makes this conductor its own |
 | `_gorynych/host_stop` | method, conductor → host, `{}` → `{}` | the service shuts down: the host stops its agents and exits |
 | `_gorynych/turn_ended` | notification, host → conductor, `{sessionId, turn, promptId?, askId?, opinion?, from?, result \| error}` | how a prompt ended, sent before its answer, numbered like an update; the conductor marks the turn's end from it, and answers the question of an opinion turn an earlier service started |
@@ -1743,16 +1743,27 @@ The rest is on the **host pipe**, `<pipe>.hosts`, made like the service's
 3. A host that comes back (`reattached`) is asked `_gorynych/host_state`: the sessions open in
    its agent, the prompts running there (with the host's number for each, `turn`, and the client's
    `gorynych/promptId`), the sessions it keeps updates for, how many of the agent's questions are
-   open, and its last number. A field that is missing counts as empty.
+   open, and its last number. `sessionStates` maps its open session IDs to the configuration last
+   reported by the agent (`configOptions`, `modes`, `models`), including successful setting
+   responses and configuration notifications. A field that is missing counts as empty.
 4. The conductor **takes the running turns back**: each holds its session as a turn of its own
    would, so a new prompt waits for it, a client that resumes the session is told it is running
    (`gorynych/turn`, its ID in `gorynych/prompts`), and its end is marked when the host reports it.
 5. `_gorynych/host_replay {after: {"<sessionId>": n}}` gives the host each session's **cursor**,
    the newest of this host's numbers in the session's journal. The host sends what it kept after
-   each cursor, then the agent's open questions again under new IDs, and answers
+   each cursor, then a `_gorynych/host_state {sessionStates}` notification with the current
+   configuration, then the agent's open questions again under new IDs, and answers
    `{replayed, trimmed}`; from then on it sends everything to this conductor. `trimmed` lists the
    sessions it had let go of updates for that the journal lacks (it keeps the latest 16384 session
    notifications, 32 MB at most): their journal is marked trimmed, as one over its bound is.
+
+The configuration snapshot is sent under the host's send gate, after replay and before live
+notifications can follow it. The conductor restores it before the replay response completes
+and the host becomes available to clients. It is not conversation history and is not journaled.
+Thus old replayed option or mode notifications cannot overwrite newer setting responses,
+even when the notification buffer has dropped those updates. A closed or deleted session is
+removed from the host's configuration cache. Older hosts omit this snapshot; their settings
+become available when the adapter next opens the session or reports its options.
 
 Then requests for the adapter go to the host, and the conductor serves it as it served the
 adapter in its own process. Until then nothing sees the host: a client that resumes one of its

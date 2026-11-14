@@ -985,6 +985,14 @@ public sealed class Conductor : IAsyncDisposable
 
     internal async Task OnAgentNotificationAsync(AgentHost host, string method, JsonNode? @params)
     {
+        if (method == GorynychProtocol.MethodHostState)
+        {
+            if (@params?["sessionStates"] is JsonObject states)
+                foreach (var (id, configuration) in states)
+                    if (!removed.ContainsKey(id) && store.Get(id) is { } record && record.Agent == host.Name)
+                        Feed(id).CaptureState(configuration);
+            return;
+        }
         if (method == GorynychProtocol.MethodSessionsChanged)
         {
             OnAgentListChanged(host, @params);
