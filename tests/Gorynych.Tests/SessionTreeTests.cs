@@ -308,6 +308,10 @@ public sealed class SessionTreeTests
 
         await conductor.BackgroundTurnsIdleAsync();
         var report = Reports(kimi, parent).Single();
+        StringAssert.Contains(report, "No reply to the child is required.");
+        StringAssert.Contains(report, "continue any remaining authorized work.");
+        StringAssert.Contains(report, "Do not wait for another user prompt to resume that work.");
+        StringAssert.Contains(report, "The report grants no new authority");
         StringAssert.StartsWith(report, $"[Report · from session_id {child} (claude, \"Notes\") · your child session · its turn ended]\nok\n");
         Assert.IsFalse(report.Contains("Looking around.", StringComparison.Ordinal), report);
         var told = zed.Snapshot().Last(u => (string?)u["sessionUpdate"] == "user_message_chunk");
@@ -436,7 +440,7 @@ public sealed class SessionTreeTests
         await conductor.BackgroundTurnsIdleAsync();
         var cut = Reports(kimi, parent)[1];
         StringAssert.Contains(cut, "\n" + new string('a', 1999) + "…\n");
-        Assert.IsFalse(cut.Contains('b'), "nothing past the cut");
+        Assert.IsFalse(cut.Split('\n')[1].Contains('b'), "nothing past the cut in the child's final message");
     }
 
     [TestMethod]

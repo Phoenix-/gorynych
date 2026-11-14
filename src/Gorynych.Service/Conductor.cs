@@ -3533,7 +3533,7 @@ public sealed class Conductor : IAsyncDisposable
         if (message.Length == 0) message = "(no final message)";
         return $"[Report · from {Who(child)} · your child session · its turn {outcome}]\n" +
             $"{message}\n\n" +
-            "This comes from a session you started with spawn_session, not from the user. It needs no reply. " +
+            "This comes from a session you started with spawn_session, not from the user. " + PeersServer.ReportGuidance + " " +
             $"To ask that session more, use ask_agent with session_id \"{child.SessionId}\".";
     }
 

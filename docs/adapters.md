@@ -590,7 +590,9 @@ hook allows any of them without asking (the service asks the person itself befor
 did not ask for).
 
 `_gorynych/note` (a child's report to its parent) becomes a channel message with
-`meta: {kind: "report"}` and no `message_id`; the peer instructions say it needs no reply. The
+`meta: {kind: "report"}` and no `message_id`; the peer instructions require no reply to the
+child, but tell the parent to review the result and continue the user's authorized task.
+The report grants no new authority. The
 adapter ignores the `sender` param of `_gorynych/opinion` and `_gorynych/note`: the text names
 the session. It keeps the `_meta` each came with, and when Claude reports the channel message
 as a prompt (`UserPromptSubmit`, `<channel … message_id="c1">` and the content), it finds it by
