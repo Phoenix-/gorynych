@@ -1,7 +1,7 @@
 # Gorynych
 
 One body, many heads. Gorynych is one cockpit for several AI coding agents. Each agent runs
-as its own unmodified program, under your own login and subscription; Gorynych brings their
+as its own unmodified program, with your existing native configuration; Gorynych brings their
 conversations, approvals and session lists into one place, and lets the sessions ask each
 other for opinions and start child sessions.
 
@@ -9,11 +9,12 @@ other for opinions and start child sessions.
 
 ## The idea
 
-- **Native agents.** Claude Code runs headless (`claude -p` with stream-json) under your own
-  plan login, driven only by per-launch flags; its interactive TUI in a pseudo console is the
+- **Native agents.** Claude Code runs headless (`claude -p` with stream-json) with your native
+  configuration, driven only by per-launch flags; its interactive TUI in a pseudo console is the
   fallback (`--claude-transport tui`). Kimi Code runs through
   `kimi acp`, Codex through `codex app-server`, DeepSeek Harness through `dsh --profile acp`
   with a per-launch patch. Gorynych never edits an agent's own configuration.
+  Authentication, provider selection and billing belong to each harness.
 - **ACP everywhere.** A per-machine service speaks the
   [Agent Client Protocol](https://agentclientprotocol.com) v1 to its clients and to its
   adapters: to a client it is one ACP agent with many sessions, to the agents an ACP client.
@@ -73,9 +74,9 @@ Claude with them; without them the questions arrive as ordinary turns.
 
 On Windows 10 1809 or later:
 
-1. Install the agents you want and log in with your own account: Claude Code, Kimi Code
-   (`kimi login`), Codex CLI (`codex login`), DeepSeek Harness (`npm install -g @deepseek-ai/dsh`,
-   with your own DeepSeek API key set in DSH).
+1. Install and configure the agents you want using their native tools: Claude Code, Kimi Code,
+   Codex CLI, DeepSeek Harness (`npm install -g @deepseek-ai/dsh`). Verify that each works on
+   its own with your chosen login or API configuration.
 2. Unzip Gorynych's [nightly build](https://github.com/Phoenix-/gorynych/releases/tag/nightly)
    into `%LOCALAPPDATA%\Programs`.
 3. Get Zed, the [fork's nightly](https://github.com/Phoenix-/zed/releases/tag/nightly) or stock
@@ -121,13 +122,15 @@ dotnet run --project tools/Gorynych.AdoptClaude -- <session-id> --cwd <folder>
 The service and other agents can keep running. Refresh the GUI session list/import dialog or
 reopen the GUI to discover it. See [manual adoption](docs/getting-started.md#bring-a-terminal-claude-session-into-gorynych).
 
-## Your subscriptions
+## Your native configuration
 
 Gorynych is a tool for one person and their own machines:
 
-- Each agent runs under your own login on each machine. Gorynych never copies credentials
+- Each agent uses your native configuration on each machine. Gorynych never copies credentials
   between machines.
 - It runs the unmodified agent binaries, through their own options and protocols.
+- Authentication, providers and billing are managed outside Gorynych. No account metadata
+  checks or subscription/API restrictions are added by the adapters.
 - It does not serve other people: do not use it to share your subscriptions.
 
 ## Documentation

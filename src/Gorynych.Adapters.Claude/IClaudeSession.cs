@@ -31,42 +31,35 @@ internal interface IClaudeSession : IAsyncDisposable
     bool IsRunning { get; }
 
     /// <param name="cancelled">True once the client cancelled after sending this prompt.</param>
-    Task<StopReason> PromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct);
+    /// <param name="arrivalSequence">Its place in the ACP stream, so a steer behind it is ordered after it.</param>
+    Task<StopReason> PromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct, long arrivalSequence = 0);
 
-    void Cancel();
+    /// <param name="arrivalSequence">The cancel's place in the ACP stream: it waits for prompts and steers before it.</param>
+    void Cancel(long arrivalSequence = 0);
 }
 
 /// <summary>The environment Claude is started with.</summary>
 internal static class ClaudeEnvironment
 {
+    // Parent-session identity must not leak into an independently managed session. All other
+    // settings, including unknown provider/authentication variables, belong to Claude Code.
+    static readonly HashSet<string> ParentSessionVariables = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_BRIDGE_SESSION_ID",
+        "CLAUDE_CODE_REMOTE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PID", "CLAUDE_EFFORT",
+    };
+
     /// <summary>
-    /// This process's environment without what would tie the child to another Claude Code session:
-    /// started from inside one (the desktop app, say), the child would otherwise attach to that
-    /// session instead of the user's own login.
+    /// This process's environment without the known identity markers of its parent Claude session.
+    /// Native authentication, provider, TLS, proxy and SDK configuration are inherited unchanged.
     /// </summary>
-    /// <param name="headless">Also leave out the API key and auth token variables: in <c>claude -p</c> they win over
-    /// the person's plan login, so headless Claude never sees them (the TUI is left as it was).</param>
     /// <param name="source">The variables to start from; this process's environment when null.</param>
-    public static Dictionary<string, string> Clean(bool headless = false, System.Collections.IDictionary? source = null)
+    public static Dictionary<string, string> Clean(System.Collections.IDictionary? source = null)
     {
         var env = new Dictionary<string, string>(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
         foreach (System.Collections.DictionaryEntry e in source ?? Environment.GetEnvironmentVariables())
             env[(string)e.Key] = (string?)e.Value ?? "";
-        if (headless)
-            foreach (var key in env.Keys.Where(k => k.Equals("ANTHROPIC_API_KEY", StringComparison.OrdinalIgnoreCase)
-                         || k.Equals("ANTHROPIC_AUTH_TOKEN", StringComparison.OrdinalIgnoreCase)).ToList())
-                env.Remove(key);
-        var nested = env.ContainsKey("CLAUDECODE");
-        foreach (var key in env.Keys.ToList())
-        {
-            if (key.Equals("CLAUDECODE", StringComparison.OrdinalIgnoreCase)
-                || key.StartsWith("CLAUDE_CODE_", StringComparison.OrdinalIgnoreCase)
-                || key.StartsWith("CLAUDE_AGENT_SDK", StringComparison.OrdinalIgnoreCase)
-                || key.StartsWith("CLAUDE_PREVIEW_", StringComparison.OrdinalIgnoreCase)
-                || key is "CLAUDE_PID" or "CLAUDE_EFFORT"
-                || (nested && key is "ANTHROPIC_BASE_URL" or "MCP_CONNECTION_NONBLOCKING" or "MCP_SERVER_CONNECTION_BATCH_SIZE"))
-                env.Remove(key);
-        }
+        foreach (var key in env.Keys.Where(ParentSessionVariables.Contains).ToList()) env.Remove(key);
         return env;
     }
 }

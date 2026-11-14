@@ -49,16 +49,19 @@ internal sealed class HeadlessSession : IClaudeSession
     bool active;            // a turn runs in Claude
     bool activeOwn;         // ... that the client's prompt did not start (a live note's, or Claude's own)
     bool activeMarked;      // ... and its start was marked with gorynych/agentTurn
+    bool ownOpen;           // ... its ACP turn is open across native result cycles (an accepted steer is pending)
     readonly HashSet<string> taken = new(StringComparer.Ordinal);   // uuids the running turn replayed
     readonly List<string> pending = [];                              // written, not replayed yet
     readonly Dictionary<string, Note> notes = new(StringComparer.Ordinal);
+    readonly Dictionary<string, Steer> steers = new(StringComparer.Ordinal); // accepted, not replayed yet
     Turn? turn;                                                      // the client's prompt
+    Turn? incoming;                                                  // its prompt is accepted, still starting
     TaskCompletionSource idle = Completed();                         // no turn and nothing pending
     TaskCompletionSource cancelSignal = NewSignal();
     long generation;
     long lastOutput;
     bool processUp;         // the current process said system/init: it is up, its MCP servers too
-    string? planError;      // an auth or billing error of the running turn
+    string? authenticationError; // a native auth or billing error of the running turn
     string? lastResultError;
 
     // Used only from the reader's handler.
@@ -68,6 +71,31 @@ internal sealed class HeadlessSession : IClaudeSession
 
     readonly ConcurrentDictionary<string, CancellationTokenSource> asks = new(StringComparer.Ordinal);
     int permissionCount;
+
+    // Admissions of this session's prompts and steers in the ACP stream's order, before their
+    // handlers run on the thread pool (docs/steering.md). A cancel after them waits for them.
+    readonly Lock arrivalGate = new();
+    readonly Dictionary<long, TaskCompletionSource> arrivals = [];
+
+    public void NoteArrival(long sequence)
+    {
+        lock (arrivalGate) arrivals[sequence] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    public void AdmitArrival(long sequence)
+    {
+        TaskCompletionSource? signal;
+        lock (arrivalGate) arrivals.Remove(sequence, out signal);
+        signal?.TrySetResult();
+    }
+
+    /// <summary>Waits until every prompt or steer that arrived before <paramref name="sequence"/> has reached its admission point.</summary>
+    public async Task WaitArrivalsBefore(long sequence, CancellationToken ct)
+    {
+        Task[] waiting;
+        lock (arrivalGate) waiting = arrivals.Where(a => a.Key < sequence).Select(a => (Task)a.Value.Task).ToArray();
+        if (waiting.Length > 0) await Task.WhenAll(waiting).WaitAsync(ct);
+    }
 
     public HeadlessSession(ClaudeAgent agent, ClaudeAdapterOptions options, string id, string cwd, bool resume)
     {
@@ -103,10 +131,34 @@ internal sealed class HeadlessSession : IClaudeSession
 
     // ---------------------------------------------------------------- prompts
 
-    public async Task<StopReason> PromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct)
+    public Task<StopReason> PromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct, long arrivalSequence = 0) =>
+        PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null);
+
+    /// <summary>
+    /// The shared extension's legacy idle start for a direct ACP caller that did not opt in: runs
+    /// the message as an ordinary prompt turn, tracked like any other, and answers once it is handed
+    /// to Claude. The conductor never takes this path: it always opts in.
+    /// </summary>
+    public async Task<JsonObject> StartIdleAsync(AcpSteering.Request request, CancellationToken ct)
+    {
+        var started = NewSignal();
+        var run = PromptCoreAsync(request.Prompt, () => false, CancellationToken.None, 0, started);
+        _ = run.ContinueWith(t =>
+        {
+            if (t.IsFaulted) started.TrySetException(t.Exception!.GetBaseException());
+            else _ = t.Exception;
+        }, TaskScheduler.Default);
+        await started.Task.WaitAsync(ct);
+        return AcpSteering.Result(AcpSteering.StartedNewTurn);
+    }
+
+    async Task<StopReason> PromptCoreAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct,
+        long arrivalSequence, TaskCompletionSource? started)
     {
         await promptGate.WaitAsync(ct);
         var current = new Turn(Guid.NewGuid().ToString());
+        lock (stateGate) incoming = current;
+        AdmitArrival(arrivalSequence); // a steer behind it waits for its input write, not for this admission
         try
         {
             if (cancelled()) return StopReason.Cancelled;
@@ -146,7 +198,7 @@ internal sealed class HeadlessSession : IClaudeSession
                 }
                 catch (IOException) when (current.Task.IsCompleted)
                 {
-                    // Claude took the message and was stopped at once (off the plan): that is the news, not the closed pipe.
+                    // Claude took the message and failed at once: that is the news, not the closed pipe.
                     written = true;
                 }
                 catch (IOException e)
@@ -158,6 +210,11 @@ internal sealed class HeadlessSession : IClaudeSession
             {
                 inputGate.Release();
                 if (!written) Withdraw(current);
+            }
+            if (written)
+            {
+                current.Admitted.TrySetResult();
+                started?.TrySetResult();
             }
             ScheduleStallCheck();
             await using var registration = ct.Register(() => current.TryComplete(StopReason.Cancelled));
@@ -173,9 +230,101 @@ internal sealed class HeadlessSession : IClaudeSession
         }
         finally
         {
-            lock (stateGate) if (ReferenceEquals(turn, current)) turn = null;
+            lock (stateGate)
+            {
+                if (ReferenceEquals(turn, current)) turn = null;
+                if (ReferenceEquals(incoming, current)) incoming = null;
+            }
+            var notStarted = new JsonRpcException(JsonRpcException.InvalidRequest,
+                "The prompt did not start, so the steering message was not delivered.");
+            if (!current.Admitted.Task.IsCompleted)
+                current.Admitted.TrySetException(notStarted);
+            if (started is { Task.IsCompleted: false }) started.TrySetException(notStarted);
             promptGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Accepts a steer into the running turn (docs/steering.md, "Claude headless"): one user message
+    /// on stdin with the service's <c>messageId</c> as its <c>uuid</c>, at Claude's default priority,
+    /// written through the same input gate as prompts and live notes. A prompt still starting is
+    /// waited for; its failure means the steer was not delivered. No turn at all answers
+    /// <c>promptRequired</c>.
+    /// </summary>
+    public async Task<JsonObject> SteerAsync(AcpSteering.Request request, string messageId, long arrivalSequence, CancellationToken ct)
+    {
+        await WaitArrivalsBefore(arrivalSequence, ct);
+        Turn? start;
+        lock (stateGate) start = !active && incoming is { Written: false } ? incoming : null;
+        if (start is not null)
+        {
+            try { await start.Admitted.Task.WaitAsync(ct); }
+            catch (OperationCanceledException) { throw; }
+            catch (JsonRpcException e)
+            {
+                throw new JsonRpcException(JsonRpcException.InvalidRequest, $"The prompt did not start, so the steering message was not delivered. {e.Message}");
+            }
+        }
+        bool idle;
+        lock (stateGate) idle = !active && turn is null && incoming is null;
+        if (idle)
+        {
+            if (request.PromptRequired)
+            {
+                AdmitArrival(arrivalSequence);
+                return AcpSteering.PromptRequiredResult();
+            }
+            var created = await StartIdleAsync(request, ct);
+            AdmitArrival(arrivalSequence);
+            return created;
+        }
+        ClaudeProcess? claude;
+        Steer steer;
+        await inputGate.WaitAsync(ct);
+        try
+        {
+            lock (stateGate)
+            {
+                // Its prompt or its own turn may have ended while this waited.
+                if (turn is not { Task.IsCompleted: false } && !active)
+                {
+                    AdmitArrival(arrivalSequence);
+                    return AcpSteering.PromptRequiredResult();
+                }
+                claude = process is { Exited.IsCompleted: false } p ? p : null;
+                if (claude is null)
+                {
+                    AdmitArrival(arrivalSequence);
+                    return AcpSteering.PromptRequiredResult();
+                }
+                steer = new Steer(messageId, turn is { Task.IsCompleted: false } owner ? owner : null);
+                steers[steer.Uuid] = steer;
+                pending.Add(steer.Uuid);
+                lastOutput = Environment.TickCount64;
+                UpdateIdle();
+            }
+            try
+            {
+                await claude.WriteAsync(StreamJson.UserMessage(steer.Uuid, StreamJson.Content(request.Prompt)), CancellationToken.None);
+            }
+            catch
+            {
+                lock (stateGate)
+                {
+                    steers.Remove(steer.Uuid);
+                    pending.Remove(steer.Uuid);
+                    UpdateIdle();
+                }
+                throw;
+            }
+        }
+        finally
+        {
+            inputGate.Release();
+        }
+        ScheduleStallCheck();
+        AdmitArrival(arrivalSequence);
+        return AcpSteering.Result(AcpSteering.Injected);
     }
 
     /// <summary>Takes back a prompt that was never written.</summary>
@@ -189,22 +338,33 @@ internal sealed class HeadlessSession : IClaudeSession
         }
     }
 
-    public void Cancel()
+    public void Cancel(long arrivalSequence = 0)
     {
         Turn? current;
-        bool written;
+        bool written, run;
+        long serial;
         lock (stateGate)
         {
             current = turn;
             if (current is not null) current.CancelRequested = true;
             written = current?.Written == true;
+            // A turn of Claude's own has no client prompt: it is interrupted by its active state.
+            run = active || written || ownOpen;
+            serial = generation;
             var wake = cancelSignal;
             cancelSignal = NewSignal();
             wake.TrySetResult();
         }
         // Not written yet: the prompt sees the cancel and writes nothing.
-        if (current is null || !written || current.Task.IsCompleted) return;
-        _ = InterruptAsync(current);
+        if (!run || current is { Task.IsCompleted: true }) return;
+        _ = InterruptAfterArrivalsAsync(current, serial, arrivalSequence);
+    }
+
+    /// <summary>A cancel goes after the prompts and steers that arrived before it, so a steer before it is written first.</summary>
+    async Task InterruptAfterArrivalsAsync(Turn? current, long serial, long arrivalSequence)
+    {
+        await WaitArrivalsBefore(arrivalSequence, CancellationToken.None);
+        await InterruptAsync(current, serial);
     }
 
     /// <summary>Withdraws the approvals still open; Claude does not wait for them once its turn is over.</summary>
@@ -222,12 +382,12 @@ internal sealed class HeadlessSession : IClaudeSession
     /// The turn ends with its result; without one, Claude's process is stopped, and the next prompt
     /// resumes the conversation in a new one.
     /// </summary>
-    async Task InterruptAsync(Turn current)
+    async Task InterruptAsync(Turn? current, long serial)
     {
         if (options.BeforeInterrupt is { } hook) await hook();
         if (process is not { Exited.IsCompleted: false } claude)
         {
-            current.TryComplete(StopReason.Cancelled);
+            current?.TryComplete(StopReason.Cancelled);
             return;
         }
         await inputGate.WaitAsync();
@@ -235,7 +395,11 @@ internal sealed class HeadlessSession : IClaudeSession
         {
             // The turn may have ended while this waited; an interrupt now would stop the next prompt.
             lock (stateGate)
-                if (!ReferenceEquals(turn, current) || current.Task.IsCompleted) return;
+            {
+                if (current is not null)
+                    if (!ReferenceEquals(turn, current) || current.Task.IsCompleted) return;
+                if (current is null && ((!active && !ownOpen) || generation != serial)) return;
+            }
             var response = await claude.ControlAsync(new JsonObject { ["subtype"] = "interrupt", ["cancel_queued"] = true }, TimeSpan.FromSeconds(5));
             // Probed with 2.1.302: {still_queued: [], cancelled: [uuids it dropped from the queue]}.
             foreach (var uuid in (response["cancelled"] as JsonArray)?.Select(n => (string?)n).OfType<string>() ?? [])
@@ -247,10 +411,23 @@ internal sealed class HeadlessSession : IClaudeSession
         }
         finally { inputGate.Release(); }
         WithdrawAsks();
-        if (await Task.WhenAny(current.Task, Task.Delay(options.InterruptGraceMs)) == current.Task) return;
+        if (current is not null)
+        {
+            if (await Task.WhenAny(current.Task, Task.Delay(options.InterruptGraceMs)) == current.Task) return;
+        }
+        else
+        {
+            var ended = System.Diagnostics.Stopwatch.StartNew();
+            while (ended.Elapsed < TimeSpan.FromMilliseconds(options.InterruptGraceMs))
+            {
+                lock (stateGate)
+                    if (!active || generation != serial) return;
+                await Task.Delay(50);
+            }
+        }
         // Given up before the turn ends, so a prompt sent as soon as the client reads the end starts a new process.
         Abandon(claude, "no result after the interrupt; the next prompt resumes the session in a new process");
-        current.TryComplete(StopReason.Cancelled);
+        current?.TryComplete(StopReason.Cancelled);
     }
 
     /// <summary>
@@ -261,15 +438,32 @@ internal sealed class HeadlessSession : IClaudeSession
     void Drop(string uuid, Exception? error)
     {
         Note? note;
+        Steer? steer;
         Turn? current;
         lock (stateGate)
         {
             pending.Remove(uuid);
+            steers.Remove(uuid, out steer);
             notes.Remove(uuid, out note);
             current = turn?.Uuid == uuid ? turn : null;
             UpdateIdle();
         }
         note?.Dropped.TrySetResult();
+        if (steer is not null)
+        {
+            // An accepted steer the cancel removed before Claude took it stays in Gorynych's
+            // history; it only leaves this turn's pending settlement.
+            if (error is not null) steer.Owner?.TryFail(error);
+            else CompleteDeferredIfSettled();
+            bool closeOwn;
+            lock (stateGate)
+            {
+                closeOwn = steer.Owner is null && ownOpen && !active && !steers.Values.Any(s => s.Owner is null);
+                if (closeOwn) ownOpen = false;
+            }
+            if (closeOwn) _ = MarkOwnTurnAsync("ended");
+            return;
+        }
         if (current is null) return;
         if (error is null) current.TryComplete(StopReason.Cancelled);
         else current.TryFail(error);
@@ -294,8 +488,8 @@ internal sealed class HeadlessSession : IClaudeSession
                 {
                     if (active || pending.Count == 0) return;
                     // Until it says system/init, which it does once its MCP servers are up, Claude is
-                    // starting, not silent: that is bounded by the startup time, and an init that shows
-                    // it off the plan must not come after the prompt was failed for a stall.
+                    // starting, not silent: that is bounded by the startup time. A startup failure
+                    // must not come after the prompt was already failed for a stall.
                     var limit = processUp ? options.StallMs : Math.Max(options.StallMs, options.StartupTimeoutSeconds * 1000L);
                     if (Environment.TickCount64 - lastOutput < limit) continue;
                     stale = pending.ToList();
@@ -494,7 +688,7 @@ internal sealed class HeadlessSession : IClaudeSession
         try
         {
             // The service can ask before the first prompt starts. Never spend a model call
-            // until the normal launch has passed its trust, subscription and permission checks.
+            // until the normal launch has passed its trust, native startup and permission checks.
             if (!await titleReady.Task.WaitAsync(job.Token)) return;
             await titleGate.WaitAsync(job.Token);
             try
@@ -569,6 +763,7 @@ internal sealed class HeadlessSession : IClaudeSession
             var claude = Launch();
             try
             {
+                if (options.BeforeStartup is { } before) await before();
                 JsonObject init;
                 try { init = await claude.ControlAsync(new JsonObject { ["subtype"] = "initialize" }, TimeSpan.FromSeconds(options.StartupTimeoutSeconds), ct); }
                 catch (Exception e) when (e is ClaudeControlException or TimeoutException or IOException)
@@ -576,9 +771,7 @@ internal sealed class HeadlessSession : IClaudeSession
                     throw new JsonRpcException(JsonRpcException.InternalError,
                         $"Claude Code did not start: {e.Message}. {StderrNote(claude)}");
                 }
-                // Never run on without the person's plan login (docs/adapters.md, "Failing loudly").
-                if (StreamJson.PlanProblem(init) is { } problem)
-                    throw new JsonRpcException(JsonRpcException.InternalError, problem);
+                // Account metadata is informational. Claude owns authentication and reports its own failures.
                 // Claude runs only in the mode it was started with: Full access exactly when the person
                 // picked it (option changes wait for the launch, so the pick cannot change meanwhile).
                 var started = (string?)init["current_permission_mode"];
@@ -591,7 +784,7 @@ internal sealed class HeadlessSession : IClaudeSession
                         $"Claude Code started in {started} instead of full access (bypassPermissions); your Claude settings may turn it off " +
                         "(permissions.disableBypassPermissionsMode). Choose another mode, or allow it in Claude itself.");
                 Settings.ReportedMode = (string?)init["current_permission_mode"] ?? Settings.ReportedMode;
-                agent.Log($"claude {Id}: Claude Code {(string?)init["claude_code_version"]}, {(string?)init["account"]?["subscriptionType"]}");
+                agent.Log($"claude {Id}: Claude Code {(string?)init["claude_code_version"]}");
                 await agent.OnInitializeAsync(this, init);
                 string? title;
                 lock (stateGate) { title = pendingTitle; pendingTitle = null; }
@@ -643,7 +836,7 @@ internal sealed class HeadlessSession : IClaudeSession
         agent.Log($"claude {Id}: launching headless in {Cwd} ({(resume ? "resume" : "new")})");
         ClaudeProcess? started = null;
         // Lines of a process the session gave up (abandoned, or replaced) are dropped: they must not start turns or answer approvals.
-        var claude = ClaudeProcess.Start(exe, args, Cwd, ClaudeEnvironment.Clean(headless: true), Path.Combine(Folder, "stderr.log"),
+        var claude = ClaudeProcess.Start(exe, args, Cwd, ClaudeEnvironment.Clean(), Path.Combine(Folder, "stderr.log"),
             m => IsCurrent(started!) ? OnMessageAsync(started!, m) : Task.CompletedTask, agent.Log);
         started = claude;
         lock (stateGate)
@@ -651,9 +844,11 @@ internal sealed class HeadlessSession : IClaudeSession
             process = claude;
             processUp = false;
             active = activeOwn = activeMarked = false;
+            ownOpen = false;
             taken.Clear();
             pending.Clear();
             notes.Clear();
+            steers.Clear();
             UpdateIdle();
         }
         _ = claude.Exited.ContinueWith(t => OnExited(claude, t.Result), TaskScheduler.Default);
@@ -682,10 +877,12 @@ internal sealed class HeadlessSession : IClaudeSession
         {
             if (!ReferenceEquals(process, claude)) return;
             process = null;
-            own = active && activeOwn && activeMarked;
+            own = ownOpen || (active && activeOwn && activeMarked);
             active = activeOwn = activeMarked = false;
+            ownOpen = false;
             taken.Clear();
             pending.Clear();
+            steers.Clear();
             lost = notes.Values.ToList();
             notes.Clear();
             withdrawn = asks.Values.ToList();
@@ -727,7 +924,7 @@ internal sealed class HeadlessSession : IClaudeSession
             }
             case "assistant":
             {
-                if (StreamJson.PlanError(m) is { } plan) lock (stateGate) planError = plan;
+                if (StreamJson.AuthenticationError(m) is { } error) lock (stateGate) authenticationError = error;
                 if (StreamJson.IsSubagent(m)) return;
                 await TurnActivityAsync();
                 var id = StreamJson.AssistantId(m);
@@ -759,11 +956,6 @@ internal sealed class HeadlessSession : IClaudeSession
             case "system" when StreamJson.Subtype(m) == "init":
             {
                 lock (stateGate) if (ReferenceEquals(process, claude)) processUp = true;
-                if (StreamJson.ApiKeySourceOfInit(m) is { } apiKey)
-                {
-                    StopOffThePlan(StreamJson.ApiKeyProblem(apiKey));
-                    return;
-                }
                 var model = (string?)m["model"];
                 var mode = (string?)m["permissionMode"];
                 if (model == Settings.ReportedModel && mode == Settings.ReportedMode) return;
@@ -786,22 +978,6 @@ internal sealed class HeadlessSession : IClaudeSession
         }
     }
 
-    /// <summary>
-    /// A turn about to run on something other than the plan: Claude is stopped before it calls the API,
-    /// and the client's prompt fails. In that order: the client may send its next prompt as soon as it
-    /// reads the failure, and that one must start a new process, not go into the one being stopped
-    /// (it would fail with the process's exit instead of the reason).
-    /// </summary>
-    void StopOffThePlan(string problem)
-    {
-        Turn? current;
-        ClaudeProcess? claude;
-        lock (stateGate) { current = turn; claude = process; }
-        if (claude is not null) Abandon(claude, problem);
-        options.OffPlanStopping?.Invoke();
-        current?.TryFail(new JsonRpcException(JsonRpcException.InternalError, problem));
-    }
-
     /// <summary>Starts a turn in the state when none runs; under stateGate.</summary>
     void BeginTurn(bool own)
     {
@@ -820,8 +996,9 @@ internal sealed class HeadlessSession : IClaudeSession
         lock (stateGate)
         {
             if (!active) BeginTurn(own: true);
-            mark = activeOwn && !activeMarked;
-            if (mark) activeMarked = true;
+            mark = activeOwn && !activeMarked && !ownOpen;
+            activeMarked = true;
+            if (mark) ownOpen = true;
         }
         if (mark) await MarkOwnTurnAsync("started");
     }
@@ -830,6 +1007,7 @@ internal sealed class HeadlessSession : IClaudeSession
     {
         var uuid = (string?)m["uuid"] ?? "";
         Note? note;
+        Steer? steer;
         var mark = false;
         lock (stateGate)
         {
@@ -837,17 +1015,36 @@ internal sealed class HeadlessSession : IClaudeSession
             // so no turn starts and no result comes. Counted as a turn, it would hold every later prompt.
             if (!pending.Contains(uuid) && StreamJson.UserText(m) is { } text && StreamJson.IsCommandRecord(text)) return;
             pending.Remove(uuid);
+            steers.Remove(uuid, out steer);
             notes.Remove(uuid, out note);
-            if (!active) BeginTurn(own: turn?.Uuid != uuid);
-            taken.Add(uuid);
-            if (note is not null)
+            if (steer is not null)
             {
-                mark = activeOwn && !activeMarked;
-                if (mark) activeMarked = true;
+                // A steered message is part of its owning ACP turn: a client prompt's, or the
+                // agent's own. It starts no new ACP turn and is never echoed as a user message.
+                if (!active) BeginTurn(own: steer.Owner is null);
+                taken.Add(uuid);
+                if (steer.Owner is null)
+                {
+                    mark = activeOwn && !activeMarked && !ownOpen;
+                    activeMarked = true;
+                    if (mark) ownOpen = true;
+                }
+            }
+            else
+            {
+                if (!active) BeginTurn(own: turn?.Uuid != uuid);
+                taken.Add(uuid);
+                if (note is not null)
+                {
+                    mark = activeOwn && !activeMarked && !ownOpen;
+                    activeMarked = true;
+                    if (mark) ownOpen = true;
+                }
             }
             UpdateIdle();
         }
         resume = true; // the conversation now exists in Claude's own store
+        if (steer is not null) return; // journaled by the conductor already: no echo
         if (note is null) return; // the client's own prompt: ACP does not echo it
         var meta = note.Meta.DeepClone().AsObject();
         meta[GorynychProtocol.MetaOrigin] = "live";
@@ -858,49 +1055,107 @@ internal sealed class HeadlessSession : IClaudeSession
     async Task OnResultAsync(JsonObject m)
     {
         Turn? current;
-        bool own, waiting;
-        string? plan;
+        bool own, waiting, deferred = false;
+        string? authError;
         lock (stateGate)
         {
-            // Only the turn that took the client's prompt ends it.
-            current = turn is { } t && taken.Contains(t.Uuid) ? t : null;
+            // Only the turn that took the client's prompt, or one waiting for its accepted steers,
+            // ends it. A later native cycle that took a pending steer stays part of that ACP turn.
+            current = turn is { } t && (taken.Contains(t.Uuid) || t.Deferred is not null) ? t : null;
             own = active && activeOwn && activeMarked;
             active = activeOwn = activeMarked = false;
             taken.Clear();
             generation++;
-            plan = planError;
-            planError = null;
+            authError = authenticationError;
+            authenticationError = null;
+            var error = StreamJson.ResultError(m);
+            var hasPending = steers.Values.Any(s => current is not null ? ReferenceEquals(s.Owner, current) : own && s.Owner is null);
+            if (error is null && hasPending)
+            {
+                // Claude closed the native turn before taking an accepted steer; it remains part of
+                // this ACP turn, and the next native cycle that takes it is waited for.
+                if (current is not null) current.Deferred = StreamJson.StopReasonOf(m, current.CancelRequested);
+                deferred = true;
+            }
+            else if (error is not null)
+            {
+                // A failed native turn ends the ACP turn now: accepted steers it did not take are resolved lost.
+                if (own) DropSteers(null);
+                else DropSteers(current);
+            }
+            if (!deferred && !hasPending) ownOpen = false;
             waiting = pending.Count > 0;
             UpdateIdle();
         }
         streamed.Clear();
         toolNames.Clear();
         WithdrawAsks(); // the turn is over: no approval of it is still awaited
-        var error = StreamJson.ResultError(m);
-        lock (stateGate) lastResultError = error;
+        var errorText = StreamJson.ResultError(m);
+        lock (stateGate) lastResultError = errorText;
         try
         {
-            if (error is not null && current is not { CancelRequested: true })
+            if (errorText is not null && current is not { CancelRequested: true })
             {
                 // An auth or billing error is never left as a quiet note: the client's prompt fails with the way back.
-                var note = plan is null ? $"[Claude stopped with an error: {error}]" : $"[Claude cannot run on your plan ({plan}): {error}] {StreamJson.TuiHint}";
+                var note = authError is null ? $"[Claude stopped with an error: {errorText}]" : $"[Claude authentication or billing error ({authError}): {errorText}]";
                 await EmitAsync(ClaudeHooks.TextChunk("\n" + note, Guid.NewGuid().ToString()));
-                if (plan is not null) agent.Log($"claude {Id}: {note}");
+                if (authError is not null) agent.Log($"claude {Id}: {note}");
             }
-            if (own) await MarkOwnTurnAsync("ended");
+            bool closeOwn;
+            lock (stateGate) closeOwn = own && !deferred && !steers.Values.Any(s => s.Owner is null);
+            if (closeOwn) await MarkOwnTurnAsync("ended");
             await agent.TouchAsync(Id);
         }
         finally
         {
-            // Whatever the feed did, the prompt ends here.
-            if (current is not null)
+            // Whatever the feed did, the prompt ends here, unless it still waits for a later cycle.
+            if (current is not null && !deferred)
             {
-                if (plan is not null && error is not null && !current.CancelRequested)
-                    current.TryFail(new JsonRpcException(JsonRpcException.InternalError, $"Claude cannot run on your plan ({plan}): {error} {StreamJson.TuiHint}"));
-                else current.TryComplete(StreamJson.StopReasonOf(m, current.CancelRequested));
+                var reason = StreamJson.StopReasonOf(m, current.CancelRequested);
+                current.Deferred = null;
+                if (authError is not null && errorText is not null && !current.CancelRequested)
+                    current.TryFail(new JsonRpcException(JsonRpcException.InternalError, $"Claude authentication or billing error ({authError}): {errorText}"));
+                else current.TryComplete(reason);
             }
             if (waiting) ScheduleStallCheck();
         }
+    }
+
+    /// <summary>Resolves accepted steers a failed or cancelled native turn will not take.</summary>
+    void DropSteers(Turn? owner, Func<Steer, bool>? predicate = null)
+    {
+        List<string> removed;
+        lock (stateGate)
+        {
+            removed = steers.Values.Where(s => predicate is null
+                    ? (owner is not null ? ReferenceEquals(s.Owner, owner) : s.Owner is null)
+                    : predicate(s))
+                .Select(s => s.Uuid).ToList();
+            foreach (var uuid in removed)
+            {
+                steers.Remove(uuid);
+                pending.Remove(uuid);
+            }
+            if (removed.Count > 0) UpdateIdle();
+        }
+        if (removed.Count > 0) agent.Log($"claude {Id}: {removed.Count} accepted steer(s) ended with their turn before Claude took them");
+    }
+
+    /// <summary>A deferred client turn completes once no accepted steer attached to it is pending.</summary>
+    void CompleteDeferredIfSettled()
+    {
+        Turn? done;
+        StopReason reason;
+        lock (stateGate)
+        {
+            var current = turn;
+            if (current?.Deferred is not { } settled || current.Task.IsCompleted) return;
+            if (steers.Values.Any(s => ReferenceEquals(s.Owner, current))) return;
+            current.Deferred = null;
+            done = current;
+            reason = current.CancelRequested ? StopReason.Cancelled : settled;
+        }
+        done.TryComplete(reason);
     }
 
     async Task MarkOwnTurnAsync(string mark)
@@ -1053,13 +1308,30 @@ internal sealed class HeadlessSession : IClaudeSession
         public TaskCompletionSource Dropped { get; } = NewSignal();
     }
 
+    /// <summary>An accepted steer: written to Claude and waiting for its replay, which marks it taken.</summary>
+    sealed class Steer(string uuid, Turn? owner)
+    {
+        public string Uuid { get; } = uuid;
+
+        /// <summary>The client's ACP prompt it joined, or null for a turn of Claude's own.</summary>
+        public Turn? Owner { get; } = owner;
+    }
+
     /// <summary>One prompt turn sent by the ACP client.</summary>
     sealed class Turn(string uuid)
     {
         readonly TaskCompletionSource<StopReason> done = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public string Uuid { get; } = uuid;
         public bool Written { get; set; }
+
+        /// <summary>The prompt's input write is done (or failed): a steer behind it may go in.</summary>
+        public TaskCompletionSource Admitted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         public bool CancelRequested { get; set; }
+
+        /// <summary>A native result came while accepted steers were still pending; the turn waits for them.</summary>
+        public StopReason? Deferred { get; set; }
+
         public Task<StopReason> Task => done.Task;
         public void TryComplete(StopReason reason) => done.TrySetResult(reason);
         public void TryFail(Exception e) => done.TrySetException(e);

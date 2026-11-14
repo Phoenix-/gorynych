@@ -120,6 +120,15 @@ static partial class FakeHeadless
         switch ((string?)request["subtype"])
         {
             case "initialize":
+                if (File.Exists(Path.Combine(cwd, "initialize-error")))
+                {
+                    await WriteAsync(new JsonObject
+                    {
+                        ["type"] = "control_response",
+                        ["response"] = new JsonObject { ["subtype"] = "error", ["request_id"] = id, ["error"] = "native initialize failed" },
+                    });
+                    break;
+                }
                 JsonNode? account = File.Exists(Path.Combine(cwd, "signed-out"))
                     ? new JsonObject { ["tokenSource"] = "none", ["apiProvider"] = "firstParty" }
                     : File.Exists(Path.Combine(cwd, "api-key"))
@@ -130,6 +139,9 @@ static partial class FakeHeadless
                 if (File.Exists(Path.Combine(cwd, "bedrock")))
                     account = new JsonObject { ["subscriptionType"] = "Claude Max", ["apiProvider"] = "bedrock" };
                 if (File.Exists(Path.Combine(cwd, "no-account"))) account = null;
+                if (File.Exists(Path.Combine(cwd, "no-provider"))) account = new JsonObject { ["email"] = "fake@example.com" };
+                if (File.Exists(Path.Combine(cwd, "empty-account"))) account = new JsonObject();
+                if (File.Exists(Path.Combine(cwd, "unknown-provider"))) account = new JsonObject { ["apiProvider"] = "future-provider" };
                 await RespondAsync(id, new JsonObject
                 {
                     ["commands"] = new JsonArray(),
@@ -212,6 +224,22 @@ static partial class FakeHeadless
         var apiKey = File.Exists(Path.Combine(Environment.CurrentDirectory, "api-key-init")) ? "ANTHROPIC_API_KEY" : "none";
         await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "init", ["session_id"] = sessionId, ["model"] = model, ["permissionMode"] = mode, ["apiKeySource"] = apiKey });
         await ReplayAsync(first, sessionId);
+        var failurePath = Path.Combine(Environment.CurrentDirectory, "auth-failure");
+        if (File.Exists(failurePath))
+        {
+            var error = File.ReadAllText(failurePath);
+            await WriteAsync(new JsonObject
+            {
+                ["type"] = "assistant", ["error"] = error, ["session_id"] = sessionId,
+                ["message"] = new JsonObject { ["id"] = Guid.NewGuid().ToString(), ["role"] = "assistant", ["content"] = new JsonArray() },
+            });
+            await WriteAsync(new JsonObject
+            {
+                ["type"] = "result", ["subtype"] = "error_during_execution", ["is_error"] = true,
+                ["session_id"] = sessionId, ["errors"] = new JsonArray("configured credentials rejected: " + error),
+            });
+            return;
+        }
         string answer;
         var aborted = false;
         var joined = new List<string>();

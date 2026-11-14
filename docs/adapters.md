@@ -88,16 +88,15 @@ user's own login and hands its stdio to the service. Observed with Kimi Code 2.4
 ## Claude Code
 
 The adapter (`Gorynych.Adapters.Claude`) is an in-process ACP agent that drives the unmodified
-`claude` binary under the person's own login. It never touches `~/.claude`: everything goes
+`claude` binary with the person's native configuration. It never touches `~/.claude`: everything goes
 through per-launch flags and Claude's own protocols. It has two transports, picked with the
 service option `--claude-transport`:
 
 - **`headless`** (the default): `claude -p` with stream-json in and out, one process per loaded
-  session. Anthropic's help center says `claude -p` and the Agent SDK signed in with a plan draw
-  from the plan's limits (updated 15 June and 7 October 2026).
+  session.
 - **`tui`** (the fallback): the interactive TUI in a Windows pseudo console, with http hooks and
-  the development channel ([below](#tui-transport)). It stays built and tested for the day
-  Anthropic moves `-p` off the plans.
+  the development channel ([below](#tui-transport)). Both transports use Claude's native
+  authentication and provider configuration.
 
 Both use Claude's own transcripts and session IDs and the adapter's one session list, so
 switching is one flag with no migration: a session started with one transport continues with
@@ -121,18 +120,18 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   hooks.
 - The process starts with the session's first prompt, not at `session/new` or
   `session/resume`, and lives until `session/close` or the service's idle unload. It gets the
-  TUI's cleaned environment without `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`, which in
-  `-p` would win over the plan login.
+  TUI's cleaned environment, preserving the person's configured `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL`. Claude Code chooses the authentication route.
 - A `session/resume` with `_meta["gorynych/draft"]: true` for a session the adapter does not
   know (it restarted before the draft's first prompt, which is when it records a session)
   opens it afresh under its ID, so its first prompt launches with `--session-id`. Without the
   mark an unknown session is not found (both transports).
-- The session handles only the lines of its current process: a process it gave up (stopped off
-  the plan, or after an interrupt without a result) may still have output in the pipe, which is
+- The session handles only the lines of its current process: a process it gave up (stopped
+  during startup, or after an interrupt without a result) may still have output in the pipe, which is
   dropped, so it can neither open a turn nor answer an approval.
 - Right after the start the adapter sends the `initialize` control request (no fields). Its
-  answer brings the model catalog and the account, which the adapter checks
-  ([below](#failing-loudly)).
+  answer brings the model catalog and current permission mode. Account/provider metadata is
+  optional information and never gates a launch or catalog.
 - Stdout is read line by line on a thread of its own; stdin takes JSON lines under one lock;
   stderr goes to `<session>/stderr.log` (up to 1 MB) and its tail into the error when Claude
   exits early.
@@ -161,10 +160,21 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   prompt among them fails ("Claude did not take the prompt"), so nothing waits for ever. Until a
   process's first `system/init`, which Claude sends once its MCP servers are up, it is starting,
   not silent: that silence may last the startup time (90 s). Otherwise a slow start would fail the
-  prompt for a stall before the init that shows it off the plan, and the person would read the
+  prompt for a stall before startup completes, and the person would read the
   wrong reason.
 - Claude exiting during a turn fails the prompt with the exit code and the end of stderr; the
   next prompt starts a new process with `--resume`.
+- **Steering** is the shared v1 extension (`_session/steering`), headless only; the TUI advertises
+  `steering.supported: false`. One accepted steer is one `user` message on stdin with the
+  service's `messageId` as its `uuid`, written through the same input gate at Claude's default
+  priority: Claude takes it after the current tool, in the same native turn. The adapter keeps
+  every accepted `uuid` on its owning ACP turn: a native `result` cannot complete that turn while
+  an accepted steer is still pending, and the next native cycle that replays it remains part of
+  the same ACP turn. It suppresses the replay echo (the conductor journaled the message), and a
+  cancel's `cancelled` list, process exit, failed write or stall resolves pending delivery without
+  leaving the prompt open. Steering preserves an open approval or question; only the turn's own
+  cancel withdraws them. No strong guarantee is made that the model answered every accepted steer,
+  and a refused startup is a definite non-delivery.
 
 #### Stream → ACP
 
@@ -243,19 +253,20 @@ ACP config options, like Codex's:
     waits, and `session/new` waits only when the service is about to set a model default and
     names it in `_meta["gorynych/requiredConfigOptions"]`
     ([service-protocol.md](service-protocol.md#default-session-configuration)). Stopping the
-    adapter stops the fetch. It is Claude launched as every headless session is (the same flags
-    and per-launch settings, the same cleaned environment, the same plan check), in
+    adapter stops the fetch. It is Claude launched with the same cleaned environment and native settings, in
     `claude/catalog`, asked only `initialize`, then closed.
     - No prompt is sent, so it uses no tokens.
     - `--no-session-persistence`: no transcript and no project folder in `~/.claude`. Checked
       live (Claude Code 2.1.302): nothing named after the fetch's session is left in `~/.claude`
-      (without the two flags below Claude still made an empty `session-env/<id>` folder, as it
-      does for every run).
-    - `--setting-sources local` (the folder has none) and `--strict-mcp-config` with an empty
-      `--mcp-config`: none of the person's settings files, so none of their hooks, and none of
-      their MCP servers run for it. Claude still reads the login, so the plan check holds.
-    - Off the plan it keeps nothing and logs why. Until a catalog arrives, `session/new` returns
-      only `mode`, unless the service is waiting for that fetch to set a model default.
+      (an empty `session-env/<id>` folder may still be created by Claude, as for any native run).
+    - Native settings stay enabled, including provider configuration and credential helpers.
+      Per-launch `--settings` adds the documented
+      [`disableAllHooks`](https://code.claude.com/docs/en/settings-reference#disableallhooks)
+      setting to suppress user hooks; managed hooks follow Claude's own policy.
+      `--strict-mcp-config` with an empty `--mcp-config` starts no configured MCP servers.
+    - A native initialize failure is logged; account metadata is never validated. Until a
+      catalog arrives, `session/new` returns only `mode`, unless the service is waiting for
+      that fetch to set a model default.
   - A model the person chose that a later catalog no longer has stays the session's model and is
     shown as such.
 - A change applies to a running Claude at once (`set_permission_mode`, `set_model`,
@@ -331,12 +342,12 @@ Headless Claude writes no generated `ai-title`, so the service asks the adapter 
 session still has only its provisional first-prompt title. The adapter runs an isolated, short
 `claude -p` request with per-launch flags only: `--tools ""` (no built-in tool),
 `--strict-mcp-config` with an empty config (no MCP server), and runs in Gorynych's own scratch
-folder with `--safe-mode` (no user hooks, skills, plugins or project settings; the login still
+folder with `--safe-mode` (no user hooks, skills or plugins; native authentication still
 works), `--no-session-persistence`,
 `--permission-prompts none` and `--json-schema` for `{title}`. The first task is the only input,
 cut at 2 KB; the answer is cut at 60 characters. One helper runs at a time per adapter, and the
 30 s deadline includes waiting for that slot and for the normal session launch to pass its trust,
-subscription and permission checks. A failed launch starts no title model call. Closing the session
+native startup and permission checks. A failed launch starts no title model call. Closing the session
 waits for helper cleanup. Nothing of
 the helper appears in the session, journal, activity, approval cards or session list. The result
 is written with the existing `rename_session` control request as Claude's own `custom-title`; a
@@ -362,22 +373,19 @@ deny fails the prompt.
 
 #### Failing loudly
 
-The transport never runs on silently when Claude is not on the person's plan. The check fails
-closed: a launch runs only when `initialize` answers with an `account` that has a plan
-(`subscriptionType`) on `apiProvider: "firstParty"`; one whose `initialize` fails, times out or is
-cancelled, or shows a token without a plan (an auth token, a gateway) or another provider, is
-stopped.
+Authentication, credential discovery, provider choice and billing belong entirely to Claude Code.
+The adapter neither inspects account metadata for eligibility nor chooses a login route or
+recommends a transport based on a subscription. Native settings and authentication-related
+environment are inherited. Claude's [authentication documentation](https://code.claude.com/docs/en/authentication)
+describes the routes the harness itself supports.
 
-- `initialize` shows no login (no plan, `tokenSource: "none"`), which is what `--bare` looks
-  like: Claude is stopped and the prompt fails, telling the person to sign in or to start the
-  service with `--claude-transport tui` (the headless docs say `--bare` will become the default
-  for `-p`; it reads no OAuth login).
-- `initialize` shows an API key (`apiKeySource`, which wins over the login in `-p`), or a turn's
-  `system/init` does: Claude is stopped before it calls the API, and the prompt fails, naming the
-  variable to remove.
-- An assistant error `authentication_failed`, `billing_error`, `account_on_hold`,
+- An `initialize` that fails, times out or is cancelled stops that launch as a protocol/startup
+  failure. Missing, empty or unfamiliar `account`, `subscriptionType`, `tokenSource`,
+  `apiKeySource` and `apiProvider` fields do not stop it.
+- A native assistant error `authentication_failed`, `billing_error`, `account_on_hold`,
   `oauth_org_not_allowed` or `verification_required` fails the client's prompt and leaves a
-  note in the feed, both naming `--claude-transport tui`.
+  note in the feed, preserving Claude's error code and message. Gorynych does not repair login,
+  switch providers or retry using different credentials.
 
 ### History made outside Gorynych
 
@@ -492,9 +500,11 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
 - The adapter does not advertise `session/delete`: the transcript belongs to `~/.claude`.
   Deleting a Claude session closes it (the process exits) and the service hides it with a
   tombstone in its overlay; `claude --resume` in a terminal still finds it.
-- Environment: `CLAUDECODE`, `CLAUDE_CODE_*`, `CLAUDE_AGENT_SDK*` and, when started from
-  inside another Claude Code session, `ANTHROPIC_BASE_URL` and the desktop MCP variables
-  are removed, so the child uses the user's own login.
+- Environment: both transports inherit the native environment, including unknown authentication,
+  provider, TLS, proxy and SDK options. Only the specific parent-session identity markers
+  `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_CHILD_SESSION`,
+  `CLAUDE_CODE_BRIDGE_SESSION_ID`, `CLAUDE_CODE_REMOTE_SESSION_ID`, `CLAUDE_CODE_ENTRYPOINT`,
+  `CLAUDE_PID` and `CLAUDE_EFFORT` are removed. There is no prefix-wide filtering.
 - Screens that need a key: the development-channels notice is confirmed with Enter, only
   for a launch with the channel, which the person agreed to
   ([below](#consent-to-development-channels)). The folder-trust question is relayed to the
@@ -865,6 +875,19 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 - **`turn/interrupt` never holds anything up**: its answer is waited for at most 5 s, and a
   `session/cancel` does not wait for it, so the ACP connection reads on.
 - Codex's own user message items are not echoed (ACP).
+- **Steering** is the shared v1 extension, from the generated `TurnSteerParams` and
+  `TurnSteerResponse` (`tools/Gorynych.CodexGen`, not hand-edited). The adapter advertises
+  `steering.supported: true` and sends `turn/steer {threadId, expectedTurnId, input,
+  clientUserMessageId: the service's messageId}`. It injects only while its turn runs: before
+  `turn/start` or `turn/started` names it, the steer waits for the name, or for startup failure,
+  turn completion/cancellation, thread close/delete or process exit; it never attaches to a later
+  turn. Success is Codex's queue admission, not proof the model read it. The native refusals are
+  mapped precisely: no running turn or a stale `expectedTurnId` → `promptRequired`;
+  `activeTurnNotSteerable` (`/review`, manual `/compact`) → `-32600` `turnNotSteerable`; other
+  failures stay uncertain errors. A response naming another turn is treated as uncertain. Codex
+  does not echo user message items, so the conductor's one journaled message stays the only one.
+  At normal completion Codex may commit leftover pending input without another model call; the
+  adapter keeps that native semantics and starts no extra turn to manufacture an answer.
 
 | Codex | ACP `session/update` |
 | --- | --- |
@@ -960,7 +983,8 @@ close, delete and shutdown. The service asks once per session (the overlay keeps
 ### Not done yet
 
 - Images and embedded resources in prompts.
-- A live-note path through `turn/steer` (a child's report into the parent's running turn).
+- A live-note path through `turn/steer` (a child's report into the parent's running turn); steering
+  itself is built ([steering.md](steering.md#codex)).
 - Pre-allowing tools, for every harness at once.
 - `thread/settings/update` (experimental) to apply an option before the next turn.
 
@@ -973,7 +997,8 @@ lacks. DSH's sandbox is per process, so there is one DSH process per permission 
 behind its own proxy, and a router in front of them ([Permission modes](#permission-modes)). The design, the probes and the decisions the user took are in
 [research/dsh-adapter-spec.md](../research/dsh-adapter-spec.md); the probes are in
 `research/probes/dsh`. Built and checked against DSH 0.2.2-rc.1 on 9 November 2026. DSH is a
-developer preview that runs on the user's own DeepSeek API key, so every turn costs money.
+developer preview; the original live probe used the user's configured DeepSeek API route.
+The adapter does not enforce that route or its billing method.
 
 - **Process.**
   - The adapter finds the `@deepseek-ai/dsh` package from the `dsh` on PATH: next to npm's

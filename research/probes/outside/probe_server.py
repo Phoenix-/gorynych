@@ -53,7 +53,10 @@ def ancestors():
     return chain
 
 
-interesting = {k: v for k, v in os.environ.items()
+# Native credentials are inherited by the probe process. Record only names, except for the
+# explicit probe marker and session identity needed by these diagnostics.
+interesting = {k: (v if k.upper() in {"GORYNYCH_PROBE_MARK", "CLAUDE_CODE_SESSION_ID"} else "<redacted>")
+               for k, v in os.environ.items()
                if k.upper().startswith(("GORYNYCH", "CLAUDE", "KIMI", "MCP", "ANTHROPIC"))}
 log("start", pid=os.getpid(), ppid=os.getppid(), cwd=os.getcwd(), argv=sys.argv,
     env_keys=sorted(os.environ.keys()), env_interesting=interesting, ancestors=ancestors())

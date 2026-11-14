@@ -75,7 +75,11 @@ sealed class FakeAppServer
 
     readonly List<(string Method, JsonObject Params)> calls = [];
     readonly ConcurrentDictionary<string, TaskCompletionSource> interrupts = new();
+    readonly ConcurrentDictionary<string, string> active = new(StringComparer.Ordinal);
     int next;
+
+    /// <summary>When set, <c>turn/steer</c> refuses as the native server does (<c>notSteerable</c>, <c>noActive</c>, <c>mismatch</c>, <c>internal</c>).</summary>
+    public string? SteerRefusal { get; set; }
 
     public ConcurrentDictionary<string, FakeThread> Threads { get; } = new();
 
@@ -324,16 +328,58 @@ sealed class FakeAppServer
                 if ((string?)p["model"] == "gpt-hidden") throw new JsonRpcException(-32600, "model gpt-hidden is not available to this account");
                 var turnId = $"turn-{Interlocked.Increment(ref next)}";
                 LastTurnId = turnId;
+                active[t.Id] = turnId;
                 interrupts[turnId] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                if (t.Ephemeral || p["outputSchema"] is not null)
+                var isTitleHelperTurn = t.Ephemeral || p["outputSchema"] is not null;
+                if (isTitleHelperTurn)
                 {
                     t.Durable = false;
                     HelperThreadIds.Add(t.Id);
                     helperInterrupts[turnId] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                    _ = Task.Run(() => RunHelperTurnAsync(t, turnId));
                 }
-                else _ = Task.Run(() => RunTurnAsync(t, turnId, p));
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        if (isTitleHelperTurn) await RunHelperTurnAsync(t, turnId);
+                        else await RunTurnAsync(t, turnId, p);
+                    }
+                    finally { active.TryRemove(new KeyValuePair<string, string>(t.Id, turnId)); }
+                });
                 return Done(new JsonObject { ["turn"] = new JsonObject { ["id"] = turnId, ["items"] = new JsonArray(), ["status"] = "inProgress" } });
+            }
+            case "turn/steer":
+            {
+                var t = Threads[(string)p["threadId"]!];
+                var expected = (string)p["expectedTurnId"]!;
+                var current = active.GetValueOrDefault(t.Id);
+                switch (SteerRefusal)
+                {
+                    case "notSteerable":
+                        throw new JsonRpcException(-32600, "cannot steer a review turn", new JsonObject
+                        {
+                            ["codexErrorInfo"] = new JsonObject
+                            {
+                                ["activeTurnNotSteerable"] = new JsonObject { ["turnKind"] = "review" },
+                            },
+                        });
+                    case "noActive" when current is null:
+                        throw new JsonRpcException(-32600, "no active turn to steer");
+                    case "mismatch":
+                        throw new JsonRpcException(-32600, $"expected active turn id `{expected}` but found `turn-other`");
+                    case "internal":
+                        throw new JsonRpcException(JsonRpcException.InternalError, "the native turn went away");
+                }
+                if (current is null) throw new JsonRpcException(-32600, "no active turn to steer");
+                if (current != expected) throw new JsonRpcException(-32600, $"expected active turn id `{expected}` but found `{current}`");
+                var shown = string.Join("\n\n", (p["input"] as JsonArray ?? []).Select(i => (string?)i?["text"]));
+                t.Items.Add((expected, new JsonObject
+                {
+                    ["type"] = "userMessage", ["id"] = $"{expected}-steer-{t.Items.Count}",
+                    ["clientId"] = p["clientUserMessageId"]?.DeepClone(),
+                    ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = shown }),
+                }));
+                return Done(new JsonObject { ["turnId"] = expected });
             }
             case "turn/interrupt":
                 if (interrupts.TryGetValue((string)p["turnId"]!, out var stop)) stop.TrySetResult();

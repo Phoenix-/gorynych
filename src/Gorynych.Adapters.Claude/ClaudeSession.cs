@@ -80,7 +80,7 @@ internal sealed partial class ClaudeSession : IClaudeSession
     // ---------------------------------------------------------------- prompts
 
     /// <summary>The TUI takes text only: blocks other than text and resource links are dropped.</summary>
-    public Task<StopReason> PromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct)
+    public Task<StopReason> PromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct, long arrivalSequence = 0)
     {
         var text = string.Join("\n\n", prompt.Select(StreamJson.BlockText).Where(t => t.Length > 0));
         if (text.Length == 0) throw new JsonRpcException(JsonRpcException.InvalidParams, "The prompt has no text.");
@@ -194,7 +194,7 @@ internal sealed partial class ClaudeSession : IClaudeSession
         pty.Write("\r");
     }
 
-    public void Cancel()
+    public void Cancel(long arrivalSequence = 0)
     {
         Turn? current;
         int generation;

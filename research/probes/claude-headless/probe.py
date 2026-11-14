@@ -85,12 +85,12 @@ def settings_json(url):
 
 def scrubbed_env(extra):
     env = dict(os.environ)
-    nested = "CLAUDECODE" in env
+    parent_session = {"CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION",
+                      "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_REMOTE_SESSION_ID",
+                      "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PID", "CLAUDE_EFFORT"}
     for key in list(env):
         k = key.upper()
-        if (k == "CLAUDECODE" or k.startswith("CLAUDE_CODE_") or k.startswith("CLAUDE_AGENT_SDK")
-                or k.startswith("CLAUDE_PREVIEW_") or k in ("CLAUDE_PID", "CLAUDE_EFFORT")
-                or (nested and k in ("ANTHROPIC_BASE_URL", "MCP_CONNECTION_NONBLOCKING", "MCP_SERVER_CONNECTION_BATCH_SIZE"))):
+        if k in parent_session:
             del env[key]
     env.update(extra)
     return env

@@ -25,9 +25,11 @@ public sealed partial class ClaudeHeadlessTests
     static readonly string FakeRoot = Path.Combine(Path.GetTempPath(), "gorynych-fake-claude");
 
     static ClaudeAdapterOptions Options(string dir, List<string>? log = null, bool liveNotes = false, Func<Task>? beforeInterrupt = null,
-        bool fetchCatalog = true, string permissionMode = "default", int stallMs = 1500, Action? offPlanStopping = null, bool autoTitle = false) => new()
+        bool fetchCatalog = true, string permissionMode = "default", int stallMs = 1500,
+        Func<Task>? beforeStartup = null, bool autoTitle = false) => new()
     {
         BeforeInterrupt = beforeInterrupt,
+        BeforeStartup = beforeStartup,
         FetchCatalog = fetchCatalog,
         AutoTitle = autoTitle,
         PermissionMode = permissionMode,
@@ -41,7 +43,6 @@ public sealed partial class ClaudeHeadlessTests
         InterruptGraceMs = 3000,
         CloseTimeoutMs = 3000,
         StallMs = stallMs,
-        OffPlanStopping = offPlanStopping,
         Log = log is null ? null : m => { lock (log) log.Add(m); },
     };
 
@@ -65,6 +66,22 @@ public sealed partial class ClaudeHeadlessTests
     static Task<PromptResponse> PromptAsync(TestClient client, string sessionId, string text) =>
         client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
             new PromptRequest { SessionId = sessionId, Prompt = [new TextContent { Text = text }] });
+
+    static Task<JsonNode?> SteerAsync(TestClient client, string sessionId, string text, string messageId) =>
+        client.Rpc.SendRequestAsync(GorynychProtocol.MethodSteering, new JsonObject
+        {
+            ["sessionId"] = sessionId,
+            ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
+            ["_meta"] = new JsonObject
+            {
+                ["gorynych/messageId"] = messageId,
+                ["gorynych/promptId"] = "steer-" + messageId,
+                ["steering"] = new JsonObject { ["idleBehavior"] = "promptRequired" },
+            },
+        });
+
+    static bool Sleeping(TestClient c, int n) =>
+        c.Snapshot().Count(u => (string?)u["sessionUpdate"] == "tool_call" && (string?)u["title"] is { } t && t.Contains("sleep", StringComparison.Ordinal)) >= n;
 
     static async Task Until(Func<bool> condition, int timeoutMs = 10_000)
     {
@@ -311,11 +328,11 @@ public sealed partial class ClaudeHeadlessTests
     }
 
     [TestMethod]
-    public async Task Review_AnOffPlanSession_DoesNotStartATitleModelCall()
+    public async Task Review_ANativeStartupFailure_DoesNotStartATitleModelCall()
     {
         var dir = TestDirs.New();
-        File.WriteAllText(Path.Combine(dir, "auth-token"), "");
-        var token = "off-plan-title-" + Guid.NewGuid().ToString("N");
+        File.WriteAllText(Path.Combine(dir, "initialize-error"), "");
+        var token = "failed-startup-title-" + Guid.NewGuid().ToString("N");
         var (agent, acp, _) = await DirectTitleAsync(dir);
         await using var ownedAgent = agent;
         await using var ownedClient = acp;
@@ -328,7 +345,7 @@ public sealed partial class ClaudeHeadlessTests
         await Assert.ThrowsExactlyAsync<JsonRpcException>(() => acp.RequestAsync<PromptRequest, PromptResponse>(
             AcpMethods.Agent.SessionPrompt, new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = token }] }));
         await Task.Delay(200);
-        Assert.IsNull(TitleLaunch(token), "Title generation must respect the main session's subscription guard.");
+        Assert.IsNull(TitleLaunch(token), "A failed native startup must not launch the title helper.");
     }
 
     static async Task<(AgentInstance Agent, JsonRpcConnection Acp, List<JsonObject> Updates)> DirectTitleAsync(string dir, List<string>? log = null, TimeSpan? timeout = null)
@@ -341,7 +358,7 @@ public sealed partial class ClaudeHeadlessTests
                 DataDirectory = options.DataDirectory, Executable = options.Executable, ProjectsDirectory = options.ProjectsDirectory,
                 ClaudeStatePath = options.ClaudeStatePath, ChannelServerCommand = options.ChannelServerCommand,
                 StartupTimeoutSeconds = options.StartupTimeoutSeconds, InterruptGraceMs = options.InterruptGraceMs,
-                CloseTimeoutMs = options.CloseTimeoutMs, StallMs = options.StallMs, OffPlanStopping = options.OffPlanStopping,
+                CloseTimeoutMs = options.CloseTimeoutMs, StallMs = options.StallMs, BeforeStartup = options.BeforeStartup,
                 Log = options.Log, TitleTimeout = t, AutoTitle = true,
             };
         var agent = await new ClaudeAdapter(options).StartAsync(CancellationToken.None);
@@ -566,24 +583,21 @@ public sealed partial class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
-    [DataRow("signed-out", "--claude-transport tui")]
-    [DataRow("no-account", "--claude-transport tui")]
-    [DataRow("api-key", "remove ANTHROPIC_API_KEY")]
-    [DataRow("api-key-init", "remove ANTHROPIC_API_KEY")]
-    [DataRow("auth-token", "reports no plan")]
-    [DataRow("bedrock", "runs through bedrock")]
-    public async Task ALaunchOffThePlan_FailsLoudly_AndRunsNothing(string marker, string hint)
+    [DataRow("signed-out")]
+    [DataRow("no-account")]
+    [DataRow("no-provider")]
+    [DataRow("empty-account")]
+    [DataRow("unknown-provider")]
+    public async Task AccountMetadata_DoesNotGateAWorkingNativeSession(string marker)
     {
         var dir = TestDirs.New();
         File.WriteAllText(Path.Combine(dir, marker), "");
         await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
         await using var client = await TestClient.ConnectAsync(conductor);
         var sessionId = await NewAsync(client, dir);
-        var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "hello"));
-        StringAssert.Contains(failed.Message, hint);
-        Assert.AreEqual("", client.Text(), "no answer came");
-        // Still off the plan: the next prompt fails the same way instead of running unchecked.
-        StringAssert.Contains((await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "again"))).Message, hint);
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "hello")).StopReason);
+        StringAssert.Contains(client.Text(), "echo: hello");
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "again")).StopReason);
     }
 
     [TestMethod]
@@ -614,11 +628,11 @@ public sealed partial class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task AClaudeSlowToStart_IsNotTakenForOneThatDroppedThePrompt_AndAnOffPlanInitSaysWhy()
+    public async Task AClaudeSlowToStart_IsNotTakenForOneThatDroppedThePrompt_WithApiAuthentication()
     {
         // Claude says system/init once its MCP servers are up, which may take long on a slow machine:
         // its silence until then is its start, not a message it did not take. Were it taken for one,
-        // the person would read "did not take the prompt" instead of how to get back on the plan.
+        // the prompt would fail before the configured API authentication could run.
         var dir = TestDirs.New();
         File.WriteAllText(Path.Combine(dir, "api-key-init"), "");
         var held = Path.Combine(dir, "init-held");
@@ -634,41 +648,29 @@ public sealed partial class ClaudeHeadlessTests
         lock (log) Assert.IsFalse(log.Any(l => l.Contains("in no turn", StringComparison.Ordinal)), string.Join(Environment.NewLine, log));
         File.Delete(held);
 
-        var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => prompt);
-        StringAssert.Contains(failed.Message, "remove ANTHROPIC_API_KEY");
-        Assert.IsFalse(failed.Message.Contains("did not take the prompt", StringComparison.Ordinal), failed.Message);
+        Assert.AreEqual(StopReason.EndTurn, (await prompt).StopReason);
+        StringAssert.Contains(client.Text(), "echo: hello");
     }
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
-    public async Task ThePromptAfterAnOffPlanFailure_StartsANewClaude_NotTheOneBeingStopped()
+    [DataRow("authentication_failed")]
+    [DataRow("billing_error")]
+    public async Task InvalidCredentialsOrBilling_StillFailThePrompt_AndAllowRecovery(string error)
     {
-        // The next prompt may come as soon as the client reads the failure: by then the process is let
-        // go, so the prompt starts a new one, which says the same reason, rather than going into the
-        // one being stopped and failing with its exit. Held between the two steps, whichever comes first.
         var dir = TestDirs.New();
-        File.WriteAllText(Path.Combine(dir, "api-key-init"), "");
-        using var stopping = new ManualResetEventSlim();
-        using var release = new ManualResetEventSlim();
-        var once = 0;
-        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, offPlanStopping: () =>
-        {
-            if (Interlocked.Exchange(ref once, 1) != 0) return;
-            stopping.Set();
-            release.Wait(TimeSpan.FromSeconds(30));
-        })));
+        File.WriteAllText(Path.Combine(dir, "auth-token"), "");
+        var marker = Path.Combine(dir, "auth-failure");
+        File.WriteAllText(marker, error);
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
         await using var client = await TestClient.ConnectAsync(conductor);
         var sessionId = await NewAsync(client, dir);
-
-        var first = PromptAsync(client, sessionId, "first");
-        Assert.IsTrue(stopping.Wait(TimeSpan.FromSeconds(30)), "the first launch found off the plan");
-        var second = PromptAsync(client, sessionId, "second");
-        await Task.Delay(300); // were the first failed already, the second would go into the process now
-        release.Set();
-
-        StringAssert.Contains((await Assert.ThrowsExactlyAsync<JsonRpcException>(() => first)).Message, "remove ANTHROPIC_API_KEY");
-        var next = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => second);
-        StringAssert.Contains(next.Message, "remove ANTHROPIC_API_KEY", "a new Claude, which says why: " + next.Message);
+        var failure = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "first"));
+        StringAssert.Contains(failure.Message, error);
+        StringAssert.Contains(client.Text(), error);
+        File.Delete(marker);
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "second")).StopReason);
+        StringAssert.Contains(client.Text(), "echo: second");
     }
 
     [TestMethod]
@@ -676,12 +678,12 @@ public sealed partial class ClaudeHeadlessTests
     public async Task AStoppedClaude_LeavesNothingBehind_AndTheNextLaunchStartsClean()
     {
         var dir = TestDirs.New();
-        var marker = Path.Combine(dir, "api-key-init");
+        var marker = Path.Combine(dir, "initialize-error");
         File.WriteAllText(marker, "");
         await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
         await using var client = await TestClient.ConnectAsync(conductor);
         var sessionId = await NewAsync(client, dir);
-        // The fake goes on with its turn after the system/init the adapter stops it for: those lines must be dropped.
+        // A native protocol startup failure must not leak state into the next launch.
         await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(client, sessionId, "first try"));
         File.Delete(marker);
         Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "second try")).StopReason);
@@ -755,6 +757,286 @@ public sealed partial class ClaudeHeadlessTests
         var answer = (string?)(await opinion)?["text"];
         StringAssert.Contains(answer, "Tabs?");
         Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "after")).StopReason);
+    }
+
+    [TestMethod]
+    public async Task SteeringCapability_IsHeadlessOnly()
+    {
+        var dir = TestDirs.New();
+        var headless = await new ClaudeAdapter(Options(dir, fetchCatalog: false)).StartAsync(CancellationToken.None);
+        try
+        {
+            var rpc = new JsonRpcConnection(headless.Input, headless.Output, "direct");
+            rpc.Start();
+            try
+            {
+                var init = await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize,
+                    new InitializeRequest { ProtocolVersion = 1 });
+                Assert.IsTrue((bool?)init.Meta?[GorynychProtocol.MetaSteering]?["supported"]);
+            }
+            finally { await rpc.DisposeAsync(); }
+        }
+        finally { await headless.DisposeAsync(); }
+
+        if (!OperatingSystem.IsWindows()) return; // the TUI transport starts only on Windows
+        var tui = await new ClaudeAdapter(new ClaudeAdapterOptions
+        {
+            Transport = ClaudeTransport.Tui,
+            DataDirectory = Path.Combine(dir, "tui"),
+            Executable = FakeClaude(),
+            FetchCatalog = false,
+            StartupTimeoutSeconds = 20,
+        }).StartAsync(CancellationToken.None);
+        try
+        {
+            var rpc = new JsonRpcConnection(tui.Input, tui.Output, "direct-tui");
+            rpc.Start();
+            try
+            {
+                var init = await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize,
+                    new InitializeRequest { ProtocolVersion = 1 });
+                Assert.AreEqual(false, (bool?)init.Meta?[GorynychProtocol.MetaSteering]?["supported"],
+                    "the TUI transport never advertises ACP steering");
+            }
+            finally { await rpc.DisposeAsync(); }
+        }
+        finally { await tui.DisposeAsync(); }
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    [DataRow("subscription")]
+    [DataRow("api-key")]
+    [DataRow("api-key-init")]
+    [DataRow("auth-token")]
+    [DataRow("bedrock")]
+    public async Task ASteer_JoinsTheRunningTurn_OneNativeResult_AndNoDuplicateEcho(string credentials)
+    {
+        var dir = TestDirs.New();
+        if (credentials != "subscription") File.WriteAllText(Path.Combine(dir, credentials), "");
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+        await PromptAsync(client, sessionId, "warm up");
+
+        var slow = PromptAsync(client, sessionId, "slow work");
+        await Until(() => Sleeping(client, 1));
+        var steered = await SteerAsync(client, sessionId, "steer one", "m-steer-one");
+        Assert.AreEqual(AcpSteering.Injected, (string?)steered?["outcome"]);
+        Assert.AreEqual(StopReason.EndTurn, (await slow).StopReason);
+
+        StringAssert.Contains(client.Text(), "slept / also: steer one");
+        var steeredChunks = conductor.Feed(sessionId).Journal.ReadAll().OfType<JsonObject>()
+            .Where(u => u["content"] is JsonObject content && (string?)content["text"] == "steer one").ToList();
+        Assert.AreEqual(1, steeredChunks.Count, "one journaled steered message, no adapter echo");
+        Assert.IsFalse(string.IsNullOrEmpty((string?)steeredChunks[0]["messageId"]), "the service's own message ID");
+        Assert.AreEqual("steer-m-steer-one", (string?)steeredChunks[0]["_meta"]?[GorynychProtocol.MetaPromptId]);
+        Assert.AreEqual(true, (bool?)steeredChunks[0]["_meta"]?[GorynychProtocol.MetaSteered]);
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task PendingSteers_KeepTheACPTurnOpenAcrossAnIntermediateResult()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+        await PromptAsync(client, sessionId, "warm up");
+        var endsBefore = conductor.Feed(sessionId).Journal.ReadAll().OfType<JsonObject>()
+            .Count(u => (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended" && u["_meta"]?[GorynychProtocol.MetaPromptId] is not null);
+
+        var slow = PromptAsync(client, sessionId, "slow hold");
+        await Until(() => Sleeping(client, 1));
+        Assert.AreEqual(AcpSteering.Injected, (string?)(await SteerAsync(client, sessionId, "first steer", "m-first"))?["outcome"]);
+        Assert.AreEqual(AcpSteering.Injected, (string?)(await SteerAsync(client, sessionId, "second steer", "m-second"))?["outcome"]);
+        Assert.AreEqual(StopReason.EndTurn, (await slow).StopReason);
+        StringAssert.Contains(client.Text(), "echo: first steer");
+        StringAssert.Contains(client.Text(), "echo: second steer");
+        var journal = conductor.Feed(sessionId).Journal.ReadAll().OfType<JsonObject>().ToList();
+        Assert.AreEqual(2, journal.Count(u => (bool?)u["_meta"]?[GorynychProtocol.MetaSteered] == true));
+        Assert.AreEqual(endsBefore + 1, journal.Count(u => (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended" && u["_meta"]?[GorynychProtocol.MetaPromptId] is not null),
+            "one ACP turn end, after both native cycles");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task CancellingALaterNativeCycle_CancelsTheOwningAcpPrompt()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        var prompt = PromptAsync(client, id, "slow hold");
+        await Until(() => Sleeping(client, 1));
+        await SteerAsync(client, id, "slow steered work", "later-native-cycle");
+        await Until(() => Sleeping(client, 2));
+        await client.Rpc.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
+        Assert.AreEqual(StopReason.Cancelled, (await prompt).StopReason,
+            "the first native cycle's end_turn must not mask cancellation of the steered cycle");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ASteerLostAfterAnIntermediateResult_DoesNotCompleteThePromptSuccessfully()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        var prompt = PromptAsync(client, id, "slow hold");
+        await Until(() => Sleeping(client, 1));
+        await SteerAsync(client, id, "swallow this input", "lost-steer");
+        var error = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => prompt.WaitAsync(TimeSpan.FromSeconds(15)));
+        StringAssert.Contains(error.Message, "Claude did not take");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ASteer_LeavesAnOpenApprovalPending()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+        await PromptAsync(client, sessionId, "warm up");
+
+        var ask = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var approvals = 0;
+        client.Approve = async r =>
+        {
+            Interlocked.Increment(ref approvals);
+            ask.TrySetResult();
+            await release.Task;
+            return new SelectedPermissionOutcome { OptionId = r.Options[0].OptionId };
+        };
+        var turn = PromptAsync(client, sessionId, "please write a file");
+        await ask.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var steered = await SteerAsync(client, sessionId, "do it differently", "m-during-approval");
+        Assert.AreEqual(AcpSteering.Injected, (string?)steered?["outcome"]);
+        Assert.AreEqual(1, Volatile.Read(ref approvals), "steering neither answers nor replaces the approval");
+        release.TrySetResult();
+        Assert.AreEqual(StopReason.EndTurn, (await turn).StopReason);
+        StringAssert.Contains(client.Text(), "wrote it");
+        StringAssert.Contains(client.Text(), "echo: do it differently");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task DirectIdleSteer_WithoutTheOptIn_KeepsTheLegacyStartedNewTurn()
+    {
+        var dir = TestDirs.New();
+        var updates = new List<JsonObject>();
+        var owner = await new ClaudeAdapter(Options(dir, fetchCatalog: false)).StartAsync(CancellationToken.None);
+        var acp = new JsonRpcConnection(owner.Input, owner.Output, "direct-idle")
+        {
+            NotificationHandler = (_, p) =>
+            {
+                if (p?["update"] is JsonObject u) lock (updates) updates.Add((JsonObject)u.DeepClone());
+                return Task.CompletedTask;
+            },
+            RequestHandler = (_, _) => Task.FromResult<JsonNode?>(AcpJson.ToNode(new RequestPermissionResponse
+            {
+                Outcome = new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId },
+            })),
+        };
+        acp.Start();
+        try
+        {
+            await acp.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
+            var sessionId = (await acp.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+                new NewSessionRequest { Cwd = dir, McpServers = [] })).SessionId;
+            var idle = await acp.SendRequestAsync(GorynychProtocol.MethodSteering, new JsonObject
+            {
+                ["sessionId"] = sessionId,
+                ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "hello from idle" }),
+                ["_meta"] = new JsonObject { ["gorynych/messageId"] = "idle-claude" },
+            });
+            Assert.AreEqual(AcpSteering.StartedNewTurn, (string?)idle?["outcome"]);
+            await Until(() => { lock (updates) return updates.Any(u => (string?)u["sessionUpdate"] == "agent_message_chunk"); });
+            lock (updates) StringAssert.Contains(string.Concat(updates.Where(u => (string?)u["sessionUpdate"] == "agent_message_chunk").Select(u => (string?)u["content"]?["text"])), "hello from idle");
+        }
+        finally
+        {
+            await acp.DisposeAsync();
+            await owner.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ASteerRacingAFailedStartup_IsRefusedWithoutDelivery()
+    {
+        var dir = TestDirs.New();
+        File.WriteAllText(Path.Combine(dir, "initialize-error"), "");
+        var starting = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, fetchCatalog: false,
+            beforeStartup: () => { starting.TrySetResult(); return release.Task; })));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+        var prompt = PromptAsync(client, sessionId, "hello");
+        await starting.Task.WaitAsync(TimeSpan.FromSeconds(10)); // the prompt is accepted, its process still starting
+        var steering = SteerAsync(client, sessionId, "too early", "m-early");
+        await Task.Delay(100);
+        Assert.IsFalse(steering.IsCompleted, "the steer waits for the accepted prompt's input write");
+        release.TrySetResult();
+        var refused = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => steering);
+        Assert.AreEqual(JsonRpcException.InvalidRequest, refused.Code, refused.Message);
+        StringAssert.Contains((await Assert.ThrowsExactlyAsync<JsonRpcException>(() => prompt)).Message, "native initialize failed");
+        Assert.AreEqual(0, conductor.Feed(sessionId).Journal.SteeredMessageIds().Count, "nothing was accepted");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ACancel_StopsATurnClaudeStartedItself()
+    {
+        var dir = TestDirs.New();
+        var updates = new List<JsonObject>();
+        var owner = await new ClaudeAdapter(Options(dir, liveNotes: true)).StartAsync(CancellationToken.None);
+        var acp = new JsonRpcConnection(owner.Input, owner.Output, "direct")
+        {
+            NotificationHandler = (_, p) =>
+            {
+                if (p?["update"] is JsonObject u) lock (updates) updates.Add((JsonObject)u.DeepClone());
+                return Task.CompletedTask;
+            },
+            RequestHandler = (_, _) => Task.FromResult<JsonNode?>(AcpJson.ToNode(new RequestPermissionResponse
+            {
+                Outcome = new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId },
+            })),
+        };
+        acp.Start();
+        try
+        {
+            await acp.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
+            var sessionId = (await acp.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+                new NewSessionRequest { Cwd = dir, McpServers = [] })).SessionId;
+            await acp.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = sessionId, Prompt = [new TextContent { Text = "warm up" }] });
+
+            _ = acp.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject
+            {
+                ["sessionId"] = sessionId, ["sender"] = "peer_kimi", ["text"] = "slow work, please",
+            });
+            await Until(() => { lock (updates) return updates.Any(u => (string?)u["title"] is { } t && t.Contains("sleep", StringComparison.Ordinal)); });
+            await acp.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId });
+            await Until(() => { lock (updates) return updates.Any(u => (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended"); });
+            lock (updates)
+            {
+                var started = updates.FindIndex(u => (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn] == "started");
+                var ended = updates.FindIndex(u => (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended");
+                Assert.IsTrue(started >= 0 && ended > started, "the agent's own turn is marked started and ended");
+            }
+            Assert.IsTrue(Controls(sessionId).Any(c => (string?)c["subtype"] == "interrupt"), "the cancel interrupted the own turn");
+        }
+        finally
+        {
+            await acp.DisposeAsync();
+            await owner.DisposeAsync();
+        }
     }
 
     [TestMethod]

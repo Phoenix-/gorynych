@@ -111,7 +111,8 @@ public sealed partial class ClaudeHeadlessTests
             .Single(a => a.Contains("--no-session-persistence") && a[a.IndexOf("--settings") + 1].StartsWith(Path.Combine(dir, "claude", "catalog"), StringComparison.OrdinalIgnoreCase));
         CollectionAssert.IsSubsetOf(new[] { "-p", "--permission-prompt-tool=stdio", "--settings" }, fetch, "launched as every session is");
         Assert.AreEqual("default", fetch[fetch.IndexOf("--permission-mode") + 1]);
-        Assert.AreEqual("local", fetch[fetch.IndexOf("--setting-sources") + 1], "none of the person's settings files, so none of their hooks");
+        CollectionAssert.DoesNotContain(fetch, "--setting-sources", "native provider and credential settings remain available");
+        Assert.AreEqual(true, (bool?)JsonNode.Parse(File.ReadAllText(fetch[fetch.IndexOf("--settings") + 1]))?["disableAllHooks"], "user hooks are disabled just for the catalog fetch");
         CollectionAssert.Contains(fetch, "--strict-mcp-config", "no MCP server of theirs");
         Assert.AreEqual("""{"mcpServers":{}}""", File.ReadAllText(fetch[fetch.IndexOf("--mcp-config") + 1]));
         lock (log) Assert.IsTrue(log.Any(l => l.Contains("fetched the model catalog", StringComparison.Ordinal)));
@@ -148,20 +149,23 @@ public sealed partial class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
-    public async Task AFetchOffThePlan_KeepsNoCatalog()
+    [DataRow("signed-out")]
+    [DataRow("no-account")]
+    [DataRow("no-provider")]
+    [DataRow("empty-account")]
+    public async Task AModelCatalog_IsKeptWithoutInterpretingAccountMetadata(string marker)
     {
         var dir = TestDirs.New();
         var log = new List<string>();
         Directory.CreateDirectory(Path.Combine(dir, "claude", "catalog"));
-        File.WriteAllText(Path.Combine(dir, "claude", "catalog", "api-key"), ""); // the fake's account then shows an API key
+        File.WriteAllText(Path.Combine(dir, "claude", "catalog", marker), "");
         await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir, log)));
         await using var client = await TestClient.ConnectAsync(conductor);
 
         await NewRawAsync(client, dir);
 
-        await Until(() => { lock (log) return log.Any(l => l.Contains("no model catalog fetched", StringComparison.Ordinal)); });
-        lock (log) Assert.IsTrue(log.Any(l => l.Contains("no model catalog fetched", StringComparison.Ordinal)), string.Join(" | ", log));
-        Assert.IsFalse(File.Exists(CatalogFile(dir)));
+        await Until(() => File.Exists(CatalogFile(dir)));
+        StringAssert.Contains(File.ReadAllText(CatalogFile(dir)), "claude-fake-2");
     }
 
     [TestMethod]

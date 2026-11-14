@@ -56,8 +56,8 @@ public sealed class ClaudeAdapterOptions
     /// </summary>
     internal Func<Func<string>, CancellationToken, Task>? GiveUpStartup { get; init; }
 
-    /// <summary>Tests: runs between stopping a Claude found off the plan and failing its prompt.</summary>
-    internal Action? OffPlanStopping { get; init; }
+    /// <summary>Tests: awaited just before a launch's <c>initialize</c>, to hold a startup a steer can race.</summary>
+    internal Func<Task>? BeforeStartup { get; init; }
 
     public int PasteEnterDelayMs { get; init; } = 400;
 
@@ -144,8 +144,31 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         Catalog = catalogStore.Load();
         Channel = options.ChannelServerCommand is { Count: > 0 } command ? new ChannelHost(command) : null;
         rpc.RequestHandler = HandleAsync;
+        rpc.RequestArrived = OnRequestArrived;
+        rpc.RequestDone = OnRequestDone;
         rpc.NotificationHandler = OnNotificationAsync;
         rpc.Log = Log;
+    }
+
+    sealed record Arrival(HeadlessSession Session, long Sequence);
+    readonly System.Runtime.CompilerServices.ConditionalWeakTable<JsonRpcRequest, Arrival> arrivals = new();
+
+    /// <summary>The stream's order of a prompt or steer is registered before its handler runs, so a steer behind a prompt waits for it and a cancel behind both waits for them.</summary>
+    void OnRequestArrived(JsonRpcRequest request)
+    {
+        if (request.Method is not (AcpMethods.Agent.SessionPrompt or GorynychProtocol.MethodSteering)) return;
+        if ((string?)request.Params?["sessionId"] is not { } id || !sessions.TryGetValue(id, out var session) || session is not HeadlessSession headless) return;
+        headless.NoteArrival(request.Sequence);
+        arrivals.AddOrUpdate(request, new Arrival(headless, request.Sequence));
+    }
+
+    void OnRequestDone(JsonRpcRequest request)
+    {
+        if (arrivals.TryGetValue(request, out var arrival))
+        {
+            arrivals.Remove(request);
+            arrival.Session.AdmitArrival(arrival.Sequence);
+        }
     }
 
     public ChannelHost? Channel { get; }
@@ -212,6 +235,12 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                         },
                     },
                     AuthMethods = [],
+                    // The shared steering extension: headless only. The TUI queues typed input, not
+                    // an ACP steer, so it says false rather than leaving clients to probe.
+                    Meta = new JsonObject
+                    {
+                        [GorynychProtocol.MetaSteering] = new JsonObject { ["supported"] = Headless },
+                    },
                 });
             case AcpMethods.Agent.SessionNew:
             {
@@ -270,9 +299,22 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 var sequence = request.Sequence;
                 state.Update(session.Id, session.Cwd, r => KeepSettings(session, r));
                 var stop = await session.PromptAsync(p.Prompt,
-                    () => cancelledAt.TryGetValue(session.Id, out var at) && at > sequence, ct);
+                    () => cancelledAt.TryGetValue(session.Id, out var at) && at > sequence, ct, request.Sequence);
                 state.Update(session.Id, session.Cwd, r => r.UpdatedAt = DateTimeOffset.UtcNow);
                 return AcpJson.ToNode(new PromptResponse { StopReason = stop, Meta = await MarkMetaAsync(session) });
+            }
+            case GorynychProtocol.MethodSteering:
+            {
+                if (!Headless)
+                    throw AcpSteering.Refused("notSupported", "Claude's TUI transport does not take ACP steering; a person's typed input stays in its own queue.");
+                var steering = AcpSteering.Parse(request.Params, image: true);
+                if (!StreamJson.HasContent(steering.Prompt))
+                    throw new JsonRpcException(JsonRpcException.InvalidParams, "The steering message has no text or image.");
+                var messageId = (string?)request.Params?["_meta"]?[GorynychProtocol.MetaMessageId] ?? Guid.NewGuid().ToString();
+                var session = Session(steering.SessionId, null);
+                if (session is not HeadlessSession headless)
+                    throw AcpSteering.Refused("notSupported", "This Claude session does not take ACP steering.");
+                return await headless.SteerAsync(steering, messageId, request.Sequence, ct);
             }
             case AcpMethods.Agent.SessionSetConfigOption:
             {
@@ -405,7 +447,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         if (method == AcpMethods.Agent.SessionCancel && (string?)@params?["sessionId"] is { } id)
         {
             cancelledAt[id] = rpc.NotificationSequence;
-            if (sessions.TryGetValue(id, out var s)) s.Cancel();
+            if (sessions.TryGetValue(id, out var s)) s.Cancel(rpc.NotificationSequence);
         }
         return Task.CompletedTask;
     }
@@ -523,11 +565,11 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     /// <summary>
     /// Fetches the catalog without a session: Claude launched as every headless session is (the same
-    /// flags, the same cleaned environment, the same plan check), in the adapter's own folder, with
+    /// flags, the same cleaned environment and native configuration), in the adapter's own folder, with
     /// no prompt and nothing saved (<c>--no-session-persistence</c>), asked only <c>initialize</c>. It
-    /// loads none of the person's settings files (<c>--setting-sources local</c>, and the folder has
-    /// none) and no MCP server (<c>--strict-mcp-config</c> with an empty <c>--mcp-config</c>), so none of
-    /// their hooks or servers runs for it. Stopping the adapter stops it.
+    /// keeps native settings, including credential helpers and provider configuration. Per-launch
+    /// <c>disableAllHooks</c> suppresses user hooks; managed hooks follow Claude's policy. No configured
+    /// MCP server is started (<c>--strict-mcp-config</c> with an empty config). Stopping the adapter stops it.
     /// </summary>
     async Task FetchCatalogAsync(CancellationToken ct)
     {
@@ -543,28 +585,25 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             var folder = Path.Combine(options.DataDirectory, "catalog");
             Directory.CreateDirectory(folder);
             var settingsPath = Path.Combine(folder, "settings.json");
-            File.WriteAllText(settingsPath, StreamJson.Settings().ToJsonString(AcpJson.TextOptions));
+            var settings = StreamJson.Settings();
+            settings["disableAllHooks"] = true;
+            File.WriteAllText(settingsPath, settings.ToJsonString(AcpJson.TextOptions));
             var id = Guid.NewGuid().ToString();
             var mcpPath = Path.Combine(folder, "mcp.json");
             File.WriteAllText(mcpPath, """{"mcpServers":{}}""");
             var args = new List<string>(StreamJson.BaseArgs)
             {
-                "--settings", settingsPath, "--setting-sources", "local", "--strict-mcp-config", "--mcp-config", mcpPath,
+                "--settings", settingsPath, "--strict-mcp-config", "--mcp-config", mcpPath,
                 "--no-session-persistence", "--session-id", id,
             };
             args.AddRange(ClaudeOptions.LaunchArgs(new ClaudeSettings(), options.PermissionMode, options.Model));
             Log($"claude: fetching the model catalog in {folder} (session {id}, not kept)");
-            await using var claude = ClaudeProcess.Start(exe, args, folder, ClaudeEnvironment.Clean(headless: true), Path.Combine(folder, "stderr.log"),
+            await using var claude = ClaudeProcess.Start(exe, args, folder, ClaudeEnvironment.Clean(), Path.Combine(folder, "stderr.log"),
                 _ => Task.CompletedTask, Log);
             claude.BeginReading();
             try
             {
                 var init = await claude.ControlAsync(new JsonObject { ["subtype"] = "initialize" }, TimeSpan.FromSeconds(options.StartupTimeoutSeconds), ct);
-                if (StreamJson.PlanProblem(init) is { } problem)
-                {
-                    Log($"claude: no model catalog fetched: {problem}");
-                    return;
-                }
                 ct.ThrowIfCancellationRequested();
                 await OnInitializeAsync(null, init);
                 Log($"claude: fetched the model catalog ({Catalog.Count} models) from Claude Code {(string?)init["claude_code_version"]}");

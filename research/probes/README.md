@@ -26,6 +26,8 @@ The production code that grew from them lives in `src/Gorynych.Adapters.Claude`.
 | `codex/codexprobe.cs` | Drives `codex app-server` over stdio. No `jsonrpc` field on the wire; `initialized` must follow `initialize`. `thread/start`, `turn/start`, `thread/name/set` (+ `thread/name/updated`), `thread/archive` (+ `thread/archived`) and `thread/list` (`archived: true` for archived threads) all work and land in the shared `~/.codex/state_5.sqlite`, which the desktop app reads. The exact schema comes from `codex app-server generate-json-schema --out <dir>`. |
 | `windows/task_job_probe.ps1` | Probe of 11 November 2026 (Windows 11, PowerShell 7) for adapter hosts under the logon task: a test task on a pipe of its own starts the service, a Kimi session starts its host, then `restart`. The service and its hosts run in Task Scheduler's job, which lets none break away but does not kill on close: the hosts outlive the service's exit, the task goes from Running to Ready, and the next `schtasks /Run` starts the next service, which the hosts join. `schtasks /End` stops the service alone, not its hosts. The task is removed at the end ([service-protocol.md](../../docs/service-protocol.md#adapter-hosts)). |
 
-Launching Claude from a process that itself runs inside a Claude Code session needs
-`CLAUDECODE` and the desktop-session variables (`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_*`)
-stripped from the environment.
+When launching an independent Claude session, remove only the specific parent-session identity
+markers listed in [adapters.md](../../docs/adapters.md#tui-transport). Preserve the configured
+authentication, provider, endpoint, TLS, proxy and SDK environment, including unfamiliar options.
+The original probes used broader environment filtering; the reusable launch scripts were
+corrected on 14 November 2026. Their earlier recorded results remain historical observations.

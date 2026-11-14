@@ -68,36 +68,33 @@ public sealed class StreamJsonTests
     }
 
     [TestMethod]
-    public void TheLogin_IsCheckedFromInitialize()
+    public void NativeAuthenticationAndBillingErrors_AreRecognizedForRelay()
     {
-        Assert.IsFalse(StreamJson.SignedOut(J("""{"account":{"email":"a@b","subscriptionType":"Claude Max","apiProvider":"firstParty"}}""")));
-        Assert.IsTrue(StreamJson.SignedOut(J("""{"account":{"tokenSource":"none","apiProvider":"firstParty"}}""")), "what --bare looks like");
-        var apiKey = J("""{"account":{"tokenSource":"claude.ai","apiKeySource":"ANTHROPIC_API_KEY","apiProvider":"firstParty"}}""");
-        Assert.IsFalse(StreamJson.SignedOut(apiKey));
-        Assert.AreEqual("ANTHROPIC_API_KEY", StreamJson.ApiKeySource(apiKey));
-        Assert.IsNull(StreamJson.ApiKeySource(J("""{"account":{"subscriptionType":"Claude Max"}}""")));
-        Assert.IsNull(StreamJson.PlanProblem(J("""{"account":{"subscriptionType":"Claude Max","apiProvider":"firstParty"}}""")));
-        StringAssert.Contains(StreamJson.PlanProblem(J("""{"account":{"tokenSource":"ANTHROPIC_AUTH_TOKEN","apiProvider":"firstParty"}}""")), "reports no plan");
-        StringAssert.Contains(StreamJson.PlanProblem(J("""{"account":{"subscriptionType":"Claude Max","apiProvider":"vertex"}}""")), "vertex");
-        StringAssert.Contains(StreamJson.PlanProblem(J("""{"account":{"subscriptionType":"Claude Max"}}""")), "unknown provider", "fails closed without a provider");
-        StringAssert.Contains(StreamJson.PlanProblem(J("""{"models":[]}""")), "did not report its account");
-        Assert.AreEqual("ANTHROPIC_API_KEY", StreamJson.ApiKeySourceOfInit(J("""{"type":"system","subtype":"init","apiKeySource":"ANTHROPIC_API_KEY"}""")));
-        Assert.IsNull(StreamJson.ApiKeySourceOfInit(J("""{"type":"system","subtype":"init","apiKeySource":"none"}""")));
-        Assert.AreEqual("billing_error", StreamJson.PlanError(J("""{"type":"assistant","error":"billing_error","message":{"content":[]}}""")));
-        Assert.IsNull(StreamJson.PlanError(J("""{"type":"assistant","error":"rate_limit","message":{"content":[]}}""")));
+        Assert.AreEqual("billing_error", StreamJson.AuthenticationError(J("""{"type":"assistant","error":"billing_error","message":{"content":[]}}""")));
+        Assert.AreEqual("authentication_failed", StreamJson.AuthenticationError(J("""{"type":"assistant","error":"authentication_failed"}""")));
+        Assert.IsNull(StreamJson.AuthenticationError(J("""{"type":"assistant","error":"rate_limit","message":{"content":[]}}""")));
     }
 
     [TestMethod]
-    public void HeadlessClaude_GetsNoApiKeyOrAuthToken_TheTuiKeepsItsEnvironment()
+    public void Claude_PreservesConfiguredApiCredentialsAndEndpoint_AndDropsSessionMarkers()
     {
         var source = new System.Collections.Hashtable
         {
             ["ANTHROPIC_API_KEY"] = "sk-x", ["ANTHROPIC_AUTH_TOKEN"] = "t", ["CLAUDE_CODE_SESSION_ID"] = "s", ["PATH"] = "p",
+            ["CLAUDECODE"] = "1", ["ANTHROPIC_BASE_URL"] = "https://configured.invalid", ["MCP_CONNECTION_NONBLOCKING"] = "1",
+            ["CLAUDE_CODE_USE_BEDROCK"] = "1",
+            ["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] = "10000", ["CLAUDE_CODE_CLIENT_CERT"] = "client.pem",
+            ["CLAUDE_CODE_CLIENT_KEY"] = "client-key.pem", ["CLAUDE_CODE_FUTURE_AUTH_OPTION"] = "opaque",
+            ["CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS"] = "1", ["CLAUDE_CONFIG_DIR"] = "configured-home",
+            ["CLAUDE_CODE_CHILD_SESSION"] = "1", ["CLAUDE_CODE_BRIDGE_SESSION_ID"] = "parent-bridge",
         };
-        var headless = ClaudeEnvironment.Clean(headless: true, source: source);
-        CollectionAssert.AreEquivalent(new[] { "PATH" }, headless.Keys.ToArray());
-        var tui = ClaudeEnvironment.Clean(headless: false, source: source);
-        CollectionAssert.AreEquivalent(new[] { "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "PATH" }, tui.Keys.ToArray());
+        var cleaned = ClaudeEnvironment.Clean(source: source);
+        foreach (var key in new[] { "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_BRIDGE_SESSION_ID" })
+            Assert.IsFalse(cleaned.ContainsKey(key), key);
+        foreach (var key in new[] { "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY", "CLAUDE_CODE_FUTURE_AUTH_OPTION",
+            "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS", "CLAUDE_CONFIG_DIR", "MCP_CONNECTION_NONBLOCKING", "PATH" })
+            Assert.AreEqual(source[key], cleaned[key], key);
     }
 
     [TestMethod]

@@ -6,8 +6,8 @@ namespace Gorynych.Adapters.Claude;
 /// <summary>
 /// One isolated, no-tool <c>claude -p</c> request that turns a session's first task into a concise
 /// title (docs/adapters.md, "Claude Code", "Titles"). It runs in Gorynych's own scratch folder with
-/// per-launch flags only: no persisted session, no settings sources, no MCP servers and no built-in
-/// tools, so the person's hooks and servers cannot run and no approval dialog can appear.
+/// per-launch flags only: no persisted session, no MCP servers and no built-in tools. Safe mode
+/// disables customizations while preserving native authentication, model and permission settings.
 /// </summary>
 internal static class ClaudeTitleGeneration
 {
@@ -58,7 +58,7 @@ internal static class ClaudeTitleGeneration
 
         var result = new TaskCompletionSource<JsonObject?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var stderr = Path.Combine(folder, "stderr.log");
-        await using var claude = ClaudeProcess.Start(exe, args, folder, ClaudeEnvironment.Clean(headless: true), stderr, message =>
+        await using var claude = ClaudeProcess.Start(exe, args, folder, ClaudeEnvironment.Clean(), stderr, message =>
         {
             if ((string?)message["type"] == "result") result.TrySetResult(message);
             return Task.CompletedTask;

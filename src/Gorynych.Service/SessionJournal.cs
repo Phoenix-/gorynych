@@ -129,6 +129,12 @@ public sealed class SessionJournal
         }
     }
 
+    /// <summary>The <c>messageId</c>s of steered messages the journal already holds, for recovery's one entry.</summary>
+    public HashSet<string> SteeredMessageIds() => ReadAll().OfType<JsonObject>()
+        .Where(e => (string?)e["sessionUpdate"] == "user_message_chunk"
+            && e["_meta"]?[Gorynych.Acp.Hosting.GorynychProtocol.MetaSteered] is JsonValue v && v.TryGetValue<bool>(out var steered) && steered)
+        .Select(e => (string?)e["messageId"]).OfType<string>().ToHashSet(StringComparer.Ordinal);
+
     /// <summary>The prompts whose end the journal has the mark of.</summary>
     public HashSet<string> EndMarkedPromptIds() => ReadAll().OfType<JsonObject>()
         .Select(e => e["_meta"] is JsonObject meta && meta[Gorynych.Acp.Hosting.GorynychProtocol.MetaAgentTurn] is JsonValue t

@@ -736,6 +736,9 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// <summary>The agent takes <c>systemPrompt</c> in append mode on new, load and resume.</summary>
     public bool TakesSystemPrompt => Info?.AgentCapabilities?.SessionCapabilities?.SystemPrompt is not null;
 
+    /// <summary>The adapter advertises the shared steering extension at its top-level <c>initialize</c> <c>_meta</c>.</summary>
+    public bool Steers => AcpSteering.Supports(Info);
+
     /// <summary>The adapter sets native titles (<c>_gorynych/set_title</c>).</summary>
     public bool CanSetTitle => Flag(GorynychProtocol.CapSetTitle);
 

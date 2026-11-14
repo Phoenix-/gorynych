@@ -70,10 +70,14 @@ fallback when the adapter does not provide it.
   again at its next use, and moves it only once a close succeeds or that host has exited. (Codex
   fails a close whose app-server did not unload the thread within 10 seconds.) An error that says
   the agent has no such session (`-32002`) counts as closed.
-- An adapter MUST run the unmodified agent binary or API client under the user's own login on
+- An adapter MUST run the unmodified agent binary or API client with the user's native configuration on
   that machine, MUST NOT copy credentials between machines, and MUST NOT edit the agent's own
   configuration (`~/.claude`, `~/.codex`, `~/.kimi-code`, `~/.dsh`). Everything it needs goes through
   per-launch flags, the agent's own protocol, hooks or a terminal.
+- Authentication, provider selection and billing belong to the harness. An adapter MUST NOT
+  gate launches or catalogs on account metadata, validate subscriptions or allowed credential
+  types, force a login route, or remove native authentication/provider settings or environment.
+  Only specific parent-session identity markers may be removed to isolate a new session.
 - The adapter's name (`IAgentAdapter.Name`, such as `claude`) is what the service records per
   session and what `spawn_session` takes; it MUST be stable.
 - An adapter MUST start its agent in a folder of its own, never in a session's folder: an agent
@@ -109,9 +113,10 @@ fallback when the adapter does not provide it.
 - The service declares no file system and no terminal (`fs.readTextFile`, `fs.writeTextFile`
   and `terminal` false), so the adapter MUST NOT call `fs/*` or `terminal/*`. It declares
   form elicitation, which it relays ([§8](#8-approvals-and-forms)).
-- An adapter MAY advertise `authMethods`. The service does not call `authenticate`: the user
-  logs in on the machine, and an authentication error from a turn reaches the client unchanged
-  (Kimi's `-32000 Authentication required`).
+- A native ACP adapter MAY advertise `authMethods`. Gorynych advertises no login/logout flow
+  and does not call `authenticate` or `logout`: the user configures the harness outside Gorynych.
+  Native authentication errors reach the client (Kimi's `-32000 Authentication required`
+  unchanged; translated transports retain the native error and message).
 
 ## 3. New sessions, the list and discovery
 
@@ -315,6 +320,33 @@ list replaces the one before.
   is discarded. The command still runs behind the session's turn gate, and `session/cancel`
   cancels it with `cancelled` as it does a native turn (Codex `/usage`).
 
+### 5.1 Steering
+
+An adapter that supports the shared ACP v1 steering extension advertises
+`_meta.steering.supported: true` at the top level of its `initialize` result and takes
+`_session/steering` as specified in [steering.md](steering.md#the-protocol). It MUST:
+
+- validate the request like `session/prompt`: a non-empty `prompt` of the negotiated content
+  types, and only `idleBehavior: "promptRequired"`; refuse malformed params with `-32602`;
+- treat a turn it has accepted as running even before the agent starts it, and take the steer
+  through the same ordered input as prompts; no turn means `promptRequired` when the caller opted
+  in, and the legacy `startedNewTurn` only for a caller that did not;
+- keep accepted steers attached to the owning ACP turn, not settle that turn successfully while
+  an accepted steer is still pending delivery, emit no `user_message_chunk` echo, and let
+  cancellation, failure, exit or a stall resolve pending delivery;
+- preserve pending approvals and elicitation/questions; steering answers neither;
+- refuse a turn that cannot take a message with `-32600`,
+  `data: {"gorynych/steerRefused": "turnNotSteerable"}`, and an unsupported session with
+  `notSupported`; a definite refusal is not acceptance. Cancel an outstanding request with
+  `$/cancel_request`, not a steering-specific withdrawal;
+- keep the shared wire shape: `injected`, `promptRequired {"reason":"noRunningTurn"}` or
+  `startedNewTurn`; an unknown or lost answer is uncertainty, and the adapter is not probed.
+
+The conductor always sends `idleBehavior: "promptRequired"` and a fresh
+`_meta["gorynych/messageId"]`; an adapter whose native input can keep it (Codex's
+`clientUserMessageId`) MUST use it. An adapter that keeps nothing on the wire itself returns only
+after it has taken the message for the running turn (Queue admission, not model consumption).
+
 ## 6. Service turns: opinions and reports
 
 A *service turn* is a turn the service runs on a session on another session's behalf: an
@@ -437,6 +469,8 @@ in the middle of one.
   to its own `message_id`; the GUI and `read_session` tell requests and reports apart by them.
 - Today only Claude has it: on Claude's input when it runs headless ([adapters.md](adapters.md#live-notes-opinions-and-reports-on-stdin)),
   through its development channel in the TUI ([adapters.md](adapters.md#mcp-servers-and-the-channel-opinions-both-ways)).
+- A person's message into a running turn is not a live note but steering, a separate path
+  (`_session/steering`, [§5.1](#51-steering)): [steering.md](steering.md).
 
 ## 7. Closing and unloading
 
@@ -582,12 +616,13 @@ DSH speaks ACP, and its adapter is a thin proxy.
 
 | Feature | Claude Code, headless (default: in-process adapter over `claude -p` with stream-json) | Claude Code, TUI (fallback, `--claude-transport tui`: the TUI in a pseudo console) | Kimi Code 2.5.2 (`kimi acp`, native ACP) | Codex 0.167 (in-process adapter over `codex app-server`) | DeepSeek Harness 0.2.2-rc.1 (`dsh --profile acp`, native ACP, in-process proxy; one process per permission mode) |
 | --- | --- | --- | --- | --- | --- |
-| Capabilities | list, resume, close, systemPrompt; `gorynych/setTitle`, `gorynych/autoTitle`; image prompts | list, resume, close, systemPrompt | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/autoTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable`, `gorynych/openElsewhere`, `gorynych/sessionsChanged` | list, resume, close; `gorynych/unloadAfter` 120 |
+| Capabilities | list, resume, close, systemPrompt; `gorynych/setTitle`, `gorynych/autoTitle`; image prompts; top-level `steering.supported` | list, resume, close, systemPrompt; `steering.supported: false` | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/autoTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable`, `gorynych/openElsewhere`, `gorynych/sessionsChanged`; top-level `steering.supported` | list, resume, close; `gorynych/unloadAfter` 120 |
 | New ([§3](#3-new-sessions-the-list-and-discovery)) | UUID from the adapter; recorded at the first prompt | UUID from the adapter; recorded at the first prompt | `session_…`; a real session at once, listed untitled | `thread/start`; nothing on disk before the first turn | UUID from DSH; durable at once, never titled, so an unused draft gets a tombstone |
 | List | the adapter's own list of the sessions it started | the adapter's own list of the sessions it started | Kimi's list; leaves natively archived sessions out; ignores `cursor` | `thread/list` (`cursor`, `limit`, exact `cwd`); archived left out; title = the thread's `name` | the read-only process's `{sessionId, cwd}` with cursor and `cwd`; the sessions open in either process added back by the proxy and the router; no title or `updatedAt` |
 | Open not loaded ([§4](#4-opening-a-session-that-is-not-loaded)) | `session/resume` only registers; the process starts with the next prompt | `session/resume` only registers; the process starts with the next prompt | `session/load`, its replay aligned with the journal | `thread/resume`, `excludeTurns`, then the turns after the mark; refused at once, naming the holder, while another Codex app has the thread (one writer; Windows), else by app-server; fails when it is archived in Codex | `session/resume` in the process of the session's mode, about 0.2 s; fails while `dsh web` or another DSH process has the session (one writer); no `session/load` |
 | History caught up ([§4](#4-opening-a-session-that-is-not-loaded)) | `gorynych/replayFrom`; mark `<uuid>@<offset>`: the transcript's last conversation entry; read from the mark's line on, the conversation walked back by `parentUuid` (`logicalParentUuid` across a compaction); a rewind replays it all | as headless | no marks: the service aligns the whole `session/load` replay by user text, leaving out Kimi's own `<system-reminder>` parts; an undo or a compaction that drops the journal's last messages imports it again | `gorynych/replayFrom`; mark: the newest completed turn's ID; `thread/turns/list` newest first without items, to the marked turn, then the newer turns' items; a rollback replays every turn | none yet: DSH's ACP replays nothing, so the journal stays as it is |
 | Turns ([§5](#5-prompts-and-turns)) | a user message on stdin; the `result` ends the turn; `interrupt` for `session/cancel` | bracketed paste into the TUI; the `Stop` hook ends the turn | native | `turn/start`; `turn/interrupt` for `session/cancel` | native; subagents run inside the prompt |
+| Steering ([§5.1](#51-steering)) | built: `_session/steering`, one default-priority user message on stdin, accepted steers held across native result cycles | not supported: `steering.supported: false`; typed TUI input stays in its queue | not yet: none advertised by `kimi acp` 2.5.2 | built: `turn/steer` after the turn is named, `expectedTurnId` and `clientUserMessageId` | not yet: none advertised by the ACP bridge |
 | Service turns and waking ([§6.1](#61-waking-a-session-and-closing-it-again)) | turns start the process; unloaded after the idle time | turns start the process; unloaded after the idle time | turns; resumed, then unloaded after the idle time | turns; resumed, then unloaded after its 2-minute idle time | turns; resumed, then unloaded after its 2-minute idle time |
 | `gorynych` MCP server ([§6.2](#62-the-gorynych-mcp-server)) | per-launch `--mcp-config` | per-launch `--mcp-config` | through ACP `mcpServers` | per-thread `config.mcp_servers` on `thread/start` and every `thread/resume` (kept only while loaded) | through ACP `mcpServers` on new and every resume |
 | System prompt ([§6.2](#62-the-gorynych-mcp-server)) | `sessionCapabilities.systemPrompt: {}` (append only): `--append-system-prompt`, after the adapter's live-note authorization; other modes and non-text content fail with `-32602` | as headless | not advertised by 2.5.2: the MCP instructions and the requests' texts | append only: `developerInstructions`; Codex keeps those a thread was created with | per launch: `personaSuffix` in the `--patch`, not advertised |

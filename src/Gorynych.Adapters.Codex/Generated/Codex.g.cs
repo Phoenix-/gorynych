@@ -2828,6 +2828,27 @@ public sealed partial class TurnStartResponse
     public Turn Turn { get; set; } = null!;
 }
 
+public sealed partial class TurnSteerParams
+{
+    [JsonPropertyName("clientUserMessageId")]
+    public string? ClientUserMessageId { get; set; }
+    /// <summary>
+    /// Required active turn id precondition. The request fails when it does not match the currently active turn.
+    /// </summary>
+    [JsonPropertyName("expectedTurnId")]
+    public string ExpectedTurnId { get; set; } = "";
+    [JsonPropertyName("input")]
+    public List<UserInput> Input { get; set; } = [];
+    [JsonPropertyName("threadId")]
+    public string ThreadId { get; set; } = "";
+}
+
+public sealed partial class TurnSteerResponse
+{
+    [JsonPropertyName("turnId")]
+    public string TurnId { get; set; } = "";
+}
+
 public sealed partial class TurnInterruptParams
 {
     [JsonPropertyName("threadId")]
@@ -4485,6 +4506,8 @@ public readonly partial record struct McpServerElicitationAction(string Value) :
 [JsonSerializable(typeof(TurnStartParams))]
 [JsonSerializable(typeof(TurnToolOutput))]
 [JsonSerializable(typeof(TurnStartResponse))]
+[JsonSerializable(typeof(TurnSteerParams))]
+[JsonSerializable(typeof(TurnSteerResponse))]
 [JsonSerializable(typeof(TurnInterruptParams))]
 [JsonSerializable(typeof(TurnInterruptResponse))]
 [JsonSerializable(typeof(ModelListParams))]

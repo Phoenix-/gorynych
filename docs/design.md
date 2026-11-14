@@ -4,7 +4,7 @@ Why Gorynych is built the way it is: the decisions, the architecture, how it map
 what the probes proved, and what is still a plan. The specifications that the code follows
 live next to this file: [service protocol](service-protocol.md),
 [adapter contract](adapter-contract.md), [adapters](adapters.md), [ACP types](acp-types.md),
-[external clients](external-clients.md). Where this document and a specification disagree,
+[external clients](external-clients.md), [the AHP face](ahp-face.md), [steering](steering.md). Where this document and a specification disagree,
 the specification wins.
 
 Status words used below: **done** (in the code and tested), **in progress** (on a branch),
@@ -39,7 +39,7 @@ approval card, one session list, without reading terminals.
 ## Decisions
 
 - **Native harnesses, unmodified.** Each agent runs as its own program, the one its vendor
-  ships, under the person's own login. Gorynych adds no model calls of its own and never
+  ships, with the person's native configuration. Gorynych adds no model calls of its own and never
   replaces a harness with a bare model.
 - **Never edit an agent's own configuration** (`~/.claude`, `~/.codex`, `~/.kimi-code`).
   Everything goes through per-launch options and the agents' own protocols, so starting or
@@ -55,13 +55,10 @@ approval card, one session list, without reading terminals.
   Codex has `codex app-server`, Claude Code has stream-json (`claude -p`). In Claude's TUI
   fallback the terminal is used only to type and to answer the few dialogs that need a key.
 - **Claude Code runs headless; the TUI is the fallback.** The unmodified `claude` binary runs as
-  `claude -p` with stream-json in and out, under the person's own plan login, one process per
-  session (decided 9 November 2026). Anthropic's help center says `claude -p` and the Agent SDK
-  signed in with a plan draw from its limits, and the legal page does not prevent signing in
-  to the unmodified binary with one's own subscription. The interactive TUI in a pseudo console
-  stays built and tested behind `--claude-transport tui`: a separate credit for `-p` was
-  announced and then paused in 2026, and `--bare` (no OAuth login) is to become the default for
-  `-p`. Switching needs no migration; both use Claude's own transcripts.
+  `claude -p` with stream-json in and out, under the person's own configured login or API credentials, one process per
+  session (decided 9 November 2026). The interactive TUI in a pseudo console stays built and
+  tested behind `--claude-transport tui`. Switching needs no migration; both use Claude's own
+  transcripts. The choice of transport imposes no login, provider or billing policy.
 - **Service and GUI are separate from day one.** A per-user background service on each
   machine owns the agent processes; a GUI connects to it, and later to several services.
 - **Several machines meet in a service, not in the GUI** (decided 10 November 2026). A service
@@ -76,8 +73,10 @@ approval card, one session list, without reading terminals.
   run time would break Native AOT, which the service keeps.
 - **Native state is the source of truth.** Titles and archive live in the harness when it has
   them; the service keeps only an overlay for the rest.
-- **One person, own subscriptions.** Each machine uses its own login; credentials never move
-  between machines; Gorynych serves nobody else.
+- **Harness authentication is out of scope.** Each harness owns login/logout, credential
+  discovery, provider selection and billing. Gorynych inherits native settings and environment,
+  does not validate account metadata or impose subscription/API restrictions, and relays native
+  errors. Credentials never move between machines; Gorynych serves nobody else.
 - **Standards first.** Before inventing a format, name the closest standard and conform to it
   or extend it through its documented extension points.
 
@@ -160,7 +159,7 @@ file in `~/.claude` or in the project changes.
 | Authorization for opinions | `--append-system-prompt` | answer opinion requests with `reply`, take no actions for other agents |
 | Title | the `rename_session` control request | Claude's own `custom-title` |
 | Folder trust | Claude's own flag, read only, else the person's answer | `-p` asks nothing itself and would run a folder's project hooks and MCP servers |
-| The login | the `account` of `initialize` | no login (what `--bare` gives) or an API key fails the prompt loudly |
+| Authentication | Claude Code's native configuration and failures | no account checks or login/billing policy in Gorynych; native failures reach the client |
 
 **TUI, the fallback:**
 
@@ -579,8 +578,8 @@ found both.
   ssh.
 - Links to files point to paths on the remote machine.
 
-**Logins.** Each machine has its own: the person signs in to each agent there by hand, and
-credentials never move between machines.
+**Native configuration.** Each machine has its own harness setup, configured outside Gorynych.
+Credentials never move between machines.
 
 ## Updating without losing work
 
@@ -928,7 +927,7 @@ Done in stage one:
   a named pipe open only to its user, the bridge for stdio clients;
 - Claude headless (`claude -p`, stream-json): streamed answers and thoughts, approvals over
   `can_use_tool`, live notes on stdin, model, effort and mode selectors, the native rename,
-  folder trust, and loud failures off the plan; the TUI fallback in ConPTY with http hooks,
+  folder trust, and loud authentication/billing failures; the TUI fallback in ConPTY with http hooks,
   the channel with `reply`, pastes after `Stop`, and the person's consent before the
   development-channels notice is confirmed;
 - Kimi through `kimi acp`, the second kind of adapter, which checked the whole model;
@@ -1027,11 +1026,9 @@ Open:
 
 Risks:
 
-- **Headless Claude on a plan can be restricted.** Anthropic announced a separate credit for
-  `claude -p` and the Agent SDK in May 2026 and paused it in June; `--bare`, which reads no OAuth
-  login, is to become the default for `-p`. The adapter fails loudly when a launch shows no
-  login or an API key, or when Claude reports an auth or billing error, and the TUI transport
-  is one flag away.
+- **Native authentication and billing can change.** The harness reports any restrictions or
+  failures. Gorynych relays those failures without inferring eligibility from account metadata
+  or choosing another authentication route. The Claude TUI transport is available explicitly.
 - **Channels are a research preview** (TUI fallback only). If Claude Code drops them, questions
   and reports go to Claude as turns, as they already do for a session without the channel.
 - **The development-channels notice** needs Enter at every launch. Gorynych confirms it only

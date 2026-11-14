@@ -25,6 +25,7 @@ sealed class CodexThread
     readonly Dictionary<string, SandboxPolicy> sandboxes = new(StringComparer.Ordinal);
 
     TaskCompletionSource<Turn>? turn;
+    TaskCompletionSource<string>? named;
     CancellationTokenSource? localCommand;
     string? turnId;
     bool stopAsked;
@@ -38,6 +39,7 @@ sealed class CodexThread
     readonly Dictionary<string, ThreadItem> tools = [];
     readonly HashSet<string> claimed = [];
     TaskCompletionSource itemStarted = Signal();
+    readonly Dictionary<long, TaskCompletionSource> arrivals = []; // prompts and steers, before their handlers
 
     public CodexThread(string id, string cwd, CodexSettings settings)
     {
@@ -204,6 +206,7 @@ sealed class CodexThread
         {
             if (turn is not null) return null;
             turn = new TaskCompletionSource<Turn>(TaskCreationOptions.RunContinuationsAsynchronously);
+            named = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
             turnId = null;
             stopAsked = cancelledAt > sequence;
             streamed.Clear();
@@ -231,8 +234,40 @@ sealed class CodexThread
         {
             if (turn is null || turnId is not null) return false;
             turnId = id;
+            named?.TrySetResult(id);
             return stopAsked;
         }
+    }
+
+    /// <summary>The running turn's name, or a failure once it ends, is abandoned, or never was: a steer behind it never attaches to a later turn.</summary>
+    public Task<string> NameOf(TaskCompletionSource<Turn> started)
+    {
+        lock (gate)
+        {
+            if (!ReferenceEquals(turn, started)) throw new InvalidOperationException("The turn already ended.");
+            return named!.Task;
+        }
+    }
+
+    /// <summary>A prompt or steer arrived on the ACP connection, before its handler runs on the thread pool.</summary>
+    public void NoteArrival(long sequence)
+    {
+        lock (gate) arrivals[sequence] = Signal();
+    }
+
+    public void AdmitArrival(long sequence)
+    {
+        TaskCompletionSource? signal;
+        lock (gate) arrivals.Remove(sequence, out signal);
+        signal?.TrySetResult();
+    }
+
+    /// <summary>Waits until every prompt or steer that arrived before <paramref name="sequence"/> reached its admission point.</summary>
+    public async Task WaitArrivalsBefore(long sequence, CancellationToken ct)
+    {
+        Task[] waiting;
+        lock (gate) waiting = arrivals.Where(a => a.Key < sequence).Select(a => (Task)a.Value.Task).ToArray();
+        if (waiting.Length > 0) await Task.WhenAll(waiting).WaitAsync(ct);
     }
 
     /// <summary>
@@ -255,7 +290,11 @@ sealed class CodexThread
     public void Completed(Turn ended)
     {
         TaskCompletionSource<Turn>? done;
-        lock (gate) done = turnId is null || turnId == ended.Id ? turn : null;
+        lock (gate)
+        {
+            done = turnId is null || turnId == ended.Id ? turn : null;
+            if (done is not null) named?.TrySetException(new InvalidOperationException("The turn ended before Codex named it."));
+        }
         done?.TrySetResult(ended);
     }
 
@@ -272,6 +311,7 @@ sealed class CodexThread
         {
             localCommand?.Cancel();
             (done, id) = (turn, turnId);
+            named?.TrySetException(new InvalidOperationException("The turn was abandoned before Codex named it."));
         }
         return done?.TrySetResult(new Turn { Id = id ?? "", Status = TurnStatus.Interrupted }) == true ? id : null;
     }
@@ -283,6 +323,7 @@ sealed class CodexThread
         {
             localCommand?.Cancel();
             done = turn;
+            named?.TrySetException(e);
         }
         done?.TrySetException(e);
     }
@@ -292,9 +333,11 @@ sealed class CodexThread
         lock (gate)
         {
             if (turn != done) return;
+            named?.TrySetException(new InvalidOperationException("The turn ended before Codex named it."));
             localCommand?.Dispose();
             localCommand = null;
             turn = null;
+            named = null;
             turnId = null;
             stopAsked = false;
         }
@@ -391,6 +434,8 @@ sealed class CodexAgent : IAsyncDisposable
 
     /// <summary>Tells the service when another Codex app takes a thread or lets it go; started with the adapter.</summary>
     CodexLockWatcher? lockWatcher;
+    sealed record Arrival(CodexThread Thread, long Sequence);
+    readonly System.Runtime.CompilerServices.ConditionalWeakTable<JsonRpcRequest, Arrival> arrivals = new();
     readonly ConcurrentDictionary<string, CodexThread> threads = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<string, CancellationTokenSource> asking = new(StringComparer.Ordinal);
     /// <summary>Threads being closed, until app-server says it unloaded them (<c>thread/closed</c>).</summary>
@@ -490,8 +535,28 @@ sealed class CodexAgent : IAsyncDisposable
             Log = Log,
         };
         rpc.RequestHandler = HandleAsync;
+        rpc.RequestArrived = OnRequestArrived;
+        rpc.RequestDone = OnRequestDone;
         rpc.NotificationHandler = OnNotificationAsync;
         rpc.Log = Log;
+    }
+
+    /// <summary>A prompt or steer is ordered at arrival, before its handler runs: a steer behind a prompt waits for it, and a cancel behind both waits for them.</summary>
+    void OnRequestArrived(JsonRpcRequest request)
+    {
+        if (request.Method is not (AcpMethods.Agent.SessionPrompt or GorynychProtocol.MethodSteering)) return;
+        if ((string?)request.Params?["sessionId"] is not { } id || !threads.TryGetValue(id, out var thread)) return;
+        thread.NoteArrival(request.Sequence);
+        arrivals.AddOrUpdate(request, new Arrival(thread, request.Sequence));
+    }
+
+    void OnRequestDone(JsonRpcRequest request)
+    {
+        if (arrivals.TryGetValue(request, out var arrival))
+        {
+            arrivals.Remove(request);
+            arrival.Thread.AdmitArrival(arrival.Sequence);
+        }
     }
 
     /// <summary>Completes when the adapter stops, also when its app-server goes away.</summary>
@@ -607,6 +672,8 @@ sealed class CodexAgent : IAsyncDisposable
                         },
                     },
                     AuthMethods = [],
+                    // The shared steering extension, at the top level as its agreed wire shape says.
+                    Meta = new JsonObject { [GorynychProtocol.MetaSteering] = new JsonObject { ["supported"] = true } },
                 });
             case AcpMethods.Agent.SessionNew:
                 return await NewAsync(request.ParamsAs<NewSessionRequest>(), ct);
@@ -648,6 +715,8 @@ sealed class CodexAgent : IAsyncDisposable
                 return new JsonObject();
             case AcpMethods.Agent.SessionPrompt:
                 return await PromptAsync(request, ct);
+            case GorynychProtocol.MethodSteering:
+                return await SteerAsync(request, ct);
             case AcpMethods.Agent.SessionSetConfigOption:
                 return SetConfigOption(request.ParamsAs<SetSessionConfigOptionRequest>());
             case GorynychProtocol.MethodCatchUp:
@@ -706,7 +775,11 @@ sealed class CodexAgent : IAsyncDisposable
         var sequence = rpc.NotificationSequence;
         // The stop is noted at once; the interrupt is not waited for, so the read loop goes on.
         if (method == AcpMethods.Agent.SessionCancel && (string?)@params?["sessionId"] is { } id && threads.TryGetValue(id, out var t))
-            _ = StopAsync(t, sequence);
+            _ = Task.Run(async () =>
+            {
+                await t.WaitArrivalsBefore(sequence, CancellationToken.None);
+                await StopAsync(t, sequence);
+            });
         return Task.CompletedTask;
     }
 
@@ -737,6 +810,7 @@ sealed class CodexAgent : IAsyncDisposable
     async Task<JsonNode?> UsageAsync(CodexThread t, long sequence, CancellationToken ct)
     {
         var done = t.Begin(sequence) ?? throw new JsonRpcException(JsonRpcException.InvalidRequest, "A turn of this session is still running.");
+        t.AdmitArrival(sequence);
         var status = TurnStatus.Completed;
         try
         {
@@ -1109,6 +1183,7 @@ sealed class CodexAgent : IAsyncDisposable
         var input = p.Prompt.Select(InputOf).OfType<UserInput>().ToList();
         if (input.Count == 0) throw new JsonRpcException(JsonRpcException.InvalidParams, "The prompt has no text.");
         var done = t.Begin(request.Sequence) ?? throw new JsonRpcException(JsonRpcException.InvalidRequest, "A turn of this session is still running.");
+        t.AdmitArrival(request.Sequence);
         try
         {
             // A cancel during turn/start is applied once Codex names the turn; turn/start itself is
@@ -1154,6 +1229,119 @@ sealed class CodexAgent : IAsyncDisposable
             t.End(done);
         }
     }
+
+    /// <summary>
+    /// <c>_session/steering</c> on Codex: wait for the running turn to be named, then
+    /// <c>turn/steer</c> with that turn as <c>expectedTurnId</c> and the service's message ID as
+    /// <c>clientUserMessageId</c>. Success is queue admission. A turn that ended, or a name that
+    /// never came, answers <c>promptRequired</c>; a review or compact turn is
+    /// <c>turnNotSteerable</c>. Other failures stay errors: they may or may not have been accepted.
+    /// </summary>
+    async Task<JsonNode?> SteerAsync(JsonRpcRequest request, CancellationToken ct)
+    {
+        var steering = AcpSteering.Parse(request.Params);
+        if (readOnly.TryGetValue(steering.SessionId, out var open))
+            throw AcpSteering.Refused("turnNotSteerable", open.Holder is not { } holder
+                ? $"Codex session {steering.SessionId} is open here for reading only; it cannot take a steer."
+                : $"Codex session {steering.SessionId} is read-only here: {ReadOnlyReason(holder)}");
+        if (!threads.TryGetValue(steering.SessionId, out var t) || !t.Loaded) return AcpSteering.PromptRequiredResult();
+        await t.WaitArrivalsBefore(request.Sequence, ct);
+        var input = steering.Prompt.Select(InputOf).OfType<UserInput>().ToList();
+        if (input.Count == 0) throw new JsonRpcException(JsonRpcException.InvalidParams, "The steering message has no text.");
+        var running = t.Turn;
+        if (running is null)
+        {
+            if (steering.PromptRequired)
+            {
+                t.AdmitArrival(request.Sequence);
+                return AcpSteering.PromptRequiredResult();
+            }
+            var created = await StartIdleAsync(t, input, messageId: (string?)request.Params?["_meta"]?[GorynychProtocol.MetaMessageId], request.Sequence, ct);
+            t.AdmitArrival(request.Sequence);
+            return created;
+        }
+        string turnId;
+        try
+        {
+            turnId = await t.NameOf(running).WaitAsync(ct);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (InvalidOperationException)
+        {
+            // The turn ended, was abandoned, or Codex closed the thread or the process went:
+            // there is no running turn to join, and this steer never reached it.
+            t.AdmitArrival(request.Sequence);
+            return AcpSteering.PromptRequiredResult();
+        }
+        var messageId = (string?)request.Params?["_meta"]?[GorynychProtocol.MetaMessageId];
+        TurnSteerResponse accepted;
+        try
+        {
+            var response = await app.StartRequestAsync(CodexMethods.Client.TurnSteer, ToNode(new TurnSteerParams
+            {
+                ThreadId = t.Id,
+                ExpectedTurnId = turnId,
+                Input = input,
+                ClientUserMessageId = messageId,
+            }, CodexJsonContext.Default.TurnSteerParams), ct);
+            t.AdmitArrival(request.Sequence); // written: a later cancel now goes after it
+            accepted = From(await response, CodexJsonContext.Default.TurnSteerResponse);
+        }
+        catch (JsonRpcException e) when (IsNoActiveTurn(e) || IsExpectedTurnMismatch(e))
+        {
+            t.AdmitArrival(request.Sequence);
+            return AcpSteering.PromptRequiredResult();
+        }
+        catch (JsonRpcException e) when (IsActiveTurnNotSteerable(e))
+        {
+            t.AdmitArrival(request.Sequence);
+            throw AcpSteering.Refused("turnNotSteerable", "This Codex turn cannot take a steer (a review or a manual compact).");
+        }
+        if (accepted.TurnId != turnId)
+            throw new JsonRpcException(JsonRpcException.InternalError,
+                $"Codex accepted the steer for turn {accepted.TurnId}, not the running turn {turnId}; its outcome is unknown.");
+        return AcpSteering.Result(AcpSteering.Injected);
+    }
+
+    /// <summary>
+    /// The shared extension's legacy idle start for a direct ACP caller that did not opt in: one
+    /// <c>turn/start</c>, tracked as the thread's running turn, answered <c>startedNewTurn</c> once
+    /// Codex accepted it. The conductor always opts in, so its own fallback owns idle starts.
+    /// </summary>
+    async Task<JsonObject> StartIdleAsync(CodexThread t, List<UserInput> input, string? messageId, long sequence, CancellationToken ct)
+    {
+        var done = t.Begin(sequence) ?? throw new JsonRpcException(JsonRpcException.InvalidRequest, "A turn of this session is still running.");
+        try
+        {
+            var started = From(await app.SendRequestAsync(CodexMethods.Client.TurnStart, ToNode(new TurnStartParams
+            {
+                ThreadId = t.Id,
+                Input = input,
+                ClientUserMessageId = messageId,
+            }, CodexJsonContext.Default.TurnStartParams), ct), CodexJsonContext.Default.TurnStartResponse);
+            Named(t, started.Turn.Id);
+            _ = done.Task.ContinueWith(_ => t.End(done), TaskScheduler.Default);
+            return AcpSteering.Result(AcpSteering.StartedNewTurn);
+        }
+        catch
+        {
+            t.Fail(new JsonRpcException(JsonRpcException.InternalError, "Codex did not start the idle turn."));
+            _ = done.Task.ContinueWith(finished => _ = finished.Exception, TaskScheduler.Default);
+            t.End(done);
+            throw;
+        }
+    }
+
+    static bool IsNoActiveTurn(JsonRpcException e) =>
+        e.Code == JsonRpcException.InvalidRequest && e.Message.Contains("no active turn to steer", StringComparison.Ordinal);
+
+    static bool IsExpectedTurnMismatch(JsonRpcException e) =>
+        e.Code == JsonRpcException.InvalidRequest && e.Message.StartsWith("expected active turn id", StringComparison.Ordinal);
+
+    static bool IsActiveTurnNotSteerable(JsonRpcException e) =>
+        e.Code == JsonRpcException.InvalidRequest
+        && (e.ErrorData?["codexErrorInfo"]?["activeTurnNotSteerable"] is not null
+            || e.ErrorData?["codex_error_info"]?["active_turn_not_steerable"] is not null);
 
     static UserInput? InputOf(ContentBlock block) => block switch
     {
