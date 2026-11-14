@@ -3028,6 +3028,221 @@ public sealed partial class ModelUpgradeInfo
     public string? UpgradeCopy { get; set; }
 }
 
+/// <summary>
+/// Usage-read capabilities of the requesting client, never inferred from its experiment arm.
+/// </summary>
+public sealed partial class GetAccountRateLimitsParams
+{
+    /// <summary>
+    /// Skip the separate reset-credit detail lookup for background usage polls. The usage response still includes the available count; omitted/false preserves detailed reads.
+    /// </summary>
+    [JsonPropertyName("excludeResetCreditDetails")]
+    public bool? ExcludeResetCreditDetails { get; set; }
+    /// <summary>
+    /// The client supports automatic Luna Reserve fallback. For eligible ChatGPT CLI users, allow the backend to record experiment exposure after ordinary usage is blocked.
+    /// </summary>
+    [JsonPropertyName("supportsLunaReserve")]
+    public bool? SupportsLunaReserve { get; set; }
+}
+
+public sealed partial class GetAccountRateLimitsResponse
+{
+    /// <summary>
+    /// Account associated with this usage snapshot, when supplied by the backend.
+    /// </summary>
+    [JsonPropertyName("accountId")]
+    public string? AccountId { get; set; }
+    /// <summary>
+    /// Backend permission for ordinary included usage, validated against the active account. Null means unavailable; clients must not infer recovery from percentages or reset times.
+    /// </summary>
+    [JsonPropertyName("ordinaryUsageAllowed")]
+    public bool? OrdinaryUsageAllowed { get; set; }
+    [JsonPropertyName("rateLimitResetCredits")]
+    public RateLimitResetCreditsSummary? RateLimitResetCredits { get; set; }
+    /// <summary>
+    /// Optional backend-owned banner from the same usage read. Its nested keys retain the backend's snake_case contract; an absent banner leaves the client's existing UI unchanged.
+    /// </summary>
+    [JsonPropertyName("rateLimitUpsell")]
+    public JsonNode? RateLimitUpsell { get; set; }
+    /// <summary>
+    /// Backward-compatible single-bucket view; mirrors the historical payload.
+    /// </summary>
+    [JsonPropertyName("rateLimits")]
+    public RateLimitSnapshot RateLimits { get; set; } = null!;
+    /// <summary>
+    /// Multi-bucket view keyed by metered `limit_id` (for example, `codex`).
+    /// </summary>
+    [JsonPropertyName("rateLimitsByLimitId")]
+    public Dictionary<string, RateLimitSnapshot?>? RateLimitsByLimitId { get; set; }
+}
+
+public sealed partial class RateLimitResetCreditsSummary
+{
+    [JsonPropertyName("availableCount")]
+    public long AvailableCount { get; set; }
+    /// <summary>
+    /// Detail rows for available reset credits, when the backend provides them.
+    ///
+    /// `null` means only `availableCount` is known, while an empty array means details were fetched and no available credits were returned. The backend may cap this list, so its length can be less than `availableCount`.
+    /// </summary>
+    [JsonPropertyName("credits")]
+    public List<RateLimitResetCredit>? Credits { get; set; }
+}
+
+public sealed partial class RateLimitResetCredit
+{
+    /// <summary>
+    /// Backend-provided display description for this credit, or `null` when unavailable.
+    /// </summary>
+    [JsonPropertyName("description")]
+    public string? Description { get; set; }
+    /// <summary>
+    /// Unix timestamp in seconds when the credit expires, or `null` if it does not expire.
+    /// </summary>
+    [JsonPropertyName("expiresAt")]
+    public long? ExpiresAt { get; set; }
+    /// <summary>
+    /// Unix timestamp in seconds when the credit was granted.
+    /// </summary>
+    [JsonPropertyName("grantedAt")]
+    public long GrantedAt { get; set; }
+    /// <summary>
+    /// Opaque backend identifier for this reset credit.
+    /// </summary>
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = "";
+    [JsonPropertyName("resetType")]
+    public RateLimitResetType ResetType { get; set; }
+    [JsonPropertyName("status")]
+    public RateLimitResetCreditStatus Status { get; set; }
+    /// <summary>
+    /// Backend-provided display title for this credit, or `null` when unavailable.
+    /// </summary>
+    [JsonPropertyName("title")]
+    public string? Title { get; set; }
+}
+
+[JsonConverter(typeof(OpenEnumJsonConverter<RateLimitResetType>))]
+public readonly partial record struct RateLimitResetType(string Value) : IOpenEnum<RateLimitResetType>
+{
+    public static RateLimitResetType CodexRateLimits { get; } = new("codexRateLimits");
+    public static RateLimitResetType Unknown { get; } = new("unknown");
+    public static RateLimitResetType Create(string value) => new(value);
+    public override string ToString() => Value;
+}
+
+[JsonConverter(typeof(OpenEnumJsonConverter<RateLimitResetCreditStatus>))]
+public readonly partial record struct RateLimitResetCreditStatus(string Value) : IOpenEnum<RateLimitResetCreditStatus>
+{
+    public static RateLimitResetCreditStatus Available { get; } = new("available");
+    public static RateLimitResetCreditStatus Redeeming { get; } = new("redeeming");
+    public static RateLimitResetCreditStatus Redeemed { get; } = new("redeemed");
+    public static RateLimitResetCreditStatus Unknown { get; } = new("unknown");
+    public static RateLimitResetCreditStatus Create(string value) => new(value);
+    public override string ToString() => Value;
+}
+
+public sealed partial class RateLimitSnapshot
+{
+    [JsonPropertyName("credits")]
+    public CreditsSnapshot? Credits { get; set; }
+    [JsonPropertyName("individualLimit")]
+    public SpendControlLimitSnapshot? IndividualLimit { get; set; }
+    [JsonPropertyName("limitId")]
+    public string? LimitId { get; set; }
+    [JsonPropertyName("limitName")]
+    public string? LimitName { get; set; }
+    /// <summary>
+    /// Normal model whose display name and reasoning options describe this quota alias.
+    /// </summary>
+    [JsonPropertyName("normalModelSlug")]
+    public string? NormalModelSlug { get; set; }
+    [JsonPropertyName("planType")]
+    public PlanType? PlanType { get; set; }
+    [JsonPropertyName("primary")]
+    public RateLimitWindow? Primary { get; set; }
+    [JsonPropertyName("rateLimitReachedType")]
+    public RateLimitReachedType? RateLimitReachedType { get; set; }
+    [JsonPropertyName("secondary")]
+    public RateLimitWindow? Secondary { get; set; }
+    /// <summary>
+    /// Backend-reported spend-control state. `None` is unavailable, not a sparse-update recovery.
+    /// </summary>
+    [JsonPropertyName("spendControlReached")]
+    public bool? SpendControlReached { get; set; }
+}
+
+public sealed partial class CreditsSnapshot
+{
+    [JsonPropertyName("balance")]
+    public string? Balance { get; set; }
+    [JsonPropertyName("hasCredits")]
+    public bool HasCredits { get; set; }
+    [JsonPropertyName("unlimited")]
+    public bool Unlimited { get; set; }
+}
+
+public sealed partial class SpendControlLimitSnapshot
+{
+    [JsonPropertyName("limit")]
+    public string Limit { get; set; } = "";
+    [JsonPropertyName("remainingPercent")]
+    public int RemainingPercent { get; set; }
+    [JsonPropertyName("resetsAt")]
+    public long ResetsAt { get; set; }
+    [JsonPropertyName("used")]
+    public string Used { get; set; } = "";
+}
+
+[JsonConverter(typeof(OpenEnumJsonConverter<PlanType>))]
+public readonly partial record struct PlanType(string Value) : IOpenEnum<PlanType>
+{
+    public static PlanType Free { get; } = new("free");
+    public static PlanType Go { get; } = new("go");
+    public static PlanType Plus { get; } = new("plus");
+    public static PlanType Pro { get; } = new("pro");
+    public static PlanType Prolite { get; } = new("prolite");
+    public static PlanType Promax { get; } = new("promax");
+    public static PlanType Team { get; } = new("team");
+    public static PlanType SelfServeBusinessProlite { get; } = new("self_serve_business_prolite");
+    public static PlanType SelfServeBusinessUsageBased { get; } = new("self_serve_business_usage_based");
+    public static PlanType Business { get; } = new("business");
+    public static PlanType Ent26 { get; } = new("ent26");
+    public static PlanType EnterpriseCbpAutomation { get; } = new("enterprise_cbp_automation");
+    public static PlanType EnterpriseCbpUsageBased { get; } = new("enterprise_cbp_usage_based");
+    public static PlanType Enterprise { get; } = new("enterprise");
+    public static PlanType Edu { get; } = new("edu");
+    public static PlanType EduPlus { get; } = new("edu_plus");
+    public static PlanType EduPro { get; } = new("edu_pro");
+    public static PlanType Sci { get; } = new("sci");
+    public static PlanType SciPlus { get; } = new("sci_plus");
+    public static PlanType Unknown { get; } = new("unknown");
+    public static PlanType Create(string value) => new(value);
+    public override string ToString() => Value;
+}
+
+public sealed partial class RateLimitWindow
+{
+    [JsonPropertyName("resetsAt")]
+    public long? ResetsAt { get; set; }
+    [JsonPropertyName("usedPercent")]
+    public int UsedPercent { get; set; }
+    [JsonPropertyName("windowDurationMins")]
+    public long? WindowDurationMins { get; set; }
+}
+
+[JsonConverter(typeof(OpenEnumJsonConverter<RateLimitReachedType>))]
+public readonly partial record struct RateLimitReachedType(string Value) : IOpenEnum<RateLimitReachedType>
+{
+    public static RateLimitReachedType RateLimitReached { get; } = new("rate_limit_reached");
+    public static RateLimitReachedType WorkspaceOwnerCreditsDepleted { get; } = new("workspace_owner_credits_depleted");
+    public static RateLimitReachedType WorkspaceMemberCreditsDepleted { get; } = new("workspace_member_credits_depleted");
+    public static RateLimitReachedType WorkspaceOwnerUsageLimitReached { get; } = new("workspace_owner_usage_limit_reached");
+    public static RateLimitReachedType WorkspaceMemberUsageLimitReached { get; } = new("workspace_member_usage_limit_reached");
+    public static RateLimitReachedType Create(string value) => new(value);
+    public override string ToString() => Value;
+}
+
 public sealed partial class ThreadNameUpdatedNotification
 {
     [JsonPropertyName("threadId")]
@@ -4280,6 +4495,14 @@ public readonly partial record struct McpServerElicitationAction(string Value) :
 [JsonSerializable(typeof(ModelServiceTier))]
 [JsonSerializable(typeof(ReasoningEffortOption))]
 [JsonSerializable(typeof(ModelUpgradeInfo))]
+[JsonSerializable(typeof(GetAccountRateLimitsParams))]
+[JsonSerializable(typeof(GetAccountRateLimitsResponse))]
+[JsonSerializable(typeof(RateLimitResetCreditsSummary))]
+[JsonSerializable(typeof(RateLimitResetCredit))]
+[JsonSerializable(typeof(RateLimitSnapshot))]
+[JsonSerializable(typeof(CreditsSnapshot))]
+[JsonSerializable(typeof(SpendControlLimitSnapshot))]
+[JsonSerializable(typeof(RateLimitWindow))]
 [JsonSerializable(typeof(ThreadNameUpdatedNotification))]
 [JsonSerializable(typeof(ThreadStatusChangedNotification))]
 [JsonSerializable(typeof(ThreadClosedNotification))]

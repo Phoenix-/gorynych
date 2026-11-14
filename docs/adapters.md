@@ -645,6 +645,17 @@ over app-server's JSON-RPC. The design and the probes behind it are in
   compliance logs. The thread's `source` is `vscode`, as for Codex Desktop's threads, so
   Codex's own apps list Gorynych's threads too. The adapter turns off the notifications it
   does not use (`optOutNotificationMethods`): hooks, rate limits, MCP startup and the like.
+- **`/usage`** is an adapter command, advertised in `available_commands_update` on new, load
+  and resume of a writable session, and in `gorynych/localCommands`. It calls
+  `account/rateLimits/read` and answers with each bucket's primary and secondary windows,
+  credits, individual spend limit and available reset credits. It starts no Codex turn and
+  spends no model tokens; its updates are marked `gorynych/localCommand`, so a usage-only
+  draft is discarded like an empty one instead of being resumed without a rollout.
+  `session/cancel` cancels the read and a later prompt is unaffected. Closing the last client
+  during the read cancels it too, and only that explicit close retries the draft discard after
+  the prompt lets the session go; a dropped resumable link still has its comeback grace. A direct
+  adapter close does not wait for the local operation's end timeout. A prompt that is not exactly
+  `/usage` (apart from surrounding whitespace) goes to Codex as usual.
 
 ### Sessions
 

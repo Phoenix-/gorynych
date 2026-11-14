@@ -296,6 +296,13 @@ list replaces the one before.
   service's own answer to it is written: a client drops a session's updates until it has the
   session's ID.
 - Fallback: an adapter that sends none leaves its sessions with no commands.
+- A command the adapter answers itself, without creating a native turn, is listed in
+  `agentCapabilities._meta["gorynych/localCommands"]` with its leading slash (for example
+  `["/usage"]`). The service leaves a draft unpromoted for it and marks its own prompt update
+  `_meta["gorynych/localCommand"]: true`; the adapter marks the answer updates the same way.
+  These updates stay in the journal but do not count as native history when a non-durable draft
+  is discarded. The command still runs behind the session's turn gate, and `session/cancel`
+  cancels it with `cancelled` as it does a native turn (Codex `/usage`).
 
 ## 6. Service turns: opinions and reports
 

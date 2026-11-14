@@ -23,6 +23,7 @@ public sealed class SessionJournal
     static readonly HashSet<string> TurnKinds = ["user_message_chunk", "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan"];
 
     const string PositionKey = Gorynych.Acp.Hosting.GorynychProtocol.MetaPosition;
+    const string LocalCommandKey = Gorynych.Acp.Hosting.GorynychProtocol.MetaLocalCommand;
 
     /// <summary>
     /// How many of the newest entries compaction never merges: a client on the resumable link
@@ -68,7 +69,7 @@ public sealed class SessionJournal
 
     string TrimmedPath => path + ".trimmed";
 
-    /// <summary>True when the journal holds any part of a turn: a message, a thought, a tool call or a plan.</summary>
+    /// <summary>True when the journal holds any part of a native turn: a message, a thought, a tool call or a plan, except local-command updates.</summary>
     public bool HasTurns
     {
         get
@@ -81,7 +82,8 @@ public sealed class SessionJournal
         }
     }
 
-    static bool IsTurn(JsonNode? node) => node is JsonObject o && TurnKinds.Contains((string?)o["sessionUpdate"] ?? "");
+    static bool IsTurn(JsonNode? node) => node is JsonObject o && TurnKinds.Contains((string?)o["sessionUpdate"] ?? "")
+        && !(o["_meta"]?[LocalCommandKey] is JsonValue local && local.TryGetValue<bool>(out var isLocal) && isLocal);
 
     /// <summary>A message, thought or user message chunk: the updates that carry a <c>messageId</c>.</summary>
     public static bool IsChunkKind(string? kind) => kind is not null && ChunkKinds.Contains(kind);

@@ -1839,9 +1839,13 @@ public sealed class Conductor : IAsyncDisposable
     /// </summary>
     static string ServicePromptId(string messageId) => "service-" + messageId;
 
+    static bool IsLocalCommand(AgentHost host, PromptRequest prompt) =>
+        prompt.Prompt is [TextContent { Text: var text }] && host.LocalCommands.Contains(text.Trim());
+
     async Task<JsonNode?> PromptInProgressAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionUse use, Action handed, CancellationToken ct)
     {
-        var record = Promote(use.Record);
+        var localCommand = IsLocalCommand(HostOf(use.Record), prompt);
+        var record = localCommand ? use.Record : Promote(use.Record);
         var (rpc, _) = await EnsureLiveAsync(record, ct);
         var feed = use.Feed;
         feed.Attach(client);
@@ -1870,13 +1874,13 @@ public sealed class Conductor : IAsyncDisposable
         {
             if (feed.Retired) throw NotFound(record.SessionId); // deleted while this prompt waited for the turn before it
             rpc = await RpcForTurnAsync(record, rpc, ct);
-            if (record.ParentSessionId is null) return await PromptTurnAsync(client, request, prompt, record, rpc, feed, handed);
+            if (record.ParentSessionId is null) return await PromptTurnAsync(client, request, prompt, record, rpc, feed, handed, localCommand);
             // A spawned session reports the end of the turn to its parent.
             feed.BeginTurnText(ReportLimit + 1);
             JsonNode? result;
             try
             {
-                result = await PromptTurnAsync(client, request, prompt, record, rpc, feed, handed);
+                result = await PromptTurnAsync(client, request, prompt, record, rpc, feed, handed, localCommand);
             }
             catch (Exception e)
             {
@@ -1897,7 +1901,7 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     async Task<JsonNode?> PromptTurnAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionRecord record,
-        JsonRpcConnection rpc, SessionFeed feed, Action handed)
+        JsonRpcConnection rpc, SessionFeed feed, Action handed, bool localCommand)
     {
         if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
         // Journal the user's message, show it to the session's other clients, and use the
@@ -1908,10 +1912,13 @@ public sealed class Conductor : IAsyncDisposable
         var promptId = PromptIdOf(prompt);
         foreach (var block in prompt.Prompt)
         {
+            var meta = new JsonObject();
+            if (promptId is not null) meta[GorynychProtocol.MetaPromptId] = promptId;
+            if (localCommand) meta[GorynychProtocol.MetaLocalCommand] = true;
             var update = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
             {
                 Content = block, MessageId = messageId,
-                Meta = promptId is null ? null : new JsonObject { [GorynychProtocol.MetaPromptId] = promptId },
+                Meta = meta.Count > 0 ? meta : null,
             })!.AsObject();
             await feed.PublishAsync(update, except: client, () => store.Touch(record.SessionId));
         }
@@ -2041,15 +2048,26 @@ public sealed class Conductor : IAsyncDisposable
     internal async Task<JsonNode?> CloseAsync(ClientConnection client, string sessionId, CancellationToken ct)
     {
         client.Release(sessionId);
-        if (feeds.TryGetValue(sessionId, out var feed))
-        {
-            feed.Detach(client, notify: false);
-            if (feed.Clients().Length > 0) return new JsonObject();
-        }
+        var closeVersion = feeds.TryGetValue(sessionId, out var feed) ? feed.DetachForClose(client) : (long?)null;
+        if (closeVersion == 0) return new JsonObject();
         if (store.Get(sessionId) is not { Deleted: false } record) return new JsonObject();
+        if (!record.Draft) feed?.CancelDiscardAfterClose();
         if (record.Draft)
         {
-            await DiscardDraftAsync(sessionId, ct);
+            if (feed is { ClientTurn: true })
+            {
+                ServiceLog.Info($"{record.Agent} {sessionId}: draft closed by its last client during a client's turn; cancelling the turn");
+                try
+                {
+                    await ForwardNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId }, sessionId);
+                }
+                catch (Exception e) when (e is IOException or JsonRpcException or ObjectDisposedException)
+                {
+                    ServiceLog.Warn($"{record.Agent} {sessionId}: the cancel did not reach the agent: {e.Message}");
+                }
+            }
+            var discarded = await DiscardDraftAsync(sessionId, ct, closeVersion);
+            if (feed is not null && discarded) feed.CompleteDiscardAfterClose(closeVersion!.Value);
             return new JsonObject();
         }
         // The timer first: a failed cancel must not leave the session loaded. A running turn keeps it from
@@ -2197,7 +2215,7 @@ public sealed class Conductor : IAsyncDisposable
     /// the session is hidden instead. Returns true when the draft is gone from the lists; a
     /// failure leaves it marked for the sweep at the next start.
     /// </summary>
-    async Task<bool> DiscardDraftAsync(string sessionId, CancellationToken ct)
+    async Task<bool> DiscardDraftAsync(string sessionId, CancellationToken ct, long? afterClose = null)
     {
         if (shutdown.IsCancellationRequested || Volatile.Read(ref disposed) != 0) return false;
         if (store.Get(sessionId) is not { Draft: true }) return false;
@@ -2217,6 +2235,8 @@ public sealed class Conductor : IAsyncDisposable
             // Read again under the gate: a client may have attached, prompted or loaded it meanwhile.
             if (store.Get(sessionId) is not { Draft: true, Deleted: false } record) return false;
             if (feed.Retired || feed.Clients().Length > 0 || feed.Users > 0) return false;
+            // An operation already registered may attach and let go again before Users reaches zero: check its generation last.
+            if (afterClose is { } closeVersion && !feed.IsDiscardAfterClose(closeVersion)) return false;
             var fate = feed.Journal.HasTurns ? DraftFate.Kept
                 : agents.TryGetValue(record.Agent, out var host) ? await DraftFateInAgentAsync(host, record, timeout.Token)
                 : DraftFate.Hidden;
@@ -2987,12 +3007,20 @@ public sealed class Conductor : IAsyncDisposable
 
     /// <summary>
     /// Something that held the session let go of it: a client detached, or an operation registered
-    /// on it ended (a turn, a service turn, a request of its agent waiting for a client). If it is
-    /// now idle with no client, its idle timer starts again from now (<see cref="StartIdle"/>).
+    /// on it ended (a turn, a service turn, a request of its agent waiting for a client). A draft's
+    /// explicit close gets another discard attempt; any other session with no client gets its idle timer.
     /// </summary>
     void IdleFromNow(string sessionId)
     {
-        if (StartIdle(sessionId) is { } unload) RunCleanup(unload);
+        var closeVersion = feeds.TryGetValue(sessionId, out var feed) ? feed.DiscardAfterCloseVersion : 0;
+        if (closeVersion != 0 && feed is not null)
+            RunCleanup(async () =>
+            {
+                if (await DiscardDraftAsync(sessionId, CancellationToken.None, closeVersion) || store.Get(sessionId) is not { Draft: true })
+                    feed.CompleteDiscardAfterClose(closeVersion);
+            });
+        else if (StartIdle(sessionId) is { } unload)
+            RunCleanup(unload);
         MoveIfStale(sessionId);
     }
 
