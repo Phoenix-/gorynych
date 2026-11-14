@@ -137,17 +137,23 @@ server ([Agents outside Gorynych](#agents-outside-gorynych)).
 
 ## Standard methods
 
+Harness authentication is configured outside Gorynych. The service advertises `authMethods: []`
+and no logout capability. `authenticate` and `logout` return `-32601 Method not found`; they
+never claim to change a harness's login state. Native authentication errors are relayed to the
+client ([adapter-contract.md](adapter-contract.md#2-initialize)).
+
 | Method | What the service does |
 | --- | --- |
-| `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`, and its extension flags in `agentCapabilities._meta`, as ACP's extensibility rules advertise custom capabilities: `gorynych/sessionsChanged: true` (see [List changes](#list-changes)), `gorynych/archive: true` (see [Archive](#archive)) and `gorynych/link: 1` (see [The resumable link](#the-resumable-link)). The result's own `_meta` has the data `gorynych/serviceId` and `gorynych/agents`, and, deprecated and kept for one release for clients built before the flags moved, the first two flags again. No `sessionCapabilities.systemPrompt` yet ([adapter-contract.md](adapter-contract.md#15-open-questions)). |
+| `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`, and its extension flags in `agentCapabilities._meta`, as ACP's extensibility rules advertise custom capabilities: `gorynych/sessionsChanged: true` (see [List changes](#list-changes)), `gorynych/archive: true` (see [Archive](#archive)) and `gorynych/link: 1` (see [The resumable link](#the-resumable-link)). The result's own top-level `_meta` has the data `gorynych/serviceId` and `gorynych/agents`, the shared v1 steering capability `steering: {supported: true}` ([steering.md](steering.md#the-protocol)), and, deprecated and kept for one release for clients built before the flags moved, the first two flags again. No `sessionCapabilities.systemPrompt` yet ([adapter-contract.md](adapter-contract.md#15-open-questions)). |
 | `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`, and a spawned session also `_meta["gorynych/parentSessionId"]` (absent for a session a client created). A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out, and so are archived sessions unless the request has `_meta["gorynych/includeArchived"]: true`; then an archived one carries `_meta["gorynych/archived"]: true`. |
-| `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers` and, for an adapter that advertises `sessionCapabilities.systemPrompt`, the peer instructions as `systemPrompt` in `append` mode (see [What agents are told](#what-agents-are-told)), forwards, then applies a client's explicit `_meta["gorynych/configOptions"]` and Gorynych's per-agent defaults for the rest, model first, replacing the answer's `configOptions` with what the agent confirmed ([Default session configuration](#default-session-configuration)); records the session as a draft (with the `gorynych/ahpUri` an AHP client gave it), attaches the client, and once its answer is written sends it the current list of commands (below). A client's own `systemPrompt` is refused with `-32602`, here and on `session/load` and `session/resume`: the service does not advertise the capability. |
-| `session/load` | Opens the session in the agent, catching the journal up with the agent's own history first ([History made outside Gorynych](#history-made-outside-gorynych); a session the journal has never seen is imported so), replays the service journal as `session/update`, then the current list of commands (below), then attaches the client. Returns the session state (below), with the link's state in `_meta` ([The resumable link](#the-resumable-link)). |
-| `session/resume` | Opens the session in the agent and attaches the client, without replay, after sending it the current list of commands (below). With `_meta["gorynych/replayFrom"]` it first sends what the journal has after a position ([The resumable link](#the-resumable-link)). Returns the session state (below), with the link's state in `_meta`. |
+| `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers` and, for an adapter that advertises `sessionCapabilities.systemPrompt`, the peer instructions as `systemPrompt` in `append` mode (see [What agents are told](#what-agents-are-told)), forwards, then applies a client's explicit `_meta["gorynych/configOptions"]` and Gorynych's per-agent defaults for the rest, model first, replacing the answer's `configOptions` with what the agent confirmed ([Default session configuration](#default-session-configuration)); records the session as a draft (with the `gorynych/ahpUri` an AHP client gave it), attaches the client, and once its answer is written sends it the current list of commands (below). A client's own `systemPrompt` is refused with `-32602`, here and on `session/load` and `session/resume`: the service does not advertise the capability. The result `_meta` says whether the session's agent steers, `gorynych/steering` ([steering.md](steering.md#the-service)). |
+| `session/load` | Opens the session in the agent, catching the journal up with the agent's own history first ([History made outside Gorynych](#history-made-outside-gorynych); a session the journal has never seen is imported so), replays the service journal as `session/update`, then the current list of commands (below), then attaches the client. Returns the session state (below), with the link's state in `_meta` ([The resumable link](#the-resumable-link)) and whether the session's agent steers (`gorynych/steering`). |
+| `session/resume` | Opens the session in the agent and attaches the client, without replay, after sending it the current list of commands (below). With `_meta["gorynych/replayFrom"]` it first sends what the journal has after a position ([The resumable link](#the-resumable-link)). Returns the session state (below), with the link's state in `_meta` and whether the session's agent steers (`gorynych/steering`). |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. A prompt with `_meta["gorynych/promptId"]` leaves the mark of its end in the journal; during a restart a prompt is refused, not started ([The resumable link](#the-resumable-link)). |
 | `session/cancel` | Forwarded to the agent. A cancel that arrives while its prompt is still on the way (the session being reopened, say) ends that prompt with `cancelled` before it reaches the agent; otherwise prompt and cancel pass one per-session gate, so the agent always sees the cancel after the prompt it stops. |
 | `session/close` | Detaches the client. When no other client has the session open, a draft is discarded (see below); any other session has a running turn that a client's prompt started cancelled, as ACP asks of a close (a service turn and a turn of the agent's own go on), and is unloaded from its agent once it has been idle for `--unload-after` minutes ([Unloading idle sessions](#unloading-idle-sessions)). A client that disconnects without it lets go of its sessions all the same, but cancels nothing. |
 | `session/delete` | Closes the session in its agent if it is open, then deletes it there if the agent can (`sessionCapabilities.delete`); otherwise the overlay keeps a tombstone. Drops the journal. A session only the agent knows is found through its list; an unknown or already deleted session succeeds. |
+| `_session/steering` | The shared v1 steering extension: forwards a message into the running turn without waiting for the turn gate, journals an accepted message once, refuses `notSupported`, or starts the legacy idle turn when the client did not opt in. The full rules are in [steering.md](steering.md#the-service). |
 | anything else with a `sessionId` | Forwarded to the session's agent. |
 
 The **session state** is what clients draw as selectors: `configOptions` (Kimi's model,
@@ -242,6 +248,12 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/notice` | `_meta` of a `user_message_chunk` with `gorynych/origin: "notice"` | what the service's entry says: `historyRewritten` |
 | `gorynych/replayFrom` | an adapter's `agentCapabilities._meta`; `session/resume` params `_meta`, service → adapter and client → service | in capabilities, `true`: the adapter replays its own history after a mark. On a resume, where to replay from: `{"type": "gorynych/after", "mark": "<mark>"}` or `{"type": "start"}` ([History made outside Gorynych](#history-made-outside-gorynych)); from a client, the mark is a journal position ([The resumable link](#the-resumable-link)) |
 | `gorynych/link` | the service's `agentCapabilities._meta`; a client's `initialize` params `_meta` | the version of the resumable link, `1`. From the service: it takes everything in [The resumable link](#the-resumable-link). From a client: it is on the link, so it may come back for its sessions, drafts too |
+| `steering` | the service's `initialize` result `_meta`, top level; an adapter's `initialize` result `_meta`, top level | the shared v1 steering extension's capability, `{"supported": true}` ([steering.md](steering.md#the-protocol)); not inside `agentCapabilities._meta`, and not a probe |
+| `gorynych/steering` | `session/new`, `session/load` and `session/resume` result `_meta` | `true` when this session's agent steers, else `false`; read when the session opens |
+| `_session/steering` | method, client → service and service → adapter, `{sessionId, prompt, _meta?: {steering?: {idleBehavior?: "promptRequired"}}}` | the shared v1 extension; results are `injected`, `promptRequired` or `startedNewTurn` ([steering.md](steering.md#the-protocol)) |
+| `gorynych/steered` | `user_message_chunk._meta` in the journal | `true`: this message joined a running turn instead of starting one; the service wrote it once on acceptance |
+| `gorynych/steerRefused` | the `data` of a steering error | `notSupported` or `turnNotSteerable`: a definite refusal, so the client keeps the message for the turn's end |
+| `gorynych/steerOrigin` | a `_session/steering` request's `_meta`, service → adapter host; the host's acceptance record | internal correlation of the client a host-retained acceptance came from; never sent to clients |
 | `gorynych/position` | `_meta` of every `session/update` the service journals; `session/load` and `session/resume` result `_meta` | the update's position in the session's journal, an opaque string; in a result, the position the client is at once the answer is written |
 | `gorynych/turn` | `session/load` and `session/resume` result `_meta` | `running` while a turn of the session runs or a client's prompt waits for one, else `idle` |
 | `gorynych/prompts` | `session/load` and `session/resume` result `_meta` | the `gorynych/promptId`s of the session's prompts still in progress |
@@ -293,11 +305,12 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/host_hello` | notification, host → conductor, the first message on the host pipe, `{token, hostId, adapter, link, pid, version, slot?, build?, options?}` | an [adapter host](#adapter-hosts) proves itself and says what it runs: which host of its adapter it is (`slot`), and its generation (`build`, `options`; [Updating adapters](#updating-adapters)) |
 | `gorynych/host` | `initialize` result `_meta`, host → conductor | `{hostId, link, reattached}`: the host, its link version, and whether it answers from its agent's first `initialize` (it came back) |
 | `_gorynych/host_state` | method, conductor → host, `{}` → `{sessions, sessionStates, turns: [{sessionId, turn, promptId?}], asks: [{sessionId, askId, opinion?, from?}], buffered, requests, seq}`; notification, host → conductor, `{sessionStates}` | what a host that came back has; `sessionStates` maps open session IDs to their latest ACP `configOptions`, `modes`, and `models`; the notification restores these after replay |
-| `_gorynych/host_replay` | method, conductor → host, `{after: {"<sessionId>": n}}` → `{replayed, trimmed}` | sends what the host kept after each session's cursor and its open questions, then makes this conductor its own |
+| `_gorynych/host_replay` | method, conductor → host, `{after: {"<sessionId>": n}}` → `{replayed, trimmed}` | sends the session updates and accepted-steer records it kept after each session's cursor, and its open questions, then makes this conductor its own |
 | `_gorynych/host_stop` | method, conductor → host, `{}` → `{}` | the service shuts down: the host stops its agents and exits |
 | `_gorynych/turn_ended` | notification, host → conductor, `{sessionId, turn, promptId?, askId?, opinion?, from?, result \| error}` | how a prompt ended, sent before its answer, numbered like an update; the conductor marks the turn's end from it, and answers the question of an opinion turn an earlier service started |
 | `_gorynych/ask_answered` | notification, host → conductor, `{sessionId, askId, from?, result \| error}` | the agent's answer to a question it took by its own way in (Claude's channel), sent before the answer, numbered like an update: the next service gives it to the asker that comes back |
-| `gorynych/hostSeq` | `_meta` of a session's update and of `_gorynych/turn_ended`, host → conductor; kept in the journal | `"<hostId>/<n>"`: its place in its host's stream. A session's cursor is the newest its journal has from that host; never sent to clients |
+| `_gorynych/steer_accepted` | notification, host → conductor, `{sessionId, messageId, promptId?, origin, prompt, outcome}` | an accepted `_session/steering` result, numbered and kept in the host's existing replay buffer before its answer: the next conductor journals it once, before the owning turn's end marker ([Adapter hosts](#adapter-hosts)) |
+| `gorynych/hostSeq` | `_meta` of a session's update, of `_gorynych/turn_ended` and of `_gorynych/steer_accepted`, host → conductor; kept in the journal for an update or an accepted steer | `"<hostId>/<n>"`: its place in its host's stream. A session's cursor is the newest its journal has from that host; never sent to clients |
 
 ## Default session configuration
 
@@ -868,8 +881,9 @@ the host's job and falling back to staying in it), waits up to 20 seconds for it
 sends the request.
 
 - It tries to start the service at most once a minute, and connects on every request.
-- The host's environment does not leak into agents: the Claude adapter already strips
-  `CLAUDECODE` and `CLAUDE_CODE_*` (`ClaudeSession.LaunchEnvironment`).
+- The Claude adapter removes specific parent-session identity markers, including `CLAUDECODE`
+  and `CLAUDE_CODE_SESSION_ID`. Native authentication and provider environment is inherited
+  unchanged ([adapters.md](adapters.md#tui-transport)).
 - **Risk.** If the host's job forbids breakaway, the fallback leaves the service in that job.
   Closing the host can then kill the service with every session. The server logs this case
   explicitly, in `%LOCALAPPDATA%\Gorynych\logs\outside-<date>.log`. The service also logs at
@@ -1607,10 +1621,12 @@ writes to the overlay are ignored.
 ## Journal
 
 Every `session/update` an adapter sends but its list of commands (session state, see
-[Standard methods](#standard-methods)), and every prompt a client sends, is appended to
-`journal/<session>.<hash>.jsonl` as the raw update object, so variants this schema
-version does not know are kept and replayed unchanged, with the `messageId`s clients got
-live. A journal written before the list was kept apart has one for every time the session was
+[Standard methods](#standard-methods)), every prompt a client sends, and every accepted steer a
+client sent, is appended to `journal/<session>.<hash>.jsonl` as the raw update object, so variants
+this schema version does not know are kept and replayed unchanged, with the `messageId`s clients
+got live. A steered message is a `user_message_chunk` with `_meta["gorynych/steered"]: true` and
+the client's `gorynych/promptId` when it gave one; it is not a turn's prompt and does not enter
+`gorynych/prompts` or get a turn-end marker of its own. A journal written before the list was kept apart has one for every time the session was
 opened; read back, it keeps the last one only, and is rewritten so once. Past the limit (default 5000 entries) the journal merges consecutive text chunks of one
 message (the same `messageId`; chunks without one, from journals written before the service
 named every message, are never merged) and then drops the oldest entries down to three
@@ -1664,6 +1680,12 @@ draft.
   written whether or not the client still seems there, since a connection may be gone before the
   service notices. A client whose answer is lost so finds out how its prompt ended: from the mark
   it got before the connection went, or from the replay or live when it comes back.
+- **A steer whose answer was lost.** A `_session/steering` request that was on its way when the
+  connection went stays open, correlated by its `gorynych/promptId`. On the resume, a journaled
+  `user_message_chunk` with `gorynych/steered: true` and that ID answers `injected` (or the legacy
+  fallback's prompt answers `startedNewTurn`). If the replay does not show it, the link answers
+  uncertainty and **does not send it again**: absence from a bounded journal proves nothing. An
+  accepted steer is never re-sent because its answer was lost.
 - **The service's own turns are marked too.** An opinion request, a report and a spawned
   session's first prompt delivered as a turn carry a prompt ID of the service's own,
   `service-<messageId>`, on their `user_message_chunk` and their `session/prompt`, and their end is
@@ -1892,6 +1914,25 @@ restart, a crash) leaves the end to the next one, which finds the report after i
 turn that ends while no conductor is there is marked once, by the next one, and a client on the
 link gets its prompt's answer from the mark.
 
+**The acceptance of a steer.** A `_session/steering` result the agent accepted (`injected`, or a
+contract-violating `startedNewTurn` despite the opt-in) is kept before its answer: the host writes
+`_gorynych/steer_accepted {sessionId, messageId, promptId?, origin, prompt, outcome}`, numbered
+like an update, into the same bounded replay buffer, and only then answers. The conductor that
+reads it journals the content once, under the service's `messageId` and `gorynych/steered: true`,
+before the end marker of the turn it joined; a record and a response for the same acceptance are
+deduplicated by that ID. A conductor that goes between native acceptance and journaling leaves the
+record after its cursor, so the next conductor journals it from the replay. If the buffer let it
+go, or the host died after native acceptance, the outcome can still be unknown: this is internal
+recovery, not an exactly-once guarantee across a host/agent crash, and the client's request is not
+automatically retried.
+
+If a terminal prompt response or an agent-owned turn-end update arrives while earlier steers
+are unresolved, the host defers that terminal record until their outcomes arrive. Only then is
+it numbered, after the acceptances. This ordering belongs to the host's replay stream as well
+as the live conductor; otherwise a restart could replay an end before its accepted input.
+The deferred terminal buffer is bounded by the host's configured entry/byte limits. It does not
+block the adapter read loop, which must still receive steering answers.
+
 **Questions.** The agent's requests (approvals, forms) reach the conductor under IDs of the
 host's connection. One still open when the conductor goes is asked of the next one again, and a
 client's link joins it to the one its client shows ([The resumable link](#the-resumable-link)).
@@ -1928,7 +1969,9 @@ it exits too.
 - a child's report for a turn taken back: it carries the final text that came after the restart;
 - the idle timers of the sessions, which start afresh;
 - a client's request on its way other than a prompt, as [The resumable link](#the-resumable-link)
-  says.
+  says; a steer whose host accepted it is journaled by the next service from the host's record,
+  and one with no record is resolved from the correlated replay or reported with uncertainty,
+  never resent.
 
 **The peers server** connects to the service for each call. It waits up to 30 seconds for a
 service that restarts: for its pipe, and while it refuses requests for the restart, which go

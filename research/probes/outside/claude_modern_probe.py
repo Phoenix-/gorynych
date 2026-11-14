@@ -19,7 +19,9 @@ with open(mcp, "w", encoding="utf-8") as f:
         "probe-modern": {"type": "stdio", "command": py, "args": [server, "--name", "probe-modern", "--log", log, "--modern"]},
     }}, f)
 env = {k: v for k, v in os.environ.items()
-       if not (k.upper().startswith(("CLAUDE", "ANTHROPIC", "MCP_")) or k.upper() == "CLAUDECODE")}
+       if k.upper() not in {"CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION",
+                            "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_REMOTE_SESSION_ID",
+                            "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PID", "CLAUDE_EFFORT"}}
 cmd = ["claude", "-p", "Call the tool mcp__probe-legacy__probe_echo once and the tool mcp__probe-modern__probe_echo once, then reply with just ok.",
        "--output-format", "stream-json", "--verbose", "--strict-mcp-config", "--mcp-config", mcp, "--model", "haiku",
        "--permission-mode", "default",

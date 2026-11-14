@@ -10,7 +10,7 @@ namespace Gorynych.Tests;
 
 /// <summary>
 /// Opt-in checks of the headless Claude adapter's catalog and Full access against the real
-/// <c>claude</c> on this machine, under the user's own plan login. Run with <c>GORYNYCH_LIVE=1</c>.
+/// <c>claude</c> on this machine, with the user's native configuration. Run with <c>GORYNYCH_LIVE=1</c>.
 /// </summary>
 [TestClass]
 [TestCategory("Live")]

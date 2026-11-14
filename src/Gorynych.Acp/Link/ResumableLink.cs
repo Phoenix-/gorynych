@@ -83,6 +83,10 @@ public sealed class ResumableLink
     // not notice the client again of what it shows, and the client is told of a change it missed.
     readonly Dictionary<string, JsonObject> shown = new(StringComparer.Ordinal);
     readonly HashSet<string> promptIds = new(StringComparer.Ordinal);
+    // Steering has no turn of its own: a promptId the client gave only correlates its message.
+    readonly HashSet<string> steerIds = new(StringComparer.Ordinal);
+    readonly Queue<string> recentSteers = new(); // accepted replies can precede the next position-bearing update
+    readonly Dictionary<string, string> steerSeen = new(StringComparer.Ordinal); // promptId -> result outcome seen in replay
     readonly HashSet<string> resuming = new(StringComparer.Ordinal); // sessions the link's handshake is resuming now
     readonly Dictionary<long, Downstream> downstream = [];
     long nextUpstream;
@@ -180,6 +184,7 @@ public sealed class ResumableLink
         var request = new Upstream
         {
             Id = Interlocked.Increment(ref nextUpstream), ClientId = id.DeepClone(), Method = method, SessionId = Text(@params?["sessionId"]),
+            Steering = method == GorynychProtocol.MethodSteering,
         };
         bool tagPrompts;
         lock (state) tagPrompts = resumable;
@@ -191,6 +196,16 @@ public sealed class ResumableLink
             meta[GorynychProtocol.MetaPromptId] = request.PromptId;
             @params["_meta"] = meta;
             lock (state) promptIds.Add(request.PromptId);
+        }
+        else if (method == GorynychProtocol.MethodSteering && tagPrompts && @params is not null)
+        {
+            // The client's ID correlates the steered message in the journal; if it gave none, the
+            // link adds one, as it does for its prompts. Neither starts nor names a turn.
+            var meta = @params["_meta"] as JsonObject ?? [];
+            request.PromptId = Text(meta[GorynychProtocol.MetaPromptId]) ?? $"{tag}-s{request.Id}";
+            meta[GorynychProtocol.MetaPromptId] = request.PromptId;
+            @params["_meta"] = meta;
+            lock (state) steerIds.Add(request.PromptId);
         }
         if (method is AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete && request.SessionId is { } closed)
             lock (state)
@@ -431,6 +446,9 @@ public sealed class ResumableLink
             else
             {
                 Forget(request);
+                if (request.Steering && request.PromptId is { } acceptedId
+                    && Text(message["result"]?["outcome"]) is AcpSteering.Injected or AcpSteering.StartedNewTurn)
+                    RememberAcceptedSteer(acceptedId);
                 // The turn is over: the answers kept for its questions go.
                 if (request.Method == AcpMethods.Agent.SessionPrompt && request.SessionId is { } turnOver)
                     foreach (var q in downstream.Values.Where(q => q.SessionId == turnOver && q.Answer is not null).ToList())
@@ -538,7 +556,7 @@ public sealed class ResumableLink
                 lock (state) shown[sessionId] = InteractivityOf(meta);
             if (Text(meta?[GorynychProtocol.MetaPromptId]) is { } promptId)
             {
-                bool mine, hide;
+                bool mine, hide, steered, steerMine, steerHide;
                 lock (state)
                 {
                     mine = promptIds.Contains(promptId);
@@ -546,6 +564,14 @@ public sealed class ResumableLink
                     // reconnect may replay it, and a prompt held across one may run only now. A load
                     // the client asked for shows it, as any history.
                     hide = mine && (resuming.Contains(sessionId) || upstream.Values.Any(r => r.PromptId == promptId));
+                    steered = meta?[GorynychProtocol.MetaSteered] is JsonValue sv && sv.TryGetValue<bool>(out var isSteered) && isSteered;
+                    steerMine = steerIds.Contains(promptId);
+                    steerHide = steerMine && Text(update["sessionUpdate"]) == "user_message_chunk"
+                        && (resuming.Contains(sessionId) || upstream.Values.Any(r => r.Steering && r.PromptId == promptId));
+                    // A correlated user message is how a held steer's outcome is found in replay:
+                    // steered means injected; the legacy idle fallback journals a prompt instead.
+                    if (steerMine && Text(update["sessionUpdate"]) == "user_message_chunk")
+                        steerSeen[promptId] = steered ? AcpSteering.Injected : AcpSteering.StartedNewTurn;
                 }
                 // The end of a prompt's turn: the link's own business.
                 if (Text(meta![GorynychProtocol.MetaAgentTurn]) == "ended")
@@ -553,7 +579,7 @@ public sealed class ResumableLink
                     if (mine) await PromptEndedAsync(promptId, meta);
                     return;
                 }
-                if (hide && Text(update["sessionUpdate"]) == "user_message_chunk") return;
+                if ((hide || steerHide) && Text(update["sessionUpdate"]) == "user_message_chunk") return;
             }
         }
         await ToClientAsync(message);
@@ -642,6 +668,11 @@ public sealed class ResumableLink
             foreach (var request in upstream.Values.Where(r => r.Generation == connection.Generation).ToList())
                 switch (PolicyOf(request.Method))
                 {
+                    case Policy.Hold when request.Steering && request.PromptId is null:
+                        // No correlation: replay absence proves nothing, and nothing may be resent.
+                        Forget(request);
+                        failed.Add(request);
+                        break;
                     case Policy.Hold when request.Ended is not null:
                         // The mark of its end came, its answer did not: answered as the mark says.
                         Forget(request);
@@ -677,6 +708,7 @@ public sealed class ResumableLink
     static Policy PolicyOf(string method) => method switch
     {
         AcpMethods.Agent.SessionPrompt => Policy.Hold,
+        GorynychProtocol.MethodSteering => Policy.Hold, // resolved from the correlated journal entry, or uncertain
         AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionResume => Policy.Reopen,
         AcpMethods.Agent.Initialize or AcpMethods.Agent.Authenticate or AcpMethods.Agent.Logout or AcpMethods.Agent.SessionList
             or AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete or AcpMethods.Agent.SessionSetMode
@@ -796,13 +828,41 @@ public sealed class ResumableLink
         lock (state)
         {
             if (Text(meta?[GorynychProtocol.MetaPosition]) is { } position) Advance(sessionId, position);
-            var held = upstream.Values.Where(r => r.Held && r.SessionId == sessionId).ToList();
+            // Steering settles by its correlated journal entry below, not by a prompt's end mark.
+            var held = upstream.Values.Where(r => r.Held && r.SessionId == sessionId && !r.Steering).ToList();
             // Not in progress there: it never got there, or it went with the agent that ran it.
             over = held.Where(r => r.PromptId is null || !inProgress.Contains(r.PromptId)).ToList();
             cancel = held.Except(over).Where(r => r.CancelAsked).ToList();
             foreach (var r in over) Forget(r);
         }
         foreach (var r in over) await AnswerAsync(r, Result(StopReason.Cancelled));
+        // A steer that was in flight when the connection went is resolved by the correlated journal
+        // entry the replay carried. No entry is inconclusive: it answers with uncertainty, never by
+        // sending the content again.
+        List<(Upstream Request, string Outcome)> steered;
+        List<Upstream> unknown;
+        lock (state)
+        {
+            steered = [];
+            unknown = [];
+            foreach (var r in upstream.Values.Where(r => r.Steering && r.Held && r.SessionId == sessionId).ToList())
+            {
+                if (r.PromptId is { } promptId && steerSeen.TryGetValue(promptId, out var outcome))
+                {
+                    Forget(r);
+                    steered.Add((r, outcome));
+                }
+                else
+                {
+                    Forget(r);
+                    unknown.Add(r);
+                }
+            }
+        }
+        foreach (var (r, outcome) in steered) await AnswerAsync(r, SteerResult(outcome));
+        foreach (var r in unknown)
+            await AnswerAsync(r, Error(JsonRpcException.InternalError,
+                "The service restarted while the steer was on its way, and the replay does not show whether it was accepted; it is not sent again."));
         if (cancel.Count > 0) await TryWriteAsync(connection, Notification(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = sessionId }));
         if (idle) await WithdrawStaleQuestionsAsync(sessionId);
         // The answer stays with the link: a change of interactivity while the link was away reaches
@@ -1028,6 +1088,8 @@ public sealed class ResumableLink
 
     static (string, JsonNode) Result(StopReason reason) => ("result", new JsonObject { ["stopReason"] = reason.Value });
 
+    static (string, JsonNode) SteerResult(string outcome) => ("result", AcpSteering.Result(outcome));
+
     static (string, JsonNode) Error(int code, string message) => ("error", new JsonObject { ["code"] = code, ["message"] = message });
 
     static JsonObject Response(JsonNode id, JsonObject answer)
@@ -1064,10 +1126,36 @@ public sealed class ResumableLink
     }
 
     /// <summary>A request answered, or given up: it is no longer waited for. Under <see cref="state"/>.</summary>
+    // A confirmed steer may not have advanced this client's cursor: its own message was excluded
+    // from live updates. Remember recent identities so reconnect does not echo optimistic UI text.
+    // This is bounded replay correlation, not submission deduplication or a delivery receipt.
+    void RememberAcceptedSteer(string promptId)
+    {
+        steerIds.Add(promptId);
+        recentSteers.Enqueue(promptId);
+        while (recentSteers.Count > 4096)
+        {
+            var old = recentSteers.Dequeue();
+            if (!upstream.Values.Any(r => r.Steering && r.PromptId == old))
+            {
+                steerIds.Remove(old);
+                steerSeen.Remove(old);
+            }
+        }
+    }
+
     void Forget(Upstream request)
     {
         upstream.Remove(request.Id);
-        if (request.PromptId is { } promptId) promptIds.Remove(promptId);
+        if (request.PromptId is { } promptId)
+        {
+            promptIds.Remove(promptId);
+            if (request.Steering)
+            {
+                steerIds.Remove(promptId);
+                steerSeen.Remove(promptId);
+            }
+        }
     }
 
     /// <summary>
@@ -1116,6 +1204,9 @@ public sealed class ResumableLink
         public required string Method { get; init; }
         public string? SessionId { get; init; }
         public string? PromptId { get; set; }
+
+        /// <summary>A <c>_session/steering</c> request: it never starts or names a turn.</summary>
+        public bool Steering { get; init; }
         public JsonObject Message { get; set; } = [];
 
         /// <summary>The connection it went out on; 0 while it waits to go.</summary>

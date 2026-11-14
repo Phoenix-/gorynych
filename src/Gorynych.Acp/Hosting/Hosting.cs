@@ -37,6 +37,39 @@ public static class GorynychProtocol
     /// <summary>Which adapter owns a session; in <c>session/new</c> params it selects one.</summary>
     public const string MetaAgent = "gorynych/agent";
 
+    /// <summary>
+    /// The shared ACP v1 steering extension: a request <c>{sessionId, prompt, _meta?}</c> into a
+    /// running turn (docs/steering.md). It is not an ACP-defined method.
+    /// </summary>
+    public const string MethodSteering = "_session/steering";
+
+    /// <summary>
+    /// Top-level <c>_meta</c> of an adapter's <c>initialize</c> result: <c>{"supported": true}</c>
+    /// when it takes <see cref="MethodSteering"/>. Next to <c>agentCapabilities</c>, not inside it.
+    /// </summary>
+    public const string MetaSteering = "steering";
+
+    /// <summary>
+    /// The <c>_meta</c> of <c>session/new</c>, <c>session/load</c> and <c>session/resume</c>: whether
+    /// this session's agent steers (docs/steering.md).
+    /// </summary>
+    public const string MetaSessionSteering = "gorynych/steering";
+
+    /// <summary>On a steered <c>user_message_chunk</c> in the journal: this message joined the turn.</summary>
+    public const string MetaSteered = "gorynych/steered";
+
+    /// <summary>In the <c>data</c> of a steering refusal: the reason (<c>notSupported</c>, <c>turnNotSteerable</c>).</summary>
+    public const string MetaSteerRefused = "gorynych/steerRefused";
+
+    /// <summary>Host → conductor, numbered and kept: an accepted steer to journal before its turn's end.</summary>
+    public const string MethodSteerAccepted = "_gorynych/steer_accepted";
+
+    /// <summary>
+    /// Internal, on a steering request toward an adapter host: which client sent it, so the conductor
+    /// journals the acceptance without echoing it to that client. Never sent to clients.
+    /// </summary>
+    public const string MetaSteerOrigin = "gorynych/steerOrigin";
+
     /// <summary>The persistent ID of the service, in the <c>initialize</c> result.</summary>
     public const string MetaServiceId = "gorynych/serviceId";
 

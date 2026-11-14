@@ -59,6 +59,18 @@ public sealed class CodexAdapterTests
             ["sessionId"] = sessionId, ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
         });
 
+    static Task<JsonNode?> SteerDirectAsync(JsonRpcConnection acp, string sessionId, string text, string messageId, bool promptRequired = true) =>
+        acp.SendRequestAsync(GorynychProtocol.MethodSteering, new JsonObject
+        {
+            ["sessionId"] = sessionId,
+            ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
+            ["_meta"] = new JsonObject
+            {
+                ["gorynych/messageId"] = messageId,
+                ["steering"] = promptRequired ? new JsonObject { ["idleBehavior"] = "promptRequired" } : null,
+            },
+        });
+
     static bool Logged(List<string> log, string text)
     {
         lock (log) return log.Any(l => l.Contains(text, StringComparison.Ordinal));
@@ -367,6 +379,105 @@ public sealed class CodexAdapterTests
 
         Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, id, "/usage")).StopReason);
         Assert.AreEqual(1, Of(zed, "agent_message_chunk").Length);
+    }
+
+    [TestMethod]
+    public async Task Steering_Advertised_AndTurnSteerCarriesTheTurnAndMessageIdentity()
+    {
+        var fake = new FakeAppServer();
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var init = await acp.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
+        Assert.IsTrue((bool?)init.Meta?[GorynychProtocol.MetaSteering]?["supported"]);
+        var id = await NewDirectAsync(acp);
+        var turn = PromptDirectAsync(acp, id, "wait");
+        await Until(() => fake.LastTurnId is not null, "the turn name");
+        var steered = await SteerDirectAsync(acp, id, "go left", "m-codex-1");
+        Assert.AreEqual(AcpSteering.Injected, (string?)steered?["outcome"]);
+        var sent = fake.Last("turn/steer");
+        Assert.AreEqual(fake.LastTurnId, (string?)sent["expectedTurnId"]);
+        Assert.AreEqual("m-codex-1", (string?)sent["clientUserMessageId"]);
+        Assert.AreEqual("go left", (string?)sent["input"]?[0]?["text"]);
+        await acp.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
+        Assert.AreEqual("cancelled", (string?)(await turn.WaitAsync(Wait))?["stopReason"]);
+    }
+
+    [TestMethod]
+    public async Task DirectIdleSteer_WithoutTheOptIn_KeepsTheLegacyStartedNewTurn()
+    {
+        var fake = new FakeAppServer();
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var updates = new List<JsonObject>();
+        acp.NotificationHandler = (_, p) =>
+        {
+            if (p?["update"] is JsonObject u) lock (updates) updates.Add((JsonObject)u.DeepClone());
+            return Task.CompletedTask;
+        };
+        var id = await NewDirectAsync(acp);
+        var idle = await SteerDirectAsync(acp, id, "hello from idle", "idle-codex", promptRequired: false);
+        Assert.AreEqual(AcpSteering.StartedNewTurn, (string?)idle?["outcome"]);
+        await Until(() => { lock (updates) return updates.Any(u => (string?)u["sessionUpdate"] == "agent_message_chunk"); }, "the idle turn's answer");
+        Assert.AreEqual("hello from idle", (string?)fake.Last("turn/start")["input"]?[0]?["text"]);
+        Assert.AreEqual("idle-codex", (string?)fake.Last("turn/start")["clientUserMessageId"]);
+    }
+
+    [TestMethod]
+    public async Task Steering_WaitsForALateTurnName_AndNeverAttachesToALaterTurn()
+    {
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { HoldTurnStart = hold };
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+        var turn = PromptDirectAsync(acp, id, "wait");
+        await Until(() => fake.Methods().Contains("turn/start"), "the turn start on its way");
+        var steering = SteerDirectAsync(acp, id, "late name", "m-codex-late");
+        await Task.Delay(200);
+        Assert.IsFalse(steering.IsCompleted, "turn/start has not named the running turn yet");
+        hold.TrySetResult();
+        var steered = await steering.WaitAsync(Wait);
+        Assert.AreEqual(AcpSteering.Injected, (string?)steered?["outcome"]);
+        Assert.AreEqual(fake.LastTurnId, (string?)fake.Last("turn/steer")["expectedTurnId"]);
+        await acp.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
+        Assert.AreEqual("cancelled", (string?)(await turn.WaitAsync(Wait))?["stopReason"]);
+    }
+
+    [TestMethod]
+    public async Task Steering_NativeRefusals_MapToPromptRequiredOrTurnNotSteerable()
+    {
+        foreach (var (refusal, outcome, code) in new[]
+                 {
+                     ("mismatch", AcpSteering.PromptRequired, 0),
+                     ("notSteerable", null, JsonRpcException.InvalidRequest),
+                     ("internal", null, JsonRpcException.InternalError),
+                 })
+        {
+            var fake = new FakeAppServer { SteerRefusal = refusal };
+            var (agent, acp) = await DirectAsync(fake);
+            await using var _ = agent;
+            await using var __ = acp;
+            var id = await NewDirectAsync(acp);
+            var turn = PromptDirectAsync(acp, id, "wait");
+            await Until(() => fake.LastTurnId is not null, "the turn name");
+            if (outcome is not null)
+            {
+                var steered = await SteerDirectAsync(acp, id, "no", "m-" + refusal);
+                Assert.AreEqual(outcome, (string?)steered?["outcome"], refusal);
+            }
+            else
+            {
+                var failed = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => SteerDirectAsync(acp, id, "no", "m-" + refusal));
+                Assert.AreEqual(code, failed.Code, refusal);
+                if (refusal == "notSteerable")
+                    Assert.AreEqual("turnNotSteerable", (string?)failed.ErrorData?[GorynychProtocol.MetaSteerRefused]);
+            }
+            await acp.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
+            await turn.WaitAsync(Wait);
+        }
     }
 
     [TestMethod]

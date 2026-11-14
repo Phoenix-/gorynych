@@ -4,10 +4,13 @@ Written and built 9 November 2026 on branch `claude/claude-headless`, with the u
 ("headless now, the TUI as the fallback"); the user confirmed headless as the default through the
 coordinator. The adapter as built is described in [docs/adapters.md](../docs/adapters.md#claude-code);
 the build-phase answers are at the end.
+This is a historical research record. Authentication and environment policy were corrected on
+14 November 2026: login, providers and billing belong to the harness; account metadata never
+gates a launch or catalog. The linked current adapter specification is authoritative.
 It adds a second way to drive Claude Code: the unmodified `claude` binary in its documented
 non-interactive mode, `claude -p` with stream-json input and output, kept running for the
-session's life. The interactive TUI in a pseudo console stays as a transport for the case
-where Anthropic restricts headless use on subscriptions.
+session's life. The interactive TUI in a pseudo console stays available as an explicit
+transport choice; neither transport adds an authentication or billing policy.
 
 It rests on:
 
@@ -50,7 +53,7 @@ It rests on:
 
 | Question | Result |
 | --- | --- |
-| Login | `claude -p` uses the person's subscription: `initialize` reports `subscriptionType: "Claude Max"`, `system/init` reports `apiKeySource: "none"`. |
+| Login in the original probe | That launch used the person's subscription: `initialize` reported `subscriptionType: "Claude Max"`, `system/init` reported `apiKeySource: "none"`. This is an observation, not an adapter requirement. |
 | One process, many turns | Yes. Each user message on stdin starts a turn when Claude is idle; each turn ends with one `result` message. Closing stdin ends the process after `SessionEnd` (about 0.5 s when idle). |
 | `initialize` control request | Answers in under a second without a model call: `models` (value, display name, `supportedEffortLevels`, `supportsAutoMode`, …), `commands`, `agents`, `account`, `capabilities`, `current_permission_mode`, `claude_code_version`. Optional: without it the session still works. |
 | Capabilities (2.1.302) | `interrupt_receipt_v1`, `interrupt_cancel_queued_v1`, `interrupt_send_now_v1`, `msg_lifecycle_v1`, `request_marker_lists_v1`, `sdk_mcp_*`, `mcp_read_resource_v1`, `mcp_tool_ui_meta_v1`, `ui_surface_v1`, `mcp_call_result_not_for_model_v1`. |
@@ -78,9 +81,8 @@ It rests on:
 - The TUI transport stays built and tested: its contract tests keep running, and the live
   smoke test runs with either transport (`GORYNYCH_CLAUDE_TRANSPORT`). Claude Code changes
   weekly; a transport nobody runs would not work on the day it is needed.
-- **When to switch back to the TUI:** Anthropic moves `-p` and the SDK off the plan's limits
-  (the paused separate credit), restricts them in the legal page, or makes `--bare` the
-  default without an opt-out. Watch the help article named above.
+- The user may select the TUI explicitly when it fits their workflow. The adapter does not
+  select a transport based on account metadata or subscription eligibility.
 
 ### Launch
 
@@ -95,9 +97,9 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 - `settings.json` keeps only the deny rule for `mcp__gorynych-outside`; no hooks.
 - `--permission-mode default` unless the person picked another mode (below); a global
   `defaultMode: auto` would otherwise decide approvals without asking.
-- The environment is cleaned as for the TUI (`CLAUDECODE`, `CLAUDE_CODE_*`,
-  `CLAUDE_AGENT_SDK*`, `CLAUDE_PREVIEW_*`, `CLAUDE_PID`, `CLAUDE_EFFORT`, and inside another
-  Claude Code session the desktop's `ANTHROPIC_BASE_URL` and MCP variables).
+- The environment is inherited, except for specific parent-session identity markers
+  ([current list](../docs/adapters.md#tui-transport)). Native authentication and provider options
+  are preserved; there is no filtering by prefix.
 - Right after the start the adapter sends `initialize` (no fields) and keeps the answer:
   models and capabilities for the selectors, the version for the log.
 - The process starts with the session's first prompt, or the first live note's turn; it is
@@ -263,23 +265,23 @@ hit exactly `-p` and the SDK, and `--bare` is to become the default for `-p`. So
 
 ## Failing loudly
 
-- **No login** in `initialize` (no plan, `tokenSource: "none"`): what `--bare` gives (probed:
-  `claude -p --bare` answers `account: {tokenSource: "none", apiProvider: "firstParty"}` and its
-  first turn fails "Not logged in"). Claude is stopped; the prompt fails, telling the person to
-  sign in or to use `--claude-transport tui`.
-- **An API key** in `initialize` (`account.apiKeySource`, probed with a dummy
-  `ANTHROPIC_API_KEY`: `{tokenSource: "claude.ai", apiKeySource: "ANTHROPIC_API_KEY"}`, no plan):
-  in `-p` the key wins over the login, so the session would be billed outside the plan. Claude
-  is stopped; the prompt fails, naming the variable to remove. A turn's `system/init` is
-  checked the same way (`apiKeySource`), before Claude calls the API.
-- **Fail closed:** an `initialize` that fails, times out or is cancelled, or an answer without
-  an `account`, stops the launch too; nothing runs unchecked.
-- **Auth or billing errors** during a turn (an assistant message's `error`:
-  `authentication_failed`, `billing_error`, `account_on_hold`, `oauth_org_not_allowed`,
-  `verification_required`): a note in the feed and the client's prompt fails, both naming
-  `--claude-transport tui`.
+The original subscription-only policy was removed on 14 November 2026. The current contract
+is in [adapters.md](../docs/adapters.md#failing-loudly):
+
+- Native authentication settings and environment are inherited. `account`, `subscriptionType`,
+  `apiProvider`, `apiKeySource` and `tokenSource` are never used to judge whether Claude may run.
+- Native protocol/startup failures still stop a launch. Missing account metadata does not.
+- Native authentication and billing failures reach the client with Claude's error and message.
+  Gorynych does not choose credentials, repair login or suggest another billing route.
+
+Historical probe: `claude -p --bare` reported `account: {tokenSource: "none", apiProvider:
+"firstParty"}` and its first turn failed "Not logged in". That was Claude's own failure; it
+does not justify a Gorynych account check.
 
 ## Build-phase answers
+
+Historical results from 9 November 2026. The subscription-only checks and broad environment
+filtering mentioned below were incorrect policy and have since been removed.
 
 - **The coordinator's review** found four more defects, fixed with tests that fail without the
   fix (checked by undoing each):
@@ -290,8 +292,8 @@ hit exactly `-p` and the SDK, and `--bare` is to become the default for `-p`. So
   - an update the client could not take could leave the prompt unfinished; the prompt is now
     completed in a `finally`, and emitting catches what a gone client throws;
   - the `interrupt` answer was only assumed; it is probed now (above), and FakeClaude matches it.
-  Also: the plan check requires a plan on `firstParty` (an auth token, a gateway or another
-  provider fails), headless Claude gets no `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`, closing a
+  The original plan check required `firstParty` and stripped API credentials; that policy was
+  removed on 14 November 2026. Other build-phase fixes: closing a
   session whose Claude stopped reading kills it instead of waiting on the stuck write, a control
   request sent as Claude exits fails at once, open approvals are withdrawn on cancel and on each
   result, and stdout is read on a dedicated blocking thread.
@@ -322,7 +324,8 @@ hit exactly `-p` and the SDK, and `--bare` is to become the default for `-p`. So
   gives no result; messages Claude stays silent on are let go after `StallMs`; a dropped live
   note goes back to the service as `-32601`; a process given up is reset at once, so the next
   prompt never writes into it; settings change only once Claude took the change; every approval
-  gets an answer. Tests cover the launch off the plan (four ways), a cancel that drops a queued
+  gets an answer. Original tests covered the former plan-only launch gate (since replaced by
+  account-metadata pass-through and native-failure regressions), a cancel that drops a queued
   note, and a message Claude never takes.
 
 ## Not verified, open (after the build)

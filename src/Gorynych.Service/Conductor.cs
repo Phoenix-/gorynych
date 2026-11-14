@@ -155,6 +155,7 @@ public sealed class Conductor : IAsyncDisposable
     readonly ConcurrentDictionary<string, string> peerTokens = new(StringComparer.Ordinal);   // token -> session
     readonly ConcurrentDictionary<string, string> sessionTokens = new(StringComparer.Ordinal); // session -> token
     readonly ConcurrentDictionary<string, PendingOpinion> pendingOpinions = new(StringComparer.Ordinal); // message_id -> request
+    readonly ConcurrentDictionary<string, ClientConnection> steerOrigins = new(StringComparer.Ordinal); // internal token -> sender, for a host record
     // askId -> a question an asker named: one this service asks (Own), or one an earlier service asked that a host answers or answered
     readonly ConcurrentDictionary<string, Reclaim> reclaims = new(StringComparer.Ordinal);
     readonly System.Diagnostics.Stopwatch sinceStart = System.Diagnostics.Stopwatch.StartNew();
@@ -744,12 +745,23 @@ public sealed class Conductor : IAsyncDisposable
     /// whether this service sent the prompt and its answer follows, or an earlier one sent it and the
     /// answer was lost with it. A turn taken back from the host (<see cref="AdoptAsync"/>) is over.
     /// </summary>
-    async Task OnTurnEndedAsync(AgentHost host, JsonObject report)
+    async Task OnTurnEndedAsync(AgentHost host, JsonObject report, bool hostSeqTaken = false)
     {
         if ((string?)report["sessionId"] is not { } sessionId || removed.ContainsKey(sessionId)) return;
         var feed = Feed(sessionId);
         var hostSeq = (string?)report["_meta"]?[GorynychProtocol.MetaHostSeq];
-        if (hostSeq is not null && !feed.TakeFromHost(hostSeq)) return; // marked already
+        if (!hostSeqTaken && hostSeq is not null && !feed.TakeFromHost(hostSeq)) return; // marked already
+        if (!hostSeqTaken && feed.HasSteeringInFlight)
+        {
+            // A steer accepted just before the native turn ended is journaled first: the end marker
+            // waits for it, outside this read loop, which must keep taking the host's messages.
+            Track(Task.Run(async () =>
+            {
+                await feed.WaitForSteeringAsync();
+                await OnTurnEndedAsync(host, report, hostSeqTaken: true);
+            }));
+            return;
+        }
         var promptId = (string?)report["promptId"];
         var result = report["result"];
         Exception? failure = report["error"] is JsonObject error
@@ -1035,6 +1047,11 @@ public sealed class Conductor : IAsyncDisposable
             if (@params is JsonObject report) await OnTurnEndedAsync(host, report);
             return;
         }
+        if (method == GorynychProtocol.MethodSteerAccepted)
+        {
+            if (@params is JsonObject record) await OnSteerAcceptedAsync(record);
+            return;
+        }
         if (method == GorynychProtocol.MethodAskAnswered)
         {
             if (@params is JsonObject report) OnAskAnswered(report);
@@ -1046,6 +1063,18 @@ public sealed class Conductor : IAsyncDisposable
         if (method == AcpMethods.Client.SessionUpdate)
         {
             if (@params!["update"] is not JsonObject update) return;
+            if (options.Hosts is null && feed.HasSteeringInFlight
+                && (string?)update["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended")
+            {
+                // In-process adapters need the same terminal ordering as a host's recovery log.
+                var terminal = @params.DeepClone();
+                Track(Task.Run(async () =>
+                {
+                    await feed.WaitForSteeringAsync();
+                    await OnAgentNotificationAsync(host, method, terminal);
+                }));
+                return;
+            }
             // From a host: taken once, though a host that comes back sends what it kept again.
             if (update["_meta"]?[GorynychProtocol.MetaHostSeq] is JsonValue s && s.TryGetValue<string>(out var hostSeq) && !feed.TakeFromHost(hostSeq)) return;
             // Activity snapshots are live observations, never conversation history.
@@ -1436,6 +1465,7 @@ public sealed class Conductor : IAsyncDisposable
         response.Meta[GorynychProtocol.MetaAgent] = host.Name;
         if (ahpUri is not null) response.Meta[GorynychProtocol.MetaAhpUri] = ahpUri;
         response.Meta[GorynychProtocol.MetaSessionState] = feed.Activity.Snapshot();
+        response.Meta[GorynychProtocol.MetaSessionSteering] = host.Steers;
         ServiceLog.Info($"{host.Name}: new session {response.SessionId} in {request.Cwd}");
         return response;
     }
@@ -1900,7 +1930,7 @@ public sealed class Conductor : IAsyncDisposable
         }
         var position = await feed.ReplayAndAttachAsync(client);
         await NoticeOnOpenAsync(feed, client);
-        return WithLinkState(response, feed, position);
+        return WithLinkState(response, feed, position, host.Steers);
     }
 
     /// <summary>
@@ -1925,7 +1955,7 @@ public sealed class Conductor : IAsyncDisposable
         activity["sessionId"] = request.SessionId;
         client.Notify(GorynychProtocol.MethodSessionState, activity);
         // An already open session gets the state the agent last reported, so every client sees its switches.
-        return WithLinkState(opened ?? use.Feed.State(), use.Feed, position);
+        return WithLinkState(opened ?? use.Feed.State(), use.Feed, position, HostOf(use.Record).Steers);
     }
 
     /// <summary>The position a client's <c>replayFrom</c> asks to resume after; null without one.</summary>
@@ -1947,13 +1977,14 @@ public sealed class Conductor : IAsyncDisposable
     /// A load's or resume's answer with what a client on the resumable link needs: the position it
     /// is at, whether a turn runs, and which of its prompts are still in progress.
     /// </summary>
-    static JsonNode WithLinkState(JsonNode? response, SessionFeed feed, long position)
+    static JsonNode WithLinkState(JsonNode? response, SessionFeed feed, long position, bool steers)
     {
         var result = response as JsonObject ?? [];
         var meta = result["_meta"] as JsonObject ?? [];
         meta[GorynychProtocol.MetaPosition] = SessionJournal.FormatPosition(position);
         meta[GorynychProtocol.MetaTurn] = feed.TurnRunning ? "running" : "idle";
         meta[GorynychProtocol.MetaSessionState] = feed.Activity.Snapshot();
+        meta[GorynychProtocol.MetaSessionSteering] = steers;
         meta[GorynychProtocol.MetaPrompts] = new JsonArray(feed.PromptsInProgress().Select(p => (JsonNode)p).ToArray());
         // Whether the client may prompt it, said in full: a client that showed it read-only before learns it is not.
         PutInteractivity(meta, feed.ReadOnly);
@@ -1967,7 +1998,8 @@ public sealed class Conductor : IAsyncDisposable
     /// the others one of its own), so its client finds out how it ended should its answer be lost
     /// (<see cref="MarkPromptEndAsync"/>), and every client that shows turns sees it end.
     /// </summary>
-    internal async Task<JsonNode?> PromptAsync(ClientConnection client, JsonRpcRequest request, CancellationToken ct)
+    internal async Task<JsonNode?> PromptAsync(ClientConnection client, JsonRpcRequest request, CancellationToken ct,
+        string? messageId = null, TaskCompletionSource? handedSignal = null)
     {
         if (Draining) throw Restarting();
         var prompt = request.ParamsAs<PromptRequest>();
@@ -1997,7 +2029,7 @@ public sealed class Conductor : IAsyncDisposable
         var livesOn = false;
         try
         {
-            return result = await PromptInProgressAsync(client, request, prompt, use, () => use.Feed.Handed(key), ct);
+            return result = await PromptInProgressAsync(client, request, prompt, use, () => use.Feed.Handed(key), ct, messageId, handedSignal);
         }
         catch (IOException e) when (LivesOnInHost(e))
         {
@@ -2033,10 +2065,196 @@ public sealed class Conductor : IAsyncDisposable
             // ended nowhere: it goes again, as it is. A turn that goes on in a host this service leaves
             // running for a restart is not over: the next service marks its end when the host reports
             // it. One its host reported the end of is marked already (OnTurnEndedAsync), and is marked no more.
+            // A steer accepted just before the native turn ended is journaled before its end marker.
+            if (!IsRestartingRefusal(failure) && !livesOn)
+                await use.Feed.WaitForSteeringAsync();
             if (!IsRestartingRefusal(failure) && !livesOn)
                 await MarkPromptEndAsync(use.Feed, promptId, result, failure);
             use.Feed.EndPrompt(key);
+            // A fallback steering call waits only for the handoff; if the turn never got that far, it
+            // learns why here rather than waiting for a turn that did not start.
+            if (handedSignal is { Task.IsCompleted: false })
+                handedSignal.TrySetException(failure ?? new JsonRpcException(JsonRpcException.InternalError,
+                    "The turn did not start, so the message was not delivered."));
         }
+    }
+
+    /// <summary>
+    /// <c>_session/steering</c>: forwards a message into the session's running turn without waiting
+    /// for its turn gate. The adapter decides whether a turn runs; the conductor never guesses from
+    /// its own gate. An accepted message is journaled once, as a steered user message, before the
+    /// owning turn's end. An idle answer without the client's opt-in starts the legacy prompt here.
+    /// A lost answer is uncertain: it is never retried automatically.
+    /// </summary>
+    internal async Task<JsonNode?> SteeringAsync(ClientConnection client, JsonRpcRequest request, CancellationToken ct)
+    {
+        if (Draining) throw Restarting();
+        var steering = AcpSteering.Parse(request.Params);
+        using var use = await UseAsync(steering.SessionId, ct);
+        if (Draining) throw Restarting();
+        var host = HostOf(use.Record);
+        var feed = use.Feed;
+        if (!host.Steers)
+            throw AcpSteering.Refused("notSupported", "This session's agent does not support steering.");
+        if (feed.OpenedReadOnly)
+            throw AcpSteering.Refused("turnNotSteerable", "This session is open read-only here, so it cannot take a steer.");
+        var (rpc, _) = await EnsureLiveAsync(use.Record, ct);
+        if (Draining) throw Restarting();
+        var messageId = SessionFeed.NewMessageId();
+        var origin = Guid.NewGuid().ToString("N");
+        steerOrigins[origin] = client;
+        // Also expire origins on refusals, transport failures and cancellation.
+        ForgetSteerOriginSoon(origin);
+        var forwarded = request.Params is JsonObject p ? p.DeepClone().AsObject() : [];
+        var meta = forwarded["_meta"] as JsonObject ?? [];
+        meta[GorynychProtocol.MetaMessageId] = messageId;
+        meta[GorynychProtocol.MetaSteerOrigin] = origin;
+        // The conductor always opts in: no adapter may start a turn this service does not know about.
+        meta[GorynychProtocol.MetaSteering] = new JsonObject { ["idleBehavior"] = AcpSteering.PromptRequiredIdle };
+        forwarded["_meta"] = meta;
+        using var steeringCall = feed.BeginSteering();
+        Task<JsonNode?> response;
+        await feed.ForwardGate.WaitAsync(ct);
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            response = await rpc.StartRequestAsync(GorynychProtocol.MethodSteering, forwarded, CancellationToken.None);
+        }
+        catch (Exception e) when (e is IOException or OperationCanceledException)
+        {
+            // It may have been written before the link failed: neither delivered nor not.
+            throw UncertainSteering(e);
+        }
+        finally
+        {
+            feed.ForwardGate.Release();
+        }
+        JsonNode? result;
+        try
+        {
+            result = await response;
+        }
+        catch (JsonRpcException e) when (e.Code is JsonRpcException.InvalidRequest or JsonRpcException.InvalidParams or JsonRpcException.MethodNotFound)
+        {
+            throw; // a definite adapter refusal: nothing was journaled
+        }
+        catch (Exception e)
+        {
+            throw UncertainSteering(e);
+        }
+        var outcome = (string?)result?["outcome"];
+        switch (outcome)
+        {
+            case AcpSteering.Injected:
+            case AcpSteering.StartedNewTurn:
+                if (outcome == AcpSteering.StartedNewTurn)
+                    ServiceLog.Warn($"{host.Name} {steering.SessionId}: the adapter started a turn despite idleBehavior promptRequired; its message is kept as accepted, and is not sent again");
+                await PublishSteeredAsync(feed, steering, messageId, hostSeq: null, except: client);
+                return AcpSteering.Result(outcome);
+            case AcpSteering.PromptRequired:
+                if (steering.PromptRequired) return AcpSteering.PromptRequiredResult();
+                // The client did not opt in: the shared extension's legacy idle fallback owns the turn.
+                steeringCall.Dispose(); // the fallback prompt must not wait for its own steer at completion
+                return await StartIdleTurnAsync(client, steering, messageId, request.Sequence, ct);
+            default:
+                throw UncertainSteering(new JsonRpcException(JsonRpcException.InternalError,
+                    $"The adapter answered steering with an unknown outcome '{outcome ?? "(none)"}'."));
+        }
+    }
+
+    static JsonRpcException UncertainSteering(Exception e) => new(JsonRpcException.InternalError,
+        $"The steering result is unknown: the message may or may not have joined the turn, so it is not sent again. {e.Message}");
+
+    void ForgetSteerOriginSoon(string origin) => _ = Task.Delay(TimeSpan.FromMinutes(1)).ContinueWith(
+        finished => steerOrigins.TryRemove(origin, out _), TaskScheduler.Default);
+
+    /// <summary>
+    /// The shared extension's legacy idle start, used only for a client that did not send
+    /// <c>idleBehavior: "promptRequired"</c>. The message becomes the next turn's prompt, with its
+    /// client prompt ID when it gave one (else <c>service-&lt;messageId&gt;</c>), and the request
+    /// answers <c>startedNewTurn</c> once that prompt is handed to the agent.
+    /// </summary>
+    async Task<JsonNode> StartIdleTurnAsync(ClientConnection client, AcpSteering.Request steering, string messageId, long requestSequence, CancellationToken ct)
+    {
+        var promptId = steering.PromptId ?? ServicePromptId(messageId);
+        var meta = new JsonObject
+        {
+            [GorynychProtocol.MetaPromptId] = promptId,
+            [GorynychProtocol.MetaMessageId] = messageId,
+        };
+        var prompt = new PromptRequest { SessionId = steering.SessionId, Prompt = steering.Prompt, Meta = meta };
+        var request = new JsonRpcRequest(JsonValue.Create(0)!, AcpMethods.Agent.SessionPrompt, AcpJson.ToNode(prompt)) { Sequence = requestSequence };
+        var handed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var running = PromptAsync(client, request, ct, messageId, handed);
+        _ = running.ContinueWith(t =>
+        {
+            if (t.IsFaulted) handed.TrySetException(t.Exception!.GetBaseException());
+        }, TaskScheduler.Default);
+        try
+        {
+            await handed.Task.WaitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw new JsonRpcException(JsonRpcException.RequestCancelled, "The steering request was cancelled before its fallback turn started.");
+        }
+        return AcpSteering.Result(AcpSteering.StartedNewTurn);
+    }
+
+    /// <summary>Journals one accepted steer with its blocks as one ACP user message.</summary>
+    async Task<bool> PublishSteeredAsync(SessionFeed feed, AcpSteering.Request steering, string messageId, string? hostSeq, ClientConnection? except)
+    {
+        var blocks = new List<JsonObject>(steering.Prompt.Count);
+        foreach (var block in steering.Prompt)
+        {
+            var meta = new JsonObject();
+            if (steering.PromptId is not null) meta[GorynychProtocol.MetaPromptId] = steering.PromptId;
+            blocks.Add(AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
+            {
+                Content = block, MessageId = messageId, Meta = meta.Count > 0 ? meta : null,
+            })!.AsObject());
+        }
+        return await feed.PublishSteeredAsync(blocks, messageId, hostSeq, except, () => store.Touch(steering.SessionId));
+    }
+
+    /// <summary>
+    /// A host reported an accepted steer from its numbered recovery buffer: journal it exactly once,
+    /// before the end of the turn it joined, with the sender's connection excluded when it still
+    /// belongs to this conductor. A record replayed after a restart is not a new message.
+    /// </summary>
+    async Task OnSteerAcceptedAsync(JsonObject record)
+    {
+        if ((string?)record["sessionId"] is not { } sessionId || removed.ContainsKey(sessionId)) return;
+        if ((string?)record["messageId"] is not { Length: > 0 } messageId) return;
+        var session = store.Get(sessionId);
+        if (session is null || !agents.TryGetValue(session.Agent, out var host)) return;
+        var prompt = record["prompt"] as JsonArray;
+        if (prompt is null || prompt.Count == 0) return;
+        AcpSteering.Request steering;
+        try
+        {
+            var meta = new JsonObject();
+            if (record["promptId"] is JsonValue promptId && promptId.TryGetValue<string>(out var clientPromptId) && clientPromptId.Length > 0)
+                meta[GorynychProtocol.MetaPromptId] = clientPromptId;
+            if (record["origin"] is JsonValue originValue && originValue.TryGetValue<string>(out var token) && token.Length > 0)
+                meta[GorynychProtocol.MetaSteerOrigin] = token;
+            steering = AcpSteering.Parse(new JsonObject
+            {
+                ["sessionId"] = sessionId, ["prompt"] = prompt.DeepClone(),
+                ["_meta"] = meta,
+            });
+        }
+        catch (JsonRpcException e)
+        {
+            ServiceLog.Warn($"{host.Name} {sessionId}: a host's steering acceptance could not be read: {e.Message}");
+            return;
+        }
+        var hostSeq = (string?)record["_meta"]?[GorynychProtocol.MetaHostSeq];
+        var origin = (string?)record["origin"];
+        var except = origin is not null && steerOrigins.TryGetValue(origin, out var sender) ? sender : null;
+        var feed = Feed(sessionId);
+        if (hostSeq is not null && !feed.TakeFromHost(hostSeq)) return;
+        await PublishSteeredAsync(feed, steering, messageId, hostSeq, except);
     }
 
     /// <summary>
@@ -2103,7 +2321,8 @@ public sealed class Conductor : IAsyncDisposable
     static bool IsLocalCommand(AgentHost host, PromptRequest prompt) =>
         prompt.Prompt is [TextContent { Text: var text }] && host.LocalCommands.Contains(text.Trim());
 
-    async Task<JsonNode?> PromptInProgressAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionUse use, Action handed, CancellationToken ct)
+    async Task<JsonNode?> PromptInProgressAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionUse use, Action handed,
+        CancellationToken ct, string? messageId = null, TaskCompletionSource? handedSignal = null)
     {
         var localCommand = IsLocalCommand(HostOf(use.Record), prompt);
         var record = localCommand ? use.Record : Promote(use.Record);
@@ -2117,7 +2336,9 @@ public sealed class Conductor : IAsyncDisposable
         // host: the wait ends, and the prompt goes to the next service, as one that got here first.
         try
         {
-            await feed.TurnGate.WaitAsync(options.Hosts is null ? CancellationToken.None : drainStop.Token);
+            using var waiting = handedSignal is not null
+                ? CancellationTokenSource.CreateLinkedTokenSource(ct, drainStop.Token) : null;
+            await feed.TurnGate.WaitAsync(waiting?.Token ?? (options.Hosts is null ? CancellationToken.None : drainStop.Token));
         }
         catch (OperationCanceledException) when (drainStop.IsCancellationRequested)
         {
@@ -2135,13 +2356,13 @@ public sealed class Conductor : IAsyncDisposable
         {
             if (feed.Retired) throw NotFound(record.SessionId); // deleted while this prompt waited for the turn before it
             rpc = await RpcForTurnAsync(record, rpc, ct);
-            if (record.ParentSessionId is null) return await PromptTurnAsync(client, request, prompt, record, rpc, feed, handed, localCommand);
+            if (record.ParentSessionId is null) return await PromptTurnAsync(client, request, prompt, record, rpc, feed, handed, localCommand, messageId, handedSignal, ct);
             // A spawned session reports the end of the turn to its parent.
             feed.BeginTurnText(ReportLimit + 1);
             JsonNode? result;
             try
             {
-                result = await PromptTurnAsync(client, request, prompt, record, rpc, feed, handed, localCommand);
+                result = await PromptTurnAsync(client, request, prompt, record, rpc, feed, handed, localCommand, messageId, handedSignal, ct);
             }
             catch (Exception e)
             {
@@ -2162,12 +2383,14 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     async Task<JsonNode?> PromptTurnAsync(ClientConnection client, JsonRpcRequest request, PromptRequest prompt, SessionRecord record,
-        JsonRpcConnection rpc, SessionFeed feed, Action handed, bool localCommand)
+        JsonRpcConnection rpc, SessionFeed feed, Action handed, bool localCommand, string? messageId = null, TaskCompletionSource? handedSignal = null,
+        CancellationToken ct = default)
     {
+        if (handedSignal is not null) ct.ThrowIfCancellationRequested();
         if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
         // Journal the user's message, show it to the session's other clients, and use the
         // first prompt as the title until the harness provides one.
-        var messageId = SessionFeed.NewMessageId(); // one message, however many blocks
+        messageId ??= SessionFeed.NewMessageId(); // one message, however many blocks
         // The prompt's ID goes with its text: a client on the link never gets its own text live, and
         // drops it when a resume after a reconnect sends it from the journal; the others learn its turn.
         var promptId = PromptIdOf(prompt);
@@ -2191,9 +2414,11 @@ public sealed class Conductor : IAsyncDisposable
         await feed.ForwardGate.WaitAsync(CancellationToken.None);
         try
         {
+            if (handedSignal is not null) ct.ThrowIfCancellationRequested();
             if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
             response = await rpc.StartRequestAsync(request.Method, WithMessageId(request.Params, messageId), CancellationToken.None);
             handed();
+            handedSignal?.TrySetResult();
         }
         finally
         {

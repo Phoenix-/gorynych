@@ -21,8 +21,10 @@ architecture. Keep this file short: it is loaded into every agent session.
     (`--claude-transport tui`).
   - Codex is integrated through `codex app-server`, Kimi through `kimi acp`, DeepSeek Harness
     through `dsh --profile acp` with a `--patch` file in Gorynych's data dir.
-- **Subscriptions.** Use only the user's own login on each machine, run the unmodified
-  agent binaries, never copy credentials between machines and never serve other people.
+- **Harness authentication is out of scope.** Run the unmodified binaries with the user's
+  native configuration on each machine. Do not manage login/logout, validate accounts or
+  subscriptions, restrict providers/billing, or filter authentication settings and environment.
+  Relay native errors. Never copy credentials between machines or serve other people.
 - **Native state is the source of truth.** Where a harness has a native attribute
   (title, archive), read and write it there; keep only the rest in the service's own
   overlay.
@@ -32,7 +34,7 @@ architecture. Keep this file short: it is loaded into every agent session.
 ## Code
 
 - Specifications live in `docs/` (design, service protocol, the adapter contract, adapters,
-  ACP types, the AHP face); keep them in step with the code. A new adapter is checked against
+  ACP types, the AHP face, steering); keep them in step with the code. A new adapter is checked against
   `docs/adapter-contract.md`. ACP types are generated: change `tools/Gorynych.AcpGen`, not `Acp.g.cs`;
   Codex's app-server types likewise: `tools/Gorynych.CodexGen`, not `Codex.g.cs`. AHP's types and
   reducers are Microsoft's NuGet package, pinned (`docs/ahp-face.md`).

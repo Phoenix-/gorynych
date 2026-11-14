@@ -31,7 +31,8 @@ public sealed partial class DshAdapterTests
         var target = Path.Combine(dir, sessionId + ".json");
         var temp = target + "." + Guid.NewGuid().ToString("N") + ".tmp";
         File.WriteAllText(temp, record.ToJsonString());
-        File.Move(temp, target, overwrite: true);
+        if (File.Exists(target)) File.Replace(temp, target, destinationBackupFileName: null);
+        else File.Move(temp, target);
     }
 
     static bool HasTitle(Service service, string title)
@@ -72,6 +73,37 @@ public sealed partial class DshAdapterTests
         WriteCache(home, id, "Replaced title");
         await WaitForTitle(service, "Replaced title");
         Assert.AreEqual("Replaced title", DshPins.TitleOf(JsonNode.Parse(File.ReadAllText(Path.Combine(home, "storages", "session_projcache", "sessions", id + ".json")))));
+    }
+
+    [TestMethod]
+    public async Task ReadingNativeTitles_DoesNotBlockConcurrentAtomicCacheReplacements()
+    {
+        var home = TestDirs.New();
+        var id = Guid.NewGuid().ToString();
+        WriteCache(home, id, "Initial title");
+        var pins = new DshPins(home);
+        using var stop = new CancellationTokenSource();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reading = Task.Run(() =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                pins.ReadTitle(id);
+                pins.Read(id);
+                started.TrySetResult();
+            }
+        });
+        try
+        {
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            for (var i = 0; i < 300; i++) WriteCache(home, id, "Title " + i);
+        }
+        finally
+        {
+            stop.Cancel();
+            await reading;
+        }
+        Assert.AreEqual("Title 299", pins.ReadTitle(id));
     }
 
     [TestMethod]

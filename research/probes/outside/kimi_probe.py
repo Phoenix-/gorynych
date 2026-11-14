@@ -15,8 +15,7 @@ if os.path.exists(log):
     os.remove(log)
 server = os.path.join(here, "probe_server.py")
 
-env = {k: v for k, v in os.environ.items()
-       if not (k.upper().startswith(("CLAUDE", "ANTHROPIC", "MCP_")) or k.upper() == "CLAUDECODE")}
+env = dict(os.environ)
 env["GORYNYCH_PROBE_MARK"] = "marker-from-adapter"
 
 proc = subprocess.Popen(["kimi", "acp"], cwd=work, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

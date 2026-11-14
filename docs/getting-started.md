@@ -10,17 +10,19 @@ published for those systems yet.
 ## What you need
 
 - Windows 10 1809 or later, x64.
-- The agents you want, installed, on your `PATH` and logged in with your own account. Any
+- The agents you want, installed, on your `PATH` and working with their native configuration. Any
   subset works:
   - Claude Code: `claude`.
-  - Kimi Code: `kimi`, after `kimi login`.
-  - Codex CLI: `codex`, after `codex login`.
+  - Kimi Code: `kimi`.
+  - Codex CLI: `codex`.
   - DeepSeek Harness: `dsh`, from `npm install -g @deepseek-ai/dsh` (it needs Node.js on your
-    `PATH`), with your own DeepSeek API key set in DSH, for example on the Models page of
-    `dsh web`. DSH is a developer preview, and every turn spends your DeepSeek API balance.
+    `PATH`), configured through DSH's native tools.
 - An ACP client. This guide uses Zed.
 
-Gorynych runs these agents as they are, under your login, and never edits their own
+Set up login or API access using each harness's own tools and verify it works there first.
+Gorynych does not manage authentication, select providers or impose a billing method.
+
+Gorynych runs these agents as they are, with that configuration, and never edits their own
 configuration (`~/.claude`, `~/.codex`, `~/.kimi-code`, `~/.dsh`). The first time Gorynych starts
 DSH, DSH creates its own `acp` profile in `~/.dsh/profiles/acp`, as any `dsh acp` does.
 
@@ -160,17 +162,16 @@ quits and serves every client.
 
 Approvals, questions and the agent's answers come into the thread as with any ACP agent.
 
-**Claude** runs headless by default: the unmodified `claude -p` under your own plan login, which
-Anthropic's terms allow today ([adapters.md](adapters.md#claude-code)). Its thread has three
+**Claude** runs headless by default: the unmodified `claude -p` with your native configuration
+([adapters.md](adapters.md#claude-code)). Its thread has three
 selectors: **mode** (`Ask`, `Accept edits`, `Plan`, `Auto` where the model has it, and `Full
 access`), **model** and **reasoning effort**. A change applies at once and stays with the session.
 **Claude's `Full access` asks you nothing:** any command, any file, outside the folder too; you
 choose it per thread, between turns. The first time Claude works in a folder you have not
 trusted in Claude Code, Gorynych asks in the thread whether to trust it.
 
-Should headless Claude stop working on your plan, start the service with
-`--claude-transport tui`: Gorynych then drives the interactive Claude Code instead, and your
-sessions carry over.
+You can select the interactive transport explicitly with `--claude-transport tui`; sessions
+carry over. Neither transport imposes a login or billing method.
 
 **Only with `--claude-transport tui`: Claude asks once about development channels.** In the TUI,
 other agents' questions reach a running Claude session through Claude Code's development
@@ -450,16 +451,9 @@ writes `%LOCALAPPDATA%\Gorynych\logs\service-<date>.log`.
   session"**. A bridge over SSH found no service and no logon task. Run
   `Gorynych.Service.exe task install` on that machine once
   ([external-clients.md](external-clients.md#a-remote-machine)).
-- **"Claude Code started without your login …"**. Run `claude` in a terminal and sign in. If you
-  are signed in, `claude -p` may have started to run bare by default, which ignores the login:
-  start the service with `--claude-transport tui`.
-- **"Claude Code would run on …, billed outside your plan"** or **"Claude Code reports no plan"**.
-  Claude Code found a key or token other than your plan login, such as an `apiKeyHelper` in its
-  settings (Gorynych already leaves `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` out). Remove
-  it, or sign in with your plan, then prompt again.
-- **"Claude cannot run on your plan (…)"**. Claude Code reported an auth or billing error. If
-  Anthropic no longer lets `claude -p` run on your plan, start the service with
-  `--claude-transport tui`.
+- **"Claude authentication or billing error (…)"**, or a native authentication error from another
+  harness. Gorynych relays the harness's error and message. Diagnose it with that harness's
+  native client and configuration; Gorynych does not select a login or repair credentials.
 - **"Claude did not start the turn within 90 s. Last screen: …"** (TUI transport). Claude Code waited on a screen
   Gorynych cannot answer, such as a login. The error quotes the screen, and the session's
   `terminal.log` under `%LOCALAPPDATA%\Gorynych\claude\sessions\<session>\` has all of it. Run

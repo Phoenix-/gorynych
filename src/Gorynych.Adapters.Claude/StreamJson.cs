@@ -77,66 +77,13 @@ public static class StreamJson
 
     // ---------------------------------------------------------------- Claude → ACP
 
-    /// <summary>
-    /// True when the <c>account</c> of an <c>initialize</c> answer shows no login at all: no plan and
-    /// <c>tokenSource: "none"</c>. That is what <c>--bare</c> looks like (it never reads the OAuth
-    /// login; probed with 2.1.302), and also a person who is signed out.
-    /// </summary>
-    public static bool SignedOut(JsonObject? initialize) =>
-        initialize?["account"] is JsonObject account
-        && (string?)account["subscriptionType"] is not { Length: > 0 }
-        && (string?)account["tokenSource"] == "none"
-        && account["apiKeySource"] is null;
-
-    /// <summary>
-    /// The API key Claude would bill instead of the plan (<c>account.apiKeySource</c> of an
-    /// <c>initialize</c> answer, such as <c>ANTHROPIC_API_KEY</c>, which wins over the login), or null.
-    /// </summary>
-    public static string? ApiKeySource(JsonObject? initialize) =>
-        (string?)initialize?["account"]?["apiKeySource"] is { Length: > 0 } source && source != "none" ? source : null;
-
-    /// <summary>The API key a <c>system/init</c> message reports (<c>apiKeySource</c> other than <c>none</c>), or null.</summary>
-    public static string? ApiKeySourceOfInit(JsonObject init) =>
-        (string?)init["apiKeySource"] is { Length: > 0 } source && source != "none" ? source : null;
-
-    public static string ApiKeyProblem(string apiKey) =>
-        $"Claude Code would run on {apiKey}, billed outside your plan. Gorynych runs Claude on your own plan login only: " +
-        $"remove {apiKey} from Claude Code's settings or from the environment the Gorynych service starts with.";
-
-    /// <summary>
-    /// Why a launch must not run, from its <c>initialize</c> answer, or null when it runs on the
-    /// person's plan login. Fails closed: an answer without an <c>account</c> does not run either.
-    /// </summary>
-    public static string? PlanProblem(JsonObject initialize)
-    {
-        if (initialize["account"] is not JsonObject account)
-            return "Claude Code did not report its account, so Gorynych cannot tell whether it runs on your plan, and does not run it. " + TuiHint;
-        if ((string?)account["apiProvider"] is var provider && provider != "firstParty")
-            return $"Claude Code runs through {provider ?? "an unknown provider"}, not on your Anthropic plan; Gorynych runs Claude on your own plan login only.";
-        if (SignedOut(initialize))
-            return "Claude Code started without your login (its account shows no plan and no token). Sign in with `claude` in a " +
-                "terminal; if you are signed in, `claude -p` may now run bare by default, which ignores the login, so start the " +
-                "Gorynych service with --claude-transport tui.";
-        if (ApiKeySource(initialize) is { } apiKey) return ApiKeyProblem(apiKey);
-        // Anything but a plan (an auth token, a gateway) is billed elsewhere.
-        if ((string?)account["subscriptionType"] is not { Length: > 0 })
-            return $"Claude Code reports no plan (its token comes from {(string?)account["tokenSource"] ?? "nowhere known"}), so it would " +
-                "not run on your subscription; Gorynych runs Claude on your own plan login only. " + TuiHint;
-        return null;
-    }
-
-    /// <summary>The assistant errors that mean Claude cannot run on the person's plan (<c>SDKAssistantMessageError</c>).</summary>
-    public static readonly HashSet<string> PlanErrors =
+    /// <summary>Native authentication and billing errors (<c>SDKAssistantMessageError</c>), relayed as prompt failures.</summary>
+    public static readonly HashSet<string> AuthenticationErrors =
         ["authentication_failed", "oauth_org_not_allowed", "account_on_hold", "verification_required", "billing_error"];
 
-    /// <summary>The <c>error</c> of an <c>assistant</c> message when it is one of <see cref="PlanErrors"/>.</summary>
-    public static string? PlanError(JsonObject assistant) =>
-        (string?)assistant["error"] is { } error && PlanErrors.Contains(error) ? error : null;
-
-    /// <summary>What the person reads when Claude cannot run headless on their plan, with the way back.</summary>
-    public const string TuiHint =
-        "If `claude -p` no longer runs on your plan (Anthropic may change that), start the Gorynych service with " +
-        "--claude-transport tui to drive the interactive Claude Code instead.";
+    /// <summary>The <c>error</c> of an <c>assistant</c> message when it is one of <see cref="AuthenticationErrors"/>.</summary>
+    public static string? AuthenticationError(JsonObject assistant) =>
+        (string?)assistant["error"] is { } error && AuthenticationErrors.Contains(error) ? error : null;
 
     public static string? Type(JsonObject m) => (string?)m["type"];
 

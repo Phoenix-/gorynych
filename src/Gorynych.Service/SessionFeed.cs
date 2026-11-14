@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
+using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
 
 namespace Gorynych.Service;
@@ -39,6 +40,116 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     Queue<JsonObject>? replay; // under clientsGate
     int replayLimit;
     bool replayDropped;
+
+    readonly SemaphoreSlim steerGate = new(1, 1); // one acceptance record and its response journal a message once
+    HashSet<string>? steeredIds; // under clientsGate once read: steered message IDs already journaled
+
+    int steeringCalls;
+    TaskCompletionSource steeringIdle = Completed();
+
+    /// <summary>
+    /// A steering request on its way to the adapter, from before it is written until its outcome is
+    /// known. A turn's end mark waits for these, so an accepted message is journaled before it.
+    /// </summary>
+    public IDisposable BeginSteering()
+    {
+        lock (clientsGate)
+        {
+            steeringCalls++;
+            if (steeringCalls == 1) steeringIdle = NewSignal();
+        }
+        return new SteeringCall(this);
+    }
+
+    sealed class SteeringCall(SessionFeed feed) : IDisposable
+    {
+        int done;
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref done, 1) != 0) return;
+            lock (feed.clientsGate)
+                if (--feed.steeringCalls == 0) feed.steeringIdle.TrySetResult();
+        }
+    }
+
+    /// <summary>Whether a steering request of the session is still on its way.</summary>
+    public bool HasSteeringInFlight
+    {
+        get { lock (clientsGate) return steeringCalls > 0; }
+    }
+
+    /// <summary>Completes once no steering request of the session is still on its way.</summary>
+    public Task WaitForSteeringAsync()
+    {
+        lock (clientsGate) return steeringCalls == 0 ? Task.CompletedTask : steeringIdle.Task;
+    }
+
+    HashSet<string> SteeredIds()
+    {
+        if (Volatile.Read(ref steeredIds) is { } known) return known;
+        var read = Journal.SteeredMessageIds();
+        lock (clientsGate) return steeredIds ??= read;
+    }
+
+    /// <summary>Whether an accepted steer with this service message ID is already in the journal.</summary>
+    public bool HasSteeredMessage(string messageId)
+    {
+        var ids = SteeredIds();
+        lock (clientsGate) return ids.Contains(messageId);
+    }
+
+    /// <summary>
+    /// Journals a confirmed accepted steer as one user message (its blocks share
+    /// <paramref name="messageId"/>) and publishes it to the clients except <paramref name="except"/>.
+    /// False when that message is journaled already: a host record and its response, or a replayed
+    /// record, journal it once. The acceptance record's place in the host stream goes on the first
+    /// block, so the journal itself remembers the cursor.
+    /// </summary>
+    public async Task<bool> PublishSteeredAsync(List<JsonObject> blocks, string messageId, string? hostSeq,
+        ClientConnection? except, Action remember)
+    {
+        await steerGate.WaitAsync();
+        try
+        {
+            if (Retired) return false;
+            var ids = SteeredIds();
+            lock (clientsGate)
+                if (ids.Contains(messageId)) return false;
+            for (var i = 0; i < blocks.Count; i++)
+            {
+                var meta = blocks[i]["_meta"] as JsonObject ?? [];
+                meta[GorynychProtocol.MetaSteered] = true;
+                if (i == 0 && hostSeq is not null) meta[GorynychProtocol.MetaHostSeq] = hostSeq;
+                blocks[i]["_meta"] = meta;
+            }
+            await gate.WaitAsync();
+            try
+            {
+                if (Retired) return false;
+                foreach (var block in blocks)
+                {
+                    StampMessageId(block);
+                    RememberToolTitle(block);
+                }
+                Journal.AppendMany(blocks);
+                lock (clientsGate) ids.Add(messageId);
+                remember();
+                foreach (var client in Clients())
+                    if (!ReferenceEquals(client, except))
+                        foreach (var block in blocks)
+                            if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(block.DeepClone()))) break;
+            }
+            finally
+            {
+                gate.Release();
+            }
+            return true;
+        }
+        finally
+        {
+            steerGate.Release();
+        }
+    }
 
     /// <summary>
     /// From now until <see cref="EndReplay"/>, the parts of turns the agent sends are its history
@@ -1087,6 +1198,15 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// What a client gets: the update, without its place in a host's stream (<c>gorynych/hostSeq</c>),
     /// which is for the journal. <paramref name="update"/> is a copy of the service's own.
     /// </summary>
+    static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    static TaskCompletionSource Completed()
+    {
+        var done = NewSignal();
+        done.TrySetResult();
+        return done;
+    }
+
     JsonObject Notification(JsonNode update)
     {
         if (update["_meta"] is JsonObject meta && meta.Remove(Gorynych.Acp.Hosting.GorynychProtocol.MetaHostSeq) && meta.Count == 0)

@@ -123,7 +123,8 @@ shipped `profiles/acp` template on first boot. Gorynych never writes into `~/.ds
     repositories.
   - **The only approvals DSH asks are sandbox escalations.** MCP tools, the gorynych tools
     included, run without asking (verified).
-  - **Every turn spends money on the user's API key**, unlike the subscription harnesses.
+  - **The original live probe used the user's DeepSeek API route.** Provider selection and
+    billing follow DSH's native configuration; Gorynych imposes no route or billing method.
 - **Two more fixes in the proxy, from the live probes:**
   - DSH drops a pending approval on cancel without telling the client, so the proxy withdraws
     it with `$/cancel_request`;
@@ -640,7 +641,7 @@ writes sessions, its projection cache and attachments under `~/.dsh`, as `dsh we
   `agentInfo.version` is a constant. Mitigations:
   - the adapter logs and checks the package version (D2);
   - the live smoke test runs against each new version before the user updates.
-- **The API key costs money.** Every turn of a DSH session spends the user's DeepSeek balance.
+- **Native API usage can cost money.** The original DeepSeek route spent the user's API balance.
   That includes `ask_agent` opinions, reports from children, DSH's own subagents, and
   autonomous work that continues after a cancel.
   - The acp profile's model is the cheap `deepseek-v4-flash`, but its default effort is `high`.

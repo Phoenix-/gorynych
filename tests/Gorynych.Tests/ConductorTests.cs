@@ -40,6 +40,40 @@ public sealed class ConductorTests
         });
 
     [TestMethod]
+    [DataRow("authenticate", false)]
+    [DataRow("authenticate", true)]
+    [DataRow("logout", false)]
+    [DataRow("logout", true)]
+    public async Task HarnessLoginAndLogout_AreNotAdvertisedOrPerformed(string method, bool sessionScoped)
+    {
+        var nativeAuthCalls = 0;
+        var adapter = new ScriptedAdapter("fake", (_, request, _) =>
+        {
+            JsonNode? result = request.Method switch
+            {
+                AcpMethods.Agent.Initialize => ScriptedAgent.Init(),
+                AcpMethods.Agent.SessionNew => AcpJson.ToNode(new NewSessionResponse { SessionId = "s1" }),
+                AcpMethods.Agent.SessionList => AcpJson.ToNode(new ListSessionsResponse { Sessions = [] }),
+                _ => new JsonObject(),
+            };
+            if (request.Method is AcpMethods.Agent.Authenticate or AcpMethods.Agent.Logout)
+                Interlocked.Increment(ref nativeAuthCalls);
+            return Task.FromResult(result);
+        });
+        await using var conductor = TestDirs.Conductor(TestDirs.New(), adapter);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        Assert.IsNotNull(client.Initialized?.AuthMethods);
+        Assert.AreEqual(0, client.Initialized.AuthMethods.Count);
+        Assert.IsNull(AcpJson.ToNode(client.Initialized.AgentCapabilities)?["auth"]?["logout"]);
+        await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("fake"));
+        var args = new JsonObject { ["methodId"] = "native-login" };
+        if (sessionScoped) args["sessionId"] = "s1";
+        var failure = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => client.Rpc.SendRequestAsync(method, args));
+        Assert.AreEqual(JsonRpcException.MethodNotFound, failure.Code);
+        Assert.AreEqual(0, nativeAuthCalls, "even an unexpected sessionId must not turn this into a native login/logout call");
+    }
+
+    [TestMethod]
     public async Task KimiRecording_RelaysTitleAndTheSubscriptionError()
     {
         var replay = KimiReplay.FromFixture();

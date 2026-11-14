@@ -168,7 +168,48 @@ public sealed class AdapterHost
         ended.TrySetResult(0);
     }
 
-    async Task AgentAnsweredAsync(JsonNode? id, JsonObject message)
+    // Terminal records must follow the outcomes of steers already in flight, even if the
+    // conductor is absent. Waiting in the conductor alone cannot fix the order of host replay.
+    sealed record DeferredTerminal(JsonObject Message, long? Response, long[] Steering, int Bytes);
+    readonly List<DeferredTerminal> deferredTerminals = []; // under state
+    long deferredTerminalBytes;
+
+    bool DeferTerminal(JsonObject message, long? response, string sessionId)
+    {
+        lock (state)
+        {
+            var dependencies = forwarded.Where(p => p.Value.Method == GorynychProtocol.MethodSteering
+                && p.Value.SessionId == sessionId).Select(p => p.Key).ToArray();
+            if (dependencies.Length == 0) return false;
+            var bytes = Encoding.UTF8.GetByteCount(message.ToJsonString());
+            if (deferredTerminals.Count >= options.BufferLimit || deferredTerminalBytes + bytes > options.BufferBytes)
+                throw new IOException("The host's pending terminal buffer overflowed while awaiting steering outcomes.");
+            deferredTerminals.Add(new(message, response, dependencies, bytes));
+            deferredTerminalBytes += bytes;
+            return true;
+        }
+    }
+
+    async Task FlushTerminalsAsync()
+    {
+        List<DeferredTerminal> ready;
+        lock (state)
+        {
+            ready = deferredTerminals.Where(t => t.Steering.All(id => !forwarded.ContainsKey(id))).ToList();
+            foreach (var terminal in ready)
+            {
+                deferredTerminals.Remove(terminal);
+                deferredTerminalBytes -= terminal.Bytes;
+            }
+        }
+        foreach (var terminal in ready)
+            if (terminal.Response is { } id)
+                await AgentAnsweredAsync(JsonValue.Create(id), terminal.Message, released: true);
+            else
+                await AgentNotifiedAsync(Text(terminal.Message["method"])!, terminal.Message, released: true);
+    }
+
+    async Task AgentAnsweredAsync(JsonNode? id, JsonObject message, bool released = false)
     {
         if (!TryId(id, out var key)) return;
         Forwarded? request;
@@ -182,6 +223,9 @@ public sealed class AdapterHost
             string? ended = null;
             lock (state)
             {
+                if (!released && forwarded.TryGetValue(key, out var pending)
+                    && pending.Method == AcpMethods.Agent.SessionPrompt && pending.SessionId is { } pendingSession
+                    && DeferTerminal(message, key, pendingSession)) return;
                 if (!forwarded.Remove(key, out request)) return;
                 Track(request, message);
                 if (request.Method == AcpMethods.Agent.SessionPrompt && request.SessionId is { } sessionId)
@@ -205,6 +249,22 @@ public sealed class AdapterHost
                     if (message["error"] is { } e) report["error"] = e.DeepClone();
                     ended = Number(Notification(GorynychProtocol.MethodAskAnswered, report));
                 }
+                // An accepted steer is kept before its answer, like a turn's end: a conductor that
+                // journals it and then goes without recording the reply finds it after its cursor.
+                else if (request.Method == GorynychProtocol.MethodSteering && request.SessionId is { } steered
+                    && message["result"] is JsonObject accepted && (string?)accepted["outcome"] is AcpSteering.Injected or AcpSteering.StartedNewTurn)
+                {
+                    var report = new JsonObject
+                    {
+                        ["sessionId"] = steered,
+                        ["messageId"] = request.MessageId,
+                        ["outcome"] = (string?)accepted["outcome"],
+                        ["prompt"] = request.Prompt?.DeepClone(),
+                    };
+                    if (request.PromptId is { } promptId) report["promptId"] = promptId;
+                    if (request.SteerOrigin is { } origin) report["origin"] = origin;
+                    ended = Number(Notification(GorynychProtocol.MethodSteerAccepted, report));
+                }
             }
             if (ended is not null && current is { IsLost: false } connection) await TryWriteLineAsync(connection, ended);
         }
@@ -219,6 +279,7 @@ public sealed class AdapterHost
         }
         message["id"] = request.ConductorId.DeepClone();
         if (!request.Connection.IsLost) await TryWriteAsync(request.Connection, message);
+        if (request.Method == GorynychProtocol.MethodSteering) await FlushTerminalsAsync();
     }
 
     /// <summary>Follows the sessions open in the agent and its prompts. Under <see cref="state"/>.</summary>
@@ -270,8 +331,12 @@ public sealed class AdapterHost
     JsonObject SessionConfigurations() => new(live.Where(configurations.ContainsKey)
         .Select(id => new KeyValuePair<string, JsonNode?>(id, configurations[id].Snapshot())));
 
-    async Task AgentNotifiedAsync(string method, JsonObject message)
+    async Task AgentNotifiedAsync(string method, JsonObject message, bool released = false)
     {
+        if (!released && method == AcpMethods.Client.SessionUpdate
+            && Text(message["params"]?["sessionId"]) is { } sessionId
+            && Text(message["params"]?["update"]?["_meta"]?[GorynychProtocol.MetaAgentTurn]) == "ended"
+            && DeferTerminal(message, null, sessionId)) return;
         if (method == AcpMethods.Protocol.CancelRequest)
         {
             // The agent withdraws a question: withdrawn from the conductor that has it.
@@ -642,6 +707,9 @@ public sealed class AdapterHost
                 AskId = Text(@params?["_meta"]?[GorynychProtocol.MetaAskId]) ?? Text(@params?["askId"]), // a prompt's _meta; _gorynych/opinion's params
                 Opinion = Text(@params?["_meta"]?[GorynychProtocol.MetaOpinion]),
                 From = Text(@params?["_meta"]?[GorynychProtocol.MetaFromSessionId]),
+                MessageId = method == GorynychProtocol.MethodSteering ? Text(@params?["_meta"]?[GorynychProtocol.MetaMessageId]) : null,
+                SteerOrigin = method == GorynychProtocol.MethodSteering ? Text(@params?["_meta"]?[GorynychProtocol.MetaSteerOrigin]) : null,
+                Prompt = method == GorynychProtocol.MethodSteering ? @params?["prompt"]?.DeepClone() as JsonArray : null,
             };
         }
         message["id"] = key;
@@ -847,6 +915,15 @@ public sealed class AdapterHost
 
         /// <summary>For an opinion: the session that asks (<c>gorynych/fromSessionId</c>), which alone takes the answer from the next service.</summary>
         public string? From { get; init; }
+
+        /// <summary>For a steer: the service message ID under which its content is journaled and kept natively.</summary>
+        public string? MessageId { get; init; }
+
+        /// <summary>For a steer: the conductor's internal sender token, kept with the acceptance.</summary>
+        public string? SteerOrigin { get; init; }
+
+        /// <summary>For a steer: its content, kept so the next conductor journals what was accepted.</summary>
+        public JsonArray? Prompt { get; init; }
     }
 
     /// <summary>A question of the agent's no conductor has answered yet.</summary>

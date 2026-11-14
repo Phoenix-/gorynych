@@ -26,7 +26,9 @@ with open(settings, "w", encoding="utf-8") as f:
     json.dump({"permissions": {"deny": ["mcp__gorynych-outside"]}}, f)
 
 env = {k: v for k, v in os.environ.items()
-       if not (k.upper().startswith(("CLAUDE", "ANTHROPIC", "MCP_")) or k.upper() == "CLAUDECODE")}
+       if k.upper() not in {"CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION",
+                            "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_REMOTE_SESSION_ID",
+                            "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PID", "CLAUDE_EFFORT"}}
 env["GORYNYCH_PROBE_MARK"] = "marker-from-adapter"
 
 cmd = ["claude", "-p", "Reply with just the word ok.", "--output-format", "stream-json", "--verbose",

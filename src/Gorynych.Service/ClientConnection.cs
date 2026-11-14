@@ -111,7 +111,7 @@ internal sealed class ClientConnection
                 return AcpJson.ToNode(Initialize());
             case AcpMethods.Agent.Authenticate:
             case AcpMethods.Agent.Logout:
-                return new JsonObject();
+                throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {request.Method}");
             case AcpMethods.Agent.SessionList:
                 return AcpJson.ToNode(await conductor.ListAsync(request.ParamsAs<ListSessionsRequest>(), ct, AgentScope));
             case AcpMethods.Agent.SessionNew:
@@ -122,6 +122,8 @@ internal sealed class ClientConnection
                 return await conductor.ResumeAsync(this, request.ParamsAs<ResumeSessionRequest>(), ct);
             case AcpMethods.Agent.SessionPrompt:
                 return await conductor.PromptAsync(this, request, ct);
+            case GorynychProtocol.MethodSteering:
+                return await conductor.SteeringAsync(this, request, ct);
             case AcpMethods.Agent.SessionClose:
                 return await conductor.CloseAsync(this, RequireSession(request), ct);
             case AcpMethods.Agent.SessionDelete:
@@ -216,6 +218,8 @@ internal sealed class ClientConnection
             [GorynychProtocol.MetaServiceId] = conductor.ServiceId,
             [GorynychProtocol.MetaAgents] = new JsonArray(conductor.Agents.Values
                 .Select(a => (JsonNode)new JsonObject { ["name"] = a.Name, ["displayName"] = a.DisplayName }).ToArray()),
+            // The shared ACP v1 steering extension, at the top level as its agreed wire shape says.
+            [GorynychProtocol.MetaSteering] = new JsonObject { ["supported"] = true },
         };
         // Deprecated: the flags' old place, kept for one release for clients built before they moved.
         foreach (var (key, value) in DeprecatedFlags()) meta[key] = value?.DeepClone();

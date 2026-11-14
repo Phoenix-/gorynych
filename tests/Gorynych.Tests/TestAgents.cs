@@ -81,7 +81,7 @@ sealed class ScriptedAgent(JsonRpcConnection rpc)
     public Task Update(string sessionId, SessionUpdate update) => Rpc.SendUpdateAsync(sessionId, update);
 
     public static JsonNode? Init(bool list = true, bool resume = true, bool load = false, bool close = false, bool delete = false,
-        bool draftsNotDurable = false, bool autoTitle = false) => AcpJson.ToNode(new InitializeResponse
+        bool draftsNotDurable = false, bool autoTitle = false, bool steering = false) => AcpJson.ToNode(new InitializeResponse
     {
         ProtocolVersion = 1,
         AgentCapabilities = new AgentCapabilities
@@ -103,6 +103,7 @@ sealed class ScriptedAgent(JsonRpcConnection rpc)
             },
         },
         AgentInfo = new Implementation { Name = "scripted", Version = "1" },
+        Meta = steering ? new JsonObject { [GorynychProtocol.MetaSteering] = new JsonObject { ["supported"] = true } } : null,
     });
 }
 

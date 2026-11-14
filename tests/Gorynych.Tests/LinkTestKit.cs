@@ -58,6 +58,12 @@ sealed class TurnAgent(string name) : IAgentAdapter
     /// <summary>It keeps nothing of a session before its first prompt, so a draft opens in no other instance (Codex).</summary>
     public bool DraftsNotDurable { get; set; }
 
+    /// <summary>It advertises and takes <c>_session/steering</c>, accepting it into the running turn.</summary>
+    public bool Steers { get; set; }
+
+    /// <summary>How many steering requests reached the agent: a lost answer is never a reason to send one again.</summary>
+    public int SteersCount;
+
     /// <summary>Put in the IDs of its sessions (<c>turns-&lt;tag&gt;1</c>), so the service log of tests that run at once tells them apart.</summary>
     public string Tag { get; init; } = "";
 
@@ -114,7 +120,7 @@ sealed class TurnAgent(string name) : IAgentAdapter
         switch (req.Method)
         {
             case AcpMethods.Agent.Initialize:
-                return ScriptedAgent.Init(close: Closes, draftsNotDurable: DraftsNotDurable);
+                return ScriptedAgent.Init(close: Closes, draftsNotDurable: DraftsNotDurable, steering: Steers);
             case AcpMethods.Agent.SessionNew:
                 Interlocked.Increment(ref News);
                 if (SlowGate is { } slowNew) await slowNew.Task;
@@ -138,6 +144,9 @@ sealed class TurnAgent(string name) : IAgentAdapter
                 }
                 if (ResumeGate is { } slowResume) await slowResume.Task;
                 return new JsonObject();
+            case GorynychProtocol.MethodSteering:
+                Interlocked.Increment(ref SteersCount);
+                return AcpSteering.Result(AcpSteering.Injected);
             case AcpMethods.Agent.SessionClose:
                 var closing = (string?)req.Params?["sessionId"] ?? "";
                 Note(agent, "close", closing);
@@ -481,6 +490,18 @@ sealed class LinkHarness : IAsyncDisposable
         ["sessionId"] = sessionId,
         ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
     });
+
+    public Task<JsonNode?> SteerAsync(string sessionId, string text, string? promptId = null) =>
+        Zed.SendRequestAsync(GorynychProtocol.MethodSteering, new JsonObject
+        {
+            ["sessionId"] = sessionId,
+            ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
+            ["_meta"] = new JsonObject
+            {
+                ["steering"] = new JsonObject { ["idleBehavior"] = "promptRequired" },
+                ["gorynych/promptId"] = promptId ?? Guid.NewGuid().ToString(),
+            },
+        });
 
     /// <summary>The agent's text Zed got, in order.</summary>
     public string Text()

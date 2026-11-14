@@ -69,6 +69,81 @@ public sealed class ResumableLinkTests
     }
 
     [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task AnAcceptedSteerWhoseAnswerWasLost_IsResolvedFromReplay_AndNotResent(bool answeredBeforeReconnect)
+    {
+        var agent = new TurnAgent("turns") { Hold = true, Steers = true };
+        await using var service = Service(TestDirs.New(), agent);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+
+        if (!answeredBeforeReconnect) zed.Current.PauseLink(); // lose the reply, or disconnect just after receiving it
+        var steering = zed.SteerAsync(sid, "link steer", "link-steer-1");
+        await LinkHarness.Until(() => service.Feed(sid).Journal.SteeredMessageIds().Count > 0, "the service journaling the acceptance");
+        if (answeredBeforeReconnect) await steering.WaitAsync(Wait);
+        zed.ConnectGate = new TaskCompletionSource();
+        zed.Break();
+        await LinkHarness.Until(() => zed.Log().Contains("lost the connection"), "the link to see the drop");
+        zed.ConnectGate.SetResult();
+        await LinkHarness.Until(() => zed.Log().Contains("connected again"), "the reconnect");
+
+        var result = await steering.WaitAsync(Wait);
+        Assert.AreEqual(AcpSteering.Injected, (string?)result?["outcome"], "found in the correlated replay");
+        lock (zed.Updates)
+            Assert.IsFalse(zed.Updates.Any(u => (bool?)u["_meta"]?[GorynychProtocol.MetaSteered] == true), "its own steered message is not re-shown");
+        Assert.AreEqual(1, agent.SteersCount, "the lost answer is not a reason to send the steer again");
+        Assert.AreEqual(1, service.Feed(sid).Journal.SteeredMessageIds().Count, "the message is journaled once");
+        agent.Release();
+        Assert.AreEqual("end_turn", (string?)(await prompt.WaitAsync(Wait))!["stopReason"]);
+        NoBreakSeen(zed);
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task ASteerMissingFromABoundedReplay_IsUncertain_AndNotResent()
+    {
+        var agent = new TurnAgent("turns") { Hold = true, Steers = true };
+        var data = TestDirs.New();
+        await using var service = new Conductor(new ConductorOptions
+        {
+            DataDirectory = data, ServiceId = "test-service", JournalMaxEntries = 16,
+        }, [agent]);
+        await using var zed = new LinkHarness(service);
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await zed.NewSessionAsync().WaitAsync(Wait);
+        var prompt = zed.PromptAsync(sid, "one");
+        await LinkHarness.Until(() => zed.Text() == "started:one ", "the turn");
+
+        zed.Current.PauseLink();
+        var steering = zed.SteerAsync(sid, "will be dropped", "dropped-steer");
+        await LinkHarness.Until(() => service.Feed(sid).Journal.SteeredMessageIds().Count > 0, "the service journaling the acceptance");
+        // More updates than the journal keeps: compaction drops the accepted steer from the replay.
+        for (var i = 0; i < 40; i++)
+            service.Feed(sid).Journal.Append(new JsonObject
+            {
+                ["sessionUpdate"] = "agent_thought_chunk",
+                ["content"] = new JsonObject { ["type"] = "text", ["text"] = "filler " + i },
+                ["messageId"] = "filler-" + i,
+            });
+        zed.ConnectGate = new TaskCompletionSource();
+        zed.Break();
+        await LinkHarness.Until(() => zed.Log().Contains("lost the connection"), "the link to see the drop");
+        zed.ConnectGate.SetResult();
+        await LinkHarness.Until(() => zed.Log().Contains("connected again"), "the reconnect");
+
+        var unknown = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => steering.WaitAsync(Wait));
+        StringAssert.Contains(unknown.Message, "not sent again", unknown.Message);
+        Assert.AreEqual(1, agent.SteersCount, "absence from a bounded replay is no permission to resend");
+        agent.Release();
+        await prompt.WaitAsync(Wait);
+    }
+
+    [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
     [DataRow(true, DisplayName = "answered while the connection is down")]
     [DataRow(false, DisplayName = "answered after the link resumed")]
