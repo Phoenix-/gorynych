@@ -158,8 +158,7 @@ internal sealed class DshPins(string? home)
         var file = Path.Combine(home, "storages", "session_projcache", "sessions", sessionId + ".json");
         try
         {
-            if (!File.Exists(file)) return null;
-            var cache = JsonNode.Parse(File.ReadAllText(file));
+            var cache = ReadCache(file);
             if (cache?["version"] is not JsonValue version || !version.TryGetValue<int>(out var v) || v != CacheVersion) return null;
             var rows = cache["record"]?["rows"];
             if (Str(rows?["sandboxMode"]?["val"]) is not { } sandbox) return null;
@@ -184,12 +183,20 @@ internal sealed class DshPins(string? home)
         var file = Path.Combine(home, "storages", "session_projcache", "sessions", sessionId + ".json");
         try
         {
-            return File.Exists(file) ? TitleOf(JsonNode.Parse(File.ReadAllText(file))) : null;
+            return TitleOf(ReadCache(file));
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
         {
             return null;
         }
+    }
+
+    static JsonNode? ReadCache(string file)
+    {
+        // DSH replaces projection records atomically. Readers must not hold up its rename/delete
+        // on Windows, and may safely finish reading the old record after its path was replaced.
+        using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return JsonNode.Parse(stream);
     }
 
     /// <summary>The title projection's value from a parsed projection-cache record; only format 7 is read.</summary>
