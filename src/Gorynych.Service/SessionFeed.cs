@@ -99,6 +99,9 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public void ExitUse() => Interlocked.Decrement(ref users);
 
     volatile bool clientTurn;
+    readonly Lock discardGate = new();
+    long discardVersion;
+    bool discardAfterClose;
 
     /// <summary>
     /// True while the turn that holds <see cref="TurnGate"/> is a client's prompt; false for a
@@ -109,6 +112,41 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     {
         get => clientTurn;
         set => clientTurn = value;
+    }
+
+    /// <summary>An explicit close's generation, or zero when no close asks for a discard retry.</summary>
+    public long DiscardAfterCloseVersion
+    {
+        get { lock (discardGate) return discardAfterClose ? discardVersion : 0; }
+    }
+
+    long RequestDiscardAfterClose()
+    {
+        lock (discardGate)
+        {
+            discardAfterClose = true;
+            return ++discardVersion;
+        }
+    }
+
+    public void CancelDiscardAfterClose()
+    {
+        lock (discardGate)
+        {
+            discardAfterClose = false;
+            discardVersion++;
+        }
+    }
+
+    public bool IsDiscardAfterClose(long version)
+    {
+        lock (discardGate) return discardAfterClose && discardVersion == version;
+    }
+
+    public void CompleteDiscardAfterClose(long version)
+    {
+        lock (discardGate)
+            if (discardVersion == version) discardAfterClose = false;
     }
 
     int otherText;
@@ -537,12 +575,24 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             if (retired) return;
             clients.Remove(client);
             clients.Add(client);
+            CancelDiscardAfterClose();
             signal = clientAttached;
             clientAttached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         }
         client.Hold(SessionId);
         StopIdle();
         signal.TrySetResult();
+    }
+
+    /// <summary>Detaches for an explicit close and, if this was the last client, atomically requests its discard generation.</summary>
+    public long DetachForClose(ClientConnection client)
+    {
+        lock (clientsGate)
+        {
+            clients.Remove(client);
+            unanswered.Remove(client);
+            return clients.Any(c => !c.Rpc.IsClosed) ? 0 : RequestDiscardAfterClose();
+        }
     }
 
     /// <param name="notify">False for a close or a disconnect, which deal with the session themselves; otherwise

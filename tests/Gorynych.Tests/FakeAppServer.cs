@@ -46,6 +46,32 @@ sealed class FakeAppServer
         ["sandbox"] = new JsonObject { ["type"] = "workspaceWrite" },
     };
 
+    public JsonObject AccountRateLimits { get; set; } = new()
+    {
+        ["rateLimits"] = new JsonObject
+        {
+            ["limitName"] = "Fallback",
+            ["primary"] = new JsonObject { ["usedPercent"] = 99, ["windowDurationMins"] = 300, ["resetsAt"] = 1_794_000_000 },
+        },
+        ["rateLimitsByLimitId"] = new JsonObject
+        {
+            ["codex"] = new JsonObject
+            {
+                ["limitId"] = "codex", ["limitName"] = "Codex",
+                ["primary"] = new JsonObject { ["usedPercent"] = 27, ["windowDurationMins"] = 300, ["resetsAt"] = 1_794_000_000 },
+                ["secondary"] = new JsonObject { ["usedPercent"] = 64, ["windowDurationMins"] = 10080, ["resetsAt"] = 1_794_000_000 },
+                ["credits"] = new JsonObject { ["hasCredits"] = true, ["unlimited"] = false, ["balance"] = "12" },
+                ["individualLimit"] = new JsonObject { ["remainingPercent"] = 40, ["used"] = "60", ["limit"] = "100", ["resetsAt"] = 1_794_000_000 },
+            },
+            ["fast"] = new JsonObject
+            {
+                ["limitId"] = "fast", ["limitName"] = "Fast",
+                ["primary"] = new JsonObject { ["usedPercent"] = 10, ["windowDurationMins"] = 15, ["resetsAt"] = 1_794_000_000 },
+            },
+        },
+        ["rateLimitResetCredits"] = new JsonObject { ["availableCount"] = 2 },
+    };
+
     readonly List<(string Method, JsonObject Params)> calls = [];
     readonly ConcurrentDictionary<string, TaskCompletionSource> interrupts = new();
     int next;
@@ -80,6 +106,12 @@ sealed class FakeAppServer
 
     /// <summary>When set, <c>turn/start</c> answers only once it completes.</summary>
     public TaskCompletionSource? HoldTurnStart { get; set; }
+
+    /// <summary>When set, <c>account/rateLimits/read</c> answers only once it completes.</summary>
+    public TaskCompletionSource? HoldAccountRateLimits { get; set; }
+
+    /// <summary><c>account/rateLimits/read</c> fails as the backend may.</summary>
+    public bool FailAccountRateLimits { get; set; }
 
     /// <summary>After <c>thread/unsubscribe</c>, tells <c>thread/status/changed</c> notLoaded and <c>thread/closed</c>, after <see cref="UnloadDelay"/>.</summary>
     public bool TellsUnload { get; set; } = true;
@@ -148,6 +180,7 @@ sealed class FakeAppServer
         var p = request.Params as JsonObject ?? [];
         lock (calls) calls.Add((request.Method, (JsonObject)p.DeepClone()));
         if (request.Method == "turn/start" && HoldTurnStart is { } hold) await hold.Task;
+        if (request.Method == "account/rateLimits/read" && HoldAccountRateLimits is { } usage) await usage.Task;
         return await AnswerAsync(request.Method, p);
     }
 
@@ -257,6 +290,9 @@ sealed class FakeAppServer
                 _ = Notify("thread/name/updated", new JsonObject { ["threadId"] = t.Id, ["threadName"] = t.Name });
                 return Done(new JsonObject());
             }
+            case "account/rateLimits/read":
+                if (FailAccountRateLimits) throw new JsonRpcException(JsonRpcException.InternalError, "usage unavailable");
+                return Done(AccountRateLimits.DeepClone());
             case "turn/start":
             {
                 var t = Threads[(string)p["threadId"]!];

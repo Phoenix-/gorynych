@@ -754,6 +754,11 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// <summary>The agent keeps nothing durable before a session's first prompt.</summary>
     public bool DraftsNotDurable => Flag(GorynychProtocol.CapDraftsNotDurable);
 
+    /// <summary>Slash commands the adapter answers without creating a native turn.</summary>
+    public string[] LocalCommands => Info?.AgentCapabilities?.Meta?[GorynychProtocol.CapLocalCommands] is JsonArray commands
+        ? commands.Select(c => (string?)c).OfType<string>().ToArray()
+        : [];
+
     /// <summary>The idle time the adapter asks for its sessions (at most a day), or null for the service's own.</summary>
     public TimeSpan? UnloadAfter =>
         Info?.AgentCapabilities?.Meta?[GorynychProtocol.CapUnloadAfter] is JsonValue v && v.TryGetValue<double>(out var seconds) && seconds >= 0

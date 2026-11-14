@@ -28,11 +28,11 @@ public sealed class CodexAdapterTests
     }, [new CodexAdapter(codex ?? Options(fake)), .. more ?? []]);
 
     static CodexAdapterOptions Options(FakeAppServer fake, List<string>? log = null, Func<IEnumerable<string>, IReadOnlyDictionary<string, string>>? holders = null,
-        TimeSpan? unloadWait = null) => new()
+        TimeSpan? unloadWait = null, TimeSpan? turnEndWait = null) => new()
     {
         Launch = fake.StartAsync,
         ClientVersion = "test",
-        TurnEndWait = TimeSpan.FromMilliseconds(200),
+        TurnEndWait = turnEndWait ?? TimeSpan.FromMilliseconds(200),
         UnloadWait = unloadWait ?? new CodexAdapterOptions().UnloadWait,
         Log = log is null ? null : m => { lock (log) log.Add(m); },
         // No other Codex app holds a fake thread; the user's own Codex folder is never read.
@@ -41,9 +41,9 @@ public sealed class CodexAdapterTests
     };
 
     /// <summary>The adapter alone, without the service: an ACP connection straight to it.</summary>
-    static async Task<(AgentInstance Agent, JsonRpcConnection Acp)> DirectAsync(FakeAppServer fake, List<string>? log = null)
+    static async Task<(AgentInstance Agent, JsonRpcConnection Acp)> DirectAsync(FakeAppServer fake, List<string>? log = null, TimeSpan? turnEndWait = null)
     {
-        var agent = await new CodexAdapter(Options(fake, log)).StartAsync(CancellationToken.None);
+        var agent = await new CodexAdapter(Options(fake, log, turnEndWait: turnEndWait)).StartAsync(CancellationToken.None);
         var acp = new JsonRpcConnection(agent.Input, agent.Output, "direct-client") { NotificationHandler = (_, _) => Task.CompletedTask };
         acp.Start();
         return (agent, acp);
@@ -134,6 +134,300 @@ public sealed class CodexAdapterTests
         await using var zed = await ZedAsync(conductor);
         await NewAsync(zed);
         Assert.IsNull(fake.Last("thread/start")["config"]!["mcp_servers"]!["gorynych-outside"], "overriding a server the config does not have fails the thread");
+    }
+
+    [TestMethod]
+    public async Task Usage_ReadsAccountLimitsWithoutStartingATurn_AndPublishesTheCommand()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+        await Until(() => Of(zed, "available_commands_update").Length == 1, "the usage command");
+
+        var command = Of(zed, "available_commands_update").Single()["availableCommands"]!.AsArray().Single();
+        Assert.AreEqual("usage", (string?)command!["name"]);
+        Assert.IsNull(command["input"]);
+
+        var done = await PromptAsync(zed, id, "  /usage\n");
+
+        Assert.AreEqual(StopReason.EndTurn, done.StopReason);
+        Assert.IsNull(done.Meta);
+        CollectionAssert.DoesNotContain(fake.Methods(), "turn/start");
+        Assert.AreEqual(1, fake.Methods().Count(m => m == "account/rateLimits/read"));
+        var text = string.Concat(Of(zed, "agent_message_chunk").Select(c => (string?)c["content"]!["text"]));
+        StringAssert.Contains(text, "**Codex 5h limit:** 73% left");
+        StringAssert.Contains(text, "**Codex Weekly limit:** 36% left");
+        StringAssert.Contains(text, "**Codex Credits:** 12");
+        StringAssert.Contains(text, "**Codex Individual spend limit:** 40% left (60 of 100 credits used;");
+        StringAssert.Contains(text, "**Fast 15m limit:** 90% left");
+        StringAssert.Contains(text, "**Limit reset credits:** 2 available");
+        Assert.IsFalse(text.Contains("Fallback", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public async Task UsageOnlyDraft_IsDiscardedOnClose_ButARealTurnAfterUsageIsDurable()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+        await PromptAsync(zed, id, "/usage");
+
+        Assert.IsFalse(conductor.Feed(id).Journal.HasTurns, "a local command is not native history");
+        await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+        var listed = await zed.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
+        Assert.IsFalse(listed.Sessions.Any(s => s.SessionId == id), "a usage-only draft has no rollout to resume");
+
+        var durable = await NewAsync(zed);
+        await PromptAsync(zed, durable, "/usage");
+        await PromptAsync(zed, durable, "hello");
+        Assert.IsTrue(conductor.Feed(durable).Journal.HasTurns);
+        Assert.IsTrue(fake.Threads[durable].Durable);
+        listed = await zed.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
+        Assert.IsTrue(listed.Sessions.Any(s => s.SessionId == durable));
+    }
+
+    [TestMethod]
+    public async Task Usage_CloseDuringRead_CancelsIt_AndDiscardsTheDraftAfterThePromptEnds()
+    {
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { HoldAccountRateLimits = hold };
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+        try
+        {
+            var turn = PromptAsync(zed, id, "/usage");
+            await Until(() => fake.Methods().Contains("account/rateLimits/read"), "the usage read");
+
+            await zed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+
+            Assert.AreEqual(StopReason.Cancelled, (await turn.WaitAsync(Wait)).StopReason);
+            await Until(() => !fake.Threads.ContainsKey(id), "the draft discarded after the prompt");
+            var listed = await zed.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
+            Assert.IsFalse(listed.Sessions.Any(s => s.SessionId == id));
+        }
+        finally
+        {
+            hold.SetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task Usage_WhenTheLinkDrops_KeepsTheDraftAndAnswerForAReconnectWithinGrace()
+    {
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { HoldAccountRateLimits = hold };
+        await using var conductor = Conductor(fake);
+        await using var zed = new LinkHarness(conductor, agent: "codex");
+        await zed.InitializeAsync().WaitAsync(Wait);
+        var id = await zed.NewSessionAsync().WaitAsync(Wait);
+        try
+        {
+            var turn = zed.PromptAsync(id, "/usage");
+            await Until(() => fake.Methods().Contains("account/rateLimits/read"), "the usage read");
+            zed.ConnectGate = new TaskCompletionSource();
+            zed.Break();
+            await LinkHarness.Until(() => zed.Log().Contains("lost the connection"), "the dropped link");
+
+            hold.SetResult();
+            await Task.Delay(300);
+            Assert.IsNotNull(conductor.Store.Get(id), "the grace period still protects the draft after its prompt ends");
+
+            zed.ConnectGate.SetResult();
+            await LinkHarness.Until(() => zed.Log().Contains("connected again"), "the reconnect");
+            Assert.AreEqual("end_turn", (string?)(await turn.WaitAsync(Wait))!["stopReason"]);
+        }
+        finally
+        {
+            hold.TrySetResult();
+            zed.ConnectGate?.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task Usage_CloseGeneration_AttachAndLastDetachAreAtomic()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake);
+        await using var first = await ZedAsync(conductor, "first");
+        await using var second = await ZedAsync(conductor, "second");
+        var id = await NewAsync(first);
+        var other = await NewAsync(second);
+        var feed = conductor.Feed(id);
+        var firstClient = feed.Clients().Single();
+        var secondClient = conductor.Feed(other).Clients().Single();
+
+        feed.Attach(secondClient);
+        Assert.AreEqual(0, feed.DetachForClose(firstClient), "another attached client prevents a close generation");
+
+        feed.Detach(secondClient, notify: false);
+        var closeVersion = feed.DetachForClose(firstClient);
+        Assert.IsTrue(closeVersion > 0);
+        feed.Attach(secondClient);
+        Assert.IsFalse(feed.IsDiscardAfterClose(closeVersion), "a later attach invalidates the close generation");
+    }
+
+    [TestMethod]
+    public async Task Usage_CloseRetry_CannotDeleteADraftReattachedWithinGrace()
+    {
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { HoldAccountRateLimits = hold };
+        await using var conductor = Conductor(fake);
+        await using var first = new LinkHarness(conductor, agent: "codex");
+        await using var again = new LinkHarness(conductor, agent: "codex");
+        await first.InitializeAsync().WaitAsync(Wait);
+        var id = await first.NewSessionAsync().WaitAsync(Wait);
+        var gate = conductor.Feed(id).ForwardGate;
+        var gateHeld = false;
+        try
+        {
+            var turn = first.PromptAsync(id, "/usage");
+            await Until(() => fake.Methods().Contains("account/rateLimits/read"), "the usage read");
+            await gate.WaitAsync();
+            gateHeld = true;
+            var closing = first.Zed.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+
+            await again.InitializeAsync().WaitAsync(Wait);
+            await again.Zed.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject
+            {
+                ["sessionId"] = id, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray(),
+            }).WaitAsync(Wait);
+            again.ConnectGate = new TaskCompletionSource();
+            again.Break();
+            await LinkHarness.Until(() => again.Log().Contains("lost the connection"), "the second dropped link");
+
+            gate.Release();
+            gateHeld = false;
+            hold.SetResult();
+            await closing.WaitAsync(Wait);
+            await Task.Delay(300);
+            Assert.IsNotNull(conductor.Store.Get(id), "the old close cannot discard the new link's draft inside its grace period");
+
+            again.ConnectGate.SetResult();
+            await LinkHarness.Until(() => again.Log().Contains("connected again"), "the second reconnect");
+            Assert.IsNotNull(conductor.Store.Get(id));
+        }
+        finally
+        {
+            if (gateHeld) gate.Release();
+            hold.TrySetResult();
+            again.ConnectGate?.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task Usage_DirectCloseDuringRead_DoesNotWaitForTheTurnEndTimeout()
+    {
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { HoldAccountRateLimits = hold };
+        var (agent, acp) = await DirectAsync(fake, turnEndWait: TimeSpan.FromSeconds(5));
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+        try
+        {
+            var turn = PromptDirectAsync(acp, id, "/usage");
+            await Until(() => fake.Methods().Contains("account/rateLimits/read"), "the usage read");
+
+            var closed = acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+
+            await closed.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.AreEqual("cancelled", (string?)(await turn.WaitAsync(Wait))!["stopReason"]);
+        }
+        finally
+        {
+            hold.SetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task Usage_Cancel_StopsTheRead_AndDoesNotCancelTheNextPrompt()
+    {
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { HoldAccountRateLimits = hold };
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+        try
+        {
+            var turn = PromptAsync(zed, id, "/usage");
+            await Until(() => fake.Methods().Contains("account/rateLimits/read"), "the usage read");
+            await zed.Rpc.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
+
+            Assert.AreEqual(StopReason.Cancelled, (await turn.WaitAsync(Wait)).StopReason);
+            Assert.AreEqual(0, Of(zed, "agent_message_chunk").Length);
+        }
+        finally
+        {
+            hold.SetResult();
+        }
+
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, id, "/usage")).StopReason);
+        Assert.AreEqual(1, Of(zed, "agent_message_chunk").Length);
+    }
+
+    [TestMethod]
+    public async Task Usage_WhenTheReadFails_FailsThePromptWithoutATurnOrNativeHistory()
+    {
+        var fake = new FakeAppServer { FailAccountRateLimits = true };
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+
+        var error = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(zed, id, "/usage"));
+
+        StringAssert.Contains(error.Message, "usage unavailable");
+        CollectionAssert.DoesNotContain(fake.Methods(), "turn/start");
+        Assert.IsFalse(conductor.Feed(id).Journal.HasTurns);
+    }
+
+    [TestMethod]
+    public async Task UsageFormatting_UsesBucketIdsAndExactDurations_AndHandlesSparseResponses()
+    {
+        var fake = new FakeAppServer
+        {
+            AccountRateLimits = new JsonObject
+            {
+                ["rateLimits"] = new JsonObject(),
+                ["rateLimitsByLimitId"] = new JsonObject
+                {
+                    ["bucket-key"] = new JsonObject
+                    {
+                        ["primary"] = new JsonObject { ["usedPercent"] = 50, ["windowDurationMins"] = 90 },
+                        ["secondary"] = new JsonObject { ["usedPercent"] = 25, ["windowDurationMins"] = 43200 },
+                        ["credits"] = new JsonObject { ["hasCredits"] = true, ["unlimited"] = true },
+                    },
+                },
+            },
+        };
+        await using var conductor = Conductor(fake);
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+
+        await PromptAsync(zed, id, "/usage");
+        var text = string.Concat(Of(zed, "agent_message_chunk").Select(c => (string?)c["content"]!["text"]));
+        StringAssert.Contains(text, "**bucket-key 90m limit:** 50% left");
+        StringAssert.Contains(text, "**bucket-key 30d limit:** 75% left");
+        StringAssert.Contains(text, "**bucket-key Credits:** unlimited");
+
+        fake.AccountRateLimits = new JsonObject
+        {
+            ["rateLimits"] = new JsonObject
+            {
+                ["limitId"] = "single",
+                ["credits"] = new JsonObject { ["hasCredits"] = true, ["unlimited"] = true },
+            },
+        };
+        await PromptAsync(zed, id, "/usage");
+        text = string.Concat(Of(zed, "agent_message_chunk").Select(c => (string?)c["content"]!["text"]));
+        StringAssert.Contains(text, "**single Credits:** unlimited");
+
+        fake.AccountRateLimits = new JsonObject { ["rateLimits"] = new JsonObject() };
+        await PromptAsync(zed, id, "/usage");
+        text = string.Concat(Of(zed, "agent_message_chunk").Select(c => (string?)c["content"]!["text"]));
+        StringAssert.Contains(text, "No Codex usage limits are available for this account.");
     }
 
     [TestMethod]
@@ -564,7 +858,8 @@ public sealed class CodexAdapterTests
 
         fake.Threads["t1"].Items.Clear();
         var (empty, updates) = await ResumeDirectAsync(fake, "t1", After(done));
-        Assert.AreEqual(("start", null, 0), ((string?)empty?["from"], (string?)empty?["mark"], updates.Count), "nothing to point at: no mark");
+        Assert.AreEqual(("start", null, 0), ((string?)empty?["from"], (string?)empty?["mark"], Texts(updates).Length), "nothing to point at: no mark");
+        Assert.AreEqual("available_commands_update", (string?)updates.Single()["sessionUpdate"]);
     }
 
     [TestMethod]
@@ -578,7 +873,8 @@ public sealed class CodexAdapterTests
 
         var (replay, updates) = await ResumeDirectAsync(fake, "t1", After(done));
 
-        Assert.AreEqual(0, updates.Count, "its messages are not whole yet: " + string.Join(" | ", Texts(updates)));
+        Assert.AreEqual(0, Texts(updates).Length, "its messages are not whole yet: " + string.Join(" | ", Texts(updates)));
+        Assert.AreEqual("available_commands_update", (string?)updates.Single()["sessionUpdate"]);
         Assert.AreEqual(("mark", done), ((string?)replay?["from"], (string?)replay?["mark"]), "the mark stays where it was");
         Assert.IsFalse(fake.All("thread/items/list").Any(l => (string?)l["turnId"] == running), "its items are not read");
 

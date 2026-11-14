@@ -208,6 +208,12 @@ public static class GorynychProtocol
     /// </summary>
     public const string CapDraftsNotDurable = "gorynych/draftsNotDurable";
 
+    /// <summary>In <c>agentCapabilities._meta</c>: slash commands the adapter answers itself, without a native turn.</summary>
+    public const string CapLocalCommands = "gorynych/localCommands";
+
+    /// <summary>On a local command's updates: <c>true</c>, so they do not make a non-durable draft native history.</summary>
+    public const string MetaLocalCommand = "gorynych/localCommand";
+
     /// <summary>
     /// In <c>session/resume</c> params <c>_meta</c>, service → adapter: <c>true</c> for a draft, a session
     /// created and never prompted. An adapter that keeps nothing before the first prompt and no longer

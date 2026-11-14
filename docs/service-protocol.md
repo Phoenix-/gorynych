@@ -267,6 +267,8 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/catch_up` | method, service → adapter, `{sessionId, _meta: {"gorynych/replayFrom": …}}` → `{_meta: {"gorynych/replay": …}}` | replays the session's history after the mark as a resume does, without opening or taking the session; for one open for reading only that can be written to again ([Read-only sessions](#read-only-sessions)). Advertised by `gorynych/catchUp: true` in the adapter's `agentCapabilities._meta` |
 | `_gorynych/open_elsewhere` | method, service → adapter, `{sessionIds}` → `{sessions: {"<id>": "<holder>"}}` | which of these sessions another app has open now, the held ones only; for the lists agents see |
 | `gorynych/draftsNotDurable` | an adapter's `agentCapabilities._meta` | `true`: its agent keeps nothing durable before the first prompt, so an unused draft is dropped ([Drafts and deletion](#drafts-and-deletion)) |
+| `gorynych/localCommands` | an adapter's `agentCapabilities._meta` | slash commands the adapter answers itself without a native turn, with their leading slash (`["/usage"]`); the service leaves a draft unpromoted for them |
+| `gorynych/localCommand` | `_meta` of a local command's user and agent updates | `true`: this is local command output, not native history when a draft is discarded |
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
 | `_gorynych/status` | method | service ID, process, data folder, `ahp` (with the [AHP face](ahp-face.md): `{port, error, clients, sessions, open}`; null without it), `dataFolderOpen` (why the data folder, or an item in it, could not be closed to other accounts at this start; null when it is closed), clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
 | `_gorynych/shutdown` | method | asks the service to exit |
@@ -1448,9 +1450,15 @@ A native delete cannot be undone, so a discard keeps the session whenever it is 
 1. Every session has a gate. Load, resume, prompt, opinions and forwarded requests register
    under it; a discard holds it throughout and goes ahead only if no client is attached and no
    operation is registered. A client that comes back meanwhile waits for the outcome, and then
-   finds the session gone or kept.
+   finds the session gone or kept. Closing the last client during a prompt cancels that prompt;
+   if the first discard found it still registered, the operation's end tries the discard again.
+   This retry belongs only to the explicit close: a dropped resumable link keeps the grace above.
+   It carries the close's generation and checks it under the gate; an attach since then invalidates it.
+   The last-client detach and that generation's registration are atomic under the clients' gate.
 2. A draft whose journal holds part of a turn (a message, a thought, a tool call, a plan) is
-   kept, and its mark cleared.
+   kept, and its mark cleared. Updates of a command advertised in `gorynych/localCommands`
+   and marked `gorynych/localCommand` are the exception: they are local output, not native
+   history, so a draft with nothing else is still discarded.
 3. An agent that can delete must list the session without a title. Kimi titles a session from
    its first prompt and lists an empty one with `title: null` (Kimi Code 2.4.1). A titled
    session is kept; one the agent does not list is hidden with a tombstone, not deleted. An

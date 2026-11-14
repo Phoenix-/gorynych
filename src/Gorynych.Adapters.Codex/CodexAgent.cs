@@ -24,6 +24,7 @@ sealed class CodexThread
     readonly Dictionary<string, SandboxPolicy> sandboxes = new(StringComparer.Ordinal);
 
     TaskCompletionSource<Turn>? turn;
+    CancellationTokenSource? localCommand;
     string? turnId;
     bool stopAsked;
     long cancelledAt;
@@ -162,6 +163,17 @@ sealed class CodexThread
         }
     }
 
+    public CancellationToken LocalCancellation(CancellationToken ct)
+    {
+        lock (gate)
+        {
+            if (turn is null || localCommand is not null) throw new InvalidOperationException("No local command can start now.");
+            localCommand = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            if (stopAsked) localCommand.Cancel();
+            return localCommand.Token;
+        }
+    }
+
     /// <summary>Codex named the running turn (<c>turn/started</c> or <c>turn/start</c>'s answer); true when a stop was asked before.</summary>
     public bool Named(string id)
     {
@@ -185,6 +197,7 @@ sealed class CodexThread
             cancelledAt = Math.Max(cancelledAt, sequence);
             if (turn is null) return (false, null);
             stopAsked = true;
+            localCommand?.Cancel();
             return (true, turnId);
         }
     }
@@ -205,14 +218,22 @@ sealed class CodexThread
     {
         TaskCompletionSource<Turn>? done;
         string? id;
-        lock (gate) (done, id) = (turn, turnId);
+        lock (gate)
+        {
+            localCommand?.Cancel();
+            (done, id) = (turn, turnId);
+        }
         return done?.TrySetResult(new Turn { Id = id ?? "", Status = TurnStatus.Interrupted }) == true ? id : null;
     }
 
     public void Fail(Exception e)
     {
         TaskCompletionSource<Turn>? done;
-        lock (gate) done = turn;
+        lock (gate)
+        {
+            localCommand?.Cancel();
+            done = turn;
+        }
         done?.TrySetException(e);
     }
 
@@ -221,6 +242,8 @@ sealed class CodexThread
         lock (gate)
         {
             if (turn != done) return;
+            localCommand?.Dispose();
+            localCommand = null;
             turn = null;
             turnId = null;
             stopAsked = false;
@@ -450,6 +473,7 @@ sealed class CodexAgent : IAsyncDisposable
                         {
                             [GorynychProtocol.CapSetTitle] = true,
                             [GorynychProtocol.CapDraftsNotDurable] = true,
+                            [GorynychProtocol.CapLocalCommands] = new JsonArray("/usage"),
                             [GorynychProtocol.CapUnloadAfter] = options.UnloadAfter.TotalSeconds,
                             [GorynychProtocol.CapOpenElsewhere] = true,
                             // It tells when a thread's list row changes: another Codex app took it or let it go.
@@ -470,6 +494,7 @@ sealed class CodexAgent : IAsyncDisposable
                 var (t, holder) = await OpenOrReadAsync(p.SessionId, p.McpServers ?? [], p.SystemPrompt, ct);
                 // Its history is read the same either way: thread/turns/list takes no writer lock.
                 var replayed = p.Meta?[GorynychProtocol.MetaReplayFrom] is JsonObject from ? await ReplayFromAsync(p.SessionId, from, ct) : null;
+                if (t is not null) await PublishCommandsAsync(p.SessionId);
                 var meta = new JsonObject();
                 if (replayed is not null) meta[GorynychProtocol.MetaReplay] = replayed;
                 if (t is null) InteractivityMeta(meta, holder);
@@ -484,6 +509,7 @@ sealed class CodexAgent : IAsyncDisposable
                 var p = request.ParamsAs<LoadSessionRequest>();
                 var (t, holder) = await OpenOrReadAsync(p.SessionId, p.McpServers, p.SystemPrompt, ct);
                 await ReplayAsync(p.SessionId, ct);
+                if (t is not null) await PublishCommandsAsync(p.SessionId);
                 return AcpJson.ToNode(new LoadSessionResponse
                 {
                     ConfigOptions = t is null ? null : ConfigOptions(t.Effective, models),
@@ -555,7 +581,47 @@ sealed class CodexAgent : IAsyncDisposable
             SettingsOf(started.Model, started.ReasoningEffort, started.ApprovalPolicy, started.Sandbox, started.ApprovalsReviewer));
         threads[t.Id] = t;
         Log($"codex: new thread {t.Id} in {started.Cwd}");
+        await PublishCommandsAsync(t.Id);
         return AcpJson.ToNode(new NewSessionResponse { SessionId = t.Id, ConfigOptions = ConfigOptions(t.Settings, models) });
+    }
+
+    Task PublishCommandsAsync(string sessionId) => Update(sessionId, new AvailableCommandsUpdate
+    {
+        AvailableCommands = [new AvailableCommand { Name = "usage", Description = "Show Codex account usage limits and reset times" }],
+    });
+
+    async Task<JsonNode?> UsageAsync(CodexThread t, long sequence, CancellationToken ct)
+    {
+        var done = t.Begin(sequence) ?? throw new JsonRpcException(JsonRpcException.InvalidRequest, "A turn of this session is still running.");
+        var status = TurnStatus.Completed;
+        try
+        {
+            var cancel = t.LocalCancellation(ct);
+            try
+            {
+                cancel.ThrowIfCancellationRequested();
+                var response = From(await app.SendRequestAsync(CodexMethods.Client.AccountRateLimitsRead,
+                    ToNode(new GetAccountRateLimitsParams(), CodexJsonContext.Default.GetAccountRateLimitsParams), cancel),
+                    CodexJsonContext.Default.GetAccountRateLimitsResponse);
+                cancel.ThrowIfCancellationRequested();
+                await Update(t.Id, new SessionUpdateAgentMessageChunk
+                {
+                    Content = new TextContent { Text = CodexUsage.Format(response) },
+                    Meta = new JsonObject { [GorynychProtocol.MetaLocalCommand] = true },
+                });
+                return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.EndTurn });
+            }
+            catch (OperationCanceledException) when (cancel.IsCancellationRequested)
+            {
+                status = TurnStatus.Interrupted;
+                return AcpJson.ToNode(new PromptResponse { StopReason = StopReason.Cancelled });
+            }
+        }
+        finally
+        {
+            done.TrySetResult(new Turn { Id = "", Status = status });
+            t.End(done);
+        }
     }
 
     /// <summary>
@@ -892,6 +958,8 @@ sealed class CodexAgent : IAsyncDisposable
                 : $"Codex session {p.SessionId} is read-only here: {ReadOnlyReason(holder)}");
         if (!threads.TryGetValue(p.SessionId, out var t) || !t.Loaded)
             throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Codex has not loaded session {p.SessionId}; resume it first.");
+        if (p.Prompt is [TextContent { Text: var command }] && command.Trim() == "/usage")
+            return await UsageAsync(t, request.Sequence, ct);
         var input = p.Prompt.Select(InputOf).OfType<UserInput>().ToList();
         if (input.Count == 0) throw new JsonRpcException(JsonRpcException.InvalidParams, "The prompt has no text.");
         var done = t.Begin(request.Sequence) ?? throw new JsonRpcException(JsonRpcException.InvalidRequest, "A turn of this session is still running.");

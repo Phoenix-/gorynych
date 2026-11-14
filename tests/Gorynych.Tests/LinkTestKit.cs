@@ -365,7 +365,7 @@ sealed class LinkHarness : IAsyncDisposable
     Wire? wire;                 // under pipe
     int connects;
 
-    public LinkHarness(Conductor service, ResumableLinkOptions? options = null)
+    public LinkHarness(Conductor service, ResumableLinkOptions? options = null, string? agent = null)
     {
         Service = service;
         Zed = new JsonRpcConnection(zedLink.ClientEnd.Input, zedLink.ClientEnd.Output, "zed");
@@ -390,7 +390,7 @@ sealed class LinkHarness : IAsyncDisposable
             Log = m => { lock (Said) Said.AppendLine(m); },
             RetryDelays = [TimeSpan.FromMilliseconds(50)],
             GiveUpAfter = TimeSpan.FromSeconds(15),
-            InitializeMeta = new JsonObject { [GorynychProtocol.MetaAgent] = "turns" },
+            InitializeMeta = new JsonObject { [GorynychProtocol.MetaAgent] = agent ?? "turns" },
         });
         Running = Link.RunAsync(Connect());
     }

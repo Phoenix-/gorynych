@@ -51,6 +51,7 @@ sealed class Generator(JsonObject bundle, string version)
         "ThreadSetNameParams", "ThreadSetNameResponse",
         "TurnStartParams", "TurnStartResponse", "TurnInterruptParams", "TurnInterruptResponse",
         "ModelListParams", "ModelListResponse",
+        "GetAccountRateLimitsParams", "GetAccountRateLimitsResponse",
         "ThreadNameUpdatedNotification", "ThreadStatusChangedNotification", "ThreadClosedNotification",
         "ThreadSettingsUpdatedNotification", "TurnStartedNotification", "TurnCompletedNotification",
         "TurnPlanUpdatedNotification", "ItemStartedNotification", "ItemCompletedNotification",
