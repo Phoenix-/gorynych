@@ -260,7 +260,7 @@ Titles and archive live in the harness when it has them; otherwise in the servic
 
 | Harness | List | Title | Archive |
 | --- | --- | --- | --- |
-| Claude Code | the adapter's own list of the sessions it started; sessions started elsewhere: **left out**, possible but laborious and fragile (below) | Claude writes `ai-title` itself; `/rename` writes `custom-title`. A name given at spawn stays in the overlay | none in Claude Code: overlay |
+| Claude Code | the adapter's own list; external sessions can be registered manually with `gorynych-adopt-claude` (below); automatic discovery is left out | Claude writes `ai-title` itself; `/rename` writes `custom-title`. A name given at spawn stays in the overlay | none in Claude Code: overlay |
 | Kimi Code | ACP `session/list` | first prompt; a name given at spawn stays in the overlay | Kimi has one, but `kimi acp` cannot reach it: overlay |
 | Codex | `thread/list` | `thread/name/set` for a name given at spawn; a thread without a name shows the service's provisional title | Codex will not resume an archived thread, so the archive stays in the overlay |
 
@@ -275,8 +275,15 @@ Titles and archive live in the harness when it has them; otherwise in the servic
 - **One thread, one writer.** Codex lets one process write a thread; a thread that Codex Desktop
   or the CLI holds is marked in the session list with the app that holds it, and fails to open
   through Gorynych at once, naming that app (`gorynych/openElsewhere`, **done**).
-- **Claude sessions started elsewhere: possible, but laborious and fragile, so left out for
-  now.** This was looked at on 10 November 2026 with Claude Code 2.1.321. Two writers were
+- **Claude sessions started elsewhere: manual adoption is supported; automatic discovery and
+  writer protection are left out.** The separate `tools/Gorynych.AdoptClaude` utility takes a
+  session UUID and working directory, validates the transcript, then adds an absent record to
+  the adapter's shared catalog under its existing lock. It does not contact the service or GUI;
+  the next `session/list` discovers the session. Existing registrations are kept unchanged.
+  Its read-only `--list` shows native session dates, names, IDs and folders to choose from.
+  The person closes the original Claude process before adopting; the service and other sessions
+  can stay running. See [the instructions](getting-started.md#bring-a-terminal-claude-session-into-gorynych).
+  Discovery was looked at on 10 November 2026 with Claude Code 2.1.321. Two writers were
   probed on 11 November 2026 with 2.1.302.
   - *What already works.* Claude Desktop, the terminal `claude` and the adapter write their
     transcripts to the same `~/.claude/projects`. `claude -p --resume <id>` takes any of them,
@@ -1002,7 +1009,7 @@ Open:
 - Text between tool calls in a long turn: whether all of it comes through `MessageDisplay`.
 - The opinion authorization in the system prompt was checked with Haiku only, not with Opus or
   Sonnet.
-- Renaming Claude sessions from the GUI. Listing those started outside Gorynych is left out
+- Renaming Claude sessions from the GUI. Automatic discovery of those started outside Gorynych is left out
   ([Sessions](#sessions-catalog-titles-archive)).
 
 Risks:

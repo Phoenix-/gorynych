@@ -49,8 +49,8 @@ jobs:
       - run: dotnet build Gorynych.slnx -c Release
 
   publish-windows:
-    # Native AOT builds of the service and of Gorynych.Outside in one Gorynych folder, laid out as
-    # docs/getting-started.md describes: the service in it, the outside server in outside\. Each
+    # Native AOT builds in one Gorynych folder, as docs/getting-started.md describes:
+    # the service in it, the outside server in outside\, the adoption utility in tools\. Each
     # push to main moves the rolling `nightly` prerelease to that commit; a v* tag gets a draft
     # release; a manual run keeps the zip as a workflow artifact.
     name: Publish win-x64
@@ -80,10 +80,19 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           dotnet publish src/Gorynych.Outside -c Release -r win-x64 -p:PublishAot=true -o publish/Gorynych/outside
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet publish tools/Gorynych.AdoptClaude -c Release -r win-x64 -p:PublishAot=true -o publish/Gorynych/tools
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & ./publish/Gorynych/tools/gorynych-adopt-claude.exe --help
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Get-ChildItem publish/Gorynych -Recurse -Include *.pdb | Remove-Item
           Copy-Item LICENSE publish/Gorynych/
           # The folder itself goes in, so the zip unpacks to Gorynych\.
           Compress-Archive -Path publish/Gorynych -DestinationPath $env:ASSET
+          $zip = [IO.Compression.ZipFile]::OpenRead((Join-Path (Get-Location) $env:ASSET))
+          try {
+            $utility = $zip.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'Gorynych/tools/gorynych-adopt-claude.exe' }
+            if (-not $utility -or $utility.Length -eq 0) { throw 'The Windows package is missing gorynych-adopt-claude.exe' }
+          } finally { $zip.Dispose() }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: github.event_name == 'workflow_dispatch'
         with:

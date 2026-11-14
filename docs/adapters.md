@@ -461,6 +461,8 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
 - `session/new` launches nothing. The adapter's own list (`claude/sessions.json` in the
   service data, used for `session/list` and `session/resume`) gets the session at its first
   prompt, so a draft that is never prompted leaves nothing behind.
+  The separate `gorynych-adopt-claude` utility can also register an existing native session
+  in that list; all hosts reread the catalog on access, using the same lock for updates.
 - The adapter does not advertise `session/delete`: the transcript belongs to `~/.claude`.
   Deleting a Claude session closes it (the process exits) and the service hides it with a
   tombstone in its overlay; `claude --resume` in a terminal still finds it.
@@ -610,7 +612,10 @@ nothing of it.
   elicitations are declined; not tried on Linux and macOS.
 - TUI: a Unix PTY host (the transport reports "not supported" off Windows), `/rename` from the
   GUI, resizing the pseudo console.
-- Listing Claude sessions the adapter did not start (`~/.claude/projects`).
+- Automatic discovery of Claude sessions the adapter did not start (`~/.claude/projects`).
+  Manual registration is available through the separate `gorynych-adopt-claude` utility
+  ([instructions](getting-started.md#bring-a-terminal-claude-session-into-gorynych)); the adapter's
+  next list reads the shared catalog without a restart.
 
 ## Codex
 

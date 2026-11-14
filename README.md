@@ -108,6 +108,19 @@ gorynych-test opinion --to <session> "a question from another agent"
 gorynych-test status | shutdown
 ```
 
+`tools/Gorynych.AdoptClaude` (`gorynych-adopt-claude`) manually registers an existing terminal
+Claude conversation, without changing the service or GUI. List saved sessions, then close the
+original Claude process before registering the chosen session:
+
+```
+dotnet run --project tools/Gorynych.AdoptClaude -- --list
+dotnet run --project tools/Gorynych.AdoptClaude -- --list --cwd <folder> --limit 100
+dotnet run --project tools/Gorynych.AdoptClaude -- <session-id> --cwd <folder>
+```
+
+The service and other agents can keep running. Refresh the GUI session list/import dialog or
+reopen the GUI to discover it. See [manual adoption](docs/getting-started.md#bring-a-terminal-claude-session-into-gorynych).
+
 ## Your subscriptions
 
 Gorynych is a tool for one person and their own machines:

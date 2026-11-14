@@ -324,6 +324,54 @@ Get-Process Gorynych.Service, Gorynych.Outside | Select-Object Id, Path
 The adapter hosts are `Gorynych.Service` processes too (`host --adapter …` on their command line).
 A file that is still in use belongs to one of them.
 
+## Bring a terminal Claude session into Gorynych
+
+This is a manual handoff of the same conversation to a new Claude process. First find its UUID
+with the utility's read-only list (Claude's resume picker shows names):
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Gorynych\tools\gorynych-adopt-claude.exe" --list
+& "$env:LOCALAPPDATA\Programs\Gorynych\tools\gorynych-adopt-claude.exe" --list --cwd "D:\your-project" --limit 100
+```
+
+The list shows local modification date, session ID, native name (or the first prompt), and working
+directory, newest first. It defaults to 50 sessions; `--limit` accepts 1 through 1000. It reads only
+the head and tail of each candidate transcript, skips subagent files, and does not register anything.
+`CLAUDE_CONFIG_DIR` is honored, just as for adoption. Active sessions can be listed too.
+
+Before adopting, close the original Claude session (an idle terminal still holds its own context).
+Gorynych does not check or lock out other Claude writers for you.
+
+Run the separate utility from the Windows package:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Gorynych\tools\gorynych-adopt-claude.exe" <session-id> --cwd "D:\your-project"
+```
+
+Or from source:
+
+```
+dotnet run --project tools/Gorynych.AdoptClaude -- <session-id> --cwd <folder>
+```
+
+Use `--data <folder>` if the service uses a custom data folder. The utility reads native
+transcripts from `CLAUDE_CONFIG_DIR/projects` when that environment variable is set, otherwise
+`~/.claude/projects`; use the same environment as the service. `--cwd` must name the original
+working directory, which must still exist. No transcript is copied or edited, and no agent
+configuration is changed.
+
+The utility adds an absent record to `<data>/claude/sessions.json` under the same cross-process
+lock as the adapter hosts, with an atomic replacement. Concurrent updates are kept, and a repeated
+invocation leaves an existing registration and its settings unchanged. Lock/read/write failures
+return a nonzero exit code; a malformed catalog is left unchanged. The service's root
+`sessions.json` is never edited.
+
+The service and other agents can keep running. Refresh the GUI session list, open its import
+dialog, or reopen the GUI: the next `session/list` discovers the registration. Opening the thread
+loads its native history; the next prompt uses `claude -p --resume <session-id>`. This is not an
+attachment to the old terminal process, a fork, or automatic discovery of every Claude session.
+If the session was deleted or archived in Gorynych, adoption does not clear that service state.
+
 ## Where things are
 
 - **Programs:** `%LOCALAPPDATA%\Programs\Gorynych`, or wherever you put them.

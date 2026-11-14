@@ -12,6 +12,7 @@
     <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\..\tools\Gorynych.AdoptClaude\Gorynych.AdoptClaude.csproj" />
     <ProjectReference Include="..\..\src\Gorynych.Acp\Gorynych.Acp.csproj" />
     <ProjectReference Include="..\..\src\Gorynych.Service\Gorynych.Service.csproj" />
     <ProjectReference Include="..\..\src\Gorynych.Adapters.Claude\Gorynych.Adapters.Claude.csproj" />

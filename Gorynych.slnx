@@ -13,6 +13,7 @@
     <Project Path="tests/Gorynych.Tests/Gorynych.Tests.csproj" />
   </Folder>
   <Folder Name="/tools/">
+    <Project Path="tools/Gorynych.AdoptClaude/Gorynych.AdoptClaude.csproj" />
     <Project Path="tools/Gorynych.AcpGen/Gorynych.AcpGen.csproj" />
     <Project Path="tools/Gorynych.CodexGen/Gorynych.CodexGen.csproj" />
     <Project Path="tools/Gorynych.TestClient/Gorynych.TestClient.csproj" />
