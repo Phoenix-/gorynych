@@ -141,6 +141,10 @@ public sealed partial class AhpFaceTests
         var answer = await outcome.Task.WaitAsync(Wait);
         Assert.AreEqual("selected", (string?)answer?["outcome"]?["outcome"]);
         Assert.AreEqual("yes", (string?)answer?["outcome"]?["optionId"]);
+        // The agent's answer says the face took the confirmation, not that the client has received its
+        // echo: the face queues that before it answers the agent, and the outbox sends it on its own.
+        await LinkHarness.Until(() => vscode.Actions(chatUri).Any(a =>
+            a.Action.Value is ChatToolCallConfirmedAction { TurnId: "t1", ToolCallId: "w1" }), "the confirmation is echoed");
         Assert.IsNull(vscode.Actions(chatUri).Single(a => a.Action.Value is ChatToolCallConfirmedAction).RejectionReason);
         await LinkHarness.Until(() => vscode.Of<SessionInputNeededRemovedAction>(sessionUri).Length == 1, "the answered approval left inputNeeded");
 

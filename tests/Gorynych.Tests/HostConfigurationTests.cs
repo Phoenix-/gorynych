@@ -42,6 +42,20 @@ public sealed class HostConfigurationTests
         },
     };
 
+    /// <summary>
+    /// A request that was in flight when the conductor restarted. The client's connection may close
+    /// first (an <see cref="IOException"/>); or the service's call to the host may fail first, and its
+    /// unhandled transport <see cref="IOException"/> reaches the client as the JSON-RPC internal error
+    /// the service makes of an exception in a request handler. Both are the same expected disconnect,
+    /// so no other error is taken for it.
+    /// </summary>
+    static async Task IgnoreConnectionLoss(Task request)
+    {
+        try { await request.WaitAsync(Wait); }
+        catch (IOException) { }
+        catch (JsonRpcException e) when (e.Code == JsonRpcException.InternalError && e.Message == "host: connection closed") { }
+    }
+
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
     [DataRow("initial")]
@@ -111,7 +125,7 @@ public sealed class HostConfigurationTests
         await HostTests.RestartAsync(service);
         await HostTests.GoneAsync(service, null, hosts);
         await first.DisposeAsync();
-        try { await prompt.WaitAsync(Wait); } catch (IOException) { }
+        await IgnoreConnectionLoss(prompt);
 
         // Updates while no service runs must enter the snapshot too. A successful set_mode
         // answer after an older mode notification must win over that notification's replay.
@@ -125,7 +139,7 @@ public sealed class HostConfigurationTests
             modeAnswer.TrySetResult();
             await LinkHarness.Until(() => (string?)host.Report()["sessionStates"]?[sid]?["modes"]?["currentModeId"] == "plan", "the mode answer");
             expected["modes"]!["currentModeId"] = "plan";
-            try { await settingMode!.WaitAsync(Wait); } catch (IOException) { }
+            await IgnoreConnectionLoss(settingMode!);
         }
         if (change is "offline" or "cleared")
         {
