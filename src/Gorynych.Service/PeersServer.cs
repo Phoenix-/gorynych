@@ -315,10 +315,12 @@ public static class PeersServer
                     if (args?["cwd"] is JsonValue cwd && cwd.TryGetValue<string>(out var folder) && folder.Length > 0) spawn["cwd"] = folder;
                     if (args?["title"] is JsonValue title && title.TryGetValue<string>(out var name) && name.Length > 0) spawn["title"] = name;
                     if (args is JsonObject supplied && supplied.ContainsKey("mode")) spawn["mode"] = supplied["mode"]?.DeepClone();
+                    if (args?["config_options"] is { } configOptions) spawn["config_options"] = configOptions.DeepClone();
                     if (args?["report"] is JsonValue report && report.TryGetValue<bool>(out var reports)) spawn["report"] = reports;
                     if (args?["initiation"] is JsonValue initiation && initiation.TryGetValue<string>(out var how) && how.Length > 0) spawn["initiation"] = how;
                     var started = await RequestAsync(route!, GorynychProtocol.MethodSpawn, spawn, ct);
                     var text = new JsonObject { ["session_id"] = (string?)started?["sessionId"] };
+                    if (started?["config"] is JsonObject confirmed) text["config_options"] = confirmed.DeepClone();
                     if ((string?)started?["note"] is { } note) text["note"] = note;
                     return Text(text.ToJsonString(AcpJson.TextOptions));
                 }
@@ -496,7 +498,8 @@ public static class PeersServer
             ["description"] = "Start a new session of one of the user's coding agents as a child of this session, with a first prompt it works on. " +
                 "The user approves each spawn first, unless they asked for it themselves in this turn (initiation user_asked); if they " +
                 "decline, nothing starts and the call fails. " +
-                "Returns {\"session_id\": ...} at once (with a note when the user was asked although you passed user_asked), without waiting for the work; the child then runs on its own, " +
+                "Returns {\"session_id\": ..., \"config_options\": {...}} at once (with a note when the user was asked although you passed user_asked), " +
+                "without waiting for the work; config_options holds the native model-related values the child actually runs with. The child then runs on its own, " +
                 "the user can open and prompt it directly, and ask_agent asks it questions. Each time the child finishes a turn, Gorynych " +
                 "sends this session a short report with the child's final message by itself, also when that turn failed (unless report " +
                 "is false), so you need not poll the child, and it need not report. " +
@@ -511,6 +514,12 @@ public static class PeersServer
                     ["cwd"] = new JsonObject { ["type"] = "string", ["description"] = "the folder to work in; default: this session's folder; a relative path is taken from it" },
                     ["title"] = new JsonObject { ["type"] = "string", ["description"] = "a short name for the session in the user's list" },
                     ["mode"] = new JsonObject { ["type"] = "string", ["description"] = "the target agent's native permission mode, applied and checked before the first prompt; omitted: its own defaults, never inherited. DSH: read-only (file edits ask; no builds/tests) or full-access (commands and writes anywhere, no approvals). Codex: read-only, auto, auto-review or full-access. Claude: default, acceptEdits, plan, auto (when supported) or bypassPermissions. Unsupported values fail with the available modes. Full access from a caller without it requires confirmation even with user_asked" },
+                    ["config_options"] = new JsonObject
+                    {
+                        ["type"] = "object",
+                        ["description"] = "native model and model-related config option IDs to values, applied before the first prompt and confirmed by the agent: model first, then effort/thinking checked against the model it now runs. Only options of ACP categories model, model_config and thought_level; permission modes are the separate mode argument, and a mode here fails. An unsupported or unconfirmed value fails the spawn and nothing is prompted. Omitted values take Gorynych's per-agent defaults, then the agent's own. DSH model values are JSON-encoded pairs, for example {\"model\": \"[\\\"deepseek-official\\\",\\\"deepseek-flash\\\"]\", \"reasoning_effort\": \"high\"}",
+                        ["additionalProperties"] = new JsonObject { ["type"] = "string" },
+                    },
                     ["report"] = new JsonObject { ["type"] = "boolean", ["description"] = "report each finished turn of the child to this session; default true" },
                     ["initiation"] = new JsonObject
                     {

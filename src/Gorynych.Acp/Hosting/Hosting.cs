@@ -105,6 +105,23 @@ public static class GorynychProtocol
     public const string MetaAhpUri = "gorynych/ahpUri";
 
     /// <summary>
+    /// In <c>session/new</c> params <c>_meta</c>, client → service: an object of native config
+    /// option IDs to string values to set on the new session, for example
+    /// <c>{"model": "[\"deepseek-official\",\"deepseek-flash\"]"}</c>. Only model and model-related
+    /// options (ACP categories <c>model</c>, <c>model_config</c> and <c>thought_level</c>) are
+    /// accepted; permission modes use the request's own <c>mode</c> surface, never this map.
+    /// </summary>
+    public const string MetaConfigOptions = "gorynych/configOptions";
+
+    /// <summary>
+    /// In <c>session/new</c> params <c>_meta</c>, service → adapter: the config option IDs the
+    /// service is about to set (docs/service-protocol.md, "Default session configuration"). An
+    /// adapter whose catalog of options arrives asynchronously (Claude's model catalog) may wait
+    /// for an already running fetch, but must not start a model call for it, before it answers.
+    /// </summary>
+    public const string MetaRequiredConfigOptions = "gorynych/requiredConfigOptions";
+
+    /// <summary>
     /// Starts a child of the calling session, after asking the person:
     /// <c>{agent, prompt, cwd?, title?, report?}</c> with the caller's peer token → <c>{sessionId}</c>.
     /// </summary>

@@ -15,6 +15,13 @@ public sealed class ConductorOptions
     public required string DataDirectory { get; init; }
     public required string ServiceId { get; init; }
     public string? DefaultAgent { get; init; }
+
+    /// <summary>
+    /// Per-agent choices for new sessions, from <c>session-defaults.json</c> in the data folder.
+    /// They are applied after <c>session/new</c> and before a spawn's first prompt, never when an
+    /// existing session is loaded or resumed. Null means none.
+    /// </summary>
+    internal SessionDefaults? SessionDefaults { get; init; }
     public int JournalMaxEntries { get; init; } = 5000;
     public int ListPageSize { get; init; } = 50;
 
@@ -1331,6 +1338,11 @@ public sealed class Conductor : IAsyncDisposable
         // An explicit choice in the request wins; otherwise the agent the connection is scoped to.
         RefuseSystemPrompt(request.SystemPrompt);
         var host = Agent((string?)request.Meta?[GorynychProtocol.MetaAgent] ?? client.AgentScope);
+        // A client's explicit choices, then the service's defaults for what it did not choose. They
+        // are Gorynych's own data and are never written to the harness's configuration.
+        var choices = ConfigChoicesFor(host.Name,
+            ExplicitConfigOptions(request.Meta?[GorynychProtocol.MetaConfigOptions], "gorynych/configOptions on session/new"));
+        if (choices.Count > 0) RequireConfigOptions(request, choices);
         var rpc = await host.OpenTargetAsync(null, ct);
         var token = NewToken();
         request.McpServers = WithPeers(request.McpServers, token);
@@ -1339,12 +1351,31 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             response = await rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, request, ct);
-            BindToken(token, response.SessionId);
-            host.MarkLive(response.SessionId, rpc);
         }
         finally
         {
             host.DoneOpening(rpc);
+        }
+        try
+        {
+            host.MarkLive(response.SessionId, rpc);
+            // Explicit creation choices first, then the service's defaults (already merged), model
+            // first; the answer's options are replaced with what the agent confirmed. A client that
+            // chooses a value after this answer (Zed's default_config_options) sends
+            // session/set_config_option and wins, as any later explicit change does.
+            if (choices.Count > 0)
+            {
+                var state = await ApplyConfigOptionsAsync(host, rpc, response.SessionId, choices, AcpJson.ToNode(response)!.AsObject(), ct);
+                response.ConfigOptions = SessionOptionsOf(state);
+            }
+            BindToken(token, response.SessionId);
+        }
+        catch
+        {
+            // The native session exists but was never stored or prompted: close and delete it (or
+            // hide it when the agent keeps its own drafts), so a failed default leaves nothing.
+            await AbandonNewSessionAsync(host, rpc, response.SessionId, request.Cwd);
+            throw;
         }
         // The URI an AHP client chose for the session it creates, kept so that every list names it so.
         var ahpUri = AhpUriOf(request.Meta);
@@ -1361,6 +1392,172 @@ public sealed class Conductor : IAsyncDisposable
         ServiceLog.Info($"{host.Name}: new session {response.SessionId} in {request.Cwd}");
         return response;
     }
+
+    /// <summary>A client's explicit <c>gorynych/configOptions</c> map, or none; a wrong shape is a bad request.</summary>
+    List<SessionConfigChoice> ExplicitConfigOptions(JsonNode? node, string what)
+    {
+        if (node is null) return [];
+        try
+        {
+            return SessionConfigOptions.Parse(node, what);
+        }
+        catch (FormatException e)
+        {
+            throw new JsonRpcException(JsonRpcException.InvalidParams, e.Message);
+        }
+    }
+
+    /// <summary>
+    /// Explicit choices override the service's per-agent defaults for the same option; defaults fill
+    /// in the rest. The order keeps the explicit choices first and the default-only ones after.
+    /// </summary>
+    List<SessionConfigChoice> ConfigChoicesFor(string agent, IReadOnlyList<SessionConfigChoice> explicitChoices)
+    {
+        var defaults = options.SessionDefaults?.For(agent) ?? [];
+        if (defaults.Count == 0) return [.. explicitChoices];
+        if (explicitChoices.Count == 0) return [.. defaults];
+        var merged = new List<SessionConfigChoice>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var choice in explicitChoices)
+            if (seen.Add(choice.Id)) merged.Add(choice);
+        foreach (var choice in defaults)
+            if (seen.Add(choice.Id)) merged.Add(choice);
+        return merged;
+    }
+
+    /// <summary>
+    /// Tells an adapter which config option IDs the service is about to set, so one whose catalog
+    /// arrives asynchronously can wait for an already running fetch, without starting a model call
+    /// for the request (docs/service-protocol.md, "Default session configuration").
+    /// </summary>
+    static void RequireConfigOptions(NewSessionRequest request, IReadOnlyList<SessionConfigChoice> choices)
+    {
+        if (choices.Count == 0) return;
+        request.Meta ??= [];
+        request.Meta[GorynychProtocol.MetaRequiredConfigOptions] = new JsonArray(choices.Select(c => (JsonNode)c.Id).ToArray());
+    }
+
+    /// <summary>
+    /// Sets model and model-related config options on a newly created session, model first, and
+    /// returns the state the agent confirmed. Each value is checked against the option the agent
+    /// advertises now; after a model change the options are read again, since its effort/thinking
+    /// choices may differ. No fallback: an unavailable or unconfirmed choice fails the caller.
+    /// </summary>
+    async Task<JsonObject> ApplyConfigOptionsAsync(AgentHost host, JsonRpcConnection rpc, string sessionId,
+        IReadOnlyList<SessionConfigChoice> choices, JsonObject state, CancellationToken ct)
+    {
+        if (choices.Count == 0) return state;
+        // Validate every choice's shape before anything changes, but not its value yet: a dependent
+        // effort is checked against the model the session will run on, after that model is set.
+        SessionConfigChoice? model = null;
+        foreach (var choice in choices)
+        {
+            var option = RequireConfigOption(host, state, choice, checkValue: false);
+            if ((string?)option["category"] != "model") continue;
+            if (model is not null)
+                throw new JsonRpcException(JsonRpcException.InvalidParams,
+                    $"config_options names more than one model option (\"{model.Id}\" and \"{choice.Id}\"); set only one.");
+            model = choice;
+        }
+        var ordered = new List<SessionConfigChoice>(choices.Count);
+        if (model is not null) ordered.Add(model);
+        ordered.AddRange(choices.Where(c => !ReferenceEquals(c, model)));
+        foreach (var choice in ordered)
+        {
+            // Re-read the state after every change, so a dependent option is checked against the
+            // choices the model it now runs on offers.
+            RequireConfigOption(host, state, choice);
+            var answer = await rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption, new JsonObject
+            {
+                ["sessionId"] = sessionId,
+                ["configId"] = choice.Id,
+                ["value"] = choice.Value,
+            }, ct);
+            if (answer?["configOptions"] is not JsonArray options)
+                throw new JsonRpcException(JsonRpcException.InvalidRequest,
+                    $"{host.DisplayName} answered session/set_config_option for \"{choice.Id}\" without its complete configOptions; the session was not started.");
+            state = state.DeepClone().AsObject();
+            state["configOptions"] = options.DeepClone();
+            var confirmed = ConfigOption(state, choice.Id);
+            if (confirmed is null || (string?)confirmed["currentValue"] != choice.Value)
+                throw new JsonRpcException(JsonRpcException.InvalidRequest,
+                    $"{host.DisplayName} did not confirm config option \"{choice.Id}\" = \"{choice.Value}\" " +
+                    $"(it reports \"{(string?)confirmed?["currentValue"] ?? "none"}\"); the session was not started.");
+        }
+        return state;
+    }
+
+    /// <summary>One advertised config option by its opaque native ID.</summary>
+    static JsonObject? ConfigOption(JsonObject state, string id) =>
+        (state["configOptions"] as JsonArray ?? []).OfType<JsonObject>().FirstOrDefault(o => (string?)o["id"] == id);
+
+    static IEnumerable<JsonObject> ConfigOptions(JsonObject state) =>
+        (state["configOptions"] as JsonArray ?? []).OfType<JsonObject>();
+
+    static IEnumerable<string> ModelRelatedOptionIds(JsonObject state) =>
+        ConfigOptions(state)
+            .Where(o => SessionConfigOptions.AllowedCategories.Contains((string?)o["category"] ?? ""))
+            .Select(o => (string?)o["id"]).OfType<string>();
+
+    /// <summary>The select's values, flat or grouped.</summary>
+    static IEnumerable<string> ConfigValues(JsonObject option) =>
+        (option["options"] as JsonArray ?? []).OfType<JsonObject>()
+            .SelectMany(o => o["options"] is JsonArray grouped ? grouped.OfType<JsonObject>() : [o])
+            .Select(o => (string?)o["value"]).OfType<string>();
+
+    /// <summary>
+    /// The choice checked against the option the agent advertises in <paramref name="state"/>: it
+    /// must exist, be a model or model-related select, and list the value. Permission modes are
+    /// refused here, so config options cannot smuggle one.
+    /// </summary>
+    static JsonObject RequireConfigOption(AgentHost host, JsonObject state, SessionConfigChoice choice, bool checkValue = true)
+    {
+        var option = ConfigOption(state, choice.Id);
+        if (option is null)
+        {
+            var related = string.Join(", ", ModelRelatedOptionIds(state));
+            throw new JsonRpcException(JsonRpcException.InvalidParams,
+                $"No native config option \"{choice.Id}\" is advertised for {host.DisplayName}. " +
+                (related.Length == 0 ? "Its agent advertises no model-related options." : $"Available model-related options: {related}."));
+        }
+        var category = (string?)option["category"];
+        if (category is null || !SessionConfigOptions.AllowedCategories.Contains(category))
+            throw new JsonRpcException(JsonRpcException.InvalidParams,
+                $"Native config option \"{choice.Id}\" has category \"{category ?? "none"}\"; only model-related options may be set " +
+                "(category model, model_config or thought_level). Permission modes use the mode parameter, never config_options.");
+        if ((string?)option["type"] != "select")
+            throw new JsonRpcException(JsonRpcException.InvalidParams,
+                $"Native config option \"{choice.Id}\" is not a select; config_options sets string select values only.");
+        if (checkValue)
+        {
+            var values = ConfigValues(option).ToArray();
+            if (!values.Contains(choice.Value, StringComparer.Ordinal))
+                throw new JsonRpcException(JsonRpcException.InvalidParams,
+                    $"Native config option \"{choice.Id}\" has no value \"{choice.Value}\" for {host.DisplayName}. Available values: " +
+                    (values.Length == 0 ? "none." : string.Join(", ", values.Select(v => $"\"{v}\"")) + "."));
+        }
+        return option;
+    }
+
+    /// <summary>The confirmed current values of the model and model-related options, by native ID.</summary>
+    static JsonObject EffectiveModelConfig(JsonObject state)
+    {
+        var map = new JsonObject();
+        foreach (var option in ConfigOptions(state))
+        {
+            if ((string?)option["id"] is not { Length: > 0 } id) continue;
+            if (!SessionConfigOptions.AllowedCategories.Contains((string?)option["category"] ?? "")) continue;
+            if ((string?)option["type"] != "select" || (string?)option["currentValue"] is not { } value) continue;
+            map[id] = value;
+        }
+        return map;
+    }
+
+    /// <summary>An agent's <c>configOptions</c> array as the typed state a response carries.</summary>
+    static List<SessionConfigOption>? SessionOptionsOf(JsonObject state) =>
+        state["configOptions"] is JsonArray options
+            ? AcpJson.FromNode<SetSessionConfigOptionResponse>(new JsonObject { ["configOptions"] = options.DeepClone() })?.ConfigOptions
+            : null;
 
     /// <summary>
     /// <c>gorynych/ahpUri</c> of a <c>session/new</c>: an <c>ahp-session:/</c> URI of one path segment, at most
@@ -2510,6 +2707,11 @@ public sealed class Conductor : IAsyncDisposable
             if (spawnParams["mode"] is not JsonValue modeValue || !modeValue.TryGetValue<string>(out mode) || string.IsNullOrWhiteSpace(mode))
                 throw new JsonRpcException(JsonRpcException.InvalidParams, "mode must be a non-empty native permission mode ID, or omitted for the agent's defaults.");
         }
+        // model and model-related native options only: shape is checked here, availability against
+        // the child's own advertised options after session/new. An explicit choice beats the
+        // service's per-agent default for the same option.
+        var configChoices = ConfigChoicesFor(host.Name,
+            ExplicitConfigOptions(request.Params?["config_options"], "spawn_session config_options"));
         var report = request.Params?["report"] is not JsonValue flag || !flag.TryGetValue<bool>(out var r) || r;
         var initiation = (string?)request.Params?["initiation"] ?? Proposal;
         if (initiation is not (UserAsked or Proposal))
@@ -2548,7 +2750,7 @@ public sealed class Conductor : IAsyncDisposable
             RequestPermissionOutcome outcome;
             try
             {
-                outcome = await AskToSpawnAsync(parentUse.Feed, parent, callId, what, host, cwd, prompt, title, mode, childState, why, ct);
+                outcome = await AskToSpawnAsync(parentUse.Feed, parent, callId, what, host, cwd, prompt, title, mode, childState, configChoices, why, ct);
             }
             catch (Exception e) when (e is OperationCanceledException or JsonRpcException)
             {
@@ -2574,9 +2776,10 @@ public sealed class Conductor : IAsyncDisposable
         if (parentUse.Feed.Retired || store.Get(parent.SessionId) is not { Deleted: false })
             throw new JsonRpcException(JsonRpcException.InvalidRequest, "The calling session was deleted, so the session was not started.");
         string childId;
+        JsonObject childConfig;
         try
         {
-            childId = await CreateChildAsync(parent, host, cwd, prompt, title, report, mode,
+            (childId, childConfig) = await CreateChildAsync(parent, host, cwd, prompt, title, report, mode, configChoices,
                 mode is null ? null : ConfirmAsync, () => asks, ct);
         }
         catch (Exception e)
@@ -2587,6 +2790,8 @@ public sealed class Conductor : IAsyncDisposable
         await EndCardAsync(ToolCallStatus.Completed, $"Started {host.DisplayName} session {childId}.");
         ServiceLog.Info($"{parent.Agent} {parent.SessionId}: spawned {host.Name} session {childId} in {cwd}" + (asks ? "" : ", as the user asked"));
         var result = new JsonObject { ["sessionId"] = childId };
+        // What the child actually runs with, as its agent confirmed it: the parent need not guess.
+        if (childConfig.Count > 0) result["config"] = childConfig;
         if (askedAnyway is not null) result["note"] = AskedAnywayNote(askedAnyway).TrimStart();
         return result;
     }
@@ -2681,13 +2886,18 @@ public sealed class Conductor : IAsyncDisposable
     /// always: every spawn is asked). Waits for a client if none is attached.
     /// </summary>
     Task<RequestPermissionOutcome> AskToSpawnAsync(SessionFeed feed, SessionRecord parent, string callId, string what, AgentHost host, string cwd,
-        string prompt, string? title, string? mode, JsonObject? childState, string? why, CancellationToken ct)
+        string prompt, string? title, string? mode, JsonObject? childState, IReadOnlyList<SessionConfigChoice> configChoices, string? why,
+        CancellationToken ct)
     {
         var input = new JsonObject { ["agent"] = host.Name, ["cwd"] = cwd, ["prompt"] = prompt };
         if (title is not null) input["title"] = title;
         if (mode is not null) input["mode"] = mode;
+        var config = SessionConfigOptions.ToObject(configChoices);
+        if (config.Count > 0) input["config_options"] = config;
         var permissions = mode is null ? "Agent defaults" : ModeDescription(childState!, mode);
-        return AskPersonAsync(feed, parent, callId, what, input, $"{prompt}\n\nFolder: {cwd}\nPermissions: {permissions}" + (why is null ? "" : $"\n\n{why}"),
+        var configuration = config.Count == 0 ? "" : $"\nConfiguration: {config.ToJsonString(AcpJson.TextOptions)}";
+        return AskPersonAsync(feed, parent, callId, what, input,
+            $"{prompt}\n\nFolder: {cwd}\nPermissions: {permissions}{configuration}" + (why is null ? "" : $"\n\n{why}"),
             new PermissionOption { OptionId = "start", Name = "Start", Kind = PermissionOptionKind.AllowOnce },
             new PermissionOption { OptionId = "decline", Name = "Don't start", Kind = PermissionOptionKind.RejectOnce }, ct);
     }
@@ -2810,16 +3020,19 @@ public sealed class Conductor : IAsyncDisposable
     /// follows the notice runs after the spawn's. A child that fails before that is closed and
     /// deleted again, as is one whose spawn is withdrawn while its agent creates it.
     /// </summary>
-    async Task<string> CreateChildAsync(SessionRecord parent, AgentHost host, string cwd, string prompt, string? title, bool report, string? mode,
+    async Task<(string Id, JsonObject Config)> CreateChildAsync(SessionRecord parent, AgentHost host, string cwd, string prompt, string? title,
+        bool report, string? mode, IReadOnlyList<SessionConfigChoice> configChoices,
         Func<JsonObject?, Task>? confirm, Func<bool> approved,
         CancellationToken ct)
     {
         var rpc = await host.OpenTargetAsync(null, ct);
         var token = NewToken();
         // Not cancelled with the spawn: the agent may create the session anyway, and only its answer names it.
-        // Session setup uses the agent's defaults. An explicit mode is applied before publishing or prompting it.
-        var creating = await rpc.StartRequestAsync(AcpMethods.Agent.SessionNew,
-            AcpJson.ToNode(new NewSessionRequest { Cwd = cwd, McpServers = WithPeers([], token), SystemPrompt = SystemPromptFor(host) }),
+        // Session setup uses the agent's defaults. Config options and an explicit mode are applied
+        // and checked before publishing or prompting it.
+        var newSession = new NewSessionRequest { Cwd = cwd, McpServers = WithPeers([], token), SystemPrompt = SystemPromptFor(host) };
+        RequireConfigOptions(newSession, configChoices);
+        var creating = await rpc.StartRequestAsync(AcpMethods.Agent.SessionNew, AcpJson.ToNode(newSession),
             CancellationToken.None);
         JsonNode? created;
         try
@@ -2832,7 +3045,7 @@ public sealed class Conductor : IAsyncDisposable
             {
                 try
                 {
-                    if ((string?)(await creating)?["sessionId"] is { } late) await AbandonChildAsync(host, rpc, late, cwd);
+                    if ((string?)(await creating)?["sessionId"] is { } late) await AbandonNewSessionAsync(host, rpc, late, cwd);
                 }
                 finally
                 {
@@ -2856,6 +3069,14 @@ public sealed class Conductor : IAsyncDisposable
             host.MarkLive(id, rpc);
             host.DoneOpening(rpc);
             feed.CaptureState(created);
+            if (configChoices.Count > 0)
+            {
+                // Model first, then effort/thinking checked against the model it now runs; no
+                // prompt runs until every value is confirmed.
+                var state = await ApplyConfigOptionsAsync(host, rpc, id, configChoices,
+                    created as JsonObject ?? new JsonObject(), ct);
+                feed.CaptureState(state);
+            }
             store.Update(id, host.Name, rec =>
             {
                 // A list that found the session in its agent just now has shown it already: it stays listed.
@@ -2894,12 +3115,12 @@ public sealed class Conductor : IAsyncDisposable
         catch
         {
             feed.TurnGate.Release();
-            await AbandonChildAsync(host, rpc, id, cwd);
+            await AbandonNewSessionAsync(host, rpc, id, cwd);
             throw;
         }
         var wasApproved = approved();
         Track(Task.Run(() => SpawnedTurnAsync(feed, record, parent, prompt, wasApproved)));
-        return id;
+        return (id, EffectiveModelConfig(feed.State()));
     }
 
     /// <summary>
@@ -2920,11 +3141,11 @@ public sealed class Conductor : IAsyncDisposable
     }
 
     /// <summary>
-    /// Takes back a child whose spawn failed before its first turn: closes it in its agent, deletes
-    /// it there when the agent can (it never had a turn), and forgets it. If the agent cannot be
-    /// reached the child stays hidden.
+    /// Takes back a session whose creation or setup failed before its first turn (a spawned child,
+    /// or a client's session/new): closes it in its agent, deletes it there when the agent can (it
+    /// never had a turn), and forgets it. If the agent cannot be reached the session stays hidden.
     /// </summary>
-    async Task AbandonChildAsync(AgentHost host, JsonRpcConnection rpc, string id, string cwd)
+    async Task AbandonNewSessionAsync(AgentHost host, JsonRpcConnection rpc, string id, string cwd)
     {
         var record = new SessionRecord { SessionId = id, Agent = host.Name, Cwd = cwd };
         var gone = false;
@@ -2939,12 +3160,12 @@ public sealed class Conductor : IAsyncDisposable
         }
         catch (Exception e)
         {
-            ServiceLog.Warn($"{host.Name}: the unused child {id} could not be deleted, hiding it: {e.Message}");
+            ServiceLog.Warn($"{host.Name}: the unused session {id} could not be deleted, hiding it: {e.Message}");
         }
         // DSH persists session/new before any prompt and cannot delete it: keep it hidden on
         // subsequent native lists too. Claude/Codex advertise when unused drafts are not durable.
         Forget(Feed(id), record, tombstone: host.CanDelete ? !gone : !host.DraftsNotDurable);
-        ServiceLog.Info($"{host.Name}: dropped the child {id}, which was never started");
+        ServiceLog.Info($"{host.Name}: dropped the unused session {id}, which was never started");
     }
 
     /// <summary>Keeps a turn or report that runs in the background, for <see cref="BackgroundTurnsIdleAsync"/>.</summary>

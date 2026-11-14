@@ -172,6 +172,11 @@ public sealed class PeersTests
         StringAssert.Contains(Description("reply"), "Use it only to answer; to start a question of your own, use ask_agent.");
         StringAssert.Contains(Description("spawn_session"), "sends this session a short report with the child's final message by itself");
         StringAssert.Contains(Description("spawn_session"), "The user approves each spawn first, unless they asked for it themselves in this turn (initiation user_asked)");
+        StringAssert.Contains(Description("spawn_session"), "config_options holds the native model-related values the child actually runs with");
+        var configOptions = tools["spawn_session"]["inputSchema"]!["properties"]!["config_options"]!;
+        Assert.AreEqual("object", (string?)configOptions["type"]);
+        Assert.AreEqual("string", (string?)configOptions["additionalProperties"]!["type"]);
+        StringAssert.Contains((string?)configOptions["description"], "permission modes are the separate mode argument");
         var initiation = tools["spawn_session"]["inputSchema"]!["properties"]!["initiation"]!;
         CollectionAssert.AreEqual(new[] { "user_asked", "proposal" }, initiation["enum"]!.AsArray().Select(v => (string?)v).ToArray());
         StringAssert.StartsWith((string?)initiation["description"], "user_asked only when the user, in this turn, explicitly asked you to start this session or task");

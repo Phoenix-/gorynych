@@ -239,10 +239,13 @@ ACP config options, like Codex's:
   headless session, so open threads get the selectors without being reopened.
   - At start the adapter loads the kept catalog, so `session/new` and `session/resume` show all
     three selectors before any launch. A file that cannot be read counts as none.
-  - With none kept, the adapter fetches one once, in the background (neither the service's start
-    nor `session/new` waits; stopping the adapter stops it): Claude launched as every headless
-    session is (the same flags and per-launch settings, the same cleaned environment, the same plan
-    check), in `claude/catalog`, asked only `initialize`, then closed.
+  - With none kept, the adapter fetches one once, in the background: the service's start never
+    waits, and `session/new` waits only when the service is about to set a model default and
+    names it in `_meta["gorynych/requiredConfigOptions"]`
+    ([service-protocol.md](service-protocol.md#default-session-configuration)). Stopping the
+    adapter stops the fetch. It is Claude launched as every headless session is (the same flags
+    and per-launch settings, the same cleaned environment, the same plan check), in
+    `claude/catalog`, asked only `initialize`, then closed.
     - No prompt is sent, so it uses no tokens.
     - `--no-session-persistence`: no transcript and no project folder in `~/.claude`. Checked
       live (Claude Code 2.1.302): nothing named after the fetch's session is left in `~/.claude`
@@ -252,7 +255,7 @@ ACP config options, like Codex's:
       `--mcp-config`: none of the person's settings files, so none of their hooks, and none of
       their MCP servers run for it. Claude still reads the login, so the plan check holds.
     - Off the plan it keeps nothing and logs why. Until a catalog arrives, `session/new` returns
-      only `mode`.
+      only `mode`, unless the service is waiting for that fetch to set a model default.
   - A model the person chose that a later catalog no longer has stays the session's model and is
     shown as such.
 - A change applies to a running Claude at once (`set_permission_mode`, `set_model`,
@@ -462,6 +465,10 @@ claude --settings <session>/settings.json --permission-mode default [--model <m>
 - `session/new` launches nothing. The adapter's own list (`claude/sessions.json` in the
   service data, used for `session/list` and `session/resume`) gets the session at its first
   prompt, so a draft that is never prompted leaves nothing behind.
+- The TUI advertises no `model` or `reasoning_effort` config options; the headless transport's
+  selectors are not implemented here. A configured model default or an explicit
+  `config_options` therefore fails clearly before the first prompt, while a session with no
+  such choices runs as before ([service-protocol.md](service-protocol.md#default-session-configuration)).
   The separate `gorynych-adopt-claude` utility can also register an existing native session
   in that list; all hosts reread the catalog on access, using the same lock for updates.
 - The adapter does not advertise `session/delete`: the transcript belongs to `~/.claude`.

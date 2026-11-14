@@ -66,6 +66,20 @@ if (closed is { } said)
     if (said.Failed) ServiceLog.Warn($"service: {said.Said}");
     else ServiceLog.Info($"service: {said.Said}");
 }
+// Per-agent defaults for new sessions, from the service's own data folder (never a harness's
+// configuration). A malformed file stops the start: silently ignoring a person's configuration
+// would leave every new session on a model they did not choose.
+SessionDefaults sessionDefaults;
+try
+{
+    sessionDefaults = SessionDefaults.Load(dataDirectory);
+}
+catch (InvalidDataException e)
+{
+    ServiceLog.Error($"service: {e.Message}");
+    Console.Error.WriteLine($"gorynych: {e.Message}");
+    return CommandLine.UsageExitCode;
+}
 // What it runs is read now, before an update can rename its executable aside and copy another in its place.
 var (serviceBuild, buildTook) = Gorynych.Service.Hosts.HostGeneration.ReadAtStart(m => ServiceLog.Warn($"service: {m}"));
 // Started by the logon task, it has a console window of its own: let it go, so that closing it cannot stop the service.
@@ -116,6 +130,7 @@ await using var conductor = new Conductor(new ConductorOptions
     DataDirectory = dataDirectory,
     ServiceId = state.ServiceId,
     DefaultAgent = line.Value("--default-agent"),
+    SessionDefaults = sessionDefaults,
     UnloadAfter = UnloadAfter(line.Value("--unload-after")),
     PeerServerCommand = line.Flag("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
     Hosts = hosts,

@@ -47,7 +47,13 @@ terminal) and by the live `PlainClient_ThroughTheBridge_…` test against real C
 - `session/load` replays the history from the service journal. It and `session/resume`
   return the agent's config options and modes with their current values, also for a session
   the service already has open, so the selectors (Kimi's model, thinking, mode) survive a Zed
-  restart.
+  restart. Neither applies a default: an existing session keeps its native model, effort and
+  other choices.
+- `session/new` applies Gorynych's per-agent defaults for model and model-related options
+  ([service-protocol.md](service-protocol.md#default-session-configuration)). A client's later
+  `session/set_config_option`, such as Zed's own `default_config_options`, wins; a client may
+  also send explicit choices in `_meta["gorynych/configOptions"]` on `session/new`. Permission
+  modes stay on their own separate surface.
 - Sessions created but never prompted (drafts) are deleted when the client closes them or
   goes away, and are not listed ([service-protocol.md](service-protocol.md#drafts-and-deletion)).
   A bridge that went is given two minutes to come back for them.

@@ -44,6 +44,13 @@ approval card, one session list, without reading terminals.
 - **Never edit an agent's own configuration** (`~/.claude`, `~/.codex`, `~/.kimi-code`).
   Everything goes through per-launch options and the agents' own protocols, so starting or
   removing Gorynych changes nothing in how the agents behave on their own.
+- **Defaults for new sessions belong to Gorynych** (decided with the session-defaults work).
+  Per-agent model and model-related choices live in the service's own data folder
+  (`session-defaults.json`) and are applied through ACP `session/set_config_option` when a
+  session is created, never on load or resume. An explicit GUI or spawn choice wins; the native
+  harness's own choice is the fallback. The GUI's client-only defaults remain useful but are no
+  longer the only place a starting model is set
+  ([service-protocol.md](service-protocol.md#default-session-configuration)).
 - **A structured protocol per harness, no screen scraping.** Kimi speaks ACP (`kimi acp`),
   Codex has `codex app-server`, Claude Code has stream-json (`claude -p`). In Claude's TUI
   fallback the terminal is used only to type and to answer the few dialogs that need a key.

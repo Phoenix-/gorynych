@@ -132,6 +132,17 @@ the agent the `mcpServers` it gets ([§6.2](#62-the-gorynych-mcp-server)).
   then closes an unused draft and drops it, with no delete and no tombstone. (Codex, which
   writes a thread at its first turn) It also means a draft opens in no other instance: after an
   update the draft stays in its stale host until its first turn has run there.
+- **Session configuration.** The service sets model and model-related choices on a new session
+  with ACP's own `session/set_config_option` (categories `model`, `model_config`,
+  `thought_level`); the adapter MUST advertise those options with their current values, refuse a
+  value it does not offer, and answer with the complete `configOptions` list and the confirmed
+  `currentValue`, as ACP requires ([service-protocol.md](service-protocol.md#default-session-configuration)).
+  It MUST NOT change its native configuration for those choices. A `session/new` may carry
+  `_meta["gorynych/requiredConfigOptions"]`, the IDs the service is about to set: an adapter
+  whose catalog arrives asynchronously (Claude's model catalog) MAY wait for an already running
+  fetch before answering, but MUST NOT start a prompt or another model call for it. An adapter
+  with no such options (Claude's TUI transport) keeps its `session/new` answer as it is; the
+  service then refuses the configured option loudly.
 - **A draft across a restart or a move.** The service keeps a draft while a client on the
   resumable link may come back for it ([service-protocol.md](service-protocol.md#the-resumable-link)),
   and moves one off a stale host as any idle session

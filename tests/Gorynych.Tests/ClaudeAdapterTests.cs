@@ -1,4 +1,5 @@
 using Gorynych.Acp;
+using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
 using Gorynych.Adapters.Claude;
 
@@ -399,6 +400,36 @@ public sealed class ClaudeAdapterTests
         }
         Assert.AreEqual(StopReason.EndTurn, next.StopReason);
         Assert.AreEqual("echo: hello", client.Text());
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task TuiSessionNew_OffersNoModelOptions_AndIgnoresTheServicesRequiredConfig()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var dir = TestDirs.New();
+        var adapter = new ClaudeAdapter(new ClaudeAdapterOptions
+        {
+            Transport = ClaudeTransport.Tui,
+            DataDirectory = Path.Combine(dir, "claude"),
+            Executable = FakeClaude(),
+            StartupTimeoutSeconds = 30,
+        });
+        await using var conductor = TestDirs.Conductor(dir, adapter);
+        await using var client = await TestClient.ConnectAsync(conductor);
+
+        var created = await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, new NewSessionRequest
+        {
+            Cwd = dir,
+            McpServers = [],
+            Meta = new System.Text.Json.Nodes.JsonObject
+            {
+                ["gorynych/agent"] = "claude",
+                [GorynychProtocol.MetaRequiredConfigOptions] = new System.Text.Json.Nodes.JsonArray("model", "reasoning_effort"),
+            },
+        });
+
+        Assert.IsNull(created.ConfigOptions, "the TUI transport is not changed: it advertises no model or effort options");
     }
 
     [TestMethod]

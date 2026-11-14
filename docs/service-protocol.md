@@ -141,7 +141,7 @@ server ([Agents outside Gorynych](#agents-outside-gorynych)).
 | --- | --- |
 | `initialize` | Answers as agent `gorynych`: `loadSession`, `sessionCapabilities.list/resume/close/delete`, and its extension flags in `agentCapabilities._meta`, as ACP's extensibility rules advertise custom capabilities: `gorynych/sessionsChanged: true` (see [List changes](#list-changes)), `gorynych/archive: true` (see [Archive](#archive)) and `gorynych/link: 1` (see [The resumable link](#the-resumable-link)). The result's own `_meta` has the data `gorynych/serviceId` and `gorynych/agents`, and, deprecated and kept for one release for clients built before the flags moved, the first two flags again. No `sessionCapabilities.systemPrompt` yet ([adapter-contract.md](adapter-contract.md#15-open-questions)). |
 | `session/list` | Asks every adapter that can list (following its cursors), merges with the overlay, sorts by `updatedAt`, pages with its own cursor. Each `SessionInfo` carries `_meta["gorynych/agent"]`, and a spawned session also `_meta["gorynych/parentSessionId"]` (absent for a session a client created). A connection scoped to one agent sees only that agent's sessions. Drafts and deleted sessions are left out, and so are archived sessions unless the request has `_meta["gorynych/includeArchived"]: true`; then an archived one carries `_meta["gorynych/archived"]: true`. |
-| `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers` and, for an adapter that advertises `sessionCapabilities.systemPrompt`, the peer instructions as `systemPrompt` in `append` mode (see [What agents are told](#what-agents-are-told)), forwards, records the session as a draft (with the `gorynych/ahpUri` an AHP client gave it), attaches the client, and once its answer is written sends it the current list of commands (below). A client's own `systemPrompt` is refused with `-32602`, here and on `session/load` and `session/resume`: the service does not advertise the capability. |
+| `session/new` | Picks the adapter from `_meta["gorynych/agent"]` (else the connection's agent, else `--default-agent`, else the first), adds the peers MCP server to `mcpServers` and, for an adapter that advertises `sessionCapabilities.systemPrompt`, the peer instructions as `systemPrompt` in `append` mode (see [What agents are told](#what-agents-are-told)), forwards, then applies a client's explicit `_meta["gorynych/configOptions"]` and Gorynych's per-agent defaults for the rest, model first, replacing the answer's `configOptions` with what the agent confirmed ([Default session configuration](#default-session-configuration)); records the session as a draft (with the `gorynych/ahpUri` an AHP client gave it), attaches the client, and once its answer is written sends it the current list of commands (below). A client's own `systemPrompt` is refused with `-32602`, here and on `session/load` and `session/resume`: the service does not advertise the capability. |
 | `session/load` | Opens the session in the agent, catching the journal up with the agent's own history first ([History made outside Gorynych](#history-made-outside-gorynych); a session the journal has never seen is imported so), replays the service journal as `session/update`, then the current list of commands (below), then attaches the client. Returns the session state (below), with the link's state in `_meta` ([The resumable link](#the-resumable-link)). |
 | `session/resume` | Opens the session in the agent and attaches the client, without replay, after sending it the current list of commands (below). With `_meta["gorynych/replayFrom"]` it first sends what the journal has after a position ([The resumable link](#the-resumable-link)). Returns the session state (below), with the link's state in `_meta`. |
 | `session/prompt` | Waits for the session's running turn (one turn at a time, opinion turns included), journals the prompt as `user_message_chunk` with a `messageId` of the service's (shown to the session's other clients), sets the first prompt as a provisional title, forwards. The turn is not cancelled when the client disconnects; stopping it is `session/cancel`. A prompt with `_meta["gorynych/promptId"]` leaves the mark of its end in the journal; during a restart a prompt is refused, not started ([The resumable link](#the-resumable-link)). |
@@ -236,6 +236,8 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/includeArchived` | `session/list` params `_meta` | `true` lists archived sessions too |
 | `gorynych/parentSessionId` | `SessionInfo._meta` in `session/list`; `session_info_update._meta`; the `_meta` of a spawned session's first `user_message_chunk` | the session that started this one with `spawn_session`; absent for a session a client created |
 | `gorynych/ahpUri` | `session/new` params `_meta`, client → service; the `session/new` result's `_meta`; `SessionInfo._meta` in `session/list` | the AHP URI (`ahp-session:/<id>`, one path segment, at most 512 characters) an AHP client chose for the session it creates through the [AHP face](ahp-face.md#identifiers); kept in the overlay, so every list names the session so, after a restart too. Anything else is not kept |
+| `gorynych/configOptions` | `session/new` params `_meta`, client → service | an object of native config option IDs to string values to set on the new session, for example `{"model": "[\"deepseek-official\",\"deepseek-flash\"]"}`. Explicit choices beat Gorynych's per-agent defaults; only model and model-related options (ACP categories `model`, `model_config` and `thought_level`) are accepted, and a permission mode fails, since modes use the request's own `mode` surface ([Default session configuration](#default-session-configuration)) |
+| `gorynych/requiredConfigOptions` | `session/new` params `_meta`, service → adapter | the config option IDs the service is about to set. An adapter whose options arrive asynchronously (Claude's model catalog) may wait for an already running fetch, but must not start a model call for it, before it answers `session/new` ([Default session configuration](#default-session-configuration)) |
 | `gorynych/origin` | `user_message_chunk._meta`; with `native`, the `_meta` of any update | where a user message came from when the client did not send it: `peer` (an opinion request delivered as a turn), `channel` (one that reached Claude through its channel, TUI), `live` (one written into a running headless Claude on its input), `spawn` (a spawned session's first prompt), `report` (a child's report delivered as a turn) or `terminal`; `native` on every update the journal took from the agent's own history, made outside Gorynych; `notice` on an entry the service wrote into the journal itself ([History made outside Gorynych](#history-made-outside-gorynych)) |
 | `gorynych/notice` | `_meta` of a `user_message_chunk` with `gorynych/origin: "notice"` | what the service's entry says: `historyRewritten` |
 | `gorynych/replayFrom` | an adapter's `agentCapabilities._meta`; `session/resume` params `_meta`, service → adapter and client → service | in capabilities, `true`: the adapter replays its own history after a mark. On a resume, where to replay from: `{"type": "gorynych/after", "mark": "<mark>"}` or `{"type": "start"}` ([History made outside Gorynych](#history-made-outside-gorynych)); from a client, the mark is a journal position ([The resumable link](#the-resumable-link)) |
@@ -279,7 +281,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/peers` | method, `{token, includeArchived?}` → `{sessions}` | the sessions the session behind `token` can ask: the others that have history (not drafts, not deleted, and titled or with a turn in the journal), open ones first, then the newest; with agent, title, folder, `status` (`open` when its agent has it loaded now, `saved` when not, the words of ACP's draft session-status RFD), `parent_session_id`. Archived ones only with `includeArchived: true`, and then every entry has `archived`. With a known token, `caller` names that session as `session_id <id> (<agent>, "<title>")`, and `callerParent` the session that started it with `spawn_session`, when there is one. Without `includeArchived`, `hiddenArchived` counts the archived sessions left out (never the caller) |
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
-| `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, mode?, report?, initiation?}` → `{sessionId}` | starts a child of the calling session after asking the person where required (see [Child sessions](#child-sessions)); accepted only with a session's peer token |
+| `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, mode?, config_options?, report?, initiation?}` → `{sessionId, config?, note?}` | starts a child of the calling session after asking the person where required (see [Child sessions](#child-sessions)); `config` holds the model-related values the child's agent confirmed; accepted only with a session's peer token |
 | `_gorynych/set_title` | method, service → adapter, `{sessionId, title}` → `{}` | writes a session's native title; only for an adapter that advertises `gorynych/setTitle` (Codex), for a `spawn_session` name |
 | `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?, _meta}` → `{}` | tells a session's agent something that needs no answer (a child's report), with `gorynych/sender` and `gorynych/fromSessionId` in `_meta` for the user message the agent reports for it; the Claude adapter writes it into a running Claude (headless) or pushes it through the channel (TUI), an agent that answers method not found, or `-32600` because it is not running, gets it as a turn |
 | `_gorynych/mcp_message` | method, outside server → service, `{serverId, requestId, method, params}` → `{result}` or `{error}`; as a notification from the service, a notification of that request | an MCP request of `gorynych-outside`, in the shape of `mcp/message` from ACP's MCP-over-ACP RFD (see [`_gorynych/mcp_message`](#agents-outside-gorynych)) |
@@ -295,6 +297,67 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/ask_answered` | notification, host → conductor, `{sessionId, askId, from?, result \| error}` | the agent's answer to a question it took by its own way in (Claude's channel), sent before the answer, numbered like an update: the next service gives it to the asker that comes back |
 | `gorynych/hostSeq` | `_meta` of a session's update and of `_gorynych/turn_ended`, host → conductor; kept in the journal | `"<hostId>/<n>"`: its place in its host's stream. A session's cursor is the newest its journal has from that host; never sent to clients |
 
+## Default session configuration
+
+Gorynych owns the per-agent defaults for new sessions. They live in its own data folder, never in
+a harness's configuration directory (`~/.claude`, `~/.codex`, `~/.kimi-code`, `~/.dsh`), and
+nothing changes the native configuration of any agent.
+
+- **Where.** `<data>/session-defaults.json`, read when the service starts; restart the service
+  after editing it. A missing file means no defaults. A malformed file stops the start with the
+  file and what is wrong (exit 2), rather than silently leaving every new session on a model the
+  person did not choose.
+- **Shape.** One object, `agents` keyed by the service's adapter names, each with a
+  `configOptions` object of native option IDs to string values:
+
+  ```json
+  {
+    "agents": {
+      "dsh": {
+        "configOptions": {
+          "model": "[\"deepseek-official\",\"deepseek-flash\"]",
+          "reasoning_effort": "high"
+        }
+      }
+    }
+  }
+  ```
+
+  IDs and values are opaque: DSH's model is a JSON-encoded provider/model pair, Kimi's thinking
+  is a plain string. No example is a built-in default; an empty or missing file leaves every
+  agent on its own choices.
+- **Scope.** Only model and model-related options may be set: ACP config option categories
+  `model`, `model_config` and `thought_level`, of type `select` (string values). Permission modes
+  are not part of this feature; they keep the separate `mode` surface of a spawn and the
+  service's existing full-access checks. A `mode` here is refused, so a model default cannot
+  smuggle a permission change.
+- **Precedence.** An explicit choice (a client's `_meta["gorynych/configOptions"]` on
+  `session/new`, or a spawn's `config_options`) beats the service's per-agent default for the
+  same option; the per-agent default beats the harness's own choice. A client that changes an
+  option after `session/new` (`session/set_config_option`, including Zed's stock
+  `default_config_options`) wins as any later explicit change does.
+- **New sessions only.** The choices are applied when the session is created, for GUI-created
+  drafts and MCP children alike. `session/load` and `session/resume` never change a native model,
+  effort or other choice; a resumed session keeps what it had.
+- **Order and confirmation.** The model option goes first, then the others in the order given.
+  After each set the service reads the complete `configOptions` the agent returns, so a dependent
+  option is checked against the choices the new model actually offers. Every value must be
+  advertised by the agent, and the agent must confirm the requested value; there is no silent
+  fallback. If any step fails, a session created by `session/new` or a spawn is closed and
+  deleted when the agent can (otherwise hidden), and no first prompt runs.
+- **Claude's asynchronous catalog.** The service names the IDs it will set in
+  `gorynych/requiredConfigOptions` on `session/new`. The Claude headless adapter, if its model
+  catalog is still being fetched in the background, waits for that fetch before answering; it
+  never starts a prompt or another paid task for a default. If the catalog brings nothing, the
+  answer has no such option and the service refuses the configured default loudly.
+- **Spawn result.** `spawn_session` (and `_gorynych/spawn`) returns the confirmed current values
+  of the child's model and model-related options in `config_options` (`config` in the service's
+  own method result), so the parent can see what actually runs. The spawn's approval card shows
+  the requested values, and the existing `mode` argument keeps its own native permission checks.
+- **No TUI support.** Claude's TUI transport advertises no model or effort options and is not
+  changed by this feature. With no relevant defaults or explicit choices it runs as before;
+  configured or explicit model-related options fail clearly before the first prompt.
+
 ## Opinions between agents
 
 Every session gets, in `mcpServers` (the ACP way to give an agent tools), a stdio MCP server
@@ -307,8 +370,9 @@ random per session and tells the service who is calling. Its tools:
   leaves out, and a last line says how many archived sessions it left out;
 - `ask_agent {session_id, question}` — starts a new question to one, by its exact
   `session_id`, and waits for the answer (`_gorynych/opinion`); archived sessions too;
-- `spawn_session {agent, prompt, cwd?, title?, mode?, report?, initiation?}` — starts a child session
-  (`_gorynych/spawn`, see [Child sessions](#child-sessions)) and returns `{"session_id": …}`;
+- `spawn_session {agent, prompt, cwd?, title?, mode?, config_options?, report?, initiation?}` —
+  starts a child session (`_gorynych/spawn`, see [Child sessions](#child-sessions)) and returns
+  `{"session_id": …, "config_options": {…}}`, the confirmed model-related values;
 - `archive_session {session_id}` and `restore_session {session_id}` — set or clear a
   session's archive flag (`_gorynych/archive`, see [Archive](#archive)), any session's, the
   caller's own included;
@@ -441,6 +505,7 @@ Errors from the peer tools say how to recover. The peers server returns them to 
 | `reply` with a `message_id` nothing waits for (the tool's own error) | `No open request with message_id "<x>" for this session; it may have been answered already or withdrawn. reply only answers a request you received, by the message_id in its header. To ask a session something, use ask_agent with its session_id.` |
 | `spawn_session` with an unknown agent (`-32602`) | `No agent "<x>". Pass one of: claude, kimi.` |
 | `spawn_session` with a folder that does not exist (`-32602`) | `No such folder: <path>. Pass an existing folder, or leave cwd out to work in this session's folder, <folder>.` |
+| `spawn_session` with an unavailable or malformed `config_options` (`-32602`) | `No native config option "<id>" is advertised for <agent>. Available model-related options: …`, `Native config option "<id>" has no value "<v>" … Available values: …`, `Permission modes use the mode parameter, never config_options.`, or `spawn_session config_options must be a JSON object …`; the prepared child is closed and never prompted |
 | `archive_session` with an unknown or deleted `session_id` (`-32002`) | `No session "<x>". Pass an exact session_id from list_agents.` and the first five sessions it can archive, the caller's own first and marked `(this session)`, under `Sessions you can archive:`, or `There is no session to archive now.` |
 | `restore_session` with an unknown or deleted `session_id` (`-32002`) | `No session "<x>". Pass an exact session_id from list_agents with include_archived: true.` and the first five archived sessions under `Archived sessions:`, or `No session is archived now.` |
 
@@ -470,7 +535,11 @@ Approvals are the same for every agent. No gorynych tool asks the person: `list_
 only), `reply` (an answer the user's own agent was asked for), `ask_agent` (the asked agent
 only gives an opinion), and `archive_session` and `restore_session` (both can be undone).
 `spawn_session` does not ask either: the service itself asks the person before a spawn the user
-did not ask for in their own turn ([Child sessions](#child-sessions)), so it is asked at most once. How each agent runs them unasked:
+did not ask for in their own turn ([Child sessions](#child-sessions)), so it is asked at most
+once. Neither a spawn's `config_options` nor Gorynych's per-agent defaults can choose a
+permission mode: they refuse category `mode`, and the existing `mode` argument and full-access
+confirmation keep their behaviour ([Default session configuration](#default-session-configuration)).
+How each agent runs them unasked:
 
 - Claude: every launch allows them with a permission rule in its `--settings`
   (`spawn_session` aside), which Claude applies before auto mode's classifier, and the adapter
@@ -531,16 +600,29 @@ open and prompt any of them directly. ACP's subagents RFD hides a subagent from
 session that names its parent in `_meta["gorynych/parentSessionId"]`; a stock client shows
 it as one more session, a Gorynych GUI can draw the tree.
 
-The agent calls the peers server's `spawn_session {agent, prompt, cwd?, title?, mode?, report?,
-initiation?}`, which sends `_gorynych/spawn` with its peer token. `initiation` says who wants
-the session: `user_asked` only when the user, in this turn, explicitly asked the agent to start
-it; otherwise `proposal`, the default.
+The agent calls the peers server's `spawn_session {agent, prompt, cwd?, title?, mode?,
+config_options?, report?, initiation?}`, which sends `_gorynych/spawn` with its peer token.
+`initiation` says who wants the session: `user_asked` only when the user, in this turn,
+explicitly asked the agent to start it; otherwise `proposal`, the default.
 
 `mode` is an optional, non-empty native permission mode ID of the target adapter. It is never
 inherited or translated from the caller. For example, a DSH coder can request `full-access`;
 its default `read-only` permits approved file edits but no builds or tests. The tool schema
 describes the built-in adapters' modes; an unsupported value fails with the available IDs.
 Omitting `mode` keeps the agent's own defaults and the creation flow below.
+
+`config_options` is an optional object of native config option IDs to string values, applied to
+the new child before its first prompt. It is the spawn's explicit choice, so it beats Gorynych's
+per-agent defaults for the same option; options it leaves out take those defaults, then the
+target harness's own. Only model and model-related options (ACP categories `model`,
+`model_config` and `thought_level`) are allowed; a permission mode fails and uses `mode`. The
+model goes first, dependent effort/thinking choices are re-read against it, and every value must
+be advertised and confirmed by the agent. No fallback: an unsupported, unavailable or
+unconfirmed value fails the spawn before the first prompt and cleans the prepared child up. DSH's
+model is one JSON-encoded string, for example
+`{"model": "[\"deepseek-official\",\"deepseek-flash\"]", "reasoning_effort": "high"}`. The
+confirmed effective values are returned as `config_options` in the MCP result (`config` in
+`_gorynych/spawn`), alongside `session_id` and an optional `note`.
 
 With an explicit `mode`, the service first prepares an unpublished draft with `session/new`,
 reads its native choices (a select config option of category `mode`, including grouped values,
@@ -585,10 +667,13 @@ Without an explicit mode, the service
    folder is the caller's unless `cwd` names another; a relative path is taken from the
    caller's), with the peers server like any session and no mode: the child starts in its
    agent's default mode (Claude's `--permission-mode` default, DSH's `read-only`, the user's own
-   Codex defaults), without inheriting the caller's full access;
+   Codex defaults), without inheriting the caller's full access; it then applies `config_options`
+   and, when given, the explicit native `mode`, model first, and confirms each value before the
+   child is published or prompted ([Default session configuration](#default-session-configuration));
 4. takes the session's turn, records the caller as its parent, journals a
    `session_info_update` with the parent in `_meta` (and the title, if given), and only then
-   lists the session (`added`, with its parent) and returns `{sessionId}`, with `note` when a
+   lists the session (`added`, with its parent) and returns `{sessionId, config?, note?}` (`config`
+   holds the confirmed model-related values, when the agent advertises any), with `note` when a
    `user_asked` spawn was asked all the same (the peers server passes it on with `session_id`:
    `The user was asked although you passed initiation user_asked, as <why>.`). Until it is listed
    the session is a draft in the overlay: if anything fails before that, or the spawn is
@@ -633,7 +718,9 @@ The spawn fails with
   spawn the same `note` sentence), for a caller deleted meanwhile, and for an unknown peer token;
 - `-32602` for an unknown agent, a folder that does not exist, or an unknown `initiation`
   (`No initiation "<x>". Pass "user_asked" only when the user asked in this turn to start this
-  session; otherwise "proposal".`);
+  session; otherwise "proposal".`), and for `config_options` that is not an object of native
+  option IDs to string values, a permission-mode option, or an option or value the target agent
+  does not advertise (the prepared child is closed and deleted, or hidden, without a prompt);
 - `-32800` when the caller's turn was cancelled: a client that sends `session/cancel` answers
   that session's pending approvals with the `cancelled` outcome, as ACP requires;
 - the agent's own error when it could not create the session.

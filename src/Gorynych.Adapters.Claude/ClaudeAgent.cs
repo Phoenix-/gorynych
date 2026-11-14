@@ -88,6 +88,9 @@ public sealed class ClaudeAdapterOptions
     /// </summary>
     public bool FetchCatalog { get; init; } = true;
 
+    /// <summary>For tests: awaited at the start of the background catalog fetch, before Claude launches.</summary>
+    internal Func<Task>? CatalogFetchStarted { get; init; }
+
     public Action<string>? Log { get; init; }
 }
 
@@ -203,6 +206,9 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 session.McpServers = p.McpServers;
                 session.SystemPrompt = systemPrompt;
                 sessions[id] = session;
+                // The service is about to set config options that need the model catalog. Wait for a
+                // fetch already under way (never launch one for this), so the answer already has them.
+                await AwaitRequiredOptionsAsync(session, p.Meta, ct);
                 return AcpJson.ToNode(new NewSessionResponse { SessionId = id, ConfigOptions = ConfigOptionsOf(session) });
             }
             case AcpMethods.Agent.SessionList:
@@ -500,6 +506,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     {
         try
         {
+            if (options.CatalogFetchStarted is { } started) await started().WaitAsync(ct);
             var exe = options.Executable ?? ExecutableLocator.Find("claude");
             if (exe is null)
             {
@@ -547,6 +554,32 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         catch (Exception e)
         {
             Log($"claude: could not fetch the model catalog: {e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// The service says which config options it is about to set on a new session. If one of them is
+    /// missing only because the model catalog is still being fetched at start, wait for that fetch
+    /// (no prompt and no paid task; it is the same bare <c>initialize</c> fetch) before answering.
+    /// With no fetch under way, or one that brought nothing, the answer is as it is and the service
+    /// refuses the unavailable option loudly instead of falling back.
+    /// </summary>
+    async Task AwaitRequiredOptionsAsync(IClaudeSession session, JsonObject? meta, CancellationToken ct)
+    {
+        if (session is not HeadlessSession) return;
+        var required = (meta?[GorynychProtocol.MetaRequiredConfigOptions] as JsonArray)?
+            .Select(id => (string?)id).OfType<string>().ToArray() ?? [];
+        if (required.Length == 0) return;
+        if (ConfigOptionsOf(session) is not { } options) return;
+        if (required.All(id => options.Any(option => option.Id == id))) return;
+        if (fetching is not { IsCompleted: false } fetch) return;
+        try
+        {
+            await fetch.WaitAsync(ct);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // The fetch ended some other way; its result, or the lack of one, is in Catalog now.
         }
     }
 

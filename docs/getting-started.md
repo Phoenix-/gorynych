@@ -118,7 +118,31 @@ In Zed run `zed: open settings file` from the command palette and add the agents
   ([external-clients.md](external-clients.md#in-a-remote-project)).
 - `auto_import_sessions` exists only in the fork. Stock Zed does not know it and ignores it.
 - `default_config_options` is a stock Zed setting. It sets an agent's selectors for new
-  threads, for example `"default_config_options": { "mode": "auto" }` for Codex.
+  threads, for example `"default_config_options": { "mode": "auto" }` for Codex. Zed applies it
+  after `session/new`, so it also wins over Gorynych's own defaults for the same option.
+- **Gorynych's defaults for new sessions** are per agent and per machine, in
+  `%LOCALAPPDATA%\Gorynych\session-defaults.json` (the service's data folder), never in an
+  agent's own configuration. They apply to new GUI threads, AHP sessions and `spawn_session`
+  children, and never to an existing session when it is loaded or resumed. Example for DeepSeek
+  Harness:
+
+  ```json
+  {
+    "agents": {
+      "dsh": {
+        "configOptions": {
+          "model": "[\"deepseek-official\",\"deepseek-flash\"]",
+          "reasoning_effort": "high"
+        }
+      }
+    }
+  }
+  ```
+
+  Only model and model-related options are allowed, model first; permission modes keep their
+  own selectors and checks. A missing file leaves every agent on its own choices. Restart the
+  service after editing it; a malformed file stops the start with the reason. The full rules are
+  in [service-protocol.md](service-protocol.md#default-session-configuration).
 - Arguments after `--agent` such as `--unload-after <minutes>`, `--claude-transport headless|tui`
   or `--claude-channels ask|accept|decline` configure the service. They apply only when the bridge
   starts it ([external-clients.md](external-clients.md)).
@@ -215,7 +239,9 @@ Every session gets a `gorynych` MCP server with these tools:
   your own message, it starts right away; any other spawn (one the agent proposes, or one in a
   turn that another session's question or report came into) you approve first. The child starts in its agent's default
   mode, never in full access, and by default the child reports each finished turn to its
-  parent.
+  parent. Its optional `config_options` picks model-related native choices for the child
+  before its first prompt, and the result says which were confirmed
+  ([service-protocol.md](service-protocol.md#default-session-configuration)).
 
 A child is an ordinary session you can open and prompt yourself. How it works:
 [design.md](design.md#sessions-that-talk-to-each-other).
@@ -378,6 +404,8 @@ If the session was deleted or archived in Gorynych, adoption does not clear that
 - **Data:** `%LOCALAPPDATA%\Gorynych`. Only you (and SYSTEM) can read it: the service closes it at
   each start, also to the commands Codex's sandbox runs, which can read the rest of your profile.
   - `sessions.json`: the service's list of sessions, with titles, parents and archive flags.
+  - `session-defaults.json`: optional per-agent model-related defaults for new sessions
+    ([above](#set-up-zed)); missing means none.
   - `journal\`: what each session said, as the service relayed it.
   - `claude\`: the Claude adapter's session list (with each session's selector choices),
     `trusted.json` (folders you trusted in Gorynych), `channels.json` (TUI only), and per session
