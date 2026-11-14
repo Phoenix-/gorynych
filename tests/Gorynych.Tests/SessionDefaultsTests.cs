@@ -175,6 +175,32 @@ public sealed class SessionDefaultsTests
     }
 
     [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task ModelCanIntroduceTheRequestedEffortSelector(bool spawn)
+    {
+        var agent = new ConfigAgent { HideEffortForSmallModel = true };
+        var defaults = spawn ? null : DefaultsFor("agent", ("reasoning_effort", "high"), ("model", "large"));
+        await using var conductor = ConductorFor(TestDirs.New(), agent, defaults, peers: spawn);
+        await using var client = await TestClient.ConnectAsync(conductor);
+        JsonNode? created;
+        if (spawn)
+        {
+            var parent = (string)(await NewAsync(client))!["sessionId"]!;
+            created = await SpawnAsync(client, agent, parent, new JsonObject
+            {
+                ["agent"] = "agent", ["prompt"] = "inspect the code",
+                ["config_options"] = new JsonObject { ["reasoning_effort"] = "high", ["model"] = "large" },
+            });
+        }
+        else created = await NewAsync(client);
+        var id = (string)created!["sessionId"]!;
+        CollectionAssert.AreEqual(new[] { "model:large", "reasoning_effort:high" },
+            agent.Sets(id).Select(s => $"{s.Id}:{s.Value}").ToArray());
+        Assert.AreEqual("high", agent.EffortOf(id));
+    }
+
+    [TestMethod]
     public async Task MissingNativeOption_FailsClearly_AndNoDefaultSessionStillWorks()
     {
         var agent = new ConfigAgent { AdvertisesOptions = false };
@@ -489,6 +515,8 @@ public sealed class SessionDefaultsTests
         /// <summary>When false the agent advertises no options, like Claude's TUI transport.</summary>
         public bool AdvertisesOptions { get; set; } = true;
 
+        public bool HideEffortForSmallModel { get; init; }
+
         public string? LastCreated { get; private set; }
 
         public string TokenOf(string session)
@@ -661,7 +689,15 @@ public sealed class SessionDefaultsTests
 
         static string[] Efforts(string model) => model is "large" or OpaqueModel ? ["low", "high"] : ["low", "medium"];
 
-        static JsonArray Options(State state) => new(
+        JsonArray Options(State state)
+        {
+            var options = AllOptions(state);
+            if (HideEffortForSmallModel && state.Model == "small")
+                options.RemoveAt(2);
+            return options;
+        }
+
+        static JsonArray AllOptions(State state) => new(
             Select("model", "Model", "model", state.Model,
                 new JsonObject { ["value"] = "small", ["name"] = "Small" },
                 new JsonObject { ["value"] = "large", ["name"] = "Large" },

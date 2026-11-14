@@ -531,6 +531,21 @@ public sealed class HostUpdateTests
 
     [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task NewSessionKeepsItsDedicatedHostAliveBeforeTheFirstPrompt()
+    {
+        await using var rig = new Rig(perSession: true);
+        await rig.Zed.InitializeAsync().WaitAsync(Wait);
+        var sid = await rig.SessionAsync();
+        var route = rig.Turns.RouteOf(sid);
+        Assert.IsNotNull(route, "the new session remains registered in its host");
+        Assert.IsFalse(route.Stopping, "finishing session/new must not reap its dedicated host");
+        await Prompt(rig, sid, "first");
+        Assert.AreEqual(1, rig.Hosts.Of("turns").Count(h => h.Slot.Contains('.')),
+            "the first prompt uses the host that created the session");
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
     public async Task WithAHostPerSession_EachSessionMovesAlone_AndEachOldHostExitsWithIt()
     {
         await using var rig = new Rig(perSession: true);

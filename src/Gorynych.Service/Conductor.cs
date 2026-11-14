@@ -1351,6 +1351,8 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             response = await rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, request, ct);
+            // Keep a dedicated host occupied before DoneOpening can reap empty hosts.
+            host.MarkLive(response.SessionId, rpc);
         }
         finally
         {
@@ -1358,7 +1360,6 @@ public sealed class Conductor : IAsyncDisposable
         }
         try
         {
-            host.MarkLive(response.SessionId, rpc);
             // Explicit creation choices first, then the service's defaults (already merged), model
             // first; the answer's options are replaced with what the agent confirmed. A client that
             // chooses a value after this answer (Zed's default_config_options) sends
@@ -1447,11 +1448,13 @@ public sealed class Conductor : IAsyncDisposable
         IReadOnlyList<SessionConfigChoice> choices, JsonObject state, CancellationToken ct)
     {
         if (choices.Count == 0) return state;
-        // Validate every choice's shape before anything changes, but not its value yet: a dependent
-        // effort is checked against the model the session will run on, after that model is set.
+        // Validate options already advertised before anything changes, but defer missing dependent
+        // selectors: selecting a model can introduce effort/thinking where none existed before.
+        // Every option is checked again against the resulting state before it is sent.
         SessionConfigChoice? model = null;
         foreach (var choice in choices)
         {
+            if (ConfigOption(state, choice.Id) is null) continue;
             var option = RequireConfigOption(host, state, choice, checkValue: false);
             if ((string?)option["category"] != "model") continue;
             if (model is not null)
