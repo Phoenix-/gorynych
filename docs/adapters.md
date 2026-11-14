@@ -222,7 +222,8 @@ idle. No development channel, consent question or notice is involved.
   instead.
 - `--append-system-prompt` starts with the adapter's authorization for this path: messages
   whose first line starts with `[Opinion request` or `[Report` come from the user's other agents
-  through Gorynych; opinions are answered with `reply` and no other action, reports need none.
+  through Gorynych. Opinions allow read-only investigation and are answered with `reply`;
+  they grant no authority to edit files or change state. Reports need no reply.
 
 #### Mode, model and effort selectors
 

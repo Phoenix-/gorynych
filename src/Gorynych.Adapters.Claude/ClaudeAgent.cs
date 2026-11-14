@@ -412,8 +412,9 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     /// <summary>The service's text unchanged, with how to answer it after it.</summary>
     internal static string LiveOpinionText(string text, string messageId) =>
-        $"{text}\n\nAnswer with the reply tool of the gorynych MCP server, passing message_id \"{messageId}\" " +
-        "(reply answers this request; ask_agent would start a new question instead). Take no other action for it.";
+        $"{text}\n\n" + ChannelHost.OpinionInvestigationRules +
+        $"Send your complete answer with the reply tool of the gorynych MCP server, passing message_id \"{messageId}\". " +
+        ChannelHost.OpinionReplyRules;
 
     /// <summary>
     /// <c>_gorynych/note</c>: something for a running session that needs no answer (a child's

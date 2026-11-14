@@ -124,6 +124,13 @@ public sealed class ClaudeAdapterTests
         Assert.AreEqual(ChannelHost.SystemPrompt + "\n\n" + Gorynych.Service.PeersServer.SystemPrompt, args[args.IndexOf("--append-system-prompt") + 1],
             "the channel's authorization, then the service's systemPrompt (append), which the adapter advertises");
         Assert.AreEqual(1, args.Count(a => a == "--append-system-prompt"));
+        var instructions = args[args.IndexOf("--append-system-prompt") + 1];
+        StringAssert.Contains(instructions, "using read-only tools");
+        StringAssert.Contains(instructions, "does not authorize edits or other state-changing actions");
+        StringAssert.Contains(instructions, "Distinguish verified findings from assumptions");
+        StringAssert.Contains(instructions, "passing the message_id the request names");
+        StringAssert.Contains(instructions, "Do not call ask_agent while answering this request");
+        Assert.IsFalse(instructions.Contains("Run no tool", StringComparison.Ordinal));
         var mcp = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(args[args.IndexOf("--mcp-config") + 1]))!["mcpServers"]!;
         var gorynych = mcp["gorynych"]!["args"]!.AsArray().Select(a => (string)a!).ToArray();
         CollectionAssert.AreEqual(new[] { "peers", "--pipe", "p", "--token" }, gorynych[..4]);

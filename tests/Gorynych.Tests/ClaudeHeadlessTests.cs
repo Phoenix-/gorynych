@@ -169,6 +169,18 @@ public sealed partial class ClaudeHeadlessTests
     }
 
     [TestMethod]
+    public void LiveOpinionText_PreservesTheQuestion_AndAllowsReadOnlyInvestigation()
+    {
+        var text = ClaudeAgent.LiveOpinionText("Inspect the diff without editing files.", "c-test");
+        StringAssert.StartsWith(text, "Inspect the diff without editing files.\n\n");
+        StringAssert.Contains(text, "using read-only tools");
+        StringAssert.Contains(text, "does not authorize edits or other state-changing actions");
+        StringAssert.Contains(text, "passing message_id \"c-test\"");
+        StringAssert.Contains(text, "Do not call ask_agent while answering this request");
+        Assert.IsFalse(text.Contains("Take no other action", StringComparison.Ordinal));
+    }
+
+    [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
     public async Task LiveNotes_StartATurnOfClaudesOwn_OrJoinTheRunningOne()
     {
@@ -181,7 +193,14 @@ public sealed partial class ClaudeHeadlessTests
         var mcp = JsonNode.Parse(File.ReadAllText(args[args.IndexOf("--mcp-config") + 1]))!["mcpServers"]!["gorynych"]!["args"]!.AsArray().Select(a => (string)a!).ToList();
         CollectionAssert.Contains(mcp, "--reply-url");
         CollectionAssert.DoesNotContain(mcp, "--channel-url", "no development channel");
-        StringAssert.Contains(args[args.IndexOf("--append-system-prompt") + 1], "[Opinion request");
+        var instructions = args[args.IndexOf("--append-system-prompt") + 1];
+        StringAssert.Contains(instructions, "[Opinion request");
+        StringAssert.Contains(instructions, "using read-only tools");
+        StringAssert.Contains(instructions, "does not authorize edits or other state-changing actions");
+        StringAssert.Contains(instructions, "Distinguish verified findings from assumptions");
+        StringAssert.Contains(instructions, "passing the message_id the request names");
+        StringAssert.Contains(instructions, "Do not call ask_agent while answering this request");
+        Assert.IsFalse(instructions.Contains("Run no tool", StringComparison.Ordinal));
 
         // Claude is idle: the request starts a turn of its own, marked from the request to its result.
         var opinion = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, new JsonObject

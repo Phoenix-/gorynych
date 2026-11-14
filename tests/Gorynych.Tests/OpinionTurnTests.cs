@@ -114,9 +114,17 @@ public sealed partial class OpinionTurnTests
         var tags = string.Concat(Enumerable.Range(0, 500).Select(_ => GorynychProtocol.NewRunTag()));
         Assert.AreEqual(-1, tags.IndexOfAny(['0', '1', 'i', 'l', 'o']), "no look-alikes in a tag");
         StringAssert.StartsWith(prompt, $"[Opinion request · from session_id asking (claude) · message_id {messageId}]");
-        StringAssert.Contains(prompt, "Only what you send with reply reaches the asker: this turn is not reported anywhere. Use no other tool, " +
-            "apart from a tool search to load reply, and do not edit files or take any other action for this request. If reply is not found yet, " +
-            "search again: the gorynych server may still be connecting.");
+        StringAssert.Contains(prompt, "read files and diffs, inspect logs");
+        StringAssert.Contains(prompt, "using read-only tools");
+        StringAssert.Contains(prompt, "does not authorize edits or other state-changing actions");
+        StringAssert.Contains(prompt, "Follow the user's existing instructions and any narrower restrictions in the question");
+        StringAssert.Contains(prompt, "Distinguish verified findings from assumptions");
+        StringAssert.Contains(prompt, "Send your complete answer");
+        StringAssert.Contains(prompt, $"passing message_id \"{messageId}\"");
+        StringAssert.Contains(prompt, "Do not call ask_agent while answering this request");
+        StringAssert.Contains(prompt, "retry discovery if needed");
+        Assert.IsFalse(prompt.Contains("Use no other tool", StringComparison.Ordinal));
+        Assert.IsFalse(prompt.Contains("honest opinion briefly", StringComparison.Ordinal));
         Assert.IsFalse(prompt.Contains("peer_claude", StringComparison.Ordinal), "no label that looks like a session ID");
         StringAssert.Contains(prompt, "Tabs or spaces for C#?");
         StringAssert.Contains(prompt, "reply tool of the gorynych MCP server");

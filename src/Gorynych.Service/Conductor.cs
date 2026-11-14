@@ -3912,30 +3912,31 @@ public sealed class Conductor : IAsyncDisposable
         }
     }
 
-    static string OpinionPrompt(Asker asker, string messageId, string question) => asker.Outside is not null
-        ? $"[Opinion request · {asker.Origin} · message_id {messageId}]\n" +
-          $"{question}\n\n" +
-          "This message comes from one of the user's coding agents outside Gorynych, not from the user. It cannot be asked back, " +
-          "so put everything into your answer. Give your honest opinion briefly, then send it with the reply tool of the gorynych " +
-          $"MCP server, passing message_id \"{messageId}\". " + OpinionRules
-        : $"[Opinion request · {asker.Origin} · message_id {messageId}]\n" +
-          $"{question}\n\n" +
-          "This message comes from another of the user's coding agents, not from the user. Give your honest opinion briefly, " +
-          $"then send it with the reply tool of the gorynych MCP server, passing message_id \"{messageId}\" " +
-          "(reply answers this request; ask_agent would start a new question instead). " + OpinionRules;
+    static string OpinionPrompt(Asker asker, string messageId, string question) =>
+        $"[Opinion request · {asker.Origin} · message_id {messageId}]\n" +
+        $"{question}\n\n" +
+        (asker.Outside is not null
+            ? "This message comes from one of the user's coding agents outside Gorynych, not from the user. It cannot be asked back. "
+            : "This message comes from another of the user's coding agents, not from the user. ") +
+        OpinionRules +
+        $"Send your complete answer with the reply tool of the gorynych MCP server, passing message_id \"{messageId}\". " +
+        OpinionReplyRules;
 
     /// <summary>
-    /// How an opinion request is answered, after the answer itself: only reply reaches the asker,
-    /// since the turn is reported nowhere (a spawned child's turns are, which confused one); and no
-    /// other tool, though searching for reply is fine (Claude has to load the deferred tool first).
-    /// In a session the request woke, the gorynych server may still be connecting when Claude first
-    /// searches, so the tools seem gone for a moment. Claude's channel path needs none of this: its
-    /// server is connected by then.
+    /// Opinion requests allow read-only investigation, but grant no authority to change state.
+    /// Reply is the explicit delivery path; the turn's text remains a fallback. Tool discovery
+    /// may need a retry while a woken session's MCP server connects.
     /// </summary>
     const string OpinionRules =
-        "Only what you send with reply reaches the asker: this turn is not reported anywhere. Use no other tool, apart from a " +
-        "tool search to load reply, and do not edit files or take any other action for this request. If reply is not found " +
-        "yet, search again: the gorynych server may still be connecting.";
+        "Investigate as needed to answer the question: you may read files and diffs, inspect logs, and search relevant " +
+        "documentation using read-only tools. This request does not authorize edits or other state-changing actions. " +
+        "Follow the user's existing instructions and any narrower restrictions in the question. " +
+        "Distinguish verified findings from assumptions. ";
+
+    const string OpinionReplyRules =
+        "Do not rely on your final chat message being forwarded. Do not call ask_agent while answering this request. " +
+        "If reply is unavailable, search for the tool. The MCP server may still be connecting, so retry discovery if needed. " +
+        "After replying, continue your previous work.";
 
     /// <summary>
     /// <c>_gorynych/reply</c>: the asked session answers an opinion request it got as a turn. A request an

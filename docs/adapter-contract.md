@@ -384,6 +384,10 @@ prompt and a spawned session's first turn are not service turns.
 
 ### 6.3 Answering with reply
 
+- An opinion request permits read-only investigation (files, diffs, logs and documentation),
+  subject to the user's existing instructions and any narrower restrictions in the question.
+  It grants no authority to edit files or change state. These rules apply to every agent and
+  delivery path.
 - An agent answers an opinion request with `reply {message_id, text}`. The peers server tries
   the live-note path first, when it has one, then the service (`_gorynych/reply`), so a
   request asked as a turn is answered even by an agent that has a live-note path.
