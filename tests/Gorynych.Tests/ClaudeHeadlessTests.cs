@@ -368,7 +368,8 @@ public sealed partial class ClaudeHeadlessTests
     {
         var dir = TestDirs.New();
         var token = "token-" + Guid.NewGuid().ToString("N");
-        var (agent, acp, updates) = await DirectTitleAsync(dir);
+        var log = new List<string>();
+        var (agent, acp, updates) = await DirectTitleAsync(dir, log);
         try
         {
             var init = await acp.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
@@ -383,7 +384,9 @@ public sealed partial class ClaudeHeadlessTests
                 ["sessionId"] = id, ["title"] = "Fix the flaky login test", ["input"] = "Fix the flaky login test " + token,
             });
             await Until(() => { lock (updates) return updates.Any(u => (string?)u["title"] == "Fake generated title"); });
-            lock (updates) Assert.IsTrue(updates.Any(u => (string?)u["title"] == "Fake generated title"));
+            string diagnostic;
+            lock (log) diagnostic = string.Join(" | ", log);
+            lock (updates) Assert.IsTrue(updates.Any(u => (string?)u["title"] == "Fake generated title"), diagnostic);
 
             var args = TitleLaunch(token)!;
             Assert.AreEqual("", args[args.IndexOf("--tools") + 1], "no built-in tool is offered");
