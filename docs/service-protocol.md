@@ -376,23 +376,26 @@ never in the text. The journal keeps the text exactly as the agent got it.
   [Opinion request · from session_id <id> (<agent>, "<title>") · message_id mk7q2-3]
   <the question>
 
-  This message comes from another of the user's coding agents, not from the user. Give your
-  honest opinion briefly, then send it with the reply tool of the gorynych MCP server, passing
-  message_id "mk7q2-3" (reply answers this request; ask_agent would start a new question
-  instead). Only what you send with reply reaches the asker: this turn is not reported
-  anywhere. Use no other tool, apart from a tool search to load reply, and do not edit files or
-  take any other action for this request. If reply is not found yet, search again: the
-  gorynych server may still be connecting.
+  This message comes from another of the user's coding agents, not from the user.
+  Investigate as needed to answer the question: you may read files and diffs, inspect logs,
+  and search relevant documentation using read-only tools. This request does not authorize
+  edits or other state-changing actions. Follow the user's existing instructions and any
+  narrower restrictions in the question. Distinguish verified findings from assumptions.
+  Send your complete answer with the reply tool of the gorynych MCP server, passing
+  message_id "mk7q2-3". Do not rely on your final chat message being forwarded. Do not call
+  ask_agent while answering this request. If reply is unavailable, search for the tool. The
+  MCP server may still be connecting, so retry discovery if needed. After replying, continue
+  your previous work.
   ```
 
   The `message_id` is `m`, a random tag of the service's run, `-` and a count:
   `m<tag>-<n>`. The tag is four characters without the look-alikes `0`, `1`, `i`, `l` and `o`
   (Kimi once copied an `l` as a `1`). The count starts again when the service does, and the
   tag keeps a late reply to a request of an earlier run from answering a new one. The
-  sentences after the `reply` instruction came from live tests: Kimi wondered whether its final
-  message went to the asker, as a spawned child's does; Claude has to search for the deferred
-  `reply` tool before it can call it; and in a session the request woke, the gorynych server
-  may still be connecting when Claude first searches, so the tools seem gone for a moment.
+  instructions allow read-only investigation for every agent, without granting authority to
+  edit files or change state. The user can impose narrower restrictions. `reply` is the explicit
+  delivery path; the turn's text remains a fallback. Tool discovery may need a retry while
+  a woken session's MCP server connects.
 
   Through Claude's channel the content is the first line without the `message_id` (the
   channel message carries it in `meta`) and the question; Claude's appended system prompt
@@ -937,12 +940,15 @@ An opinion request from outside, delivered as a turn:
 <the question>
 
 This message comes from one of the user's coding agents outside Gorynych, not from the user.
-It cannot be asked back, so put everything into your answer. Give your honest opinion
-briefly, then send it with the reply tool of the gorynych MCP server, passing message_id
-"mk7q2-3". Only what you send with reply reaches the asker: this turn is not reported anywhere.
-Use no other tool, apart from a tool search to load reply, and do not edit files or take any
-other action for this request. If reply is not found yet, search again: the gorynych server
-may still be connecting.
+It cannot be asked back. Investigate as needed to answer the question: you may read files and
+diffs, inspect logs, and search relevant documentation using read-only tools. This request
+does not authorize edits or other state-changing actions. Follow the user's existing
+instructions and any narrower restrictions in the question. Distinguish verified findings
+from assumptions. Send your complete answer with the reply tool of the gorynych MCP server,
+passing message_id "mk7q2-3". Do not rely on your final chat message being forwarded. Do not
+call ask_agent while answering this request. If reply is unavailable, search for the tool.
+The MCP server may still be connecting, so retry discovery if needed. After replying,
+continue your previous work.
 ```
 
 - The parenthesis is the host's `client.title` (else `client.name`) and its `folder`. A host

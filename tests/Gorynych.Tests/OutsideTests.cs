@@ -477,14 +477,15 @@ public sealed class OutsideTests
         var (answer, isError) = ToolText(await McpAsync(zed, "tools/call", Call("ask_agent", new JsonObject { ["session_id"] = target, ["question"] = "Tabs or spaces?" })));
         Assert.AreEqual(("ok", false), (answer, isError));
         var id = System.Text.RegularExpressions.Regex.Match(kimi.Prompts.Last().Text, "message_id (m[a-z0-9]{4}-1)]").Groups[1].Value;
-        Assert.AreEqual(
-            $"[Opinion request · from an agent outside Gorynych (Probe Host, {Folder}) · message_id {id}]\nTabs or spaces?\n\n" +
-            "This message comes from one of the user's coding agents outside Gorynych, not from the user. It cannot be asked back, " +
-            "so put everything into your answer. Give your honest opinion briefly, then send it with the reply tool of the gorynych MCP " +
-            $"server, passing message_id \"{id}\". Only what you send with reply reaches the asker: this turn is not reported anywhere. " +
-            "Use no other tool, apart from a tool search to load reply, and do not edit files or take any other action for this request. " +
-            "If reply is not found yet, search again: the gorynych server may still be connecting.",
-            kimi.Prompts.Last().Text);
+        var prompt = kimi.Prompts.Last().Text;
+        StringAssert.StartsWith(prompt, $"[Opinion request · from an agent outside Gorynych (Probe Host, {Folder}) · message_id {id}]\nTabs or spaces?\n\n");
+        StringAssert.Contains(prompt, "It cannot be asked back.");
+        StringAssert.Contains(prompt, "using read-only tools");
+        StringAssert.Contains(prompt, "does not authorize edits or other state-changing actions");
+        StringAssert.Contains(prompt, $"passing message_id \"{id}\"");
+        StringAssert.Contains(prompt, "Do not call ask_agent while answering this request");
+        StringAssert.Contains(prompt, "retry discovery if needed");
+        Assert.IsFalse(prompt.Contains("Use no other tool", StringComparison.Ordinal));
 
         await using var other = await TestClient.ConnectAsync(conductor, "other");
         await other.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject { ["sessionId"] = target, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
