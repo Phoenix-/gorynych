@@ -517,6 +517,12 @@ DSH process per mode.
 
 **D9. Titles stay the service's provisional ones.**
 
+> Updated for the generated-title work: this decision was reversed. Gorynych's per-launch patch
+> sets `session-title-llm` to `disabled: false`, so DSH runs its own bounded title provider and
+> writes `session/title` natively. The adapter reads the `title` projection from the cache (format
+> 7, read only), lists it and sends `session_info_update`; it never writes DSH's files and does not
+> advertise `_gorynych/set_title`. See [adapters.md](../docs/adapters.md#titles-2).
+
 - DSH's acp app switches its model titles off; DSH then keeps a deterministic title, the first
   words of the first prompt (finding 13), and `dsh web` shows it.
 - Neither title reaches ACP. The service's provisional title is the same text, so nothing is lost.

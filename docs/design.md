@@ -267,14 +267,17 @@ Titles and archive live in the harness when it has them; otherwise in the servic
 
 | Harness | List | Title | Archive |
 | --- | --- | --- | --- |
-| Claude Code | the adapter's own list; external sessions can be registered manually with `gorynych-adopt-claude` (below); automatic discovery is left out | Claude writes `ai-title` itself; `/rename` writes `custom-title`. A name given at spawn stays in the overlay | none in Claude Code: overlay |
+| Claude Code | the adapter's own list; external sessions can be registered manually with `gorynych-adopt-claude` (below); automatic discovery is left out | TUI: Claude writes `ai-title` itself; `/rename` writes `custom-title`. Headless writes no `ai-title`, so the adapter generates one in an isolated no-tool `claude -p` request and writes it as `custom-title`. A name given at spawn stays in the overlay | none in Claude Code: overlay |
 | Kimi Code | ACP `session/list` | first prompt; a name given at spawn stays in the overlay | Kimi has one, but `kimi acp` cannot reach it: overlay |
-| Codex | `thread/list` | `thread/name/set` for a name given at spawn; a thread without a name shows the service's provisional title | Codex will not resume an archived thread, so the archive stays in the overlay |
+| Codex | `thread/list` | `thread/name/set` for a name given at spawn; a thread without a name is titled by the adapter's isolated ephemeral thread, then `thread/name/set` | Codex will not resume an archived thread, so the archive stays in the overlay |
+| DeepSeek Harness | ACP `session/list` | DSH's own title service (enabled per launch) writes a native title; the adapter reads it from DSH's projection cache, never writes it, and sends it as `session_info_update`. A name given at spawn stays in the overlay | none in DSH: overlay |
 
 - **Sessions start from the first prompt.** Creating a session is the composer: pick the agent
   and the folder, write the first prompt. The service runs `session/new` and `session/prompt`;
-  for Claude the prompt is the launch argument. The title arrives by itself as a
-  `session_info_update` (Claude's `ai-title` a few seconds after the first answer).
+  for Claude the prompt is the launch argument. The service shows the first prompt as a provisional
+  title, then a real name arrives as a `session_info_update`: Claude's `ai-title` a few seconds
+  after the first answer (TUI), a generated `custom-title` (headless Claude, Codex), or DSH's own
+  native title (read from its projection cache). A name set at spawn wins over all of them.
 - **Drafts disappear.** A session created but never prompted (Zed creates one whenever a thread
   view opens) is deleted when its client lets go of it, and never listed.
 - **Deleting** is native where the agent can (Kimi); a Claude session is only hidden, its

@@ -509,6 +509,26 @@ in the middle of one.
   harness shows a nameless session by its first message anyway. Codex has `thread/name/set`;
   headless Claude has the `rename_session` control request; the TUI's `/rename` would need the
   terminal. (Codex, Claude headless)
+- An adapter whose harness can generate a title of its own for a session that still has only the
+  provisional first-prompt title SHOULD advertise `agentCapabilities._meta["gorynych/autoTitle"]:
+  true` and take `_gorynych/generate_title {sessionId, title, input, cwd}` → `{}`. The service asks
+  at most once per session, only when that session's title source is `prompt`; a `spawn` name never
+  qualifies. The adapter's answer means "accepted": generation runs off the main prompt, is bounded
+  in input, output, time and concurrency, and writes the native name, which comes back as the usual
+  `session_info_update`. A person's rename (`_gorynych/set_title` or the harness's own) cancels an
+  in-flight generation, and a stale completion MUST NOT overwrite it. A failed, timed-out or
+  cancelled generation leaves the provisional title; the service does not retry it on later turns or
+  after a restart. (Codex, Claude headless)
+- The generation request MUST NOT run the person's work: no tool or MCP server may be reachable, the
+  helper must not appear in the session list, journal, activity or approvals, and it must be cleaned
+  up on success, failure, cancellation and shutdown. Its input is the first user task only, bounded,
+  never the system prompt, AGENTS.md or peer scaffolding. (Codex, Claude headless)
+- An adapter whose harness generates and persists titles natively (DSH's session-title service)
+  does not advertise `gorynych/autoTitle`: it enables that generator per launch, reads the native
+  title without writing it, and sends the change as `session_info_update`; its `session/list`
+  carries the native title too, so a restart and an unloaded session show it. A native fallback
+  title is not treated as a person's or a provider's final name. (DSH)
+
 
 ## 10. Delete
 
@@ -562,7 +582,7 @@ DSH speaks ACP, and its adapter is a thin proxy.
 
 | Feature | Claude Code, headless (default: in-process adapter over `claude -p` with stream-json) | Claude Code, TUI (fallback, `--claude-transport tui`: the TUI in a pseudo console) | Kimi Code 2.5.2 (`kimi acp`, native ACP) | Codex 0.167 (in-process adapter over `codex app-server`) | DeepSeek Harness 0.2.2-rc.1 (`dsh --profile acp`, native ACP, in-process proxy; one process per permission mode) |
 | --- | --- | --- | --- | --- | --- |
-| Capabilities | list, resume, close, systemPrompt; `gorynych/setTitle`; image prompts | list, resume, close, systemPrompt | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable`, `gorynych/openElsewhere`, `gorynych/sessionsChanged` | list, resume, close; `gorynych/unloadAfter` 120 |
+| Capabilities | list, resume, close, systemPrompt; `gorynych/setTitle`, `gorynych/autoTitle`; image prompts | list, resume, close, systemPrompt | load, list, resume, close, delete (and fork) | load, list, resume, close, delete, systemPrompt; `gorynych/setTitle`, `gorynych/autoTitle`, `gorynych/unloadAfter` 120, `gorynych/draftsNotDurable`, `gorynych/openElsewhere`, `gorynych/sessionsChanged` | list, resume, close; `gorynych/unloadAfter` 120 |
 | New ([§3](#3-new-sessions-the-list-and-discovery)) | UUID from the adapter; recorded at the first prompt | UUID from the adapter; recorded at the first prompt | `session_…`; a real session at once, listed untitled | `thread/start`; nothing on disk before the first turn | UUID from DSH; durable at once, never titled, so an unused draft gets a tombstone |
 | List | the adapter's own list of the sessions it started | the adapter's own list of the sessions it started | Kimi's list; leaves natively archived sessions out; ignores `cursor` | `thread/list` (`cursor`, `limit`, exact `cwd`); archived left out; title = the thread's `name` | the read-only process's `{sessionId, cwd}` with cursor and `cwd`; the sessions open in either process added back by the proxy and the router; no title or `updatedAt` |
 | Open not loaded ([§4](#4-opening-a-session-that-is-not-loaded)) | `session/resume` only registers; the process starts with the next prompt | `session/resume` only registers; the process starts with the next prompt | `session/load`, its replay aligned with the journal | `thread/resume`, `excludeTurns`, then the turns after the mark; refused at once, naming the holder, while another Codex app has the thread (one writer; Windows), else by app-server; fails when it is archived in Codex | `session/resume` in the process of the session's mode, about 0.2 s; fails while `dsh web` or another DSH process has the session (one writer); no `session/load` |
@@ -579,7 +599,7 @@ DSH speaks ACP, and its adapter is a thin proxy.
 | Turns of its own marked ([§7](#7-closing-and-unloading)) | yes: from the first update of a turn the client did not start (a live note's, or one Claude began itself) to its `result` or the exit | yes: channel and terminal turns, from `UserPromptSubmit` to `Stop` or exit | none to mark: Kimi runs no turn of its own | none: one writer, so the adapter's process drives every turn | none marked: autonomous work after a cancel falls back to idle since the last update |
 | Approvals ([§8](#8-approvals-and-forms)) | `can_use_tool` control requests; Allow / Deny only; the gorynych tools allowed by a per-launch rule and pre-allowed; in Full access nothing asks; `bypassPermissions` marked `gorynych/fullAccess` | the PermissionRequest hook; Allow / Deny only; the gorynych tools allowed by a per-launch rule and pre-allowed | Kimi's own `session/request_permission`; the service pre-allows the gorynych tools | command, file change, permissions and MCP tool approvals; no option that writes `~/.codex`; the gorynych tools run unasked (`default_tools_approval_mode: "approve"`); `full-access` marked | sandbox escalations only: a shell escalation refused by the proxy, a file write asks the person; in full access nothing asks; MCP tools unasked; `full-access` marked |
 | Forms | `AskUserQuestion` as `elicitation/create`, through `can_use_tool`; MCP elicitations declined | `AskUserQuestion` as `elicitation/create`; MCP elicitations shown only in the terminal | none seen | `item/tool/requestUserInput` and MCP form elicitations as `elicitation/create`; URL elicitations declined | none (no ask tool, no elicitation in the acp profile) |
-| Titles ([§9](#9-titles)) | `custom-title` from the transcript; `_gorynych/set_title` → `rename_session`, which writes `custom-title` | `ai-title` / `custom-title` from the transcript; no way to set one | the first prompt, cut at 200 characters; no way to set one | `thread/name/updated`; `_gorynych/set_title` → `thread/name/set` for spawn names | none over ACP: the provisional title |
+| Titles ([§9](#9-titles)) | `custom-title` from the transcript; `_gorynych/set_title` → `rename_session`; `gorynych/autoTitle`: one isolated no-tool `claude -p` request, written as `custom-title` | `ai-title` / `custom-title` from the transcript; no way to set one, no generated helper | the first prompt, cut at 200 characters; no way to set one | `thread/name/updated`; `_gorynych/set_title` → `thread/name/set`; `gorynych/autoTitle`: one ephemeral `thread/start` with tools and MCP servers off and `outputSchema` | native title enabled in the acp profile; read from the projection cache (format 7, never written) and sent as `session_info_update`; listed with the session |
 | Close ([§7](#7-closing-and-unloading)) | ends the process | ends the process | `session/close`, still listed | `turn/interrupt`, up to 5 s for the turn to end, then `thread/unsubscribe`; app-server, started with `thread_unload_delay_secs=0`, unloads it at once and the close waits for `thread/closed` (at most 10 s, else it fails), so the thread is free for another Codex app | `session/close`: cancels a running prompt, drains DSH's subagents |
 | Delete ([§10](#10-delete)) | none: a tombstone | none: a tombstone | `session/delete` (`-32602` for an unknown one) | `thread/delete` (also deletes Codex's own sub-agent threads); a thread Codex lacks: `-32002` | none: a tombstone (`dsh web` can delete) |
 | Archive ([§11](#11-archive)) | none: the overlay | none: the overlay | native in Kimi's UI, not in `kimi acp`: the overlay | native, but an archived thread cannot be resumed: the overlay; Codex-archived threads left out | none: the overlay |
@@ -589,7 +609,7 @@ DSH speaks ACP, and its adapter is a thin proxy.
 1. Go through §1–§12 and fill in a column of the table above, marking every MUST it cannot meet.
 2. The service side of each feature is covered by contract tests against scripted agents
    (`tests/Gorynych.Tests`: `SessionLifecycleTests`, `OpinionTurnTests`, `SessionTreeTests`,
-   `ArchiveTests`, `WakeTests`, `StableAcpTests`). A new adapter needs tests of its own translation, as
+   `ArchiveTests`, `WakeTests`, `StableAcpTests`, `AutoTitleTests`). A new adapter needs tests of its own translation, as
    `ClaudeAdapterTests` and `ClaudeHooksTests` do for Claude.
 3. Add a live smoke test under `GORYNYCH_LIVE=1` (`LiveSmokeTests`): a first prompt, an
    approval, a title, a reload, an `ask_agent` both ways, and a service turn that wakes a

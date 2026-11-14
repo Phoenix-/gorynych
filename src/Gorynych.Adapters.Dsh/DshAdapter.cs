@@ -44,6 +44,9 @@ public sealed class DshAdapterOptions
     /// <summary>How long the full-access process may take to answer <c>initialize</c> before it is stopped (it takes about 4 s).</summary>
     public TimeSpan StartTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>How often the read-only projection cache is scanned for native DSH titles; for tests, short.</summary>
+    public TimeSpan TitlePollInterval { get; init; } = TimeSpan.FromSeconds(2);
+
     public Action<string>? Log { get; init; }
 }
 
@@ -73,13 +76,18 @@ public sealed class DshAdapter(DshAdapterOptions options) : IAgentAdapter
         var main = await StartLaneAsync(DshModes.ReadOnly, ct);
         var link = new DuplexLink();
         var modes = new DshModeStore(Path.Combine(options.DataDirectory, ModesFile), options.Log);
-        var router = new DshRouter(options, link.AgentEnd, main, mode => StartLaneAsync(mode, CancellationToken.None), modes,
-            new DshPins(options.DshHome ?? DshPins.DefaultHome()));
+        var pins = new DshPins(options.DshHome ?? DshPins.DefaultHome());
+        var router = new DshRouter(options, link.AgentEnd, main, mode => StartLaneAsync(mode, CancellationToken.None), modes, pins);
         router.Start();
+        // DSH titles itself natively; ACP carries no titles, so the cache is followed read only.
+        var titles = new DshTitleWatcher(pins, router.PublishTitleAsync, options.TitlePollInterval, options.Log);
+        titles.Start();
+        _ = router.Completion.ContinueWith(_ => titles.StopAsync(), TaskScheduler.Default);
         var (input, output) = link.ClientEnd;
         return new AgentInstance(input, output, router.Completion, async () =>
         {
             // Each DSH's stdin ends, DSH drains and exits, and the read-only one's output ending completes the router.
+            await titles.StopAsync();
             await router.StopAsync();
             try { await output.DisposeAsync(); } catch (Exception e) when (e is IOException or ObjectDisposedException) { }
         });

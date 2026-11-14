@@ -53,6 +53,10 @@ internal static class DshPatch
             text.Append(line.Length == 0 ? "" : "      " + line).Append('\n');
         text.Append("- id: sandbox-policy\n  config:\n    mode: ").Append(mode.Sandbox).Append("\n    workspaceRoot: !!js process.cwd()\n");
         text.Append("- id: approval\n  config:\n    policy: ask\n");
+        // The acp app disables DSH's native model-generated titles (ACP has no title surface);
+        // Gorynych turns the existing provider back on, so DSH titles its own sessions with its
+        // bounded auxiliary request and keeps the title in its log (docs/adapters.md, "Titles").
+        text.Append("- id: session-title-llm\n  disabled: false\n");
         // DSH's permission presets pin a sandbox into each new session, and a pinned session keeps it
         // in any process. Without them, a session runs in the sandbox of the process that has it open.
         text.Append("- id: permission\n  disabled: true\n");

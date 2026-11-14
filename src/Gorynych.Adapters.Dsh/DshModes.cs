@@ -171,6 +171,36 @@ internal sealed class DshPins(string? home)
         }
     }
 
+    /// <summary>DSH's home, or null when it has none; read only, never written.</summary>
+    public string? Home => home;
+
+    /// <summary>
+    /// The session's native title from DSH's projection cache (its <c>title</c> projection), or null
+    /// when the cache is absent, of another version or has no title yet. Read only, best effort.
+    /// </summary>
+    public string? ReadTitle(string sessionId)
+    {
+        if (home is null || !IsId(sessionId)) return null;
+        var file = Path.Combine(home, "storages", "session_projcache", "sessions", sessionId + ".json");
+        try
+        {
+            return File.Exists(file) ? TitleOf(JsonNode.Parse(File.ReadAllText(file))) : null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>The title projection's value from a parsed projection-cache record; only format 7 is read.</summary>
+    internal static string? TitleOf(JsonNode? cache)
+    {
+        if (cache?["version"] is not JsonValue version || !version.TryGetValue<int>(out var v) || v != CacheVersion) return null;
+        return Str(cache["record"]?["rows"]?["title"]?["val"]) is { Length: > 0 } title ? title : null;
+    }
+
+    /// <summary>The folder DSH keeps its projection-cache session records in, whether it exists or not.</summary>
+    public string? CacheDirectory => home is null ? null : Path.Combine(home, "storages", "session_projcache", "sessions");
 }
 
 /// <summary>

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Text;
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
@@ -29,20 +30,69 @@ sealed class CodexThread
     bool stopAsked;
     long cancelledAt;
 
+    readonly SemaphoreSlim titleGate = new(1, 1);
+    CancellationTokenSource? titleJob;
+    bool manualTitle;
+
     readonly HashSet<string> streamed = [];
     readonly Dictionary<string, ThreadItem> tools = [];
     readonly HashSet<string> claimed = [];
     TaskCompletionSource itemStarted = Signal();
 
-    public CodexThread(string id, CodexSettings settings)
+    public CodexThread(string id, string cwd, CodexSettings settings)
     {
         Id = id;
+        Cwd = cwd;
         this.settings = settings;
         Remember(settings.Sandbox);
     }
 
     public string Id { get; }
+    public string Cwd { get; }
     public volatile bool Loaded = true;
+
+    // ---------------------------------------------------------------- generated titles
+
+    /// <summary>The gate a generated title and a manual rename take, so the later one wins.</summary>
+    public SemaphoreSlim TitleGate => titleGate;
+
+    /// <summary>The person named the thread: a generated title must no longer be written.</summary>
+    public bool ManualTitle
+    {
+        get { lock (gate) return manualTitle; }
+    }
+
+    /// <summary>
+    /// Cancels the running title generation and installs <paramref name="next"/> (null to leave none).
+    /// <paramref name="manual"/> when the person is naming the thread now: later completions are stale.
+    /// </summary>
+    public CancellationTokenSource? ReplaceTitleJob(CancellationTokenSource? next, bool manual = false)
+    {
+        CancellationTokenSource? before;
+        lock (gate)
+        {
+            before = titleJob;
+            titleJob = next;
+            if (manual) manualTitle = true;
+        }
+        try { before?.Cancel(); } catch (ObjectDisposedException) { }
+        return before;
+    }
+
+    /// <summary>Whether <paramref name="job"/> is still the session's running generation.</summary>
+    public bool IsTitleJob(CancellationTokenSource job)
+    {
+        lock (gate) return ReferenceEquals(titleJob, job);
+    }
+
+    /// <summary>Forgets <paramref name="job"/> if it is still the running one.</summary>
+    public void EndTitleJob(CancellationTokenSource job)
+    {
+        lock (gate) if (ReferenceEquals(titleJob, job)) titleJob = null;
+    }
+
+    /// <summary>Stops any title generation, for a manual rename, a close, a delete or shutdown.</summary>
+    public void CancelTitleJob(bool manual = false) => ReplaceTitleJob(null, manual);
 
     static TaskCompletionSource Signal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -346,6 +396,73 @@ sealed class CodexAgent : IAsyncDisposable
     /// <summary>Threads being closed, until app-server says it unloaded them (<c>thread/closed</c>).</summary>
     readonly ConcurrentDictionary<string, TaskCompletionSource> unloading = new(StringComparer.Ordinal);
 
+    /// <summary>The ephemeral threads of generated titles, by thread ID: their notifications never reach the service.</summary>
+    readonly ConcurrentDictionary<string, TitleJob> titleHelpers = new(StringComparer.Ordinal);
+
+    /// <summary>Every ephemeral title thread seen, kept so a late notification cannot be mistaken for a session's.</summary>
+    readonly ConcurrentDictionary<string, byte> helperThreadIds = new(StringComparer.Ordinal);
+
+    /// <summary>One generated title at a time: the requests are bounded by their own timeout.</summary>
+    readonly SemaphoreSlim titleGate = new(1, 1);
+
+    /// <summary>A generated title's isolated thread and turn, and what the adapter waits for.</summary>
+    sealed class TitleJob(string sessionId, CodexThread thread, CancellationTokenSource stop)
+    {
+        readonly Lock gate = new();
+        string? text;
+        bool ended;
+        bool turnEnded;
+
+        public string SessionId { get; } = sessionId;
+        public CodexThread Thread { get; } = thread;
+        public CancellationTokenSource Stop { get; } = stop;
+        public string? HelperThreadId { get; set; }
+        public string? TurnId { get; private set; }
+        public TaskCompletionSource<string?> Answer { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool TurnEnded { get { lock (gate) return turnEnded; } }
+
+        public void Started(string turnId)
+        {
+            lock (gate) TurnId = turnId;
+        }
+
+        /// <summary>An agent message of the title turn: the last one is the structured answer.</summary>
+        public bool Text(string value)
+        {
+            lock (gate)
+            {
+                if (ended) return false;
+                if (Encoding.UTF8.GetByteCount(value) > 8 * 1024) return false;
+                text = value;
+                return true;
+            }
+        }
+
+        public void Complete(TurnStatus status)
+        {
+            string? answer;
+            lock (gate)
+            {
+                if (ended) return;
+                ended = true;
+                turnEnded = true;
+                answer = text;
+            }
+            if (status == TurnStatus.Completed) Answer.TrySetResult(answer);
+            else Answer.TrySetException(new InvalidOperationException($"the title turn ended {status}"));
+        }
+
+        public void Fail(Exception error)
+        {
+            lock (gate)
+            {
+                if (ended) return;
+                ended = true;
+            }
+            Answer.TrySetException(error);
+        }
+    }
+
     /// <summary>Turns ended here before Codex said so (a close, delete or unload): their late <c>turn/completed</c> is dropped.</summary>
     readonly ConcurrentDictionary<string, byte> abandoned = new(StringComparer.Ordinal);
     readonly TaskCompletionSource exited = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -472,6 +589,7 @@ sealed class CodexAgent : IAsyncDisposable
                         Meta = new JsonObject
                         {
                             [GorynychProtocol.CapSetTitle] = true,
+                            [GorynychProtocol.CapAutoTitle] = options.AutoTitle,
                             [GorynychProtocol.CapDraftsNotDurable] = true,
                             [GorynychProtocol.CapLocalCommands] = new JsonArray("/usage"),
                             [GorynychProtocol.CapUnloadAfter] = options.UnloadAfter.TotalSeconds,
@@ -544,11 +662,33 @@ sealed class CodexAgent : IAsyncDisposable
             }
             case GorynychProtocol.MethodSetTitle:
             {
+                var id = RequireId(request);
                 var title = (string?)request.Params?["title"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "title is required");
-                await app.SendRequestAsync(CodexMethods.Client.ThreadNameSet, ToNode(new ThreadSetNameParams { ThreadId = RequireId(request), Name = title },
-                    CodexJsonContext.Default.ThreadSetNameParams), ct);
+                if (threads.TryGetValue(id, out var t))
+                {
+                    // The person's name wins, also over a generated title still in flight.
+                    t.CancelTitleJob(manual: true);
+                    await t.TitleGate.WaitAsync(ct);
+                    try
+                    {
+                        t.CancelTitleJob(manual: true);
+                        await app.SendRequestAsync(CodexMethods.Client.ThreadNameSet, ToNode(new ThreadSetNameParams { ThreadId = id, Name = title },
+                            CodexJsonContext.Default.ThreadSetNameParams), ct);
+                    }
+                    finally
+                    {
+                        t.TitleGate.Release();
+                    }
+                }
+                else
+                {
+                    await app.SendRequestAsync(CodexMethods.Client.ThreadNameSet, ToNode(new ThreadSetNameParams { ThreadId = id, Name = title },
+                        CodexJsonContext.Default.ThreadSetNameParams), ct);
+                }
                 return new JsonObject();
             }
+            case GorynychProtocol.MethodGenerateTitle:
+                return StartTitleGeneration(request);
             default:
                 // No live-note path (_gorynych/opinion, _gorynych/note): the service asks in a turn.
                 throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {request.Method}");
@@ -577,7 +717,7 @@ sealed class CodexAgent : IAsyncDisposable
             Config = McpConfig(p.McpServers),
             DeveloperInstructions = Instructions(p.SystemPrompt),
         }, CodexJsonContext.Default.ThreadStartParams), ct), CodexJsonContext.Default.ThreadStartResponse);
-        var t = new CodexThread(started.Thread.Id,
+        var t = new CodexThread(started.Thread.Id, started.Cwd,
             SettingsOf(started.Model, started.ReasoningEffort, started.ApprovalPolicy, started.Sandbox, started.ApprovalsReviewer));
         threads[t.Id] = t;
         Log($"codex: new thread {t.Id} in {started.Cwd}");
@@ -704,7 +844,7 @@ sealed class CodexAgent : IAsyncDisposable
         {
             throw Explain(e, id);
         }
-        var t = new CodexThread(id, SettingsOf(resumed.Model, resumed.ReasoningEffort, resumed.ApprovalPolicy, resumed.Sandbox, resumed.ApprovalsReviewer));
+        var t = new CodexThread(id, resumed.Cwd, SettingsOf(resumed.Model, resumed.ReasoningEffort, resumed.ApprovalPolicy, resumed.Sandbox, resumed.ApprovalsReviewer));
         threads[id] = t;
         return t;
     }
@@ -870,7 +1010,9 @@ sealed class CodexAgent : IAsyncDisposable
     async Task CloseAsync(string id, CancellationToken ct)
     {
         readOnly.TryRemove(id, out _); // open for reading only: nothing of it is loaded here
-        if (!threads.TryGetValue(id, out var t) || !t.Loaded) return;
+        if (!threads.TryGetValue(id, out var t)) return;
+        t.CancelTitleJob();
+        if (!t.Loaded) return;
         await StopTurnAsync(t);
         var closed = unloading.GetOrAdd(id, _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
         var unsubscribed = false;
@@ -899,7 +1041,7 @@ sealed class CodexAgent : IAsyncDisposable
     {
         readOnly.TryRemove(id, out _);
         threads.TryGetValue(id, out var t);
-        if (t is not null) await StopTurnAsync(t);
+        if (t is not null) { t.CancelTitleJob(); await StopTurnAsync(t); }
         try
         {
             await app.SendRequestAsync(CodexMethods.Client.ThreadDelete, ToNode(new ThreadDeleteParams { ThreadId = id },
@@ -1137,7 +1279,244 @@ sealed class CodexAgent : IAsyncDisposable
         return string.Join("\n\n", prompt.Content.OfType<TextContent>().Select(t => t.Text));
     }
 
-    // ---------------------------------------------------------------- app-server's notifications
+    // ---------------------------------------------------------------- generated titles
+
+    /// <summary>
+    /// Accepts a request for a generated title and starts it in the background; the service does
+    /// not wait for it. Anything about the session that is already named (a spawn name, a native
+    /// name, a person's rename) is left alone.
+    /// </summary>
+    JsonNode StartTitleGeneration(JsonRpcRequest request)
+    {
+        var id = RequireId(request);
+        var input = (string?)request.Params?["input"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "input is required");
+        var provisional = (string?)request.Params?["title"];
+        var cwd = (string?)request.Params?["cwd"];
+        if (!threads.TryGetValue(id, out var t) || !t.Loaded)
+            throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"Codex has not loaded session {id}; it cannot be titled.");
+        if (t.ManualTitle) return new JsonObject();
+        var stop = new CancellationTokenSource();
+        var job = new TitleJob(id, t, stop);
+        t.ReplaceTitleJob(stop);
+        _ = Task.Run(() => GenerateTitleAsync(job, input, provisional, cwd is { Length: > 0 } ? cwd : t.Cwd));
+        return new JsonObject();
+    }
+
+    async Task GenerateTitleAsync(TitleJob job, string input, string? provisional, string cwd)
+    {
+        var t = job.Thread;
+        try
+        {
+            await titleGate.WaitAsync(job.Stop.Token);
+            try
+            {
+                if (job.Stop.IsCancellationRequested || t.ManualTitle || !t.IsTitleJob(job.Stop)) return;
+                var mcp = await EffectiveMcpAsync(cwd, job.Stop.Token);
+                if (mcp is null)
+                {
+                    Log($"codex {job.SessionId}: no generated title: the effective MCP servers could not be read, so tools cannot be turned off");
+                    return;
+                }
+                var start = new ThreadStartParams
+                {
+                    Cwd = cwd,
+                    Config = CodexTitleGeneration.Config(mcp),
+                    Model = t.Settings.Model,
+                    ApprovalPolicy = JsonValue.Create("never"),
+                    Sandbox = SandboxMode.ReadOnly,
+                    Ephemeral = true,
+                    ThreadSource = "thread_title",
+                    BaseInstructions = CodexTitleGeneration.Instructions,
+                };
+                ThreadStartResponse started;
+                try
+                {
+                    started = From(await app.SendRequestAsync(CodexMethods.Client.ThreadStart, ToNode(start, CodexJsonContext.Default.ThreadStartParams),
+                        job.Stop.Token), CodexJsonContext.Default.ThreadStartResponse);
+                }
+                catch (Exception e) when (e is not OperationCanceledException)
+                {
+                    Log($"codex {job.SessionId}: no generated title: the isolated thread did not start: {e.Message}");
+                    return;
+                }
+                job.HelperThreadId = started.Thread.Id;
+                helperThreadIds[started.Thread.Id] = 0;
+                titleHelpers[started.Thread.Id] = job;
+                if (job.Stop.IsCancellationRequested) return;
+                var turn = new TurnStartParams
+                {
+                    ThreadId = started.Thread.Id,
+                    Input = [new TextUserInput { Text = CodexTitleGeneration.Prompt(input, options.TitleInputBytes) }],
+                    OutputSchema = CodexTitleGeneration.Schema(options.TitleMaxChars),
+                };
+                TurnStartResponse answer;
+                try
+                {
+                    answer = From(await app.SendRequestAsync(CodexMethods.Client.TurnStart, ToNode(turn, CodexJsonContext.Default.TurnStartParams),
+                        job.Stop.Token), CodexJsonContext.Default.TurnStartResponse);
+                }
+                catch (OperationCanceledException) when (job.Stop.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception e)
+                {
+                    Log($"codex {job.SessionId}: no generated title: the isolated turn did not start: {e.Message}");
+                    return;
+                }
+                job.Started(answer.Turn.Id);
+                string? text;
+                try
+                {
+                    text = await job.Answer.Task.WaitAsync(options.TitleTimeout, job.Stop.Token);
+                }
+                catch (TimeoutException)
+                {
+                    Log($"codex {job.SessionId}: no generated title: the isolated turn timed out");
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception e)
+                {
+                    Log($"codex {job.SessionId}: no generated title: {e.Message}");
+                    return;
+                }
+                if (CodexTitleGeneration.Normalize(text, options.TitleMaxChars) is not { } title)
+                {
+                    Log($"codex {job.SessionId}: no generated title: the isolated turn returned no usable title");
+                    return;
+                }
+                await ApplyGeneratedTitleAsync(job, title, provisional);
+            }
+            finally
+            {
+                titleGate.Release();
+            }
+        }
+        finally
+        {
+            if (job.TurnId is { } turnId && !job.TurnEnded) await InterruptAsync(job.HelperThreadId ?? "", turnId);
+            if (job.HelperThreadId is { } helper)
+            {
+                titleHelpers.TryRemove(helper, out _);
+                await UnsubscribeHelperAsync(helper);
+            }
+            t.EndTitleJob(job.Stop);
+            job.Stop.Dispose();
+        }
+    }
+
+    /// <summary>The config/read for this folder, with every effective MCP server explicitly disabled; null fails closed.</summary>
+    async Task<JsonObject?> EffectiveMcpAsync(string cwd, CancellationToken ct)
+    {
+        try
+        {
+            var response = await app.SendRequestAsync(CodexMethods.Client.ConfigRead, new JsonObject { ["cwd"] = cwd }, ct);
+            if (response?["config"]?["mcp_servers"] is not JsonObject servers) return new JsonObject();
+            var mcp = new JsonObject();
+            foreach (var (name, _) in servers) mcp[name] = new JsonObject { ["enabled"] = false };
+            foreach (var name in userServers) if (!mcp.ContainsKey(name)) mcp[name] = new JsonObject { ["enabled"] = false };
+            return mcp;
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            Log($"codex: the effective MCP servers could not be read: {e.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>Writes a generated title natively unless a person named the thread meanwhile.</summary>
+    async Task ApplyGeneratedTitleAsync(TitleJob job, string title, string? provisional)
+    {
+        try
+        {
+            await job.Thread.TitleGate.WaitAsync(job.Stop.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        try
+        {
+            if (job.Stop.IsCancellationRequested || job.Thread.ManualTitle || !job.Thread.IsTitleJob(job.Stop)) return;
+            await app.SendRequestAsync(CodexMethods.Client.ThreadNameSet,
+                ToNode(new ThreadSetNameParams { ThreadId = job.SessionId, Name = title }, CodexJsonContext.Default.ThreadSetNameParams), job.Stop.Token);
+            Log($"codex {job.SessionId}: generated title \"{title}\"{(provisional is null ? "" : $" (was \"{provisional}\")")}");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception e)
+        {
+            Log($"codex {job.SessionId}: the generated title was not saved: {e.Message}");
+        }
+        finally
+        {
+            job.Thread.TitleGate.Release();
+        }
+    }
+
+    /// <summary>Detaches an ephemeral title thread, best effort and bounded; it was never durable.</summary>
+    async Task UnsubscribeHelperAsync(string threadId)
+    {
+        try
+        {
+            using var limit = new CancellationTokenSource(options.TurnEndWait);
+            await app.SendRequestAsync(CodexMethods.Client.ThreadUnsubscribe, ToNode(new ThreadUnsubscribeParams { ThreadId = threadId },
+                CodexJsonContext.Default.ThreadUnsubscribeParams), limit.Token);
+        }
+        catch (Exception e) when (e is JsonRpcException or IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            Log($"codex: the title thread {threadId} was not detached: {e.Message}");
+        }
+    }
+
+    /// <summary>True for a notification or request of a generated title's ephemeral thread; it is never forwarded.</summary>
+    bool IsTitleHelper(string? threadId) => threadId is not null && helperThreadIds.ContainsKey(threadId);
+
+    /// <summary>A title thread's notifications: only the answer and its turn's end matter.</summary>
+    async Task OnTitleNotificationAsync(string method, JsonNode? p)
+    {
+        var threadId = (string?)p?["threadId"];
+        if (threadId is null || !titleHelpers.TryGetValue(threadId, out var job)) return;
+        try
+        {
+            switch (method)
+            {
+                case CodexMethods.Notification.ItemCompleted:
+                {
+                    var n = From(p, CodexJsonContext.Default.ItemCompletedNotification);
+                    if (n.Item is AgentMessageThreadItem a && a.Text.Length > 0 && !job.Text(a.Text))
+                        job.Fail(new InvalidOperationException("the title answer was too large"));
+                    break;
+                }
+                case CodexMethods.Notification.TurnCompleted:
+                {
+                    var n = From(p, CodexJsonContext.Default.TurnCompletedNotification);
+                    job.Complete(n.Turn.Status);
+                    break;
+                }
+                case CodexMethods.Notification.ThreadClosed:
+                    job.Fail(new IOException("the title thread was unloaded"));
+                    break;
+                case CodexMethods.Notification.ThreadStatusChanged:
+                {
+                    var n = From(p, CodexJsonContext.Default.ThreadStatusChangedNotification);
+                    if (n.Status is NotLoadedThreadStatus) job.Fail(new IOException("the title thread was unloaded"));
+                    break;
+                }
+            }
+        }
+        catch (Exception e) when (e is IOException or InvalidOperationException or System.Text.Json.JsonException)
+        {
+            job.Fail(e);
+        }
+        await Task.CompletedTask;
+    }
+
 
     CodexThread? Thread(string id) => threads.GetValueOrDefault(id);
 
@@ -1190,6 +1569,11 @@ sealed class CodexAgent : IAsyncDisposable
 
     async Task OnServerNotificationCoreAsync(string method, JsonNode? p)
     {
+        if (IsTitleHelper((string?)p?["threadId"]))
+        {
+            await OnTitleNotificationAsync(method, p);
+            return;
+        }
         var ctx = CodexJsonContext.Default;
         switch (method)
         {
@@ -1354,6 +1738,9 @@ sealed class CodexAgent : IAsyncDisposable
 
     async Task<JsonNode?> OnServerRequestAsync(JsonRpcRequest request, CancellationToken ct)
     {
+        // A title thread never asks the person or the service: it has no tools, and anything it
+        // still asks is refused here, off the visible connection.
+        if (IsTitleHelper((string?)request.Params?["threadId"])) return TitleHelperRefusal(request.Method);
         var key = request.Id.ToJsonString();
         using var resolved = CancellationTokenSource.CreateLinkedTokenSource(ct);
         asking[key] = resolved;
@@ -1466,6 +1853,15 @@ sealed class CodexAgent : IAsyncDisposable
     /// <summary>A permissions request's answer that grants nothing.</summary>
     static JsonObject NoPermissions() => new() { ["permissions"] = new JsonObject(), ["scope"] = "turn" };
 
+    /// <summary>What a request from a title thread gets: nothing done, never a question to the person.</summary>
+    static JsonObject TitleHelperRefusal(string method) => method switch
+    {
+        CodexMethods.Server.ItemToolRequestUserInput => new JsonObject { ["answers"] = new JsonObject() },
+        CodexMethods.Server.ItemPermissionsRequestApproval => NoPermissions(),
+        CodexMethods.Server.McpServerElicitationRequest => new JsonObject { ["action"] = "cancel" },
+        _ => new JsonObject { ["decision"] = "cancel" },
+    };
+
     /// <summary>
     /// An MCP elicitation: Codex's approval of an MCP tool call (<c>codex_approval_kind:
     /// mcp_tool_call</c>) becomes an approval, offered once or for the session but never
@@ -1553,6 +1949,8 @@ sealed class CodexAgent : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        foreach (var t in threads.Values) t.CancelTitleJob();
+        foreach (var job in titleHelpers.Values) job.Fail(new IOException("Codex's app-server stopped during title generation."));
         foreach (var t in threads.Values)
             t.Fail(new JsonRpcException(JsonRpcException.InternalError, "Codex's app-server stopped during the turn."));
         foreach (var cts in asking.Values)

@@ -15,6 +15,14 @@ public sealed class SessionRecord
     /// <summary><c>agent</c> when the harness gave the title, <c>prompt</c> when it is the first prompt.</summary>
     public string? TitleSource { get; set; }
 
+    /// <summary>
+    /// The service asked the adapter for a generated title once, for this session's provisional
+    /// first-prompt title. Kept across a restart so a title that never arrives is not asked for
+    /// again on every turn, or after the service comes back.
+    /// </summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool AutoTitleAttempted { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 
@@ -299,6 +307,7 @@ public sealed class SessionStore
     static SessionRecord Clone(SessionRecord r) => new()
     {
         SessionId = r.SessionId, Agent = r.Agent, Cwd = r.Cwd, Title = r.Title, TitleSource = r.TitleSource,
+        AutoTitleAttempted = r.AutoTitleAttempted,
         CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt, Draft = r.Draft, Deleted = r.Deleted,
         ParentSessionId = r.ParentSessionId, ReportToParent = r.ReportToParent, Archived = r.Archived, PeerToken = r.PeerToken,
         HostSeen = r.HostSeen, HostPrompts = r.HostPrompts is null ? null : [.. r.HostPrompts],

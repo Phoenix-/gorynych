@@ -28,6 +28,8 @@ sealed class FakeDsh(FakeDshStore? shared = null)
     readonly FakeDshStore store = shared ?? new FakeDshStore();
     readonly HashSet<string> open = [];
 
+    public FakeDshStore Store => store;
+
     public JsonRpcConnection Rpc { get; private set; } = null!;
     public string? PatchPath { get; private set; }
 
@@ -211,11 +213,18 @@ public sealed partial class DshAdapterTests
         }
     }
 
-    static async Task<(Service Service, FakeDsh Dsh, string Data)> StartAsync(string? instructions = "Peer instructions.")
+    static async Task<(Service Service, FakeDsh Dsh, string Data)> StartAsync(string? instructions = "Peer instructions.",
+        string? dshHome = null, TimeSpan? titlePoll = null)
     {
         var dsh = new FakeDsh();
         var data = TestDirs.New();
-        var adapter = new DshAdapter(new DshAdapterOptions { DataDirectory = data, Instructions = instructions, Launch = dsh.LaunchAsync });
+        var adapter = new DshAdapter(new DshAdapterOptions
+        {
+            DataDirectory = data, Instructions = instructions, Launch = dsh.LaunchAsync,
+            // Never the user's own DSH home: these tests must not read or react to real sessions.
+            DshHome = dshHome ?? Path.Combine(data, "dsh-home"),
+            TitlePollInterval = titlePoll ?? TimeSpan.FromSeconds(2),
+        });
         var instance = await adapter.StartAsync(CancellationToken.None);
         var rpc = new JsonRpcConnection(instance.Input, instance.Output, "service");
         var service = new Service { Instance = instance, Rpc = rpc };
@@ -273,7 +282,7 @@ public sealed partial class DshAdapterTests
     public async Task Initialize_KeepsDshsCapabilities_AndAddsGorynychsFlags()
     {
         var dsh = new FakeDsh();
-        var adapter = new DshAdapter(new DshAdapterOptions { DataDirectory = TestDirs.New(), Launch = dsh.LaunchAsync });
+        var adapter = new DshAdapter(new DshAdapterOptions { DataDirectory = TestDirs.New(), Launch = dsh.LaunchAsync, DshHome = TestDirs.New() });
         await using var instance = await adapter.StartAsync(CancellationToken.None);
         await using var rpc = new JsonRpcConnection(instance.Input, instance.Output, "service");
         rpc.Start();

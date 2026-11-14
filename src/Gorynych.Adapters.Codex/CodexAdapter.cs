@@ -55,6 +55,21 @@ public sealed class CodexAdapterOptions
     /// <summary>How long closing a thread waits for app-server to unload it (<c>thread/closed</c>).</summary>
     internal TimeSpan UnloadWait { get; init; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// Advertises native title generation to the service (<c>gorynych/autoTitle</c>). The service
+    /// turns it on; an adapter constructed by a harness or a test keeps it off.
+    /// </summary>
+    public bool AutoTitle { get; init; }
+
+    /// <summary>How long a generated title's isolated turn may take before it is interrupted and dropped.</summary>
+    public TimeSpan TitleTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>The first-prompt bytes a generated title's request may carry, cut without splitting a character.</summary>
+    public int TitleInputBytes { get; init; } = 960;
+
+    /// <summary>The longest generated title kept, in characters.</summary>
+    public int TitleMaxChars { get; init; } = 60;
+
     public Action<string>? Log { get; init; }
 }
 

@@ -739,6 +739,9 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// <summary>The adapter sets native titles (<c>_gorynych/set_title</c>).</summary>
     public bool CanSetTitle => Flag(GorynychProtocol.CapSetTitle);
 
+    /// <summary>The adapter generates a native title for a session whose title is still provisional (<c>_gorynych/generate_title</c>).</summary>
+    public bool GeneratesTitle => Flag(GorynychProtocol.CapAutoTitle);
+
     /// <summary>The adapter tells when a row of its list changes (<c>_gorynych/sessions_changed</c>).</summary>
     public bool TellsListChanges => Flag(GorynychProtocol.MetaSessionsChanged);
 

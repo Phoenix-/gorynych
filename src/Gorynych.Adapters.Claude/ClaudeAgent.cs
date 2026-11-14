@@ -91,6 +91,21 @@ public sealed class ClaudeAdapterOptions
     /// <summary>For tests: awaited at the start of the background catalog fetch, before Claude launches.</summary>
     internal Func<Task>? CatalogFetchStarted { get; init; }
 
+    /// <summary>
+    /// Advertises native title generation to the service (<c>gorynych/autoTitle</c>) for the headless
+    /// transport. The service turns it on; an adapter constructed by a harness or a test keeps it off.
+    /// </summary>
+    public bool AutoTitle { get; init; }
+
+    /// <summary>How long an isolated title request may take before its process is stopped and the title dropped.</summary>
+    public TimeSpan TitleTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>The first-prompt bytes a title request may carry, cut without splitting a character.</summary>
+    public int TitleInputBytes { get; init; } = 2000;
+
+    /// <summary>The longest generated title kept, in characters.</summary>
+    public int TitleMaxChars { get; init; } = 60;
+
     public Action<string>? Log { get; init; }
 }
 
@@ -191,6 +206,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                             [GorynychProtocol.CapReplayFrom] = true,
                             // Headless sessions write Claude's own title through rename_session.
                             [GorynychProtocol.CapSetTitle] = Headless,
+                            // Headless Claude writes no ai-title, so the service may ask for one.
+                            [GorynychProtocol.CapAutoTitle] = Headless && options.AutoTitle,
                         },
                     },
                     AuthMethods = [],
@@ -275,6 +292,15 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 if (Session(id, null) is not HeadlessSession headless)
                     throw new JsonRpcException(JsonRpcException.MethodNotFound, "Claude's TUI sessions cannot be renamed by Gorynych.");
                 await headless.SetTitleAsync(title, ct);
+                return new JsonObject();
+            }
+            case GorynychProtocol.MethodGenerateTitle:
+            {
+                var id = (string?)request.Params?["sessionId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
+                var input = (string?)request.Params?["input"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "input is required");
+                if (!Headless || Session(id, null) is not HeadlessSession headless)
+                    throw new JsonRpcException(JsonRpcException.MethodNotFound, "Only headless Claude sessions take a generated title.");
+                await headless.GenerateTitleAsync(input, (string?)request.Params?["title"]);
                 return new JsonObject();
             }
             case AcpMethods.Agent.SessionClose:

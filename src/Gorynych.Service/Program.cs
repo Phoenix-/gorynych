@@ -208,10 +208,11 @@ static List<IAgentAdapter> Adapters(CommandLine line, string dataDirectory) =>
         Model = line.Value("--claude-model"),
         ChannelServerCommand = line.Flag("--no-channel") ? null : [Environment.ProcessPath!, "peers"],
         Channels = Channels(line.Value("--claude-channels")),
+        AutoTitle = true,
         Log = ServiceLog.Info,
     }),
     new KimiAdapter(new KimiAdapterOptions { Log = ServiceLog.Info }),
-    new CodexAdapter(new CodexAdapterOptions { Log = ServiceLog.Info, ClientVersion = AgentHost.Version }),
+    new CodexAdapter(new CodexAdapterOptions { Log = ServiceLog.Info, ClientVersion = AgentHost.Version, AutoTitle = true }),
     new DshAdapter(new DshAdapterOptions
     {
         DataDirectory = Path.Combine(dataDirectory, "dsh"),

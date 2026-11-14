@@ -39,6 +39,10 @@ internal sealed class HeadlessSession : IClaudeSession
     bool disposed;
     string? pendingTitle;
 
+    readonly SemaphoreSlim titleGate = new(1, 1);
+    CancellationTokenSource? titleJob;
+    bool manualTitle;
+
     // Under stateGate.
     bool active;            // a turn runs in Claude
     bool activeOwn;         // ... that the client's prompt did not start (a live note's, or Claude's own)
@@ -418,22 +422,122 @@ internal sealed class HeadlessSession : IClaudeSession
     /// <summary>Writes Claude's own title (<c>custom-title</c>) through <c>rename_session</c>; waits for the next launch when Claude is not running.</summary>
     public async Task SetTitleAsync(string title, CancellationToken ct)
     {
-        if (process is { Exited.IsCompleted: false } claude) await RenameAsync(claude, title, ct);
-        else lock (stateGate) pendingTitle = title;
+        // The person's name wins, also over a generated title still in flight.
+        CancellationTokenSource? before;
+        lock (stateGate)
+        {
+            manualTitle = true;
+            before = titleJob;
+            titleJob = null;
+        }
+        try { before?.Cancel(); } catch (ObjectDisposedException) { }
+        await titleGate.WaitAsync(ct);
+        try
+        {
+            await WriteTitleAsync(title, ct);
+        }
+        finally
+        {
+            titleGate.Release();
+        }
     }
 
-    async Task RenameAsync(ClaudeProcess claude, string title, CancellationToken ct)
+    async Task<bool> WriteTitleAsync(string title, CancellationToken ct)
+    {
+        if (process is { Exited.IsCompleted: false } claude) return await RenameAsync(claude, title, ct);
+        lock (stateGate) pendingTitle = title;
+        return true;
+    }
+
+    async Task<bool> RenameAsync(ClaudeProcess claude, string title, CancellationToken ct)
     {
         try
         {
             await claude.ControlAsync(new JsonObject { ["subtype"] = "rename_session", ["title"] = title, ["source"] = "host", ["session_id"] = Id },
                 TimeSpan.FromSeconds(15), ct);
+            return true;
         }
         catch (Exception e) when (e is ClaudeControlException or IOException or TimeoutException)
         {
             agent.Log($"claude {Id}: rename failed: {e.Message}");
             lock (stateGate) pendingTitle ??= title;
+            return false;
         }
+    }
+
+    // ---------------------------------------------------------------- generated title
+
+    /// <summary>
+    /// Starts an isolated no-tool title request for a session that still has only the service's
+    /// first-prompt title. The answer is written as Claude's own <c>custom-title</c>; a person's
+    /// rename meanwhile cancels it, and a request that fails leaves the provisional title.
+    /// </summary>
+    public Task GenerateTitleAsync(string input, string? provisional)
+    {
+        lock (stateGate)
+        {
+            if (manualTitle || disposed) return Task.CompletedTask;
+            var before = titleJob;
+            var job = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            titleJob = job;
+            try { before?.Cancel(); } catch (ObjectDisposedException) { }
+            _ = Task.Run(() => GenerateTitleCoreAsync(job, input, provisional));
+        }
+        return Task.CompletedTask;
+    }
+
+    async Task GenerateTitleCoreAsync(CancellationTokenSource job, string input, string? provisional)
+    {
+        try
+        {
+            await titleGate.WaitAsync(job.Token);
+            try
+            {
+                if (job.IsCancellationRequested || IsNotCurrentTitleJob(job) || ManualTitle) return;
+                // A name Claude or a person already wrote natively wins over a generated one.
+                if (transcript is { Title: { Length: > 0 } }) return;
+                var exe = options.Executable ?? ExecutableLocator.Find("claude");
+                if (exe is null)
+                {
+                    agent.Log($"claude {Id}: no generated title: claude was not found on PATH");
+                    return;
+                }
+                var model = Settings.Model ?? options.Model;
+                var title = await ClaudeTitleGeneration.GenerateAsync(exe, options.DataDirectory, input, model,
+                    options.TitleTimeout, options.TitleInputBytes, options.TitleMaxChars, agent.Log, job.Token);
+                if (title is null || job.IsCancellationRequested || IsNotCurrentTitleJob(job) || ManualTitle || transcript is { Title: { Length: > 0 } })
+                    return;
+                if (!await WriteTitleAsync(title, job.Token)) return;
+                agent.Log($"claude {Id}: generated title \"{title}\"{(provisional is null ? "" : $" (was \"{provisional}\")")}");
+                await agent.OnTitleAsync(Id, title);
+            }
+            finally
+            {
+                titleGate.Release();
+            }
+        }
+        catch (OperationCanceledException) when (job.IsCancellationRequested)
+        {
+        }
+        catch (Exception e)
+        {
+            agent.Log($"claude {Id}: no generated title: {e.Message}");
+        }
+        finally
+        {
+            lock (stateGate) if (ReferenceEquals(titleJob, job)) titleJob = null;
+            job.Dispose();
+        }
+    }
+
+    bool IsNotCurrentTitleJob(CancellationTokenSource job)
+    {
+        lock (stateGate) return !ReferenceEquals(titleJob, job);
+    }
+
+    bool ManualTitle
+    {
+        get { lock (stateGate) return manualTitle; }
     }
 
     // ---------------------------------------------------------------- launch

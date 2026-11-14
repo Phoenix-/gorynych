@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
@@ -94,6 +95,8 @@ internal sealed class DshRouter
     readonly Dictionary<(DshLane Lane, string Id), string> routerIds = [];
     readonly Dictionary<string, (DshLane Lane, TaskCompletionSource<JsonObject> Answer)> own = [];
     readonly Dictionary<string, Live> live = [];
+    /// <summary>Sessions this adapter has seen: opened, resumed, forked or listed. A cache record for another one is not announced.</summary>
+    readonly HashSet<string> known = new(StringComparer.Ordinal);
     /// <summary>Sessions that were open in a process that ended, with its mode, until they are opened again.</summary>
     readonly Dictionary<string, DshMode> lost = [];
     /// <summary>
@@ -730,14 +733,17 @@ internal sealed class DshRouter
             {
                 case AcpMethods.Agent.SessionNew when result is not null && Str(result["sessionId"]) is { } created:
                     live[created] = Opened(lane, Str(request.Params?["cwd"]) ?? "", request.Params?["mcpServers"], null, result);
+                    known.Add(created);
                     break;
                 case AcpMethods.Agent.SessionResume or AcpMethods.Agent.SessionLoad when result is not null && sessionId is not null:
                     if (!live.ContainsKey(sessionId))
                         live[sessionId] = Opened(lane, Str(request.Params?["cwd"]) ?? "", request.Params?["mcpServers"], request.Pin, result);
+                    known.Add(sessionId);
                     break;
                 case SessionFork when result is not null && Str(result["sessionId"]) is { } fork && sessionId is not null:
                     var parent = live.GetValueOrDefault(sessionId);
                     live[fork] = Opened(lane, Str(request.Params?["cwd"]) ?? parent?.Cwd ?? "", request.Params?["mcpServers"] ?? parent?.McpServers, null, result);
+                    known.Add(fork);
                     forked = fork;
                     break;
                 case AcpMethods.Agent.SessionPrompt when sessionId is not null:
@@ -764,6 +770,7 @@ internal sealed class DshRouter
             case AcpMethods.Agent.SessionList when (result?["sessions"]) is JsonArray sessions:
                 if ((request.Params?["cursor"]) is null && (result?["nextCursor"]) is null) MergeOthers(sessions, Str(request.Params?["cwd"]));
                 StampTimes(sessions);
+                StampTitles(sessions);
                 break;
         }
         if (request.SessionId is { } ended
@@ -789,6 +796,52 @@ internal sealed class DshRouter
             if (session["updatedAt"] is null && Str(session["sessionId"]) is { } id && pins.LastWrite(id, projects) is { } at)
                 session["updatedAt"] = at.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
     }
+
+    /// <summary>
+    /// DSH's native title, read from its projection cache (read only), on the sessions it lists; the
+    /// cache and the list then agree, also after a restart or for a session not loaded here.
+    /// </summary>
+    void StampTitles(JsonArray sessions)
+    {
+        foreach (var session in sessions.OfType<JsonObject>())
+        {
+            if (Str(session["sessionId"]) is not { } id) continue;
+            lock (gate) known.Add(id);
+            if (pins.ReadTitle(id) is not { Length: > 0 } title) continue;
+            session["title"] = title;
+            lock (announcedTitleGate) announcedTitles[id] = title;
+        }
+    }
+
+    /// <summary>
+    /// A title DSH wrote in its own cache after a turn: send the service the standard
+    /// <c>session_info_update</c>. Titles are never written back to DSH's files. False when the
+    /// session is not one this adapter has seen, so the scan retries once a list or open makes it so.
+    /// </summary>
+    internal async Task<bool> PublishTitleAsync(string sessionId, string title)
+    {
+        lock (gate) if (!known.Contains(sessionId)) return false;
+        lock (announcedTitleGate) if (announcedTitles.GetValueOrDefault(sessionId) == title) return false;
+        await ToServiceAsync(new JsonObject
+        {
+            ["jsonrpc"] = "2.0",
+            ["method"] = AcpMethods.Client.SessionUpdate,
+            ["params"] = new JsonObject
+            {
+                ["sessionId"] = sessionId,
+                ["update"] = AcpJson.ToNode<SessionUpdate>(new SessionInfoUpdate
+                {
+                    Title = title,
+                    UpdatedAt = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+                })!.AsObject(),
+            },
+        });
+        lock (announcedTitleGate) announcedTitles[sessionId] = title;
+        return true;
+    }
+
+    readonly Lock announcedTitleGate = new();
+    readonly Dictionary<string, string> announcedTitles = new(StringComparer.Ordinal);
 
     /// <summary>
     /// DSH lists every session it keeps but those open in its own process: the read-only process's

@@ -261,7 +261,9 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/askId` | `_meta` of `_gorynych/opinion` (peers server) and of `_gorynych/mcp_message` for `ask_agent` (outside server); toward a host, `askId` in `_gorynych/opinion`'s params or the opinion turn's `session/prompt` `_meta` | the asker's random name for a question, by which it takes the answer from the next service after a restart ([Questions across a restart](#questions-across-a-restart)) |
 | `gorynych/reclaim` | next to `gorynych/askId` | `true`: the answer to that question, not the question again; a question the service does not know, or that another session asked, fails with `data: {"gorynych/askLost": true}`; one still being answered is waited for |
 | `gorynych/messageId` | `session/prompt` params `_meta`, service → adapter | the `messageId` the service journals the prompt's text under, for a harness that keeps it with the message (Codex) |
-| `gorynych/setTitle` | an adapter's `agentCapabilities._meta` | `true`: the adapter takes `_gorynych/set_title {sessionId, title}` → `{}`, and the service writes a `spawn_session` name natively ([Child sessions](#child-sessions)) |
+| `gorynych/setTitle` | an adapter's `agentCapabilities._meta` | `true`: the adapter takes `_gorynych/set_title {sessionId, title}` → `{}`, and the service writes a `spawn_session` name or a rename natively ([Child sessions](#child-sessions)); Codex and headless Claude |
+| `gorynych/autoTitle` | an adapter's `agentCapabilities._meta` | `true`: the adapter takes `_gorynych/generate_title {sessionId, title, input, cwd}` → `{}` and generates a native title for a session that still has only the service's first-prompt title ([Titles](adapter-contract.md#9-titles)); the service asks once per session, never for a `spawn` name |
+| `_gorynych/generate_title` | method, service → adapter, `{sessionId, title, input, cwd}` → `{}` | accepts a bounded generated-title request; the answer means it was accepted, not that a title was written. The adapter runs its harness-specific isolated request and writes the native name, which comes back as the usual `session_info_update`; a person's rename cancels it |
 | `gorynych/unloadAfter` | an adapter's `agentCapabilities._meta` | seconds: its sessions' idle time when shorter than `--unload-after` ([Unloading idle sessions](#unloading-idle-sessions)); read as at most a day |
 | `gorynych/openElsewhere` | `SessionInfo._meta` of `session/list`, the `_meta` of a `session/load` or `session/resume` answer and of a `session_info_update` while the session is read-only; an adapter's `agentCapabilities._meta` | a string naming another app that has the session open, so its agent cannot take it here until it is closed there (`Codex Desktop`, `VS Code`, `a terminal codex (pid 4242)`); absent: free, or not known. In capabilities, `true`: the adapter takes `_gorynych/open_elsewhere` ([Sessions open in another app](#sessions-open-in-another-app)) |
 | `gorynych/interactivity` | `SessionInfo._meta` of `session/list`; the `_meta` of a `session/load` or `session/resume` answer; the `_meta` of a `session_info_update` | `"full"`: a client may prompt the session; `"read-only"`: it may watch it, not prompt it. Absent means `"full"`, as AHP's `ChatInteractivity`; an answer and a change always say it, `"full"` too ([Read-only sessions](#read-only-sessions)) |
@@ -282,7 +284,7 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `_gorynych/archive` | method, `{sessionId, archived}` → `{}` | sets the session's archive flag (see [Archive](#archive)); from the peers server, with its token, the result also has `text`, what the agent is told |
 | `_gorynych/reply` | method, `{messageId, text}` → `{delivered}` | the asked session answers a request it got as a turn; accepted only from that session's token |
 | `_gorynych/spawn` | method, `{agent, prompt, cwd?, title?, mode?, config_options?, report?, initiation?}` → `{sessionId, config?, note?}` | starts a child of the calling session after asking the person where required (see [Child sessions](#child-sessions)); `config` holds the model-related values the child's agent confirmed; accepted only with a session's peer token |
-| `_gorynych/set_title` | method, service → adapter, `{sessionId, title}` → `{}` | writes a session's native title; only for an adapter that advertises `gorynych/setTitle` (Codex), for a `spawn_session` name |
+| `_gorynych/set_title` | method, service → adapter, `{sessionId, title}` → `{}` | writes a session's native title; only for an adapter that advertises `gorynych/setTitle` (Codex and Claude headless), for a `spawn_session` name or a rename. It also cancels an in-flight generated title, so the person's name wins |
 | `_gorynych/note` | method, service → adapter, `{sessionId, text, sender, fromSessionId?, _meta}` → `{}` | tells a session's agent something that needs no answer (a child's report), with `gorynych/sender` and `gorynych/fromSessionId` in `_meta` for the user message the agent reports for it; the Claude adapter writes it into a running Claude (headless) or pushes it through the channel (TUI), an agent that answers method not found, or `-32600` because it is not running, gets it as a turn |
 | `_gorynych/mcp_message` | method, outside server → service, `{serverId, requestId, method, params}` → `{result}` or `{error}`; as a notification from the service, a notification of that request | an MCP request of `gorynych-outside`, in the shape of `mcp/message` from ACP's MCP-over-ACP RFD (see [`_gorynych/mcp_message`](#agents-outside-gorynych)) |
 | `_gorynych/read` | method, `{sessionId, cursor?, limit?, thoughts?}` → `{updates, nextCursor?, total, inProgress, trimmed}` | a page of a session's history from the journal (see [Reading a session](#reading-a-session)) |
@@ -2175,10 +2177,12 @@ still waits; `restart` prints the hosts that keep running. The executable an upd
 
 `sessions.json` holds, per session: the owning adapter, `cwd`, `title` and its source
 (`agent` when the harness gave it, `prompt` for the provisional first-prompt title, `spawn`
-for a name given to `spawn_session`), `createdAt`, `updatedAt`, `parentSessionId` and
+for a name given to `spawn_session`), `autoTitleAttempted` once the service has asked an
+adapter for a generated title, `createdAt`, `updatedAt`, `parentSessionId` and
 `reportToParent` for a spawned session, and `draft`, `deleted` or `archived` when set. Native state wins:
 a title or `updatedAt` from the harness replaces the overlay's, except a `spawn` name, which
-no harness can store yet.
+no harness can store yet. The one-attempt flag is kept so a restart does not ask again, and
+a title that never arrives leaves the provisional one.
 
 The file is replaced atomically (a temporary file moved over it). An antivirus scanner or
 the indexer can hold it open for a moment, so the move is retried for up to about 400 ms,

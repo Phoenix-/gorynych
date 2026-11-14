@@ -327,9 +327,27 @@ They run without asking the person, in every mode ([service-protocol.md](service
 
 #### Titles
 
-Headless Claude writes no generated `ai-title`, so the service's provisional title stays until
-a name is given. The adapter advertises `gorynych/setTitle`: `_gorynych/set_title` becomes the
-`rename_session` control request, which writes Claude's own `custom-title` (waiting for the next
+Headless Claude writes no generated `ai-title`, so the service asks the adapter for one when the
+session still has only its provisional first-prompt title. The adapter runs an isolated, short
+`claude -p` request with per-launch flags only: `--tools ""` (no built-in tool),
+`--strict-mcp-config` with an empty config (no MCP server), and runs in Gorynych's own scratch
+folder with `--safe-mode` (no user hooks, skills, plugins or project settings; the login still
+works), `--no-session-persistence`,
+`--permission-prompts none` and `--json-schema` for `{title}`. The first task is the only input,
+cut at 2 KB; the answer is cut at 60 characters and the process is bounded by 30 s. Nothing of
+the helper appears in the session, journal, activity, approval cards or session list. The result
+is written with the existing `rename_session` control request as Claude's own `custom-title`; a
+manual rename cancels an in-flight helper, and the transcript watcher still follows a title
+written elsewhere. The TUI transport keeps Claude's own `ai-title` and never starts the helper,
+so a session is titled once.
+
+The adapter advertises `gorynych/setTitle` and, for headless only, `gorynych/autoTitle`: the
+former writes a name through `_gorynych/set_title` (`rename_session`), the latter takes
+`_gorynych/generate_title`. `_gorynych/set_title` writes Claude's own `custom-title` (waiting for
+the next launch when Claude is not running). The transcript is still followed, so a title written
+elsewhere reaches the client.
+
+
 launch when Claude is not running). The transcript is still followed, so a title written
 elsewhere reaches the client.
 
@@ -919,6 +937,26 @@ ACP config options, applied with the next `turn/start`, which Codex keeps for la
   carrying a change, the change is dropped and the options are reset, so it cannot fail the
   turns after it.
 
+### Titles
+
+Codex's app-server does not generate a thread name; Codex's own TUI does it in a hidden ephemeral
+thread. The adapter follows that pattern for a session that still has only the service's
+provisional first-prompt title: on `_gorynych/generate_title` it reads the effective MCP servers
+(`config/read`, fail closed), starts an **ephemeral** `thread/start` with the same model and folder,
+`approvalPolicy: never`, `sandbox: read-only`, `baseInstructions` that only ask for a title, and a
+`config` that turns every MCP server off and disables the built-in tool features (shell, unified
+exec, code mode, view image, web search, apps, plugins, multi-agent and the rest); then one
+`turn/start` with `outputSchema` `{title}` and the first task, cut at 960 bytes. The response is
+bounded to 8 KB, the whole request to 30 s, and one generation runs at a time. The adapter writes
+the name with `thread/name/set`, so it is Codex's own native name and comes back as
+`thread/name/updated` → `session_info_update`. A manual `_gorynych/set_title` takes the same gate
+and cancels the generation, so the person's name wins; a stale, failed or timed-out result writes
+nothing. The ephemeral thread is never listed, never materializes on disk, and its notifications
+and requests are stopped in the adapter: they never reach the service, journal, activity,
+approvals or session state. It is interrupted and unsubscribed on success, failure, cancellation,
+close, delete and shutdown. The service asks once per session (the overlay keeps
+`autoTitleAttempted`) and never for a `spawn_session` name.
+
 ### Not done yet
 
 - Images and embedded resources in prompts.
@@ -968,6 +1006,10 @@ developer preview that runs on the user's own DeepSeek API key, so every turn co
     - **`sandbox-policy`: `read-only` or `danger-full-access`; `approval`: `ask`.**
     - **`permission`: disabled.** DSH's permission presets would pin a sandbox into each new
       session, and a pinned session keeps it in any process ([Permission modes](#permission-modes)).
+    - **`session-title-llm`: enabled.** The acp profile disables DSH's model-generated title
+      provider (ACP has no title surface); Gorynych turns it back on, so DSH titles its own fresh
+      sessions with one bounded auxiliary request and appends `session/title` to its native session
+      log. No extra session is made and Gorynych writes no title itself.
   - The user's own layers (`~/.dsh/cordis.patch.yml`, the acp profile's `cordis.patch.yml`)
     still apply, but these rows are replaced by Gorynych's.
 
@@ -1086,7 +1128,7 @@ The full-access process runs DSH's `danger-full-access` sandbox with approval `a
 | ACP | DSH, through the proxy |
 | --- | --- |
 | `session/new` | DSH's own: a bare UUID, durable at once (it writes the session log before any prompt). DSH lists no title for it ever, and cannot delete it, so an unused draft gets a tombstone; it stays in `~/.dsh`, where `dsh web` can delete it |
-| `session/list` | The read-only process's `{sessionId, cwd}`, newest-created first, with its cursor and `cwd` filter. DSH leaves out the sessions open in its own process, so the proxy adds back the sessions it has open, and the router those the full-access process has open, on the first page and in the requested folder. No `title`: the service shows its provisional title. No `updatedAt` either: the router adds the time DSH last wrote the session, the newest file of its folder in DSH's session store (`sessions/<project>/<id>/`), else its projection cache, so an old session does not look new; one DSH has no files of has none |
+| `session/list` | The read-only process's `{sessionId, cwd}`, newest-created first, with its cursor and `cwd` filter. DSH leaves out the sessions open in its own process, so the proxy adds back the sessions it has open, and the router those the full-access process has open, on the first page and in the requested folder. No `updatedAt`: the router adds the time DSH last wrote the session, the newest file of its folder in DSH's session store (`sessions/<project>/<id>/`), else its projection cache, so an old session does not look new; one DSH has no files of has none. The native `title` is read from the projection cache, never written, so a listed session carries it (`Titles` below) |
 | `session/resume` | DSH's own, in the process of the session's mode, with the request's `mcpServers` (about 0.2 s). A session open in another DSH process fails with `-32603`, which the proxy words as "This DeepSeek Harness session is open in another DSH app (dsh web or another dsh); close it there, then try again." |
 | `session/load`, `session/delete` | not supported (`-32601`); history comes from the service's journal (not caught up yet, below), delete is a tombstone |
 | `session/close` | DSH's own: it cancels a running prompt (`cancelled`), drains DSH's subagents and flushes |
@@ -1133,14 +1175,33 @@ The full-access process runs DSH's `danger-full-access` sandbox with approval `a
   The proxy keeps reading either way. Everything for DSH's stdin goes through one queue and one
   writer, so reading never waits on DSH reading its input. A session DSH says it does not have
   (`unknown session`), or one whose close was answered at all, is no longer added to the list.
-- No forms: the acp profile has no ask tool and no elicitation. No plans, no titles over ACP,
-  no live-note path (`-32601`).
+- No forms: the acp profile has no ask tool and no elicitation. No plans, no titles over ACP
+  (the native title is read from the projection cache, below), no live-note path (`-32601`).
+
+### Titles
+
+DSH's own title service writes a `title` projection, but its ACP never sends it. Gorynych enables
+the native `session-title-llm` provider per launch (above), so DSH makes one bounded auxiliary
+model call for a fresh session's first prompt, keeps the first-prompt fallback until it finishes,
+and appends `session/title` to its own log. Gorynych never writes that log or the cache. Instead
+the adapter reads the `title` row of DSH's projection cache
+(`storages/session_projcache/sessions/<id>.json`, format 7, read only) and:
+
+- adds it to `session/list`, so an unloaded session and a restarted adapter show it;
+- scans the cache folder every 2 s (one bounded loop, stopped with the adapter) for writes after a
+  turn, atomic replacements, a folder that appears late and a cache that is missing or stale;
+- sends a standard `session_info_update` when the title changes, which the service propagates as
+  its own title change. A record of another format, a missing title or an unreadable file is left
+  alone until the next scan.
+
+A native name is the source of truth, including one a person set in DSH's own UI; a name given at
+spawn still wins in the service's overlay. The first-prompt fallback is not treated as a final
+generated name: a later provider title replaces it, and the scan does not mistake its repetition
+for a change.
 
 ### Not done yet
 
 - Switching a session DSH pinned (DSH 0.2.2 has no ACP surface for `/permission`).
-- Titles from DSH: its acp app switches its model titles off, and the title it keeps is in its
-  projection cache, not on the wire.
 - History made outside Gorynych: sessions made in `dsh web`, and turns taken there or in the
   `dsh` TUI. DSH's ACP replays nothing. Its session log
   (`~/.dsh/sessions/<project>/<id>/session.v4.jsonl.zstd`) is append-only zstd JSONL with a

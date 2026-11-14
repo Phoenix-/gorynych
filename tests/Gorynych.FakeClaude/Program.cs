@@ -10,6 +10,8 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
+// `claude -p --json-schema ...`: the isolated title request (Title.cs).
+if (args.Contains("--json-schema")) return await FakeTitle.RunAsync(args);
 // `claude -p` in stream-json mode: the headless transport (Headless.cs).
 if (args.Contains("-p")) return await FakeHeadless.RunAsync(args);
 

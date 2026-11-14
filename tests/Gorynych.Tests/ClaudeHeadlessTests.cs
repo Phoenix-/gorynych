@@ -25,10 +25,11 @@ public sealed partial class ClaudeHeadlessTests
     static readonly string FakeRoot = Path.Combine(Path.GetTempPath(), "gorynych-fake-claude");
 
     static ClaudeAdapterOptions Options(string dir, List<string>? log = null, bool liveNotes = false, Func<Task>? beforeInterrupt = null,
-        bool fetchCatalog = true, string permissionMode = "default", int stallMs = 1500, Action? offPlanStopping = null) => new()
+        bool fetchCatalog = true, string permissionMode = "default", int stallMs = 1500, Action? offPlanStopping = null, bool autoTitle = false) => new()
     {
         BeforeInterrupt = beforeInterrupt,
         FetchCatalog = fetchCatalog,
+        AutoTitle = autoTitle,
         PermissionMode = permissionMode,
         DataDirectory = Path.Combine(dir, "claude"),
         Executable = FakeClaude(),
@@ -288,6 +289,187 @@ public sealed partial class ClaudeHeadlessTests
         {
             await acp.DisposeAsync();
             await agent.DisposeAsync();
+        }
+    }
+
+    static List<string>? TitleLaunch(string token)
+    {
+        foreach (var file in Directory.GetFiles(FakeRoot, "title-*.args.json"))
+            try
+            {
+                var args = JsonNode.Parse(File.ReadAllText(file))!.AsArray().Select(a => (string)a!).ToList();
+                if (args.LastOrDefault()?.Contains(token, StringComparison.Ordinal) == true) return args;
+            }
+            catch (Exception e) when (e is IOException or System.Text.Json.JsonException) { }
+        return null;
+    }
+
+    static async Task UntilTitleLaunch(string token)
+    {
+        for (var i = 0; i < 200 && TitleLaunch(token) is null; i++) await Task.Delay(25);
+        Assert.IsNotNull(TitleLaunch(token), "the isolated title request started");
+    }
+
+    static async Task<(AgentInstance Agent, JsonRpcConnection Acp, List<JsonObject> Updates)> DirectTitleAsync(string dir, List<string>? log = null, TimeSpan? timeout = null)
+    {
+        var options = Options(dir, log, autoTitle: true);
+        if (timeout is { } t)
+            options = new ClaudeAdapterOptions
+            {
+                BeforeInterrupt = options.BeforeInterrupt, FetchCatalog = options.FetchCatalog, PermissionMode = options.PermissionMode,
+                DataDirectory = options.DataDirectory, Executable = options.Executable, ProjectsDirectory = options.ProjectsDirectory,
+                ClaudeStatePath = options.ClaudeStatePath, ChannelServerCommand = options.ChannelServerCommand,
+                StartupTimeoutSeconds = options.StartupTimeoutSeconds, InterruptGraceMs = options.InterruptGraceMs,
+                CloseTimeoutMs = options.CloseTimeoutMs, StallMs = options.StallMs, OffPlanStopping = options.OffPlanStopping,
+                Log = options.Log, TitleTimeout = t, AutoTitle = true,
+            };
+        var agent = await new ClaudeAdapter(options).StartAsync(CancellationToken.None);
+        var updates = new List<JsonObject>();
+        var acp = new JsonRpcConnection(agent.Input, agent.Output, "direct-client")
+        {
+            NotificationHandler = (_, p) =>
+            {
+                if (p?["update"] is JsonObject u) lock (updates) updates.Add(u);
+                return Task.CompletedTask;
+            },
+            RequestHandler = (_, _) => Task.FromResult<JsonNode?>(AcpJson.ToNode(new RequestPermissionResponse
+            {
+                Outcome = new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId },
+            })),
+        };
+        acp.Start();
+        return (agent, acp, updates);
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task GeneratedTitle_RunsAnIsolatedNoToolRequest_AndWritesClaudesOwnCustomTitle()
+    {
+        var dir = TestDirs.New();
+        var token = "token-" + Guid.NewGuid().ToString("N");
+        var (agent, acp, updates) = await DirectTitleAsync(dir);
+        try
+        {
+            var init = await acp.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
+            Assert.IsTrue((bool?)init.AgentCapabilities?.Meta?[GorynychProtocol.CapAutoTitle] == true);
+            var id = (await acp.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+                new NewSessionRequest { Cwd = dir, McpServers = [] })).SessionId;
+            await acp.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = "Fix the flaky login test " + token }] });
+
+            await acp.SendRequestAsync(GorynychProtocol.MethodGenerateTitle, new JsonObject
+            {
+                ["sessionId"] = id, ["title"] = "Fix the flaky login test", ["input"] = "Fix the flaky login test " + token,
+            });
+            await Until(() => { lock (updates) return updates.Any(u => (string?)u["title"] == "Fake generated title"); });
+            lock (updates) Assert.IsTrue(updates.Any(u => (string?)u["title"] == "Fake generated title"));
+
+            var args = TitleLaunch(token)!;
+            Assert.AreEqual("", args[args.IndexOf("--tools") + 1], "no built-in tool is offered");
+            CollectionAssert.Contains(args, "--strict-mcp-config");
+            CollectionAssert.Contains(args, "--safe-mode");
+            CollectionAssert.Contains(args, "--no-session-persistence");
+            Assert.AreEqual("none", args[args.IndexOf("--permission-prompts") + 1], "no approval dialog can appear");
+            Assert.AreEqual("default", args[args.IndexOf("--permission-mode") + 1]);
+            Assert.IsTrue(Controls(id).Any(c => (string?)c["subtype"] == "rename_session" && (string?)c["title"] == "Fake generated title"),
+                "the name is Claude's own custom-title");
+            var listed = await acp.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
+            Assert.AreEqual(1, listed.Sessions.Count, "the helper left no session behind");
+        }
+        finally
+        {
+            await acp.DisposeAsync();
+            await agent.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task AManualName_WinsOverAGeneratedTitleStillInFlight()
+    {
+        var dir = TestDirs.New();
+        var token = "hold-token-" + Guid.NewGuid().ToString("N");
+        var (agent, acp, updates) = await DirectTitleAsync(dir);
+        try
+        {
+            await acp.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
+            var id = (await acp.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+                new NewSessionRequest { Cwd = dir, McpServers = [] })).SessionId;
+            await acp.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = "hold-title fix the login test " + token }] });
+
+            await acp.SendRequestAsync(GorynychProtocol.MethodGenerateTitle, new JsonObject
+            {
+                ["sessionId"] = id, ["title"] = "Fix the login test", ["input"] = "hold-title fix the login test " + token,
+            });
+            await UntilTitleLaunch(token);
+            await acp.SendRequestAsync(GorynychProtocol.MethodSetTitle, new JsonObject { ["sessionId"] = id, ["title"] = "Manual title" });
+            await Until(() => { lock (updates) return updates.Any(u => (string?)u["title"] == "Manual title"); });
+            File.WriteAllText(Path.Combine(dir, "claude", "title", "release-title"), "");
+            await Task.Delay(750);
+            lock (updates)
+            {
+                Assert.IsTrue(updates.Any(u => (string?)u["title"] == "Manual title"));
+                Assert.IsFalse(updates.Any(u => (string?)u["title"] == "Fake generated title"), "the stale helper never renamed the session");
+            }
+        }
+        finally
+        {
+            await acp.DisposeAsync();
+            await agent.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task AFailedOrTimedOutHelper_LeavesTheProvisionalTitle()
+    {
+        var dir = TestDirs.New();
+        var token = "fail-token-" + Guid.NewGuid().ToString("N");
+        var (agent, acp, updates) = await DirectTitleAsync(dir);
+        try
+        {
+            await acp.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
+            var id = (await acp.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+                new NewSessionRequest { Cwd = dir, McpServers = [] })).SessionId;
+            await acp.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = "fail-title fix the login test " + token }] });
+            await acp.SendRequestAsync(GorynychProtocol.MethodGenerateTitle, new JsonObject
+            {
+                ["sessionId"] = id, ["title"] = "Fix the login test", ["input"] = "fail-title fix the login test " + token,
+            });
+            await UntilTitleLaunch(token);
+            await Task.Delay(500);
+            lock (updates) Assert.IsFalse(updates.Any(u => (string?)u["title"] == "Fake generated title"));
+        }
+        finally
+        {
+            await acp.DisposeAsync();
+            await agent.DisposeAsync();
+        }
+
+        var timeoutDir = TestDirs.New();
+        var timeoutToken = "timeout-token-" + Guid.NewGuid().ToString("N");
+        var (slowAgent, slowAcp, slowUpdates) = await DirectTitleAsync(timeoutDir, timeout: TimeSpan.FromMilliseconds(150));
+        try
+        {
+            await slowAcp.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
+            var id = (await slowAcp.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+                new NewSessionRequest { Cwd = timeoutDir, McpServers = [] })).SessionId;
+            await slowAcp.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+                new PromptRequest { SessionId = id, Prompt = [new TextContent { Text = "timeout-title fix the login test " + timeoutToken }] });
+            await slowAcp.SendRequestAsync(GorynychProtocol.MethodGenerateTitle, new JsonObject
+            {
+                ["sessionId"] = id, ["title"] = "Fix the login test", ["input"] = "timeout-title fix the login test " + timeoutToken,
+            });
+            await UntilTitleLaunch(timeoutToken);
+            await Task.Delay(750);
+            lock (slowUpdates) Assert.IsFalse(slowUpdates.Any(u => (string?)u["title"] == "Fake generated title"));
+        }
+        finally
+        {
+            await slowAcp.DisposeAsync();
+            await slowAgent.DisposeAsync();
         }
     }
 

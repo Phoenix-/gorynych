@@ -28,9 +28,10 @@ public sealed class CodexAdapterTests
     }, [new CodexAdapter(codex ?? Options(fake)), .. more ?? []]);
 
     static CodexAdapterOptions Options(FakeAppServer fake, List<string>? log = null, Func<IEnumerable<string>, IReadOnlyDictionary<string, string>>? holders = null,
-        TimeSpan? unloadWait = null, TimeSpan? turnEndWait = null) => new()
+        TimeSpan? unloadWait = null, TimeSpan? turnEndWait = null, bool autoTitle = false) => new()
     {
         Launch = fake.StartAsync,
+        AutoTitle = autoTitle,
         ClientVersion = "test",
         TurnEndWait = turnEndWait ?? TimeSpan.FromMilliseconds(200),
         UnloadWait = unloadWait ?? new CodexAdapterOptions().UnloadWait,
@@ -41,9 +42,9 @@ public sealed class CodexAdapterTests
     };
 
     /// <summary>The adapter alone, without the service: an ACP connection straight to it.</summary>
-    static async Task<(AgentInstance Agent, JsonRpcConnection Acp)> DirectAsync(FakeAppServer fake, List<string>? log = null, TimeSpan? turnEndWait = null)
+    static async Task<(AgentInstance Agent, JsonRpcConnection Acp)> DirectAsync(FakeAppServer fake, List<string>? log = null, TimeSpan? turnEndWait = null, CodexAdapterOptions? options = null)
     {
-        var agent = await new CodexAdapter(Options(fake, log, turnEndWait: turnEndWait)).StartAsync(CancellationToken.None);
+        var agent = await new CodexAdapter(options ?? Options(fake, log, turnEndWait: turnEndWait)).StartAsync(CancellationToken.None);
         var acp = new JsonRpcConnection(agent.Input, agent.Output, "direct-client") { NotificationHandler = (_, _) => Task.CompletedTask };
         acp.Start();
         return (agent, acp);
@@ -1146,10 +1147,130 @@ public sealed class CodexAdapterTests
         Assert.AreEqual("cancelled", (string?)(await turn.WaitAsync(Wait))!["stopReason"]);
     }
 
+    // ---------------------------------------------------------------- generated titles
+
+    static Task<JsonNode?> GenerateAsync(JsonRpcConnection acp, string sessionId, string text, string title = "Fix the flaky login test") =>
+        acp.SendRequestAsync(GorynychProtocol.MethodGenerateTitle, new JsonObject
+        {
+            ["sessionId"] = sessionId, ["cwd"] = Cwd, ["input"] = text, ["title"] = title,
+        });
+
+    [TestMethod]
+    public async Task ThroughTheService_TheFirstPromptAsksForAGeneratedTitle_AndTheNativeNameReachesTheClient()
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake, codex: Options(fake, autoTitle: true));
+        await using var zed = await ZedAsync(conductor);
+        var id = await NewAsync(zed);
+
+        await PromptAsync(zed, id, "Fix the flaky login test");
+        await Until(() => fake.Threads.TryGetValue(id, out var t) && t.Name == "Generated title", "the generated name");
+        await Until(() => Of(zed, "session_info_update").Any(u => (string?)u["title"] == "Generated title"), "the title update");
+        Assert.AreEqual(1, fake.HelperStarts);
+    }
+
+    [TestMethod]
+    public async Task AGeneratedTitle_UsesAnIsolatedEphemeralThread_WithToolsAndMcpServersOff_AndSetsTheNativeName()
+    {
+        var fake = new FakeAppServer { UserServers = ["other-tool", "gorynych-outside"] };
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var updates = new List<(string? SessionId, JsonObject Update)>();
+        acp.NotificationHandler = (method, p) =>
+        {
+            if (method == AcpMethods.Client.SessionUpdate && p?["update"] is JsonObject u)
+                lock (updates) updates.Add(((string?)p["sessionId"], u));
+            return Task.CompletedTask;
+        };
+        var id = await NewDirectAsync(acp);
+
+        await GenerateAsync(acp, id, "Fix the flaky login test, it fails on CI only");
+        await Until(() => fake.Threads.TryGetValue(id, out var t) && t.Name == "Generated title", "the generated name");
+        await Until(() => { lock (updates) return updates.Any(u => u.SessionId == id && (string?)u.Update["title"] == "Generated title"); },
+            "the generated title update");
+
+        var start = fake.All("thread/start").Last();
+        Assert.AreEqual(true, (bool?)start["ephemeral"], "an ephemeral thread, never on disk");
+        Assert.AreEqual("thread_title", (string?)start["threadSource"]);
+        Assert.AreEqual("never", (string?)start["approvalPolicy"]);
+        Assert.AreEqual("read-only", (string?)start["sandbox"]);
+        Assert.AreEqual("gpt-fake", (string?)start["model"]);
+        Assert.AreEqual(false, (bool?)start["config"]!["features"]!["shell_tool"]);
+        Assert.AreEqual(false, (bool?)start["config"]!["features"]!["multi_agent"]);
+        Assert.AreEqual(false, (bool?)start["config"]!["agents"]!["enabled"]);
+        Assert.AreEqual("disabled", (string?)start["config"]!["web_search"]);
+        Assert.AreEqual(false, (bool?)start["config"]!["mcp_servers"]!["other-tool"]!["enabled"]);
+        Assert.AreEqual(false, (bool?)start["config"]!["mcp_servers"]!["gorynych-outside"]!["enabled"]);
+        Assert.AreEqual(CodexTitleGeneration.Instructions, (string?)start["baseInstructions"]);
+        Assert.AreEqual(1, fake.HelperStarts);
+
+        var helperId = fake.HelperThreadIds.Single();
+        await Until(() => fake.All("thread/unsubscribe").Any(p => (string?)p["threadId"] == helperId), "the helper thread's cleanup");
+        lock (updates)
+        {
+            Assert.IsFalse(updates.Any(u => u.SessionId == helperId), "the helper's stream never reaches the service");
+            Assert.IsTrue(updates.Any(u => u.SessionId == id && (string?)u.Update["title"] == "Generated title"));
+        }
+        Assert.AreEqual("Generated title", fake.Threads[id].Name);
+    }
+
+    [TestMethod]
+    public async Task AManualName_WinsOverAGeneratedTitleStrandedInFlight()
+    {
+        var fake = new FakeAppServer { HoldHelperTurn = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously) };
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+
+        await GenerateAsync(acp, id, "Fix the flaky login test");
+        await Until(() => fake.HelperThreadIds.Count == 1 && fake.LastTurnId is not null, "the helper's turn");
+        await acp.SendRequestAsync(GorynychProtocol.MethodSetTitle, new JsonObject { ["sessionId"] = id, ["title"] = "Manual title" });
+        Assert.AreEqual("Manual title", fake.Threads[id].Name);
+
+        fake.HoldHelperTurn.SetResult();
+        await Until(() => fake.HelperInterrupted, "the helper's interrupt");
+        await Task.Delay(150);
+        Assert.AreEqual("Manual title", fake.Threads[id].Name, "a stale generated title never replaces a manual one");
+    }
+
+    [TestMethod]
+    public async Task AHelperThatFailsOrTimesOut_LeavesTheProvisionalTitleAndNothingElse()
+    {
+        var fake = new FakeAppServer { FailHelperTurn = true };
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var id = await NewDirectAsync(acp);
+        await GenerateAsync(acp, id, "Fix the flaky login test");
+        await Until(() => fake.HelperThreadIds.Count == 1, "the helper's turn");
+        await Task.Delay(250);
+        Assert.IsNull(fake.Threads[id].Name, "a failed helper leaves the service's provisional title");
+
+        var timingOut = new FakeAppServer { NeverFinishHelper = true };
+        var (slowAgent, slowAcp) = await DirectAsync(timingOut, options: new CodexAdapterOptions
+        {
+            Launch = timingOut.StartAsync,
+            ClientVersion = "test",
+            TurnEndWait = TimeSpan.FromMilliseconds(200),
+            TitleTimeout = TimeSpan.FromMilliseconds(150),
+            FindHolders = _ => new Dictionary<string, string>(),
+            LocksDirectory = Path.Combine(Path.GetTempPath(), "gorynych-no-codex-locks"),
+        });
+        await using var ___ = slowAgent;
+        await using var ____ = slowAcp;
+        var slowId = await NewDirectAsync(slowAcp);
+        await GenerateAsync(slowAcp, slowId, "Fix the flaky login test");
+        await Until(() => timingOut.HelperInterrupted, "the timed-out helper's interrupt");
+        await Task.Delay(150);
+        Assert.IsNull(timingOut.Threads[slowId].Name);
+    }
+
     [TestMethod]
     public void ACancelHandledBeforeItsPromptBegins_StopsThatTurn_ButNotALaterOne()
     {
-        var t = new CodexThread("t", new CodexMap.CodexSettings("gpt-fake", "low", null, null, "user"));
+        var t = new CodexThread("t", Cwd, new CodexMap.CodexSettings("gpt-fake", "low", null, null, "user"));
 
         // The prompt was message 5 of the ACP stream and the cancel message 6, handled first.
         Assert.AreEqual((false, (string?)null), t.Stop(6));

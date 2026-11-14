@@ -27,6 +27,7 @@ sealed class FakeAppServer
         public string? Name { get; set; }
         public bool Archived { get; set; }
         public bool Durable { get; set; }
+        public bool Ephemeral { get; set; }
         public bool Loaded { get; set; }
         public bool OpenElsewhere { get; set; }
         public long UpdatedAt { get; set; } = 1_794_000_000;
@@ -112,6 +113,23 @@ sealed class FakeAppServer
 
     /// <summary><c>account/rateLimits/read</c> fails as the backend may.</summary>
     public bool FailAccountRateLimits { get; set; }
+    /// <summary>The title an isolated structured turn returns.</summary>
+    public string HelperTitle { get; set; } = "Generated title";
+
+    /// <summary>When set, an isolated structured turn waits for it before answering.</summary>
+    public TaskCompletionSource? HoldHelperTurn { get; set; }
+
+    /// <summary>An isolated structured turn never ends, as a title generation that outlasts its timeout.</summary>
+    public bool NeverFinishHelper { get; set; }
+
+    /// <summary>An isolated structured turn fails.</summary>
+    public bool FailHelperTurn { get; set; }
+
+    public int HelperStarts { get; private set; }
+    public bool HelperInterrupted { get; private set; }
+    public HashSet<string> HelperThreadIds { get; } = [];
+
+    readonly ConcurrentDictionary<string, TaskCompletionSource> helperInterrupts = new();
 
     /// <summary>After <c>thread/unsubscribe</c>, tells <c>thread/status/changed</c> notLoaded and <c>thread/closed</c>, after <see cref="UnloadDelay"/>.</summary>
     public bool TellsUnload { get; set; } = true;
@@ -213,7 +231,9 @@ sealed class FakeAppServer
                 });
             case "thread/start":
             {
-                var t = new FakeThread { Id = $"thread-{Interlocked.Increment(ref next)}", Cwd = (string?)p["cwd"] ?? "", Loaded = true };
+                var ephemeral = (bool?)p["ephemeral"] == true;
+                var t = new FakeThread { Id = $"thread-{Interlocked.Increment(ref next)}", Cwd = (string?)p["cwd"] ?? "", Loaded = true, Ephemeral = ephemeral };
+                if (ephemeral) HelperStarts++;
                 Threads[t.Id] = t;
                 return Done(ThreadResponse(t));
             }
@@ -301,11 +321,23 @@ sealed class FakeAppServer
                 var turnId = $"turn-{Interlocked.Increment(ref next)}";
                 LastTurnId = turnId;
                 interrupts[turnId] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                _ = Task.Run(() => RunTurnAsync(t, turnId, p));
+                if (t.Ephemeral || p["outputSchema"] is not null)
+                {
+                    t.Durable = false;
+                    HelperThreadIds.Add(t.Id);
+                    helperInterrupts[turnId] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _ = Task.Run(() => RunHelperTurnAsync(t, turnId));
+                }
+                else _ = Task.Run(() => RunTurnAsync(t, turnId, p));
                 return Done(new JsonObject { ["turn"] = new JsonObject { ["id"] = turnId, ["items"] = new JsonArray(), ["status"] = "inProgress" } });
             }
             case "turn/interrupt":
                 if (interrupts.TryGetValue((string)p["turnId"]!, out var stop)) stop.TrySetResult();
+                if (helperInterrupts.TryGetValue((string)p["turnId"]!, out var helper))
+                {
+                    HelperInterrupted = true;
+                    helper.TrySetResult();
+                }
                 return Done(new JsonObject());
             default:
                 throw new JsonRpcException(JsonRpcException.MethodNotFound, $"fake app-server: {method}");
@@ -326,7 +358,7 @@ sealed class FakeAppServer
     static JsonObject ThreadJson(FakeThread t) => new()
     {
         ["id"] = t.Id, ["sessionId"] = t.Id, ["cwd"] = t.Cwd, ["name"] = t.Name, ["preview"] = "", ["cliVersion"] = "0.167.0",
-        ["createdAt"] = t.UpdatedAt, ["updatedAt"] = t.UpdatedAt, ["ephemeral"] = false, ["modelProvider"] = "openai",
+        ["createdAt"] = t.UpdatedAt, ["updatedAt"] = t.UpdatedAt, ["ephemeral"] = t.Ephemeral, ["modelProvider"] = "openai",
         ["source"] = "vscode", ["originator"] = "gorynych", ["projectId"] = null, ["status"] = new JsonObject { ["type"] = t.Loaded ? "idle" : "notLoaded" },
         ["turns"] = new JsonArray(),
     };
@@ -369,6 +401,31 @@ sealed class FakeAppServer
         var answer = await Rpc!.SendRequestAsync(method, p);
         lock (Answers) Answers.Add((method, answer?.DeepClone()));
         return answer;
+    }
+
+    async Task RunHelperTurnAsync(FakeThread t, string turnId)
+    {
+        await Notify("turn/started", new JsonObject { ["threadId"] = t.Id, ["turn"] = new JsonObject { ["id"] = turnId, ["items"] = new JsonArray(), ["status"] = "inProgress" } });
+        if (HoldHelperTurn is { } hold) await hold.Task;
+        if (NeverFinishHelper)
+        {
+            await helperInterrupts[turnId].Task;
+            await Notify("turn/completed", new JsonObject
+            {
+                ["threadId"] = t.Id, ["turn"] = new JsonObject { ["id"] = turnId, ["items"] = new JsonArray(), ["status"] = "interrupted" },
+            });
+            return;
+        }
+        var status = FailHelperTurn ? "failed" : "completed";
+        if (!FailHelperTurn)
+        {
+            var text = new JsonObject { ["title"] = HelperTitle }.ToJsonString();
+            await Item(t, turnId, new JsonObject { ["type"] = "agentMessage", ["id"] = $"msg-{turnId}", ["text"] = text, ["phase"] = "final_answer" });
+        }
+        await Notify("turn/completed", new JsonObject
+        {
+            ["threadId"] = t.Id, ["turn"] = new JsonObject { ["id"] = turnId, ["items"] = new JsonArray(), ["status"] = status },
+        });
     }
 
     async Task RunTurnAsync(FakeThread t, string turnId, JsonObject p)

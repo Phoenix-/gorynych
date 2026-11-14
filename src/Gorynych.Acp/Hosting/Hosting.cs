@@ -214,6 +214,18 @@ public static class GorynychProtocol
     public const string CapSetTitle = "gorynych/setTitle";
 
     /// <summary>
+    /// Asks an adapter to generate a concise native title for a session that still has only the
+    /// service's provisional first-prompt title: <c>{sessionId, title, input, cwd}</c> → <c>{}</c>.
+    /// The adapter does the bounded harness-specific generation and writes the native name; the
+    /// answer says only that the request was accepted. The service calls it only on an adapter that
+    /// advertises <see cref="CapAutoTitle"/> (docs/adapter-contract.md, §9).
+    /// </summary>
+    public const string MethodGenerateTitle = "_gorynych/generate_title";
+
+    /// <summary>In <c>agentCapabilities._meta</c>: <c>true</c> when the adapter takes <see cref="MethodGenerateTitle"/>.</summary>
+    public const string CapAutoTitle = "gorynych/autoTitle";
+
+    /// <summary>
     /// In <c>agentCapabilities._meta</c>: seconds; the agent's sessions are unloaded after this
     /// idle time when it is shorter than the service's own (docs/adapter-contract.md, §7).
     /// </summary>

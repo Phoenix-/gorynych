@@ -152,6 +152,8 @@ public sealed class Conductor : IAsyncDisposable
     readonly ConcurrentDictionary<string, long> lastUpdateNotice = new(StringComparer.Ordinal); // session -> tick of its last "added" or "updated"
     readonly ConcurrentDictionary<string, byte> trailingUpdateNotice = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<Task, byte> backgroundTurns = new();
+    readonly ConcurrentDictionary<Task, byte> autoTitleTasks = new();
+    readonly SemaphoreSlim autoTitleGate = new(4, 4); // bounded asks to adapters; generation itself is bounded there
     readonly SemaphoreSlim archiveGate = new(1, 1); // archive changes, so their session_info_updates keep the flag's order
 
     long opinionCount;
@@ -2130,7 +2132,7 @@ public sealed class Conductor : IAsyncDisposable
             })!.AsObject();
             await feed.PublishAsync(update, except: client, () => store.Touch(record.SessionId));
         }
-        await ProvisionalTitleAsync(feed, record, prompt.Prompt);
+        await ProvisionalTitleAsync(feed, record, rpc, prompt.Prompt);
         // A turn outlives the client that started it: closing the GUI must not stop the agent.
         // Stopping a turn is an explicit session/cancel, which must reach the agent after the
         // prompt, so both go through the session's forward gate.
@@ -2189,14 +2191,62 @@ public sealed class Conductor : IAsyncDisposable
         return copy;
     }
 
-    /// <summary>Uses the first prompt as the session's title until the harness provides one.</summary>
-    async Task ProvisionalTitleAsync(SessionFeed feed, SessionRecord record, IEnumerable<ContentBlock> prompt)
+    /// <summary>
+    /// Uses the first prompt as the session's title until the harness provides one, and asks an
+    /// adapter that can generate a concise title to do so once (fire and forget).
+    /// </summary>
+    async Task ProvisionalTitleAsync(SessionFeed feed, SessionRecord record, JsonRpcConnection rpc, IEnumerable<ContentBlock> prompt)
     {
         if (record.Title is not null || FirstText(prompt) is not { } text) return;
         var title = Shorten(text);
         store.Update(record.SessionId, record.Agent, r => { r.Title ??= title; r.TitleSource ??= "prompt"; });
         var info = AcpJson.ToNode<SessionUpdate>(new SessionInfoUpdate { Title = title })!.AsObject();
         if (!feed.IsRepeatedTitle(info)) await feed.PublishAsync(info, except: null, () => { });
+        StartAutoTitle(feed, record, rpc, text);
+    }
+
+    /// <summary>
+    /// Asks an adapter for a generated native title when the session still has only the service's
+    /// first-prompt title. At most one attempt per session, kept in the overlay so a restart does
+    /// not repeat it; a spawn name never qualifies (its title is already set). The prompt does
+    /// not wait for the generation (docs/adapter-contract.md, §9).
+    /// </summary>
+    void StartAutoTitle(SessionFeed feed, SessionRecord record, JsonRpcConnection rpc, string text)
+    {
+        if (!agents.TryGetValue(record.Agent, out var host) || !host.GeneratesTitle) return;
+        var current = store.Get(record.SessionId);
+        if (current is not { TitleSource: "prompt", AutoTitleAttempted: false }) return;
+        store.Update(record.SessionId, record.Agent, r => r.AutoTitleAttempted = true);
+        var task = RunAutoTitleAsync(host, feed.SessionId, rpc, current.Cwd, current.Title ?? Shorten(text), text);
+        autoTitleTasks[task] = 0;
+        _ = task.ContinueWith(t => autoTitleTasks.TryRemove(t, out _), TaskScheduler.Default);
+    }
+
+    async Task RunAutoTitleAsync(AgentHost host, string sessionId, JsonRpcConnection rpc, string cwd, string provisional, string text)
+    {
+        await autoTitleGate.WaitAsync(cleanupStop.Token);
+        try
+        {
+            await rpc.SendRequestAsync(GorynychProtocol.MethodGenerateTitle, new JsonObject
+            {
+                ["sessionId"] = sessionId,
+                ["title"] = provisional,
+                ["cwd"] = cwd,
+                // The first user task only: no system prompt, AGENTS.md or peer scaffolding.
+                ["input"] = text,
+            }).WaitAsync(TimeSpan.FromSeconds(10), cleanupStop.Token);
+        }
+        catch (OperationCanceledException) when (cleanupStop.IsCancellationRequested || shutdown.IsCancellationRequested)
+        {
+        }
+        catch (Exception e)
+        {
+            ServiceLog.Warn($"{host.Name} {sessionId}: a generated title was not asked for: {e.Message}");
+        }
+        finally
+        {
+            autoTitleGate.Release();
+        }
     }
 
     static JsonNode? Cancelled() => AcpJson.ToNode(new PromptResponse { StopReason = StopReason.Cancelled });
@@ -3208,7 +3258,7 @@ public sealed class Conductor : IAsyncDisposable
             })!.AsObject();
             await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
             promptId = id;
-            await ProvisionalTitleAsync(feed, use.Record, [task]);
+            await ProvisionalTitleAsync(feed, use.Record, rpc, [task]);
             feed.BeginTurnText(ReportLimit + 1);
             Task<JsonNode?> response;
             await feed.ForwardGate.WaitAsync(CancellationToken.None);
@@ -4757,6 +4807,8 @@ public sealed class Conductor : IAsyncDisposable
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         cleanupStop.Cancel();
         Volatile.Read(ref reclaimSweep)?.Dispose();
+        try { await Task.WhenAll(autoTitleTasks.Keys).WaitAsync(TimeSpan.FromSeconds(2)); }
+        catch (Exception e) { ServiceLog.Warn($"generated titles at exit: {e.Message}"); }
         try { await Task.WhenAll(cleanups.Keys).WaitAsync(TimeSpan.FromSeconds(5)); }
         catch (Exception e) { ServiceLog.Warn($"cleanup at exit: {e.Message}"); }
         // No host is taken from now on, and those in the middle of their handshake are taken or not
