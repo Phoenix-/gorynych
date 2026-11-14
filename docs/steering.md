@@ -433,9 +433,19 @@ dispatches when it consumes the message. In step 2 of the [AHP face](ahp-face.md
    before steering, completed with its output marker, and the final answer included the steered
    instruction. The earlier Claude startup blocker was Gorynych's subscription-only policy,
    now removed. Harness authentication and billing are outside Gorynych's scope.
-3. **The Zed fork — planned.** The capability, connection method and toggle. Check turn-end queue
-   races, definite refusals and uncertain results. Live checks through Gorynych with Claude and
-   Codex: steer taken at a safe point, continued work, one user message, and still one after reload.
+3. **The Zed fork — built.** [External ACP steering in Zed](https://github.com/Phoenix-/zed/commit/1563768547)
+   reads the connection capability and session override, sends the shared extension through the
+   existing ACP SDK, and exposes the queued-message toggle. Reserved entries cannot also be
+   sent, edited or removed while delivery is in flight. `promptRequired` becomes the next prompt;
+   definite refusals return to the ordinary queue; unknown delivery stays visible, survives
+   connection recovery, and is never retried automatically. The three affected Zed crates passed
+   all 1,134 tests, including deterministic GPUI queue races and the SDK transport test.
+   On 15 November 2026, the locally installed Zed and merged Gorynych builds were checked live:
+   the user submitted two steers to Claude and one to Codex through Zed. In both sessions the
+   executing tool kept its process ID through completion, no new tool call started after steering,
+   and the final reply included the steered marker. Fresh ACP clients then reloaded both sessions
+   with `session/load`: each steered user message appeared exactly once, with the final reply
+   retained. This history check exercised ACP replay; a separate GUI reopen was not automated.
 4. **The AHP face — planned**, with its step 2, including pending-slot replacement during delivery.
 
 Steps 1 and 2 are documented as they land: the extension in
