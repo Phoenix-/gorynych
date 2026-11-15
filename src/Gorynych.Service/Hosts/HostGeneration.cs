@@ -66,18 +66,11 @@ public sealed class HostGeneration(string build, IReadOnlyList<string> options)
     public static (string? Version, string? Build, string? Unread) OnDisk(string? exePath)
     {
         if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath)) return (null, null, "the executable is not there or its path is not known");
-        string? version = null;
-        try
-        {
-            var info = System.Diagnostics.FileVersionInfo.GetVersionInfo(exePath);
-            version = info.ProductVersion ?? info.FileVersion;
-            if (string.IsNullOrWhiteSpace(version)) version = null;
-        }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException
-            or PlatformNotSupportedException or NotSupportedException)
-        {
-            version = null;
-        }
+        // Unix apphosts have no Windows version resource. In a managed layout the
+        // matching assembly carries the version; read that file, never this CLI's version.
+        var assemblyPath = exePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            ? Path.ChangeExtension(exePath, ".dll") : exePath + ".dll";
+        var version = FileVersion(exePath) ?? FileVersion(assemblyPath);
         try
         {
             var folder = Path.GetDirectoryName(Path.GetFullPath(exePath))!;
@@ -101,6 +94,21 @@ public sealed class HostGeneration(string build, IReadOnlyList<string> options)
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
             return (version, null, e.Message);
+        }
+    }
+
+    static string? FileVersion(string path)
+    {
+        try
+        {
+            var info = System.Diagnostics.FileVersionInfo.GetVersionInfo(path);
+            return !string.IsNullOrWhiteSpace(info.ProductVersion) ? info.ProductVersion
+                : !string.IsNullOrWhiteSpace(info.FileVersion) ? info.FileVersion : null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException
+            or PlatformNotSupportedException or NotSupportedException)
+        {
+            return null;
         }
     }
 

@@ -270,6 +270,13 @@ public sealed class SessionDefaultsTests
             id = (string)(await NewAsync(client))!["sessionId"]!;
             Assert.AreEqual("large", agent.ModelOf(id));
             Assert.AreEqual("high", agent.EffortOf(id));
+            // A session/new alone is a draft, discarded when its last client leaves.
+            // Give the session history before testing that it survives a restart.
+            await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject
+            {
+                ["sessionId"] = id,
+                ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "keep this session" }),
+            });
         }
 
         var before = agent.Sets(id).Length;
