@@ -145,7 +145,9 @@ public sealed class ServiceLaunchTests
         foreach (var (wrong, problem) in new[]
         {
             (new[] { "--bogus" }, "unknown option '--bogus'"),
-            (["start"], "unknown command 'start'"),
+            (["stopp"], "unknown command 'stopp'"),
+            (["start"], "start needs --all or --agent <name>"),
+            (["stop"], "stop needs --all or --agent <name>"),
             (["serve", "--bogus"], "unknown option '--bogus'"),
             (["--pipe"], "--pipe needs a value"),
             (["--pipe", "--data", "d"], "--pipe needs a value"),

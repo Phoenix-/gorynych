@@ -292,6 +292,45 @@ Zed can stay open: its threads go on with the new service
 *adapter hosts* of their own, which a restart leaves running, so a turn that runs goes on and its
 answer arrives whole ([service-protocol.md](service-protocol.md#adapter-hosts)).
 
+### With `update`
+
+`Gorynych.Service update` updates only Gorynych. It never updates a harness, including the npm
+Codex CLI, and it never changes an agent's configuration or authentication.
+
+```powershell
+# A local archive or an URL; --dry-run stages and checks it but changes nothing.
+& "$env:LOCALAPPDATA\Programs\Gorynych\Gorynych.Service.exe" update .\gorynych-windows-x64.zip --dry-run
+& "$env:LOCALAPPDATA\Programs\Gorynych\Gorynych.Service.exe" update https://example.invalid/gorynych-windows-x64.zip
+```
+
+- **What it accepts.** A `.zip` or `.tar.gz` archive whose root (or one folder in it) has either
+  `gorynych-package.json` or exactly one `Gorynych.Service.exe`/`Gorynych.Service`. A manifest is:
+  `{"schemaVersion": 1, "product": "gorynych", "version": "…", "os": "windows|linux|macos",
+  "arch": "x64|arm64", "entry": "Gorynych.Service.exe", "build": "…", "files": {"name": "sha256"}}`;
+  `build` and `files` are optional. The nightly's existing layout is accepted without a manifest,
+  with its version read from the executable where the platform exposes one (`unknown` otherwise),
+  its OS and architecture read from the native headers. Anything ambiguous (several roots or
+  service binaries), unsupported (another OS/architecture, a non-Gorynych archive), or unsafe
+  (absolute or `..` paths, symlinks, devices) is refused before the install is touched.
+- **What it does.** It downloads and extracts first, compares the package with the running and
+  on-disk build, checks the install's files for Windows locks, then stages the new files inside the
+  install, renames the old ones aside (they are kept as rollback copies), copies the new ones, and
+  restarts the conductor. Adapter hosts keep their turns; old hosts migrate idle sessions to the
+  new build as [Updating adapters](service-protocol.md#updating-adapters) describes. It then checks
+  that the service answers on the pipe with the package's build. If activation fails, it restores
+  the previous files and says what could not be restored; a running binary is never deleted.
+- **Blockers.** With adapter hosts (`--hosts on`, the default on Windows and Linux) a running turn
+  is not a blocker: the restart leaves it in its host. Without hosts, or while a restart or a
+  management stop is in progress, `update` refuses rather than interrupt work. `--dry-run` prints
+  the same plan and blockers and changes nothing in the install or the service.
+- **Where.** The running service's folder, or the folder this executable is in. If neither can be
+  inferred, pass `--install <dir>`; an explicit path must already be a Gorynych install.
+- **After it.** The command leaves `Gorynych.Service.<stamp>.old.exe` and other `*.old` copies.
+  Delete one only when no process runs it: `status` says whether a host of an earlier build still
+  waits. A harness's own update is the person's separate step.
+
+### By hand
+
 1. Windows will not overwrite an exe that runs (the service, Zed's bridges, an outside server),
    but it allows a rename. The stamp keeps the name free while a copy from an earlier update
    still runs; delete the `*.old.exe` files once nothing runs them.
@@ -326,7 +365,7 @@ answer arrives whole ([service-protocol.md](service-protocol.md#adapter-hosts)).
    yet is lost, and the agent is told to ask again.
 4. **Without hosts** (`--hosts off`, the default on macOS) a restart still stops the
    agents, so it starts no new turn and waits up to five minutes for the running ones
-   (`--timeout <minutes>` changes that). **If a turn still runs after the wait**, the restart is
+   (`--timeout <duration>` changes that; `30s`, `5m`, `1h`, or a number of minutes). **If a turn still runs after the wait**, the restart is
    called off: the command lists the sessions still at work and exits with 4, and the service goes
    on as before, the held prompts included. Run `restart` again once they end, give it a longer
    `--timeout`, or add `--force`, which cancels them and restarts all the same. `--no-wait`
@@ -414,6 +453,10 @@ If the session was deleted or archived in Gorynych, adoption does not clear that
   - `dsh\`: `gorynych.patch.yml` and `gorynych.full-access.patch.yml`, the overlays Gorynych gives
     its two DSH processes, rewritten at every start; `modes.json`, the threads in full access.
   - `host.token`: what proves an adapter host to the service; the service writes it.
+  - `maintenance.json`: adapters a management `stop` disabled, and whether everything was stopped
+    (`stop --all`). `start` clears it; a bridge will not start a stopped-all service.
+  - `service-options.json`: the behavioural service options of the last start, so `start --all`
+    starts it the same way (`--hosts off`, `--no-peers`, `--claude-model`, …). It holds no secrets.
   - `logs\`: `service-<date>.log`, `host-<adapter>-<date>.log` for each adapter host, and
     `outside-<date>.log`.
 - **The agents' own state** stays in their folders (`~/.claude`, `~/.codex`, `~/.kimi-code`,

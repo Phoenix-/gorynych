@@ -57,6 +57,51 @@ public sealed class HostGeneration(string build, IReadOnlyList<string> options)
         }
     }
 
+    /// <summary>
+    /// What a Gorynych executable on disk is: its file version where the platform has one, and the
+    /// build <see cref="ReadAtStart"/> would read from the same files. Both are null/unknown when they
+    /// cannot be read; a status command must not guess. Unlike <see cref="ReadAtStart"/>, this hashes
+    /// the files at <paramref name="exePath"/> and its folder, not this process's.
+    /// </summary>
+    public static (string? Version, string? Build, string? Unread) OnDisk(string? exePath)
+    {
+        if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath)) return (null, null, "the executable is not there or its path is not known");
+        string? version = null;
+        try
+        {
+            var info = System.Diagnostics.FileVersionInfo.GetVersionInfo(exePath);
+            version = info.ProductVersion ?? info.FileVersion;
+            if (string.IsNullOrWhiteSpace(version)) version = null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            version = null;
+        }
+        try
+        {
+            var folder = Path.GetDirectoryName(Path.GetFullPath(exePath))!;
+            var files = new List<string> { Path.GetFullPath(exePath) };
+            if (Directory.Exists(folder))
+                files.AddRange(Directory.EnumerateFiles(folder, "Gorynych.*.dll").Order(StringComparer.OrdinalIgnoreCase));
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = new byte[81920];
+            foreach (var file in files)
+            {
+                using var part = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                for (int n; (n = stream.Read(buffer)) > 0;) part.AppendData(buffer, 0, n);
+                hash.AppendData(Encoding.UTF8.GetBytes(Path.GetFileName(file)));
+                hash.AppendData(part.GetHashAndReset());
+            }
+            var label = version ?? "unknown";
+            return (version, $"{label}+{Convert.ToHexString(hash.GetHashAndReset())[..16].ToLowerInvariant()}", null);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return (version, null, e.Message);
+        }
+    }
+
     /// <summary>The build, or null and in <paramref name="unread"/> what could not be read.</summary>
     static string Read(out string? unread)
     {

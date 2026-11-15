@@ -53,8 +53,10 @@ not use `proxy/*` methods yet because the RFD is unstable. Types: [acp-types.md]
   service ID), `sessions.json` (the overlay), `journal/`, `claude/` (the Claude adapter's
   session list and `channels.json`, the person's answer about development channels),
   `host.token` (what proves an [adapter host](#adapter-hosts) to the service), `logs/`
-  (`service-<date>.log`, and `host-<adapter>-<date>.log` for each host), `.gorynych-data` (names
-  the folder as Gorynych's) and, on Windows, `.closed` (below).
+  (`service-<date>.log`, and `host-<adapter>-<date>.log` for each host), `maintenance.json` (the
+  adapters a management `stop` disabled, and whether everything was stopped),
+  `service-options.json` (the behavioural options of the last start, for `start --all`),
+  `.gorynych-data` (names the folder as Gorynych's) and, on Windows, `.closed` (below).
   - **The folder is the user's alone.** At each start the service gives it a protected DACL on
     Windows: the user and SYSTEM, full control, inherited by all inside, nothing inherited from the
     parent. Under `%LOCALAPPDATA%` it would otherwise inherit what the profile grants others, such as
@@ -105,9 +107,17 @@ The same executable is
 also the `gorynych` MCP server agents start over stdio:
 `peers [--pipe … --token …] [--channel-url … | --reply-url …]` (see Opinions below), the stdio bridge
 for external ACP clients: `acp --agent claude|kimi|codex|dsh` (see [external-clients.md](external-clients.md)),
+`status [--pipe …] [--data …] [--tree] [--json]`, which shows the service, its adapter hosts,
+owned harness processes and descendants, live sessions, turns and blockers, and still reports the
+data folder and detected external harnesses when no service runs
+([Management stop and start](#management-stop-and-start)),
+`stop --agent <name> [--agent …] | --all [--wait] [--timeout <duration>]` and
+`start --agent <name> [--agent …] | --all`, which safely disable and restore adapters,
+`update <local-archive-or-url> [--dry-run] [--install <dir>]`, which updates only Gorynych
+([getting-started.md](getting-started.md#update)),
 `shutdown [--pipe …]`, which sends the running service `_gorynych/shutdown` and waits up
 to 30 seconds for its process to end (exit code 0; 1 when no service runs on the pipe; 2 when
-it still runs), `restart [--pipe …] [--timeout <minutes>] [--no-wait] [--force]`, which sends
+it still runs), `restart [--pipe …] [--timeout <duration>] [--no-wait] [--force]`, which sends
 `_gorynych/restart` and waits the same way, with the same exit codes and 4 when turns still
 ran after the wait, so the restart was called off and the service goes on
 ([The resumable link](#the-resumable-link)), `host --adapter claude|kimi|codex|dsh [--pipe …] [--data …] [adapter options]`,
@@ -263,6 +273,9 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/error` | the `_meta` of the mark that ends a prompt's turn | `{code, message}`: the prompt failed so |
 | `gorynych/restarting` | the `data` of an error | `true`: the service did not carry the request out because it is restarting; it may go again, as it is, to the next service, or to this one once the restart is called off |
 | `gorynych/restart` | the `data` of a `gorynych/restarting` error | the number of the restart that refused it, as in `_gorynych/restarting` and `_gorynych/restart_aborted` |
+| `gorynych/stopped` | the `data` of an error; `_gorynych/status` `maintenance` | the adapter a management stop disabled or is draining; no new work starts for it until `_gorynych/start` |
+| `gorynych/stopping` | the `data` of an error | `true`: the adapter is being stopped; a request it refuses now may go again after `start` |
+| `gorynych/maintenance` | `_gorynych/status` | `{stoppedAll, stoppedAgents, stoppingAgents, stopInProgress}` |
 | `gorynych/draft` | `session/resume` params `_meta`, service → adapter | `true` for a session with no turn yet: a draft, also one that moved to another host and whose first prompt is on its way ([Updating adapters](#updating-adapters)). An adapter that keeps nothing before the first prompt and no longer knows the session opens it afresh under its ID; one that knows it opens it as it is ([adapter-contract.md](adapter-contract.md#3-new-sessions-the-list-and-discovery)) |
 | `gorynych/replay` | `session/resume` result `_meta`, adapter → service | what was replayed: `{"from": "mark" \| "start", "mark": "<new mark>"}` |
 | `gorynych/historyMark` | `session/prompt` result `_meta`; the `_meta` of the update that ends a turn of the agent's own (`gorynych/agentTurn: "ended"`) | the adapter's opaque mark of how far into its own history the journal now goes |
@@ -286,7 +299,9 @@ keys keep the `gorynych/` prefix until a domain for reverse-DNS keys is chosen.
 | `gorynych/localCommands` | an adapter's `agentCapabilities._meta` | slash commands the adapter answers itself without a native turn, with their leading slash (`["/usage"]`); the service leaves a draft unpromoted for them |
 | `gorynych/localCommand` | `_meta` of a local command's user and agent updates | `true`: this is local command output, not native history when a draft is discarded |
 | `gorynych/fullAccess` | `_meta` of a mode's value: a `SessionConfigSelectOption` of the option with category `mode`, or a `SessionMode` | `true`: in that mode the agent runs anything without asking the person (Claude's `bypassPermissions`, DSH's and Codex's `full-access`), so the service asks the person before a session not in such a mode asks one that is ([Approvals](#approvals)) |
-| `_gorynych/status` | method | service ID, process, data folder, `ahp` (with the [AHP face](ahp-face.md): `{port, error, clients, sessions, open}`; null without it), `dataFolderOpen` (why the data folder, or an item in it, could not be closed to other accounts at this start; null when it is closed), clients, sessions, pending requests, `restarting`, `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's, with hosts), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, sessions, turns, stopping}` ([Updating adapters](#updating-adapters)) |
+| `_gorynych/status` | method | service ID, process, `processPath`, `processStartedAt`, data folder, `ahp` (with the [AHP face](ahp-face.md): `{port, error, clients, sessions, open}`; null without it), `dataFolderOpen` (why the data folder, or an item in it, could not be closed to other accounts at this start; null when it is closed), clients, sessions, pending requests, `restarting`, `maintenance` (stopped and stopping adapters, `stopInProgress`), `hosts` (the adapters run in [adapter hosts](#adapter-hosts)), `build` (this executable's), `sessions` (the count, as before) and `sessionDetails` (live sessions with `state`, `open`, `turnRunning`, `pendingRequests`, `users`, `agentTurn`, `blockers`; see [Management stop and start](#management-stop-and-start)), adapters: each with its `generation` (what a host it starts now runs), `host` (the ID of its adapter-wide host of that generation) and `hosts`: every host it has, `{hostId, slot, current, forSession, build, options, processId, processStartedAt, sessions, turns, stopping, waiting}` ([Updating adapters](#updating-adapters)) |
+| `_gorynych/stop` | method, `{agents?: [name], all?: bool, wait?: bool, timeoutSeconds?: number}` | enters maintenance for the adapters atomically, enumerates running and queued turns, approvals/forms, opinions, reports, spawns, loads and native work, waits up to the timeout with `wait`, unloads idle sessions and stops their hosts; `{stopped: true, all, agents, unloadedSessions, hosts, serviceExits, waitedSeconds}` or `{stopped: false, blockers: [{sessionId, agent, title, reasons}], waitedSeconds, reason}`; a refusal leaves every adapter usable and cancels nothing. With `all` the service exits after the answer |
+| `_gorynych/start` | method, `{agents?: [name], all?: bool}` | clears a management stop so those adapters are available again (`all` also clears the stopped-all marker); `{started: true, all, agents}`. Availability only: an adapter starts at its next use |
 | `_gorynych/shutdown` | method | asks the service to exit |
 | `_gorynych/restart` | method, `{wait?, timeoutSeconds?, force?}` → `{restarted: true, processId, waitedSeconds, cancelledTurns}` or `{restarted: false, processId, waitedSeconds, running: [{sessionId, agent, title}]}`; with hosts always `{restarted: true, processId, waitedSeconds, cancelledTurns: 0, turnsInHosts}` | asks the service to exit for an update without breaking its clients' work; without hosts, called off when turns outlast the wait, unless `force` ([The resumable link](#the-resumable-link)); with hosts, it waits for no turn ([Adapter hosts](#adapter-hosts)) |
 | `_gorynych/restarting` | notification to clients, `{restart}` | the service has begun restart number `restart`: a client on the link holds its new prompts |
@@ -1559,6 +1574,56 @@ The unload checks all this again under the session's gate (the one a discard hol
 the session before it keeps the session loaded, and one that comes while it is under way waits
 for it and opens the session again. Each session has one timer: starting it again cancels the
 wait before, so a session read over and over keeps a single wait.
+
+## Management stop and start
+
+`Gorynych.Service stop` disables adapters safely and `start` restores them. It is not
+`shutdown`: shutdown cancels client turns, while a management stop never cancels or ends work. The
+service does the safety part; the command only waits and reports.
+
+- **The barrier first.** The service enters maintenance for the named adapters before it looks at
+  their work, so a prompt, opinion, spawn, load or forwarded request that arrives in between is
+  refused with `gorynych/stopped` (and `gorynych/stopping` while the stop drains). There is no
+  check-then-act race in which new work starts after the check.
+- **What counts as active work.** A running turn of the person's, another client's or the service's;
+  a queued prompt (one waiting behind a turn); an agent's own turn; an approval or form waiting for
+  an answer; an opinion, report, spawn, load, read or other registered operation; a steer in
+  flight; and a turn adopted from a host. A stopped adapter's own work is never silently cancelled.
+- **Wait or refuse.** Without `--wait` the service refuses at once if any of that is active and
+  lists it. With `--wait` it waits up to `--timeout` (5 minutes when omitted; `30s`, `5m`, `1h`,
+  or a bare number of minutes). At the timeout it calls the stop off, makes every adapter usable
+  again and returns the blockers; nothing is left half-stopped.
+- **What a successful stop does.** It unloads each idle session from its agent (a client that is
+  only attached does not keep it loaded; its next use opens it again), skips drafts so their
+  content is not discarded, and asks every host of the adapter to stop (`_gorynych/host_stop`). An
+  adapter that runs in the service's own process (`--hosts off`) is disposed and starts afresh at
+  its next use. Harness processes that Gorynych did not start are never touched.
+- **It stays stopped.** The stopped set is written to `maintenance.json` in the data folder before
+  the answer. A service restart or an update keeps it; `session/list` still shows the overlay's
+  sessions, but nothing starts an agent or a host for a stopped adapter. `start` clears it.
+- **`stop --all`.** After the same drain it stops every adapter's hosts and exits the service. The
+  marker says everything is stopped, so a bridge or the outside server that finds no pipe refuses
+  to start the service: it says to run `start --all`. The command waits for the service process,
+  for every owned host PID it reported, and for the harness/MCP descendants it saw under them
+  before the stop, trusting a PID only together with its start time (a reused PID is not another
+  process). It never kills anything; if something still runs after the timeout it exits with code
+  2 and says so. A service that is already absent is just marked.
+- **`start`.** `start --agent …` restores those adapters; starting one out of a stop-all keeps the
+  rest explicitly stopped. `start --all` also clears the stopped-all marker, and starts the service
+  when it is not running with the behavioural options it last ran with (`--hosts`, `--ahp`,
+  `--claude-*`, `--unload-after`, `--no-channel`, `--no-peers`; kept in
+  `service-options.json` in the data folder). Availability only: a host starts at the adapter's
+  next use.
+- **Exit codes.** 0 stopped/started, 1 no service or a request error, 2 the service or an owned
+  host did not exit in time, 4 the stop was refused because active work would be interrupted.
+- **`status`.** `status --tree` shows service → adapter host (or the in-process adapter) → harness
+  → descendants; `status --json` prints the same as one object, plus live sessions with state,
+  turns and blockers, versions/builds and `maintenance`. Each process row has its PID, executable
+  path and start time, never a command line, environment or token. Gorynych's own processes are
+  marked as owned; detected external harnesses are listed separately as informational and are never
+  stopped. A renamed `*.old.exe` and a host whose PID was reused show as such. Without a service
+  the report still names the data folder, the marker and external harnesses. `unknown` means the
+  version or build could not be read; it is never guessed.
 
 ## Drafts and deletion
 

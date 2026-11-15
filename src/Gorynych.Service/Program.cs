@@ -4,6 +4,7 @@ using Gorynych.Adapters.Claude;
 using Gorynych.Adapters.Codex;
 using Gorynych.Adapters.Dsh;
 using Gorynych.Adapters.Kimi;
+using Gorynych.Management;
 using Gorynych.Service;
 
 // The commands and their options: CommandLine.Usage. A wrong command line, or --help, prints the
@@ -27,13 +28,23 @@ switch (line.Command)
     // Asks the running service to exit and waits for it; exit code 1 when none runs on the pipe.
     case "shutdown":
         return await AcpBridge.ShutdownAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName);
-    // Shows the running service and its hosts: what runs where, and what waits to move after an update.
+    // Shows the running service, its hosts, owned harness processes and external agents; useful without a service too.
     case "status":
-        return await AcpBridge.StatusAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName);
+        return await StatusCommand.RunAsync(line);
+    // Safely stops adapters, or everything, with a maintenance barrier and blocker enumeration.
+    case "stop":
+        return await ManagementCommand.StopAsync(line);
+    // Restores adapters stop disabled, and clears the stopped-all marker.
+    case "start":
+        return await ManagementCommand.StartAsync(line);
+    // Updates only Gorynych from a checked package; no harness update.
+    case "update":
+        return await UpdateCommand.RunAsync(line);
     // Asks it to exit for an update without breaking its clients' work; its bridges start the new one.
     case "restart":
         return await AcpBridge.RestartAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName, !line.Flag("--no-wait"),
-            CommandLine.MinutesOf(line.Value("--timeout")) ?? Conductor.DefaultRestartTimeout, line.Flag("--force"));
+            line.Value("--timeout") is { } timeout ? CommandLine.DurationOf(timeout) ?? Conductor.DefaultRestartTimeout : Conductor.DefaultRestartTimeout,
+            line.Flag("--force"));
     // The stdio entry point for external ACP clients (Zed); starts the service when needed.
     case "acp":
         return await AcpBridge.RunAsync(line.Value("--agent")!, line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName, line.ServiceArguments("--pipe"));
@@ -58,6 +69,8 @@ if (DataFolder.Refusal(dataDirectory) is { } refused)
 }
 Directory.CreateDirectory(dataDirectory);
 DataFolder.Claim(dataDirectory);
+// What this start runs with, so `start --all` brings the service back the same way.
+ServiceOptions.Write(dataDirectory, line.PersistentServiceArguments());
 ServiceLog.Init(Path.Combine(dataDirectory, "logs"), console: line.Flag("--console"));
 // Every session's journal, the peer tokens and the logs are the user's alone (Codex's sandbox could read them).
 var closed = DataFolder.Protect(dataDirectory);
@@ -114,6 +127,12 @@ ServiceLog.Info($"service {state.ServiceId} starting, pid {Environment.ProcessId
 if (Gorynych.Outside.DetachedProcess.KillOnCloseJob() is { } job) ServiceLog.Warn($"service: {job}");
 
 var adapters = Adapters(line, dataDirectory);
+// What a management command stopped before this start stays stopped: a service restart or an
+// update must not bring a disabled adapter back on its own (see `Gorynych.Service start`).
+var managed = ManagementState.Read(dataDirectory);
+IReadOnlySet<string> stoppedAgents = managed.StoppedAll
+    ? new HashSet<string>(CommandLine.AdapterNames, StringComparer.Ordinal)
+    : managed.Agents;
 // Adapter hosts: on by default on Windows and Linux, where they are tried; on macOS only when asked for.
 var hosted = line.Value("--hosts") switch { "on" => true, "off" => false, _ => OperatingSystem.IsWindows() || OperatingSystem.IsLinux() };
 Gorynych.Service.Hosts.IHostLauncher? hosts = null;
@@ -139,6 +158,7 @@ await using var conductor = new Conductor(new ConductorOptions
     HostGeneration = hosted ? a => new Gorynych.Service.Hosts.HostGeneration(serviceBuild, AdapterArguments(line, a)) : null,
     SessionHosts = new HashSet<string>(["claude"], StringComparer.Ordinal),
     DataFolderOpen = closed is { Failed: true } ? closed.Value.Said : null,
+    StoppedAgents = stoppedAgents,
 }, adapters);
 
 // The AHP face (docs/ahp-face.md), for VS Code's Agents window: off unless --ahp on or a port.

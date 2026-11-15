@@ -26,10 +26,23 @@ internal sealed class CommandLine
               the stdio bridge for ACP clients such as Zed; starts the service when its pipe is missing
           Gorynych.Service shutdown [--pipe <name>]
               asks the running service to exit and waits for it
-          Gorynych.Service status [--pipe <name>]
+          Gorynych.Service status [--pipe <name>] [--data <dir>] [--tree] [--json]
               shows the running service and its adapter hosts: their build, sessions and running turns,
-              and which sessions still wait to move to a host of the current build after an update
-          Gorynych.Service restart [--pipe <name>] [--timeout <minutes>] [--no-wait] [--force]
+              and which sessions still wait to move to a host of the current build after an update.
+              --tree shows service -> adapter host -> harness -> descendants; --json prints the same as
+              one JSON object. A service that is not running is reported too, with what was stopped
+          Gorynych.Service stop --agent <name> [--agent <name>...] | --all [--wait] [--timeout <duration>]
+              safely stops adapters: enters maintenance first, refuses if active work would be
+              interrupted (or waits up to the timeout with --wait; 5m when --timeout is left out),
+              unloads idle sessions and stops their hosts. --all then stops the service and its
+              owned hosts, and keeps bridges from starting it again until start
+          Gorynych.Service start --agent <name> [--agent <name>...] | --all [--pipe <name>] [--data <dir>]
+              restores adapters a stop disabled; with --all also clears the stopped-all marker and
+              starts the service when it is not running
+          Gorynych.Service update <local-archive-or-url> [--dry-run] [--install <dir>] [--pipe <name>] [--data <dir>]
+              updates only Gorynych from a package whose layout, version, OS and architecture it
+              checks first. --dry-run prints the plan and blockers without touching the install
+          Gorynych.Service restart [--pipe <name>] [--timeout <duration>] [--no-wait] [--force]
               asks the running service to exit for an update: it starts no new turn, waits for the
               running ones (5 minutes at most by default; none with --no-wait), and its bridges start
               the new one; if turns still run then, it stays (exit code 4), unless --force cancels them
@@ -85,9 +98,31 @@ internal sealed class CommandLine
     /// <summary><c>install</c> or <c>uninstall</c> for <c>task</c>.</summary>
     public string? Action { get; }
 
+    /// <summary>The non-option arguments of a command that takes one, such as <c>update</c>'s source.</summary>
+    public List<string> Arguments { get; } = [];
+
+    public IEnumerable<string> Values(string name) => options.Where(o => o.Name == name).Select(o => o.Value).OfType<string>();
+
     public string? Value(string name) => options.FirstOrDefault(o => o.Name == name).Value;
 
     public bool Flag(string name) => options.Any(o => o.Name == name);
+
+    /// <summary>
+    /// The service options worth remembering for <c>start --all</c>: those that change behaviour,
+    /// without the endpoint, data folder or console, which a later start supplies itself.
+    /// </summary>
+    public List<string> PersistentServiceArguments()
+    {
+        var list = new List<string>();
+        foreach (var (name, value) in options)
+        {
+            if (name is "--pipe" or "--data" or "--console") continue;
+            if (!(ServiceValues.Contains(name) || ServiceFlags.Contains(name))) continue;
+            list.Add(name);
+            if (value is not null) list.Add(value);
+        }
+        return list;
+    }
 
     /// <summary>The service options given, in order, as arguments for a service this command starts.</summary>
     public List<string> ServiceArguments(params string[] except)
@@ -121,8 +156,20 @@ internal sealed class CommandLine
             case "acp":
                 known = ([.. ServiceValues, "--agent"], ServiceFlags);
                 break;
-            case "shutdown" or "status":
+            case "shutdown":
                 known = (["--pipe"], []);
+                break;
+            case "status":
+                known = (["--pipe", "--data"], ["--tree", "--json"]);
+                break;
+            case "stop":
+                known = (["--pipe", "--data", "--agent", "--timeout"], ["--all", "--wait"]);
+                break;
+            case "start":
+                known = (["--pipe", "--data", "--agent"], ["--all"]);
+                break;
+            case "update":
+                known = (["--pipe", "--data", "--install"], ["--dry-run"]);
                 break;
             case "restart":
                 known = (["--pipe", "--timeout"], ["--no-wait", "--force"]);
@@ -166,6 +213,15 @@ internal sealed class CommandLine
             var name = args[i];
             string? value = null;
             if (IsHelp(name)) throw new UsageException(null);
+            if (!name.StartsWith('-'))
+            {
+                if (command == "update" && line.Arguments.Count == 0)
+                {
+                    line.Arguments.Add(name);
+                    continue;
+                }
+                throw new UsageException($"unexpected argument '{name}'");
+            }
             if (known.Values.Contains(name))
             {
                 // A value is never empty and never an option: "--pipe --data d" lacks the pipe.
@@ -181,6 +237,15 @@ internal sealed class CommandLine
         }
         if (command == "acp" && line.Value("--agent") is null) throw new UsageException("acp needs --agent");
         if (command == "host" && line.Value("--adapter") is null) throw new UsageException("host needs --adapter");
+        if (command is "stop" or "start")
+        {
+            var all = line.Flag("--all");
+            var anyAgent = line.Values("--agent").Any();
+            if (all == anyAgent)
+                throw new UsageException(command == "stop" ? "stop needs --all or --agent <name>" : "start needs --all or --agent <name>");
+        }
+        if (command == "update" && line.Arguments.Count != 1)
+            throw new UsageException("update needs one local archive or URL");
         return line;
     }
 
@@ -207,7 +272,8 @@ internal sealed class CommandLine
         {
             "--claude-transport" => value is "headless" or "tui",
             "--claude-channels" => value is "ask" or "accept" or "decline",
-            "--unload-after" or "--timeout" => MinutesOf(value) is not null,
+            "--unload-after" => MinutesOf(value) is not null,
+            "--timeout" => DurationOf(value) is not null,
             "--hosts" => value is "on" or "off",
             "--ahp" => value is "on" or "off" || (int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var port) && port is > 0 and < 65536),
             "--adapter" => AdapterNames.Contains(value),
@@ -236,4 +302,30 @@ internal sealed class CommandLine
     /// <summary>A number of minutes, 0 or more, that makes a time span; null for anything else.</summary>
     public static TimeSpan? MinutesOf(string? value) =>
         double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var m) && m >= 0 && Minutes(m) ? TimeSpan.FromMinutes(m) : null;
+
+    /// <summary>
+    /// A duration as the management commands take one: <c>30s</c>, <c>5m</c>, <c>1h</c>, or a bare
+    /// number of minutes as <c>restart</c> has always taken. Null for anything else, negative
+    /// included; at most a day.
+    /// </summary>
+    public static TimeSpan? DurationOf(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var text = value.Trim();
+        var unit = text[^1];
+        if (unit is 's' or 'm' or 'h' or 'd')
+        {
+            var number = text[..^1];
+            if (!double.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out var n) || !double.IsFinite(n) || n < 0) return null;
+            var span = unit switch
+            {
+                's' => TimeSpan.FromSeconds(n),
+                'm' => TimeSpan.FromMinutes(n),
+                'h' => TimeSpan.FromHours(n),
+                _ => TimeSpan.FromDays(n),
+            };
+            return span <= TimeSpan.FromDays(1) ? span : null;
+        }
+        return MinutesOf(text);
+    }
 }

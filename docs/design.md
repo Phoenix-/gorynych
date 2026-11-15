@@ -676,6 +676,17 @@ a restart onto a new executable, or with other adapter options, makes the runnin
   go of the overlay's name for it, before requests could see it. A resume in between opened the
   session in a second host, and the old one was stopped mid-turn.
 
+**Safe management** (**done** 15 November 2026). `Gorynych.Service stop` enters maintenance in
+the conductor before it enumerates work, so a prompt, opinion, spawn or load cannot slip in after
+the check. It refuses (or waits, up to a timeout) while a turn, a queued prompt, an approval, an
+opinion, a spawn, a load or an agent's own turn runs; it never cancels one, and a timeout calls the
+stop off. A successful stop unloads idle sessions and stops the adapters' hosts; `stop --all`
+also exits the service and leaves `maintenance.json`, which keeps bridges from restarting it.
+`start` restores availability explicitly. `status --tree`/`--json` reports owned processes,
+external harnesses, versions/builds and blockers without command lines or secrets. `update` stages
+and validates a Gorynych package, restarts the conductor while hosts keep running turns, verifies
+the new build and rolls back an activation failure; harness updates stay out of scope.
+
 **One resumable link, two uses.** The same mechanism serves:
 - the bridge and the service across a restart (**done** on 10 November 2026:
   `ResumableLink` and `Gorynych.Service restart`,

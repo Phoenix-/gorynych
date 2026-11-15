@@ -6,6 +6,7 @@ using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
+using Gorynych.Management;
 using Gorynych.Service.Hosts;
 
 namespace Gorynych.Service;
@@ -108,6 +109,13 @@ public sealed class ConductorOptions
     /// <summary>The adapters that run each session in a host of its own (Claude), rather than all in one.</summary>
     public IReadOnlySet<string> SessionHosts { get; init; } = new HashSet<string>(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Adapters a management command stopped before this service started
+    /// (<see cref="ManagementState"/>): their sessions are listed but no work starts for them, and no
+    /// host is started, until <c>_gorynych/start</c>. Empty for a service nobody stopped.
+    /// </summary>
+    public IReadOnlySet<string> StoppedAgents { get; init; } = new HashSet<string>(StringComparer.Ordinal);
+
     /// <summary>How often the conductor looks for idle sessions to move off stale hosts, besides when a session goes idle.</summary>
     public TimeSpan MoveSweep { get; init; } = TimeSpan.FromSeconds(30);
 
@@ -199,6 +207,7 @@ public sealed class Conductor : IAsyncDisposable
         store.Removed = r => { if (r.Listed) AnnounceList(r.SessionId, r.Agent, "removed"); };
         store.Active = AnnounceActivity;
         Outside = new OutsideService(this, options.OutsideProgressInterval);
+        stoppedAgents = new HashSet<string>(options.StoppedAgents.Where(agents.ContainsKey), StringComparer.Ordinal);
         // A session's peer token outlives this run: the agent's peers server (in a host) keeps it.
         foreach (var r in store.All())
             if (r.PeerToken is { Length: > 0 } token && !r.Deleted)
@@ -261,6 +270,7 @@ public sealed class Conductor : IAsyncDisposable
             else if (link < GorynychProtocol.MinHostLinkVersion || link > GorynychProtocol.HostLinkVersion)
                 refusal = $"it speaks host link {link}, and this service takes {GorynychProtocol.MinHostLinkVersion} to {GorynychProtocol.HostLinkVersion}";
             else if (options.Hosts is null) refusal = "this service runs its adapters in its own process";
+            else if (adapter is not null && IsStopping(adapter)) refusal = $"the {adapter} adapter is stopped by a management command";
             if (refusal is not null)
             {
                 // Stopped, not only closed: else it would try again until it is an orphan, and keep the
@@ -962,6 +972,349 @@ public sealed class Conductor : IAsyncDisposable
 
     IEnumerable<SessionFeed> Running() => feeds.Values.Where(f => !f.Retired && f.TurnRunning);
 
+    // ---------------------------------------------------------------- management stop and start
+
+    readonly Lock maintenanceGate = new();
+    readonly HashSet<string> stoppingAgents = new(StringComparer.Ordinal);
+    readonly HashSet<string> stoppedAgents;
+    Task<JsonObject>? stopTask;
+    bool stopAll;
+
+    /// <summary>True when a management command stopped the adapter: no new work starts for it.</summary>
+    public bool IsStopped(string agent)
+    {
+        lock (maintenanceGate) return stopAll || stoppedAgents.Contains(agent);
+    }
+
+    /// <summary>True while a management stop drains the adapter: new work is refused before it is checked.</summary>
+    public bool IsStopping(string agent)
+    {
+        lock (maintenanceGate) return stopAll || stoppedAgents.Contains(agent) || stoppingAgents.Contains(agent);
+    }
+
+    /// <summary>The error for work of an adapter a management command stopped or is stopping.</summary>
+    internal JsonRpcException Unavailable(string agent)
+    {
+        bool stopping, all;
+        lock (maintenanceGate)
+        {
+            stopping = stoppingAgents.Contains(agent) && !stoppedAgents.Contains(agent);
+            all = stopAll;
+        }
+        var data = new JsonObject { [GorynychProtocol.MetaStopped] = agent };
+        if (stopping) data[GorynychProtocol.MetaStopping] = true;
+        return new JsonRpcException(JsonRpcException.InternalError,
+            stopping
+                ? $"The {agent} adapter is being stopped by a management command; no new work starts for it. " +
+                  $"Wait for the stop to finish, or run `Gorynych.Service start --agent {agent}` to restore it."
+                : $"The {agent} adapter is stopped by a management command. " +
+                  $"Run `Gorynych.Service start --agent {agent}` to restore it.",
+            data);
+    }
+
+    internal JsonObject MaintenanceStatus()
+    {
+        lock (maintenanceGate)
+            return new JsonObject
+            {
+                ["stoppedAll"] = stopAll,
+                ["stoppedAgents"] = new JsonArray(stoppedAgents.Order(StringComparer.Ordinal).Select(a => (JsonNode)a).ToArray()),
+                ["stoppingAgents"] = new JsonArray(stoppingAgents.Order(StringComparer.Ordinal).Select(a => (JsonNode)a).ToArray()),
+                ["stopInProgress"] = stopTask is not null && !stopTask.IsCompleted,
+            };
+    }
+
+    /// <summary>
+    /// <c>_gorynych/stop</c>: enters maintenance for the adapters atomically (so a request that comes
+    /// now is refused before it can start work), enumerates their active work, waits for it as asked,
+    /// unloads idle sessions, stops their hosts, and remembers them stopped. With <c>all</c> it also
+    /// exits the service after the answer. A timeout or a close failure calls the stop off: the
+    /// adapters become available again and the result enumerates what still ran, so nothing is
+    /// cancelled and no undefined half-state is left.
+    /// </summary>
+    internal async Task<JsonNode?> StopAsync(JsonRpcRequest request)
+    {
+        static bool Flag(JsonNode? node, bool otherwise) =>
+            node is JsonValue v && v.TryGetValue<bool>(out var b) ? b : otherwise;
+        var all = Flag(request.Params?["all"], false);
+        var wait = Flag(request.Params?["wait"], false);
+        var timeout = request.Params?["timeoutSeconds"] is JsonValue t && t.TryGetValue<double>(out var seconds) && double.IsFinite(seconds) && seconds >= 0
+            ? TimeSpan.FromSeconds(Math.Min(seconds, TimeSpan.FromDays(1).TotalSeconds))
+            : DefaultRestartTimeout;
+        var requested = (request.Params?["agents"] as JsonArray ?? []).Select(a => (string?)a).OfType<string>().ToArray();
+        string[] names;
+        if (all) names = [.. agents.Keys];
+        else
+        {
+            if (requested.Length == 0)
+                throw new JsonRpcException(JsonRpcException.InvalidParams, "stop needs all: true or a non-empty agents array");
+            names = requested.Distinct(StringComparer.Ordinal).ToArray();
+            foreach (var name in names)
+                if (!agents.ContainsKey(name))
+                    throw new JsonRpcException(JsonRpcException.InvalidParams,
+                        $"Unknown agent '{name}'. Known: {string.Join(", ", agents.Keys)}");
+        }
+        Task<JsonObject> work;
+        lock (maintenanceGate)
+        {
+            if (stopTask is { } running) work = running;
+            else
+            {
+                foreach (var name in names)
+                    if (!stoppedAgents.Contains(name)) stoppingAgents.Add(name);
+                work = stopTask = Task.Run(() => StopCoreAsync(names, all, wait, timeout));
+            }
+        }
+        var result = await work;
+        if (result["stopped"] is JsonValue v && v.TryGetValue<bool>(out var stopped) && stopped && all)
+        {
+            StopHostsOnExit = true;
+            request.AfterResult(() => { RequestShutdown(); return Task.CompletedTask; });
+            _ = Task.Delay(TimeSpan.FromSeconds(2)).ContinueWith(_ => RequestShutdown(), TaskScheduler.Default);
+        }
+        return result.DeepClone();
+    }
+
+    async Task<JsonObject> StopCoreAsync(string[] names, bool all, bool wait, TimeSpan timeout)
+    {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var succeeded = false;
+        try
+        {
+            var unloaded = new List<string>();
+            while (true)
+            {
+                var blockers = ActiveBlockers(names);
+                if (blockers.Count > 0)
+                {
+                    if (!wait || clock.Elapsed >= timeout)
+                    {
+                        ServiceLog.Info($"stop {string.Join(",", names)}: called off with {blockers.Count} active work item(s) after {clock.Elapsed.TotalSeconds:0.#} s");
+                        return Refused(blockers, clock.Elapsed, "active work would be interrupted; nothing was stopped or cancelled");
+                    }
+                    await Task.Delay(100);
+                    continue;
+                }
+                // Nothing is active now. New work is already refused (maintenance), but a prompt that
+                // was queued before this may just have started: unload under each session's life gate,
+                // and if one became busy again, wait for it and look again rather than fail the stop.
+                var failed = new List<JsonObject>();
+                foreach (var record in store.All().Where(r => names.Contains(r.Agent) && !r.Deleted && !unloaded.Contains(r.SessionId)).ToList())
+                {
+                    if (record.Draft) continue; // nothing to unload; closing a draft would discard it
+                    var feed = Feed(record.SessionId);
+                    await feed.LifeGate.WaitAsync();
+                    try
+                    {
+                        if (feed.Retired || feed.Users > 0 || feed.TurnRunning || feed.PendingRequests > 0 || feed.Asking > 0
+                            || feed.HasSteeringInFlight)
+                        {
+                            failed.Add(BlockerOf(record, "it became busy again"));
+                            continue;
+                        }
+                        if (!agents.TryGetValue(record.Agent, out var host)) continue;
+                        var route = host.RouteOf(record.SessionId);
+                        if (route is not { CanClose: true }) continue;
+                        feed.StopIdle();
+                        if (!await CloseInAgentAsync(host, route.Rpc, record.SessionId, CancellationToken.None))
+                            failed.Add(BlockerOf(record, "its close failed; it may still be open in its agent"));
+                        else unloaded.Add(record.SessionId);
+                    }
+                    finally
+                    {
+                        feed.LifeGate.Release();
+                    }
+                }
+                if (failed.Count == 0) break;
+                if (!wait || clock.Elapsed >= timeout)
+                {
+                    ServiceLog.Info($"stop {string.Join(",", names)}: called off; {failed.Count} session(s) could not be unloaded");
+                    return Refused(failed, clock.Elapsed, "an idle session could not be unloaded safely; nothing was stopped");
+                }
+                await Task.Delay(100);
+            }
+            var hosts = HostRowsOf(names);
+            foreach (var name in names)
+                if (agents.TryGetValue(name, out var host))
+                    try { await host.StopForMaintenanceAsync(); }
+                    catch (Exception e) { ServiceLog.Warn($"stop {name}: its adapter did not stop cleanly: {e.Message}"); }
+            lock (maintenanceGate)
+            {
+                foreach (var name in names) stoppedAgents.Add(name);
+                if (all) stopAll = true;
+                try
+                {
+                    SaveMaintenanceLocked();
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                {
+                    foreach (var name in names) stoppedAgents.Remove(name);
+                    if (all) stopAll = false;
+                    stopTask = null;
+                    stoppingAgents.Clear();
+                    ServiceLog.Error($"stop {string.Join(",", names)}: its state could not be saved: {e.Message}");
+                    return Refused([new JsonObject { ["reason"] = $"the stopped state could not be saved in the data folder: {e.Message}" }],
+                        clock.Elapsed, "nothing was stopped");
+                }
+                stopTask = null;
+                stoppingAgents.Clear();
+                succeeded = true;
+            }
+            ServiceLog.Info($"stop {string.Join(",", names)}: {(all ? "everything" : string.Join(", ", names))} stopped; " +
+                $"{unloaded.Count} idle session(s) unloaded, {hosts.Count} host(s) stopped");
+            return new JsonObject
+            {
+                ["stopped"] = true,
+                ["all"] = all,
+                ["agents"] = new JsonArray(names.Select(n => (JsonNode)n).ToArray()),
+                ["unloadedSessions"] = new JsonArray(unloaded.Select(s => (JsonNode)s).ToArray()),
+                ["hosts"] = hosts,
+                ["serviceExits"] = all,
+                ["waitedSeconds"] = Math.Round(clock.Elapsed.TotalSeconds, 1),
+            };
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            lock (maintenanceGate)
+            {
+                stopTask = null;
+                stoppingAgents.Clear();
+            }
+            ServiceLog.Error($"stop {string.Join(",", names)}: {e.Message}");
+            return Refused([new JsonObject { ["reason"] = e.Message }], clock.Elapsed, "the stop failed; the adapters serve on");
+        }
+        finally
+        {
+            if (!succeeded)
+                lock (maintenanceGate)
+                {
+                    stopTask = null;
+                    stoppingAgents.Clear();
+                }
+        }
+    }
+
+    /// <summary>The result of a stop that was called off: nothing changed, and this says what ran.</summary>
+    static JsonObject Refused(List<JsonObject> blockers, TimeSpan waited, string why) => new()
+    {
+        ["stopped"] = false,
+        ["blockers"] = new JsonArray(blockers.Select(b => (JsonNode)b).ToArray()),
+        ["waitedSeconds"] = Math.Round(waited.TotalSeconds, 1),
+        ["reason"] = why,
+    };
+
+    /// <summary>Writes the stopped set to the data folder; the caller holds <see cref="maintenanceGate"/>.</summary>
+    void SaveMaintenanceLocked()
+    {
+        var state = new ManagementState(stopAll, new HashSet<string>(stoppedAgents, StringComparer.Ordinal), DateTimeOffset.UtcNow);
+        if (state.StoppedAll || state.Agents.Count > 0) ManagementState.Write(options.DataDirectory, state);
+        else ManagementState.Clear(options.DataDirectory);
+    }
+
+    /// <summary>
+    /// <c>_gorynych/start</c>: restores the adapters a management stop disabled. Availability only:
+    /// an adapter starts again at its next use.
+    /// </summary>
+    internal JsonNode? Start(JsonRpcRequest request)
+    {
+        static bool Flag(JsonNode? node, bool otherwise) =>
+            node is JsonValue v && v.TryGetValue<bool>(out var b) ? b : otherwise;
+        var all = Flag(request.Params?["all"], false);
+        var requested = (request.Params?["agents"] as JsonArray ?? []).Select(a => (string?)a).OfType<string>().ToArray();
+        string[] names;
+        if (all) names = [.. agents.Keys];
+        else
+        {
+            if (requested.Length == 0)
+                throw new JsonRpcException(JsonRpcException.InvalidParams, "start needs all: true or a non-empty agents array");
+            names = requested.Distinct(StringComparer.Ordinal).ToArray();
+            foreach (var name in names)
+                if (!agents.ContainsKey(name))
+                    throw new JsonRpcException(JsonRpcException.InvalidParams,
+                        $"Unknown agent '{name}'. Known: {string.Join(", ", agents.Keys)}");
+        }
+        lock (maintenanceGate)
+        {
+            if (all)
+            {
+                stoppedAgents.Clear();
+                stopAll = false;
+                stopTask = null;
+            }
+            else
+            {
+                // Starting one adapter out of a stop-all keeps the rest stopped, explicitly.
+                if (stopAll)
+                {
+                    stopAll = false;
+                    foreach (var name in agents.Keys) if (!names.Contains(name)) stoppedAgents.Add(name);
+                }
+                foreach (var name in names) stoppedAgents.Remove(name);
+            }
+            SaveMaintenanceLocked();
+        }
+        ServiceLog.Info($"start {string.Join(",", names)}: available again");
+        return new JsonObject
+        {
+            ["started"] = true,
+            ["all"] = all,
+            ["agents"] = new JsonArray(names.Select(n => (JsonNode)n).ToArray()),
+        };
+    }
+
+    /// <summary>What the service considers active work for these adapters now.</summary>
+    List<JsonObject> ActiveBlockers(IReadOnlyCollection<string> names)
+    {
+        var blockers = new List<JsonObject>();
+        foreach (var feed in feeds.Values)
+        {
+            if (feed.Retired) continue;
+            if (store.Get(feed.SessionId) is not { Deleted: false } record || !names.Contains(record.Agent)) continue;
+            var reasons = new List<string>();
+            if (feed.TurnRunning) reasons.Add("a turn is running");
+            if (feed.PromptsInProgress().Length > 0) reasons.Add("a prompt is queued or running");
+            if (feed.PromptsOnTheirWay > 0) reasons.Add("a prompt is on its way to the agent");
+            if (feed.PendingRequests > 0) reasons.Add("an approval or form waits for an answer");
+            if (feed.Asking > 0) reasons.Add("an approval or form waits for an answer (the agent is asking)");
+            if (feed.HasSteeringInFlight) reasons.Add("a steer is on its way");
+            if (feed.CurrentOpinion is { } opinion) reasons.Add($"it is answering opinion request {opinion}");
+            if (feed.Adopted is not null) reasons.Add("a turn adopted from a host is running");
+            if (feed.Users > 0 && reasons.Count == 0) reasons.Add("an operation is in progress");
+            if (reasons.Count == 0) continue;
+            blockers.Add(BlockerOf(record, reasons.Distinct(StringComparer.Ordinal).ToArray()));
+        }
+        return blockers;
+    }
+
+    static JsonObject BlockerOf(SessionRecord record, params string[] reasons) => new()
+    {
+        ["sessionId"] = record.SessionId,
+        ["agent"] = record.Agent,
+        ["title"] = record.Title,
+        ["reasons"] = new JsonArray(reasons.Select(r => (JsonNode)r).ToArray()),
+    };
+
+    static JsonObject BlockerOf(SessionRecord record, string reason) => BlockerOf(record, [reason]);
+
+    /// <summary>Each adapter's hosts, as <c>_gorynych/status</c> describes them, for a stop's result.</summary>
+    JsonArray HostRowsOf(IEnumerable<string> names)
+    {
+        var rows = new JsonArray();
+        foreach (var name in names)
+            if (agents.TryGetValue(name, out var host))
+                foreach (var row in (host.Describe()["hosts"] as JsonArray ?? []).OfType<JsonObject>())
+                    rows.Add((JsonNode)new JsonObject
+                    {
+                        ["agent"] = name,
+                        ["hostId"] = row["hostId"]?.DeepClone(),
+                        ["processId"] = row["processId"]?.DeepClone(),
+                        ["processStartedAt"] = row["processStartedAt"]?.DeepClone(),
+                        ["build"] = row["build"]?.DeepClone(),
+                        ["slot"] = row["slot"]?.DeepClone(),
+                    });
+        return rows;
+    }
+
     /// <summary>Serves one client until it disconnects.</summary>
     public async Task ServeClientAsync(Stream input, Stream output, string name)
     {
@@ -1314,6 +1667,8 @@ public sealed class Conductor : IAsyncDisposable
         foreach (var host in agents.Values)
         {
             if (agentScope is not null && host.Name != agentScope) continue;
+            // A stopped adapter is not started for a list: its overlay rows are shown, no agent runs.
+            if (IsStopping(host.Name)) continue;
             try
             {
                 var rpc = await host.GetAsync(ct);
@@ -1412,12 +1767,19 @@ public sealed class Conductor : IAsyncDisposable
         // An explicit choice in the request wins; otherwise the agent the connection is scoped to.
         RefuseSystemPrompt(request.SystemPrompt);
         var host = Agent((string?)request.Meta?[GorynychProtocol.MetaAgent] ?? client.AgentScope);
+        if (IsStopping(host.Name)) throw Unavailable(host.Name);
         // A client's explicit choices, then the service's defaults for what it did not choose. They
         // are Gorynych's own data and are never written to the harness's configuration.
         var choices = ConfigChoicesFor(host.Name,
             ExplicitConfigOptions(request.Meta?[GorynychProtocol.MetaConfigOptions], "gorynych/configOptions on session/new"));
         if (choices.Count > 0) RequireConfigOptions(request, choices);
         var rpc = await host.OpenTargetAsync(null, ct);
+        // A stop may have begun while the host was opening: do not create a session in it after all.
+        if (IsStopping(host.Name))
+        {
+            host.DoneOpening(rpc);
+            throw Unavailable(host.Name);
+        }
         var token = NewToken();
         request.McpServers = WithPeers(request.McpServers, token);
         request.SystemPrompt = SystemPromptFor(host);
@@ -1667,6 +2029,7 @@ public sealed class Conductor : IAsyncDisposable
     internal async Task<(JsonRpcConnection Rpc, JsonObject? Opened)> EnsureLiveAsync(SessionRecord record, CancellationToken ct, bool holdingTurn = false)
     {
         var host = HostOf(record);
+        if (IsStopping(host.Name)) throw Unavailable(host.Name);
         var feed = Feed(record.SessionId);
         var wasOpen = host.IsLive(record.SessionId);
         // In a stale host: moved first when it is idle, so the new host takes the turn. A turn about to
@@ -1911,6 +2274,7 @@ public sealed class Conductor : IAsyncDisposable
         using var use = await UseAsync(request.SessionId, ct);
         var record = use.Record;
         var host = HostOf(record);
+        if (IsStopping(host.Name)) throw Unavailable(host.Name);
         var feed = use.Feed;
         JsonObject response;
         try
@@ -1945,6 +2309,7 @@ public sealed class Conductor : IAsyncDisposable
         // A resumable link coming back says what its client shows of the session's interactivity.
         if (request.Meta?[GorynychProtocol.MetaInteractivity] is not null) client.Knows(request.SessionId, ReadOnlyOf(request.Meta));
         using var use = await UseAsync(request.SessionId, ct);
+        if (IsStopping(HostOf(use.Record).Name)) throw Unavailable(HostOf(use.Record).Name);
         var (_, opened) = await EnsureLiveAsync(use.Record, ct);
         var position = await use.Feed.ResumeAndAttachAsync(client, after);
         await NoticeOnOpenAsync(use.Feed, client);
@@ -2015,6 +2380,7 @@ public sealed class Conductor : IAsyncDisposable
             if (request.Params is JsonObject forwarded) forwarded["_meta"] = prompt.Meta.DeepClone();
         }
         using var use = await UseAsync(prompt.SessionId, ct);
+        if (IsStopping(HostOf(use.Record).Name)) throw Unavailable(HostOf(use.Record).Name);
         var key = use.Feed.BeginPrompt(promptId);
         // A restart that began while this prompt found its session saw nothing in progress: refused
         // all the same, so it goes to the next service rather than die with this one.
@@ -2585,6 +2951,9 @@ public sealed class Conductor : IAsyncDisposable
         var closeVersion = feeds.TryGetValue(sessionId, out var feed) ? feed.DetachForClose(client) : (long?)null;
         if (closeVersion == 0) return new JsonObject();
         if (store.Get(sessionId) is not { Deleted: false } record) return new JsonObject();
+        // A stopped adapter is not started for a close, a draft discard or an unload: the client is
+        // detached above, and the next use after `start` opens it again.
+        if (IsStopping(record.Agent)) return new JsonObject();
         if (!record.Draft) feed?.CancelDiscardAfterClose();
         if (record.Draft)
         {
@@ -2709,6 +3078,8 @@ public sealed class Conductor : IAsyncDisposable
         try
         {
             if (store.Get(sessionId) is not { Deleted: false } record) return new JsonObject();
+            // Deleting would open the session in its agent (and so start a stopped adapter): refuse it.
+            if (IsStopping(record.Agent)) throw Unavailable(record.Agent);
             var native = false;
             if (agents.TryGetValue(record.Agent, out var host))
             {
@@ -2768,6 +3139,8 @@ public sealed class Conductor : IAsyncDisposable
         {
             // Read again under the gate: a client may have attached, prompted or loaded it meanwhile.
             if (store.Get(sessionId) is not { Draft: true, Deleted: false } record) return false;
+            // A stopped adapter is not started just to decide a draft: it waits for `start`.
+            if (IsStopping(record.Agent)) return false;
             if (feed.Retired || feed.Clients().Length > 0 || feed.Users > 0) return false;
             // An operation already registered may attach and let go again before Users reaches zero: check its generation last.
             if (afterClose is { } closeVersion && !feed.IsDiscardAfterClose(closeVersion)) return false;
@@ -3029,6 +3402,7 @@ public sealed class Conductor : IAsyncDisposable
         if (agentName is null || !agents.TryGetValue(agentName, out var host))
             throw new JsonRpcException(JsonRpcException.InvalidParams,
                 (agentName is null ? "agent is required." : $"No agent \"{agentName}\".") + $" Pass one of: {string.Join(", ", agents.Keys)}.");
+        if (IsStopping(host.Name)) throw Unavailable(host.Name);
         var title = ((string?)request.Params?["title"])?.Trim() is { Length: > 0 } named ? Shorten(named) : null;
         string? mode = null;
         if (request.Params is JsonObject spawnParams && spawnParams.ContainsKey("mode"))
@@ -5032,7 +5406,9 @@ public sealed class Conductor : IAsyncDisposable
     {
         ["serviceId"] = options.ServiceId,
         ["processId"] = Environment.ProcessId,
-        ["version"] = AgentHost.Version,
+        ["processPath"] = Environment.ProcessPath,
+        ["processStartedAt"] = AgentHost.ProcessStartedAt(Environment.ProcessId),
+        ["version"] = HostGeneration.ThisBuild.Split('+')[0],
         ["dataDirectory"] = options.DataDirectory,
         ["dataFolderOpen"] = options.DataFolderOpen,
         ["clients"] = clients.Count,
@@ -5040,10 +5416,73 @@ public sealed class Conductor : IAsyncDisposable
         ["pendingRequests"] = feeds.Values.Sum(f => f.PendingRequests),
         ["restarting"] = draining,
         ["hosts"] = options.Hosts is not null,
-        ["build"] = options.Hosts is null ? null : HostGeneration.ThisBuild,
+        ["build"] = HostGeneration.ThisBuild,
+        ["maintenance"] = MaintenanceStatus(),
         ["agents"] = new JsonArray(agents.Values.Select(a => (JsonNode)a.Describe(s => !removed.ContainsKey(s) && Feed(s).TurnRunning, WhyNotMoved)).ToArray()),
+        ["sessionDetails"] = SessionStatus(),
         ["ahp"] = AhpStatus?.Invoke(),
     };
+
+    /// <summary>
+    /// The live sessions and their blockers, for <c>_gorynych/status</c>: every loaded session, and
+    /// every one the overlay says waits in a host, with its activity and what a safe stop would name.
+    /// </summary>
+    JsonArray SessionStatus()
+    {
+        var rows = new List<(string SessionId, JsonObject Row)>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var feed in feeds.Values)
+        {
+            if (feed.Retired || store.Get(feed.SessionId) is not { Deleted: false } record) continue;
+            seen.Add(record.SessionId);
+            rows.Add((record.SessionId, SessionRow(record, feed)));
+        }
+        foreach (var record in store.All())
+        {
+            if (record.Deleted || seen.Contains(record.SessionId)) continue;
+            if (record.HostOf is null && record.HostPrompts is not { Count: > 0 }) continue;
+            rows.Add((record.SessionId, new JsonObject
+            {
+                ["sessionId"] = record.SessionId, ["agent"] = record.Agent, ["title"] = record.Title,
+                ["state"] = "idle", ["open"] = true, ["hostId"] = record.HostOf,
+                ["turnRunning"] = false, ["pendingRequests"] = 0, ["users"] = 0,
+                ["promptsOnTheirWay"] = 0, ["agentTurn"] = false, ["blockers"] = new JsonArray(),
+            }));
+        }
+        rows.Sort((a, b) => string.CompareOrdinal(a.SessionId, b.SessionId));
+        return new JsonArray(rows.Select(r => (JsonNode)r.Row).ToArray());
+    }
+
+    JsonObject SessionRow(SessionRecord record, SessionFeed feed)
+    {
+        var reasons = new List<string>();
+        if (feed.TurnRunning) reasons.Add("a turn is running");
+        if (feed.PromptsInProgress().Length > 0) reasons.Add("a prompt is queued or running");
+        if (feed.PromptsOnTheirWay > 0) reasons.Add("a prompt is on its way to the agent");
+        if (feed.PendingRequests > 0) reasons.Add("an approval or form waits for an answer");
+        if (feed.Asking > 0) reasons.Add("an approval or form waits for an answer (the agent is asking)");
+        if (feed.HasSteeringInFlight) reasons.Add("a steer is on its way");
+        if (feed.CurrentOpinion is { } opinion) reasons.Add($"answering opinion request {opinion}");
+        if (feed.Adopted is not null) reasons.Add("a turn adopted from a host is running");
+        if (feed.Users > 0 && reasons.Count == 0) reasons.Add("an operation is in progress");
+        var state = feed.Activity.Snapshot()["state"]?.GetValue<string>() ?? "idle";
+        return new JsonObject
+        {
+            ["sessionId"] = record.SessionId,
+            ["agent"] = record.Agent,
+            ["title"] = record.Title,
+            ["state"] = state,
+            ["open"] = agents.TryGetValue(record.Agent, out var host) && host.IsLive(record.SessionId),
+            ["hostId"] = agents.TryGetValue(record.Agent, out var owner) ? owner.RouteOf(record.SessionId)?.HostId : null,
+            ["turnRunning"] = feed.TurnRunning,
+            ["pendingRequests"] = feed.PendingRequests,
+            ["users"] = feed.Users,
+            ["promptsOnTheirWay"] = feed.PromptsOnTheirWay,
+            ["agentTurn"] = feed.AgentTurnRunning,
+            ["draft"] = record.Draft,
+            ["blockers"] = new JsonArray(reasons.Select(r => (JsonNode)r).ToArray()),
+        };
+    }
 
     /// <summary>The AHP face's state for <c>_gorynych/status</c> (its port, or why it is off); null without the face.</summary>
     internal Func<JsonObject>? AhpStatus { get; set; }

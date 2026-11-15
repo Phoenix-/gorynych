@@ -3,6 +3,7 @@ using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
+using Gorynych.Management;
 
 namespace Gorynych.Outside;
 
@@ -223,6 +224,9 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
         try
         {
             if (await TryConnectAsync(TimeSpan.FromMilliseconds(300), ct) is { } ready) return ready; // another request started it
+            if (ManagementState.Read(ManagementState.DefaultDirectory()).StoppedAll)
+                throw new ServiceUnreachableException("Gorynych was stopped by `Gorynych.Service stop --all`; " +
+                    "run `Gorynych.Service start --all` (or `start --agent <name>`) to enable it again");
             if (Environment.TickCount64 - lastStart < (long)StartRetry.TotalMilliseconds)
                 throw new ServiceUnreachableException(lastStartFailure ?? "it was started less than a minute ago and has not opened its pipe");
             lastStart = Environment.TickCount64;

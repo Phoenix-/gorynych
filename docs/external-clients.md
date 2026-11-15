@@ -8,7 +8,10 @@ Gorynych.Service acp [--agent claude|kimi|codex|dsh|<agent>@<machine>] [--pipe <
 
 The bridge connects to the service's pipe and passes ACP between its stdin/stdout and the pipe.
 When the service is not running, the bridge starts it: with the logon task when there is one,
-and never from an ssh login without it ([A remote machine](#a-remote-machine)). It changes one thing: it adds
+and never from an ssh login without it ([A remote machine](#a-remote-machine)). After
+`Gorynych.Service stop --all` it starts nothing: the data folder's `maintenance.json` says the
+person stopped everything, and only `Gorynych.Service start --all` (or `start --agent …`) clears
+that. It changes one thing: it adds
 `_meta["gorynych/agent"]` to the client's `initialize`, which scopes that connection to one
 agent. New sessions then go to that agent and `session/list` shows only its sessions, so the
 client needs no Gorynych extensions. `codex app-server proxy` follows the same idea.

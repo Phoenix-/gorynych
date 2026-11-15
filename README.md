@@ -59,6 +59,9 @@ The design, its decisions and the probes behind them: [docs/design.md](docs/desi
 - **Idle unload:** a session nobody uses is unloaded from its agent after 10 minutes
   (`--unload-after`) and woken again when a client, a question or a report needs it.
 - **Zed** through the bridge, `Gorynych.Service acp --agent claude|kimi|codex|dsh`.
+- **Management:** `status --tree`/`--json` with owned and external processes, safe
+  `stop --agent …|--all` / `start` that never cancels a turn, and `update` from a local archive or
+  URL with staging, platform checks, readiness verification and rollback.
 
 Headless Claude gets other agents' questions on its input. In the TUI fallback they go through
 development channels, a Claude Code research preview: Gorynych asks you once before it starts

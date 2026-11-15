@@ -405,6 +405,23 @@ public static class GorynychProtocol
     /// <summary>Returns service status: ID, process, adapters, sessions.</summary>
     public const string MethodStatus = "_gorynych/status";
 
+    /// <summary>
+    /// The management CLI's safe stop: <c>{agents?: [name], all?: bool, wait?: bool, timeoutSeconds?: number}</c>.
+    /// The service first enters maintenance so no new work starts for those adapters, then enumerates
+    /// their active work. Without <c>wait</c> it refuses if any exists; with it, waits up to the
+    /// timeout and refuses (leaving the service usable) if some is left. On success it unloads idle
+    /// sessions and stops the adapters' hosts, and the stopped set is kept in the data folder. With
+    /// <c>all</c>, it then exits; bridges will not start it again until <c>_gorynych/start</c>.
+    /// </summary>
+    public const string MethodStop = "_gorynych/stop";
+
+    /// <summary>
+    /// Restores adapters a management stop disabled: <c>{agents?: [name], all?: bool}</c>. Availability
+    /// only; a stopped agent starts again at its next use. With <c>all</c> it also clears the
+    /// stopped-all marker that keeps bridges from starting the service.
+    /// </summary>
+    public const string MethodStart = "_gorynych/start";
+
     /// <summary>Asks the service to exit.</summary>
     public const string MethodShutdown = "_gorynych/shutdown";
 
@@ -487,6 +504,18 @@ public static class GorynychProtocol
     /// because it is restarting, so it may be sent again to the next service as it is.
     /// </summary>
     public const string MetaRestarting = "gorynych/restarting";
+
+    /// <summary>
+    /// In the <c>data</c> of an error: the adapter that a management command stopped or is stopping.
+    /// No new work of that adapter starts until <c>_gorynych/start</c>.
+    /// </summary>
+    public const string MetaStopped = "gorynych/stopped";
+
+    /// <summary>In the <c>data</c> of an error: <c>true</c> while a management stop drains the adapter.</summary>
+    public const string MetaStopping = "gorynych/stopping";
+
+    /// <summary>In <c>_gorynych/status</c>: the management state (stopped agents, stopped all, draining).</summary>
+    public const string MetaMaintenance = "gorynych/maintenance";
 
     /// <summary>
     /// The version of the link between the conductor and its adapter hosts this build speaks; a

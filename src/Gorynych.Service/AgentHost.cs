@@ -794,6 +794,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
                 ["build"] = link.Generation?.Build, ["options"] = new JsonArray((link.Generation?.Options ?? []).Select(o => (JsonNode)o).ToArray()),
                 ["processId"] = link.ProcessId, ["sessions"] = new JsonArray(sessions.Select(s => (JsonNode)s).ToArray()),
                 ["turns"] = sessions.Count(turnRuns), ["stopping"] = link.Stopping,
+                ["processStartedAt"] = ProcessStartedAt(link.ProcessId),
             };
             if (!link.Current)
             {
@@ -814,6 +815,21 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             ["hosts"] = hosts,
             ["agentInfo"] = Info?.AgentInfo is { } a ? AcpJson.ToNode(a) : null,
         };
+    }
+
+    /// <summary>A process's start time, for telling a PID that was reused from the one a host reported; null when unknown.</summary>
+    internal static string? ProcessStartedAt(int processId)
+    {
+        if (processId <= 0) return null;
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(processId);
+            return process.StartTime.ToUniversalTime().ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+        }
+        catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -854,6 +870,40 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         try { await rpc.SendRequestAsync(GorynychProtocol.MethodHostStop, new JsonObject()).WaitAsync(TimeSpan.FromSeconds(5)); }
         catch (Exception e) when (e is IOException or JsonRpcException or TimeoutException) { }
         return false;
+    }
+
+    /// <summary>
+    /// Stops this adapter for a management stop, without ending the service: its hosts are asked to
+    /// stop (<c>_gorynych/host_stop</c>), and an adapter that runs in this process is disposed. Unlike
+    /// <see cref="DisposeAsync"/> it leaves the adapter able to start again when a later
+    /// <c>_gorynych/start</c> makes it available; the conductor has already unloaded its idle sessions.
+    /// </summary>
+    internal async Task StopForMaintenanceAsync()
+    {
+        List<HostLink> all;
+        lock (linksGate)
+        {
+            all = [.. links];
+            links.Clear();
+            route.Clear();
+            pinned.Clear();
+            claimed.Clear();
+        }
+        var running = Interlocked.Exchange(ref instance, null);
+        foreach (var link in all)
+        {
+            if (link.HostId is not null)
+                try { await link.Rpc.SendRequestAsync(GorynychProtocol.MethodHostStop, new JsonObject()).WaitAsync(TimeSpan.FromSeconds(5)); }
+                catch (Exception e) when (e is IOException or JsonRpcException or TimeoutException)
+                {
+                    ServiceLog.Warn($"{Name}: host {link.HostId} did not take its stop: {e.Message}");
+                }
+            await link.Rpc.DisposeAsync();
+        }
+        if (running is not null)
+            try { await running.DisposeAsync(); }
+            catch (Exception e) { ServiceLog.Warn($"{Name}: its in-process adapter did not stop cleanly: {e.Message}"); }
+        ServiceLog.Info($"{Name}: stopped for maintenance");
     }
 
     /// <summary>

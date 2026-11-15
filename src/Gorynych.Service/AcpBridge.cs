@@ -5,6 +5,7 @@ using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
 using Gorynych.Acp.Link;
+using Gorynych.Management;
 using Gorynych.Outside;
 
 namespace Gorynych.Service;
@@ -360,6 +361,11 @@ public static class AcpBridge
     static async Task<NamedPipeClientStream> StartAndConnectAsync(string pipe, IReadOnlyList<string> serviceArgs)
     {
         const int wait = 20;
+        // A management stop-all is explicit: a bridge or a client must not undo it by starting a service.
+        var dataDirectory = DataDirectoryOf(serviceArgs);
+        if (ManagementState.Read(dataDirectory).StoppedAll)
+            throw new NotStartedException("Gorynych was stopped by `Gorynych.Service stop --all`. " +
+                "Run `Gorynych.Service start --all` (or `start --agent <name>`) to enable it again.");
         switch (ServiceLaunch.Decide(LogonTask.Exists(pipe), ServiceLaunch.IsRemoteLogon()))
         {
             case ServiceLaunch.Way.Refuse:
@@ -383,6 +389,14 @@ public static class AcpBridge
                         "closing the client may stop the service and every session");
                 return await ServicePipe.ConnectAsync(pipe, TimeSpan.FromSeconds(wait)) ?? throw new TimeoutException("the service did not open its pipe");
         }
+    }
+
+    /// <summary>The data folder in a service argument list, as the service itself would read it.</summary>
+    internal static string DataDirectoryOf(IReadOnlyList<string> serviceArgs)
+    {
+        for (var i = 0; i < serviceArgs.Count - 1; i++)
+            if (serviceArgs[i] == "--data") return Path.GetFullPath(serviceArgs[i + 1]);
+        return ManagementState.DefaultDirectory();
     }
 
     /// <summary>The bridge started no service, on purpose; the message says why.</summary>

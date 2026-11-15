@@ -130,6 +130,12 @@ internal sealed class ClientConnection
                 return await conductor.DeleteAsync(RequireSession(request), ct);
             case GorynychProtocol.MethodStatus:
                 return conductor.Status();
+            case GorynychProtocol.MethodStop:
+                ServiceLog.Info($"{Rpc.Name}: asked for a management stop");
+                return await conductor.StopAsync(request);
+            case GorynychProtocol.MethodStart:
+                ServiceLog.Info($"{Rpc.Name}: asked to start adapters");
+                return conductor.Start(request);
             case GorynychProtocol.MethodOpinion:
                 return await conductor.OpinionAsync(request, ct, linkGone: () => Rpc.IsClosed);
             case GorynychProtocol.MethodPeers:
