@@ -331,9 +331,10 @@ public sealed partial class AhpFaceTests
         }), null, CancellationToken.None);
         await LinkHarness.Until(() => vscode.Actions(sessionUri).Any(a => a.Action.Value is SessionConfigChangedAction && a.Origin?.ClientId == "vscode"), "echoed");
         Assert.IsNull(vscode.Actions(sessionUri).First(a => a.Action.Value is SessionConfigChangedAction && a.Origin?.ClientId == "vscode").RejectionReason);
-        lock (rig.Kimi.Modes) Assert.AreEqual("full", rig.Kimi.Modes[id]);
         await LinkHarness.Until(() => { lock (rig.Zed.SessionUpdates) return rig.Zed.SessionUpdates.Any(u => u.SessionId == id && (string?)u.Update["sessionUpdate"] == "config_option_update"
             && (u.Update["configOptions"] as JsonArray)!.Any(o => (string?)o?["id"] == "mode" && (string?)o?["currentValue"] == "full")); }, "Zed sees the change");
+        // AHP echoes optimistically; the native change is complete when ACP reports the new options.
+        lock (rig.Kimi.Modes) Assert.AreEqual("full", rig.Kimi.Modes[id]);
         // A value the session does not have is refused.
         await vscode.Client.DispatchAsync(sessionUri, new StateAction(new SessionConfigChangedAction
         {
@@ -371,8 +372,11 @@ public sealed partial class AhpFaceTests
 
         var (sessionUri, _, id) = await CreateAsync(rig, vscode, "kimi", config: new() { ["mode"] = AhpNames.Element(JsonValue.Create("full")) });
         lock (rig.Kimi.Modes) Assert.AreEqual("full", rig.Kimi.Modes[id], "set before ready");
-        await LinkHarness.Until(() => vscode.Of<SessionConfigChangedAction>(sessionUri).LastOrDefault(c => c.Config.ContainsKey("mode")) is { } last
-            && last.Config["mode"].GetString() == "full", "the session's config says it");
+        // Creation may finish before the first subscription: the chosen config is then in its
+        // snapshot, with no change action to follow. Read the ready state rather than requiring an event.
+        var ready = (await vscode.SubscribeAsync(sessionUri)).State.Session!;
+        Assert.AreEqual(SessionLifecycle.Ready, ready.Lifecycle);
+        Assert.AreEqual("full", ready.Config!.Values["mode"].GetString(), "the ready session's config says it");
     }
 
     [TestMethod]
