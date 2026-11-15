@@ -71,7 +71,7 @@ internal static class StatusCommand
         public List<Item> Children { get; } = [];
     }
 
-    static JsonObject Report(string pipe, string dataDirectory, JsonObject? status, IReadOnlyList<ProcessSnapshot> snapshot)
+    internal static JsonObject Report(string pipe, string dataDirectory, JsonObject? status, IReadOnlyList<ProcessSnapshot> snapshot)
     {
         var byPid = snapshot.ToDictionary(p => p.Pid);
         var service = status is null ? null : ServiceReport(status, byPid, snapshot);
@@ -159,7 +159,7 @@ internal static class StatusCommand
                 var blockers = sessions.OfType<JsonObject>()
                     .Where(s => (string?)s["agent"] == name && hostSessions.Any(x => (string?)x == (string?)s["sessionId"]))
                     .SelectMany(s => (s["blockers"] as JsonArray ?? []).Select(b => b!))
-                    .Distinct().ToArray();
+                    .Distinct().Select(b => b.DeepClone()).ToArray();
                 var node = new JsonObject
                 {
                     ["hostId"] = host["hostId"]?.DeepClone(),

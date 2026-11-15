@@ -121,6 +121,31 @@ public sealed class ManagementCliTests
     }
 
     [TestMethod]
+    public void Status_WithActiveHostBlockers_DoesNotReparentItsInputNodes()
+    {
+        var raw = new JsonObject
+        {
+            ["processId"] = 100,
+            ["sessionDetails"] = new JsonArray(new JsonObject
+            {
+                ["agent"] = "codex", ["sessionId"] = "s1", ["blockers"] = new JsonArray("a turn is running"),
+            }),
+            ["agents"] = new JsonArray(new JsonObject
+            {
+                ["name"] = "codex",
+                ["hosts"] = new JsonArray(new JsonObject
+                {
+                    ["hostId"] = "h1", ["processId"] = 1234, ["sessions"] = new JsonArray("s1"), ["turns"] = 1,
+                }),
+            }),
+        };
+        var before = raw.ToJsonString();
+        var report = Gorynych.Service.StatusCommand.Report("test", TestDirs.New(), raw, []);
+        StringAssert.Contains(report.ToJsonString(), "a turn is running");
+        Assert.AreEqual(before, raw.ToJsonString(), "status must leave its source tree unchanged");
+    }
+
+    [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
     public async Task Status_WithoutAService_StillReportsTheDataFolderAndTheMarker()
     {
