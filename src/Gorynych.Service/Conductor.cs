@@ -1054,19 +1054,55 @@ public sealed class Conductor : IAsyncDisposable
                     throw new JsonRpcException(JsonRpcException.InvalidParams,
                         $"Unknown agent '{name}'. Known: {string.Join(", ", agents.Keys)}");
         }
-        Task<JsonObject> work;
-        lock (maintenanceGate)
+        JsonObject result;
+        while (true)
         {
-            if (stopTask is { } running) work = running;
-            else
+            Task<JsonObject>? work = null;
+            var done = false;
+            lock (maintenanceGate)
             {
-                foreach (var name in names)
-                    if (!stoppedAgents.Contains(name)) stoppingAgents.Add(name);
-                work = stopTask = Task.Run(() => StopCoreAsync(names, all, wait, timeout));
+                var missing = names.Where(n => !stoppedAgents.Contains(n)).ToArray();
+                if (stopTask is { } running) work = running;
+                else if (missing.Length == 0) done = true;
+                else
+                {
+                    foreach (var name in missing) stoppingAgents.Add(name);
+                    // `all` is the caller's request: if another stop covered only some adapters, the
+                    // next phase still records the stopped-all marker and then exits.
+                    work = stopTask = Task.Run(() => StopCoreAsync(missing, all, wait, timeout));
+                }
             }
+            if (done)
+            {
+                if (all)
+                    lock (maintenanceGate)
+                    {
+                        stopAll = true;
+                        try { SaveMaintenanceLocked(); }
+                        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                        {
+                            stopAll = false;
+                            return Refused([new JsonObject { ["reason"] = $"the stopped-all state could not be saved: {e.Message}" }],
+                                TimeSpan.Zero, "nothing was changed");
+                        }
+                    }
+                result = new JsonObject
+                {
+                    ["stopped"] = true, ["all"] = all, ["agents"] = new JsonArray(names.Select(n => (JsonNode)n).ToArray()),
+                    ["unloadedSessions"] = new JsonArray(), ["hosts"] = new JsonArray(), ["serviceExits"] = all, ["waitedSeconds"] = 0,
+                };
+                break;
+            }
+            var answered = await work!;
+            if (answered["stopped"] is not JsonValue v || !v.TryGetValue<bool>(out var stopped) || !stopped)
+                return answered.DeepClone();
+            result = answered;
+            lock (maintenanceGate)
+                if (all ? stopAll : names.All(stoppedAgents.Contains)) break;
+            // The stop that was already running covered only another set: stop what this caller asked
+            // for that is still available, then answer. A refusal above leaves everything usable.
         }
-        var result = await work;
-        if (result["stopped"] is JsonValue v && v.TryGetValue<bool>(out var stopped) && stopped && all)
+        if (all)
         {
             StopHostsOnExit = true;
             request.AfterResult(() => { RequestShutdown(); return Task.CompletedTask; });
