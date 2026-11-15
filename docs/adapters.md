@@ -676,7 +676,9 @@ over app-server's JSON-RPC. The design and the probes behind it are in
   (`codex app-server daemon`) is not used: it starts MCP servers outside the service's process
   tree. When app-server exits, the adapter stops, the service starts it again on the next
   use, and every session is not loaded. Starting and initializing app-server takes about
-  0.4 s.
+  0.4 s. The launch passes `-c tools.update_plan.enabled=true`: Codex 0.152 made the
+  checklist tool opt-in, and its `turn/plan/updated` notifications supply ACP's `plan`
+  display. This changes only Gorynych's app-server; `~/.codex` is not edited.
 - **Identity.** `initialize` sends `clientInfo {name: "gorynych", title: "Gorynych"}`. Codex
   records the name as the thread's `originator` and puts it in its user agent and OpenAI's
   compliance logs. The thread's `source` is `vscode`, as for Codex Desktop's threads, so

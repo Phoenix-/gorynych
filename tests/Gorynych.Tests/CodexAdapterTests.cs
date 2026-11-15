@@ -1576,7 +1576,7 @@ public sealed class CodexAdapterTests
     public void AppServer_IsStartedToUnloadAThreadAsSoonAsNobodySubscribes()
     {
         // Codex's default keeps an unsubscribed thread, and its writer lock, for 60 s (probed with 0.167).
-        CollectionAssert.AreEqual(new[] { "app-server", "-c", "thread_unload_delay_secs=0" }, CodexAdapter.AppServerArguments);
+        CollectionAssert.AreEqual(new[] { "app-server", "-c", "thread_unload_delay_secs=0", "-c", "tools.update_plan.enabled=true" }, CodexAdapter.AppServerArguments);
     }
 
     [TestMethod]

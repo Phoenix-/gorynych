@@ -113,7 +113,9 @@ public sealed class CodexAdapter(CodexAdapterOptions options) : IAgentAdapter
     /// its writer lock held, for 60 s after <c>thread/unsubscribe</c>, so Codex Desktop or a terminal
     /// could not take a thread Gorynych had let go of for that long (probed with Codex 0.167).
     /// </summary>
-    internal static readonly string[] AppServerArguments = ["app-server", "-c", "thread_unload_delay_secs=0"];
+    // Codex 0.152 made the checklist tool opt-in; its updates drive ACP's plan display.
+    internal static readonly string[] AppServerArguments =
+        ["app-server", "-c", "thread_unload_delay_secs=0", "-c", "tools.update_plan.enabled=true"];
 
     (AgentInstance AppServer, int Pid) StartAppServer()
     {
