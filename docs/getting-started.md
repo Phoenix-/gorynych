@@ -318,7 +318,8 @@ Codex CLI, and it never changes an agent's configuration or authentication.
   restarts the conductor. Adapter hosts keep their turns; old hosts migrate idle sessions to the
   new build as [Updating adapters](service-protocol.md#updating-adapters) describes. It then checks
   that the service answers on the pipe with the package's build. If activation fails, it restores
-  the previous files and says what could not be restored; a running binary is never deleted.
+  the previous files, restarts and verifies the previous conductor, and reports any recovery
+  failure. It never forces a restart to cancel turns; a running binary is never deleted.
 - **Blockers.** With adapter hosts (`--hosts on`, the default on Windows and Linux) a running turn
   is not a blocker: the restart leaves it in its host. Without hosts, or while a restart or a
   management stop is in progress, `update` refuses rather than interrupt work. `--dry-run` prints

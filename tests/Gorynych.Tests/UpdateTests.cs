@@ -34,6 +34,7 @@ public sealed class UpdateTests
             bytes[0] = (byte)'M'; bytes[1] = (byte)'Z';
             BitConverter.GetBytes(0x80).CopyTo(bytes, 0x3C);
             bytes[0x80] = (byte)'P'; bytes[0x81] = (byte)'E';
+            bytes[0x82] = 0; bytes[0x83] = 0;
             BitConverter.GetBytes((ushort)0x8664).CopyTo(bytes, 0x84);
         }
         else if (OperatingSystem.IsLinux())
@@ -304,6 +305,49 @@ public sealed class UpdateTests
         var code = await Run(Package(), install, NoService(), dryRun: true);
         Assert.AreEqual(UpdateCommand.BusyExitCode, code);
         CollectionAssert.AreEqual(before, File.ReadAllBytes(path));
+    }
+
+    [TestMethod]
+    public async Task Review_GzipTarPackage_IsAccepted()
+    {
+        var folder = TestDirs.New();
+        ZipFile.ExtractToDirectory(Package(), folder);
+        var archive = Path.Combine(TestDirs.New(), "package.tar.gz");
+        using (var output = File.Create(archive))
+        using (var gzip = new GZipStream(output, CompressionLevel.Fastest))
+            System.Formats.Tar.TarFile.CreateFromDirectory(folder, gzip, includeBaseDirectory: false);
+        Assert.AreEqual(0, await Run(archive, NewInstall(), NoService(), dryRun: true));
+    }
+
+    [TestMethod]
+    public async Task Review_ManifestCannotDisguiseANonExecutableEntry()
+    {
+        var package = Package();
+        using (var zip = ZipFile.Open(package, ZipArchiveMode.Update))
+        {
+            zip.GetEntry(ServiceName)!.Delete();
+            Add(zip, ServiceName, Encoding.UTF8.GetBytes("this is not a service binary"));
+        }
+        Assert.AreEqual(1, await Run(package, NewInstall(), NoService(), dryRun: true));
+    }
+
+    [TestMethod]
+    public async Task Review_FailedActivationRestartsPreviousServiceAfterRollback()
+    {
+        var install = NewInstall();
+        var before = File.ReadAllBytes(Path.Combine(install, ServiceName));
+        var restarted = false;
+        var hooks = new UpdateCommand.Hooks(
+            _ => Task.FromResult<UpdateCommand.ServiceInfo?>(Running(install, "1.0.0+old", hosts: true)),
+            (_, _) => Task.FromResult(new UpdateCommand.ActivationResult(false, "new process failed", null)),
+            (_, _) =>
+            {
+                CollectionAssert.AreEqual(before, File.ReadAllBytes(Path.Combine(install, ServiceName)));
+                restarted = true;
+                return Task.FromResult(true);
+            });
+        Assert.AreEqual(1, await Run(Package(), install, hooks));
+        Assert.IsTrue(restarted, "Restoring files must restore a conductor for hosts that keep running turns.");
     }
 
     /// <summary>A minimal HTTP/1.1 server for the local update tests; no external traffic.</summary>

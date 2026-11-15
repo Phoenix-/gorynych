@@ -43,6 +43,7 @@ public sealed class HostLink
     public bool ForSession { get; init; }
 
     public int ProcessId { get; init; }
+    public string? ProcessStart { get; init; }
 
     internal readonly HashSet<string> Sessions = new(StringComparer.Ordinal); // under the AgentHost's linksGate
     internal int Opening; // opens on their way to it; under linksGate
@@ -493,6 +494,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         var link = new HostLink(rpc, init)
         {
             HostId = hello.HostId, Slot = hello.Slot, Generation = hello.Generation, ProcessId = hello.ProcessId,
+            ProcessStart = ProcessStartedAt(hello.ProcessId),
             Current = expected is null || expected.Same(hello.Generation),
             ForSession = hello.Slot.Contains('.'),
         };
@@ -794,7 +796,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
                 ["build"] = link.Generation?.Build, ["options"] = new JsonArray((link.Generation?.Options ?? []).Select(o => (JsonNode)o).ToArray()),
                 ["processId"] = link.ProcessId, ["sessions"] = new JsonArray(sessions.Select(s => (JsonNode)s).ToArray()),
                 ["turns"] = sessions.Count(turnRuns), ["stopping"] = link.Stopping,
-                ["processStartedAt"] = ProcessStartedAt(link.ProcessId),
+                ["processStartedAt"] = link.ProcessStart,
             };
             if (!link.Current)
             {

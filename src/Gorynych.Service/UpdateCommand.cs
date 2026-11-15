@@ -301,12 +301,14 @@ internal static class UpdateCommand
                 {
                     service = await ActivateAsync(plan, pipe, dataDirectory, ct);
                 }
+                if (service is null || service.Build is null)
+                    throw new PackageException("the restarted service did not report its running build; readiness cannot be verified");
                 if (service is not null)
                 {
                     var disk = service.ProcessPath is { } actualPath
                         ? HostGeneration.OnDisk(actualPath)
                         : (Version: (string?)null, Build: (string?)null, Unread: (string?)null);
-                    var actualBuild = service.Build ?? disk.Build;
+                    var actualBuild = service.Build;
                     if (plan.Package.Build is { } wanted && actualBuild is { } got && wanted != got)
                         throw new PackageException($"the restarted service runs build {got}, not the package's {wanted}");
                     Console.WriteLine($"gorynych update: verified service process {service.ProcessId}, version {service.Version ?? disk.Version ?? "unknown"}, build {actualBuild ?? "unknown"}");
@@ -324,6 +326,44 @@ internal static class UpdateCommand
             Console.Error.WriteLine(rollback
                 ? "gorynych update: rolled back to the previous files; the old service can start again."
                 : "gorynych update: rollback was incomplete; the output above names what could not be restored. Nothing was deleted.");
+            if (rollback && plan.Running is not null)
+            {
+                try
+                {
+                    if (hooks is not null)
+                    {
+                        if (!await hooks.StartService(plan, CancellationToken.None))
+                            Console.Error.WriteLine("gorynych update: the previous service could not be restarted after rollback.");
+                    }
+                    else
+                    {
+                        var current = await QueryStatusAsync(pipe, CancellationToken.None);
+                        if (current is not null && current.Build != plan.Running.Build)
+                        {
+                            // Hosted restart leaves any turns in their hosts; never force a rollback restart.
+                            var result = await AcpBridge.RestartAsync(pipe, wait: true,
+                                timeout: Conductor.DefaultRestartTimeout, force: false);
+                            if (result != 0) throw new PackageException("the conductor could not restart onto the restored files");
+                            current = null;
+                        }
+                        if (current is null)
+                        {
+                            var exe = Path.Combine(plan.InstallDirectory, plan.ServiceEntry);
+                            if (!await ManagementCommand.StartServiceAsync(pipe, dataDirectory, exe, TimeSpan.FromSeconds(30),
+                                    ServiceOptions.Read(dataDirectory)))
+                                throw new PackageException("the previous service did not open its pipe after rollback");
+                        }
+                        var restored = await WaitForStatusAsync(pipe, TimeSpan.FromSeconds(15), CancellationToken.None);
+                        if (restored is null || restored.Build != plan.Running.Build)
+                            throw new PackageException("the previous service's readiness/build could not be verified after rollback");
+                        Console.Error.WriteLine($"gorynych update: previous service restored, process {restored.ProcessId}.");
+                    }
+                }
+                catch (Exception recovery) when (recovery is IOException or PackageException or UnauthorizedAccessException)
+                {
+                    Console.Error.WriteLine($"gorynych update: rollback recovery failed: {recovery.Message}");
+                }
+            }
             return FailedExitCode;
         }
     }

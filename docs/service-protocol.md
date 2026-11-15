@@ -1594,8 +1594,9 @@ service does the safety part; the command only waits and reports.
   or a bare number of minutes). At the timeout it calls the stop off, makes every adapter usable
   again and returns the blockers; nothing is left half-stopped.
 - **What a successful stop does.** It unloads each idle session from its agent (a client that is
-  only attached does not keep it loaded; its next use opens it again), skips drafts so their
-  content is not discarded, and asks every host of the adapter to stop (`_gorynych/host_stop`). An
+  only attached does not keep it loaded; its next use opens it again), skips durable drafts, and
+  asks every host of the adapter to stop (`_gorynych/host_stop`). A draft that exists only in its
+  current harness blocks the stop until its tab is closed, so it is not lost. An
   adapter that runs in the service's own process (`--hosts off`) is disposed and starts afresh at
   its next use. Harness processes that Gorynych did not start are never touched.
 - **It stays stopped.** The stopped set is written to `maintenance.json` in the data folder before
@@ -1608,6 +1609,12 @@ service does the safety part; the command only waits and reports.
   before the stop, trusting a PID only together with its start time (a reused PID is not another
   process). It never kills anything; if something still runs after the timeout it exits with code
   2 and says so. A service that is already absent is just marked.
+- **`stop --agent`.** The command also waits for the selected hosts and their observed harness
+  descendants to exit before reporting success, so an acknowledged stop is not mistaken for an
+  unlocked executable during a manual harness update. Other adapters keep running.
+- **Concurrent lifecycle commands.** Restart and management stop reserve the same barrier and
+  refuse to overlap. Creating a session or a child registers adapter work before it has a session
+  ID; listing an adapter registers work too. These operations block a stop that would dispose it.
 - **`start`.** `start --agent …` restores those adapters; starting one out of a stop-all keeps the
   rest explicitly stopped. `start --all` also clears the stopped-all marker, and starts the service
   when it is not running with the behavioural options it last ran with (`--hosts`, `--ahp`,

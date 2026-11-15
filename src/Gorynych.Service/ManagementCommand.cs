@@ -74,10 +74,16 @@ internal static class ManagementCommand
             status = await rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject());
             var snapshot = ProcessInspector.Snapshot();
             var roots = new List<int>();
-            if ((int?)status?["processId"] is { } servicePid) roots.Add(servicePid);
+            if (all && (int?)status?["processId"] is { } servicePid) roots.Add(servicePid);
             foreach (var agent in (status?["agents"] as JsonArray ?? []).OfType<JsonObject>())
+            {
+                if (!all && !agents.Contains((string?)agent["name"], StringComparer.Ordinal)) continue;
                 foreach (var host in (agent["hosts"] as JsonArray ?? []).OfType<JsonObject>())
                     if ((int?)host["processId"] is { } hostPid) roots.Add(hostPid);
+            }
+            if (!all && (bool?)status?["hosts"] != true && (int?)status?["processId"] is { } inProcessPid)
+                roots.AddRange(snapshot.Where(p => p.ParentPid == inProcessPid
+                    && agents.Contains(Path.GetFileNameWithoutExtension(p.Name), StringComparer.OrdinalIgnoreCase)).Select(p => p.Pid));
             ownedBefore = Descendants(roots, snapshot);
             var request = new JsonObject { ["all"] = all, ["wait"] = wait, ["timeoutSeconds"] = timeout.TotalSeconds };
             if (!all) request["agents"] = new JsonArray(agents.Select(a => (JsonNode)a).ToArray());
@@ -116,14 +122,13 @@ internal static class ManagementCommand
         foreach (var row in hosts)
             Console.WriteLine($"  {(string?)row["agent"],-7} host {(string?)row["hostId"]} process {(int?)row["processId"]}");
 
-        if (!all) return 0;
         // Wait for the service itself, then for the hosts and harness processes it owned. A PID is
         // trusted only with the start time the service saw, so a reused PID is not mistaken for one.
         var processId = (int?)status?["processId"] ?? 0;
         var startedAt = ParseTime((string?)status?["processStartedAt"]);
         var left = timeout;
         var clock = Stopwatch.StartNew();
-        if (!await WaitForExitAsync(processId, startedAt, left))
+        if (all && !await WaitForExitAsync(processId, startedAt, left))
         {
             Console.Error.WriteLine($"gorynych stop: the service (process {processId}) still runs after {timeout.TotalSeconds:0.#} s");
             return StillRunningExitCode;
@@ -156,7 +161,9 @@ internal static class ManagementCommand
             Console.Error.WriteLine("gorynych stop: nothing was killed. Check the host logs; `status --tree` shows their processes.");
             return StillRunningExitCode;
         }
-        Console.WriteLine("gorynych stop: the service and its owned hosts have exited. `start --all` enables them again.");
+        Console.WriteLine(all
+            ? "gorynych stop: the service and its owned hosts have exited. `start --all` enables them again."
+            : "gorynych stop: the selected adapter hosts and their observed harness processes have exited.");
         return 0;
     }
 

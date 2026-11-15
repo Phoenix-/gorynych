@@ -855,7 +855,16 @@ public sealed class Conductor : IAsyncDisposable
             ? TimeSpan.FromSeconds(Math.Min(seconds, TimeSpan.FromDays(1).TotalSeconds))
             : DefaultRestartTimeout;
         Task<JsonObject> drain;
-        lock (restartGate) drain = restart ??= Task.Run(() => DrainAsync(wait ? timeout : TimeSpan.Zero, force));
+        lock (maintenanceGate)
+        {
+            if (stopTask is not null || managementExiting)
+                return new JsonObject { ["restarted"] = false, ["reason"] = "a management stop is in progress", ["running"] = new JsonArray() };
+            lock (restartGate)
+            {
+                draining = true; // reserve the restart before releasing the management barrier
+                drain = restart ??= Task.Run(() => DrainAsync(wait ? timeout : TimeSpan.Zero, force));
+            }
+        }
         var result = await drain;
         if (result["restarted"] is JsonValue r && r.TryGetValue<bool>(out var restarted) && restarted)
         {
@@ -975,10 +984,32 @@ public sealed class Conductor : IAsyncDisposable
     // ---------------------------------------------------------------- management stop and start
 
     readonly Lock maintenanceGate = new();
+    readonly Dictionary<string, int> agentOperations = new(StringComparer.Ordinal);
+
+    sealed class AgentOperation(Action release) : IDisposable
+    {
+        Action? remaining = release;
+        public void Dispose() => Interlocked.Exchange(ref remaining, null)?.Invoke();
+    }
+
+    // Creation has no session/feed yet. Register it under the same lock that reserves a stop.
+    internal IDisposable RegisterAgentOperation(string agent)
+    {
+        lock (maintenanceGate)
+        {
+            if (IsStopping(agent)) throw Unavailable(agent);
+            agentOperations[agent] = agentOperations.GetValueOrDefault(agent) + 1;
+            return new AgentOperation(() =>
+            {
+                lock (maintenanceGate) agentOperations[agent]--;
+            });
+        }
+    }
     readonly HashSet<string> stoppingAgents = new(StringComparer.Ordinal);
     readonly HashSet<string> stoppedAgents;
     Task<JsonObject>? stopTask;
     bool stopAll;
+    bool managementExiting;
 
     /// <summary>True when a management command stopped the adapter: no new work starts for it.</summary>
     public bool IsStopped(string agent)
@@ -1064,6 +1095,8 @@ public sealed class Conductor : IAsyncDisposable
             var done = false;
             lock (maintenanceGate)
             {
+                if (Draining)
+                    throw new JsonRpcException(JsonRpcException.InternalError, "A restart is in progress; try stopping after it finishes.");
                 var missing = names.Where(n => !stoppedAgents.Contains(n)).ToArray();
                 if (stopTask is { } running) work = running;
                 else if (missing.Length == 0) done = true;
@@ -1081,10 +1114,12 @@ public sealed class Conductor : IAsyncDisposable
                     lock (maintenanceGate)
                     {
                         stopAll = true;
+                        managementExiting = true;
                         try { SaveMaintenanceLocked(); }
                         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                         {
                             stopAll = false;
+                            managementExiting = false;
                             return Refused([new JsonObject { ["reason"] = $"the stopped-all state could not be saved: {e.Message}" }],
                                 TimeSpan.Zero, "nothing was changed");
                         }
@@ -1173,10 +1208,6 @@ public sealed class Conductor : IAsyncDisposable
                 await Task.Delay(100);
             }
             var hosts = HostRowsOf(names);
-            foreach (var name in names)
-                if (agents.TryGetValue(name, out var host))
-                    try { await host.StopForMaintenanceAsync(); }
-                    catch (Exception e) { ServiceLog.Warn($"stop {name}: its adapter did not stop cleanly: {e.Message}"); }
             lock (maintenanceGate)
             {
                 foreach (var name in names) stoppedAgents.Add(name);
@@ -1195,8 +1226,18 @@ public sealed class Conductor : IAsyncDisposable
                     return Refused([new JsonObject { ["reason"] = $"the stopped state could not be saved in the data folder: {e.Message}" }],
                         clock.Elapsed, "nothing was stopped");
                 }
+            }
+            // Persist before stopping hosts: a failed write must never resurrect an adapter whose
+            // process was already stopped. Keep the reservation until teardown has completed.
+            foreach (var name in names)
+                if (agents.TryGetValue(name, out var host))
+                    try { await host.StopForMaintenanceAsync(); }
+                    catch (Exception e) { ServiceLog.Warn($"stop {name}: its adapter did not stop cleanly: {e.Message}"); }
+            lock (maintenanceGate)
+            {
                 stopTask = null;
                 stoppingAgents.Clear();
+                if (all) managementExiting = true;
                 succeeded = true;
             }
             ServiceLog.Info($"stop {string.Join(",", names)}: {(all ? "everything" : string.Join(", ", names))} stopped; " +
@@ -1274,6 +1315,8 @@ public sealed class Conductor : IAsyncDisposable
         }
         lock (maintenanceGate)
         {
+            if (Draining || managementExiting)
+                throw new JsonRpcException(JsonRpcException.InternalError, "The service is exiting or restarting; start it again after it exits.");
             if (names.Any(stoppingAgents.Contains))
                 throw new JsonRpcException(JsonRpcException.InternalError,
                     "A management stop of that adapter is in progress; let it finish, then start it.");
@@ -1308,11 +1351,22 @@ public sealed class Conductor : IAsyncDisposable
     List<JsonObject> ActiveBlockers(IReadOnlyCollection<string> names)
     {
         var blockers = new List<JsonObject>();
+        lock (maintenanceGate)
+            foreach (var name in names)
+                if (agentOperations.GetValueOrDefault(name) > 0)
+                    blockers.Add(new JsonObject
+                    {
+                        ["agent"] = name,
+                        ["reasons"] = new JsonArray("an adapter operation is in progress"),
+                    });
         foreach (var feed in feeds.Values)
         {
             if (feed.Retired) continue;
             if (store.Get(feed.SessionId) is not { Deleted: false } record || !names.Contains(record.Agent)) continue;
             var reasons = new List<string>();
+            if (record.Draft && agents.TryGetValue(record.Agent, out var draftHost)
+                && draftHost.RouteOf(record.SessionId) is { DraftsNotDurable: true })
+                reasons.Add("an unsaved draft exists only in this harness; close its tab before stopping it");
             if (feed.TurnRunning) reasons.Add("a turn is running");
             if (feed.PromptsInProgress().Length > 0) reasons.Add("a prompt is queued or running");
             if (feed.PromptsOnTheirWay > 0) reasons.Add("a prompt is on its way to the agent");
@@ -1713,6 +1767,7 @@ public sealed class Conductor : IAsyncDisposable
             if (IsStopping(host.Name)) continue;
             try
             {
+                using var operation = RegisterAgentOperation(host.Name);
                 var rpc = await host.GetAsync(ct);
                 if (!host.CanList) continue;
                 string? cursor = null;
@@ -1809,6 +1864,7 @@ public sealed class Conductor : IAsyncDisposable
         // An explicit choice in the request wins; otherwise the agent the connection is scoped to.
         RefuseSystemPrompt(request.SystemPrompt);
         var host = Agent((string?)request.Meta?[GorynychProtocol.MetaAgent] ?? client.AgentScope);
+        using var operation = RegisterAgentOperation(host.Name);
         if (IsStopping(host.Name)) throw Unavailable(host.Name);
         // A client's explicit choices, then the service's defaults for what it did not choose. They
         // are Gorynych's own data and are never written to the harness's configuration.
@@ -3069,7 +3125,11 @@ public sealed class Conductor : IAsyncDisposable
         {
             var record = await FindAsync(sessionId, ct);
             if (feed.Retired) throw NotFound(sessionId);
-            feed.EnterUse();
+            lock (maintenanceGate)
+            {
+                if (IsStopping(record.Agent)) throw Unavailable(record.Agent);
+                feed.EnterUse();
+            }
             return new SessionUse(feed, record, () => IdleFromNow(sessionId));
         }
         finally
@@ -3770,6 +3830,7 @@ public sealed class Conductor : IAsyncDisposable
         Func<JsonObject?, Task>? confirm, Func<bool> approved,
         CancellationToken ct)
     {
+        using var operation = RegisterAgentOperation(host.Name);
         var rpc = await host.OpenTargetAsync(null, ct);
         var token = NewToken();
         // Not cancelled with the spawn: the agent may create the session anyway, and only its answer names it.

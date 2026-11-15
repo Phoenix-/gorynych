@@ -243,6 +243,8 @@ internal static class StatusCommand
                 ["path"] = child.Path,
                 ["startedAt"] = child.StartedAt?.ToString("O", CultureInfo.InvariantCulture),
                 ["role"] = role,
+                ["version"] = null, // the image on disk may have changed since this process started
+                ["diskVersion"] = DiskVersion(child.Path),
                 ["children"] = ChildrenTree(child.Pid, byPid, snapshot, adapter, depth + 1),
             };
             rows.Add((JsonNode)node);
@@ -266,6 +268,21 @@ internal static class StatusCommand
             if (adapter is "kimi" or "dsh" && candidate.Equals("node", StringComparison.OrdinalIgnoreCase)) return "harness";
         }
         return null;
+    }
+
+    static string? DiskVersion(string? path)
+    {
+        if (path is null) return null;
+        try
+        {
+            var info = FileVersionInfo.GetVersionInfo(path);
+            var version = info.ProductVersion ?? info.FileVersion;
+            return string.IsNullOrWhiteSpace(version) ? null : version;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
     }
 
     static JsonArray ExternalReport(IReadOnlyList<ProcessSnapshot> snapshot, JsonObject? status)
@@ -302,6 +319,8 @@ internal static class StatusCommand
                 ["path"] = process.Path,
                 ["startedAt"] = process.StartedAt?.ToString("O", CultureInfo.InvariantCulture),
                 ["role"] = "external",
+                ["version"] = null,
+                ["diskVersion"] = DiskVersion(process.Path),
                 ["note"] = "detected outside Gorynych; informational only, never stopped",
             });
         }
@@ -449,6 +468,8 @@ internal static class StatusCommand
     {
         var pad = new string(' ', indent);
         Console.WriteLine($"{pad}{(string?)node["role"],-10} {(string?)node["name"]} {node["pid"]}");
+        if ((string?)node["role"] == "harness")
+            Console.WriteLine($"{pad}           version {Text(node["version"])}, disk version {Text(node["diskVersion"])}");
         if ((string?)node["path"] is { } path) Console.WriteLine($"{pad}           {path}");
         foreach (var child in node["children"] as JsonArray ?? []) if (child is JsonObject row) PrintNode(row, indent + 2);
     }

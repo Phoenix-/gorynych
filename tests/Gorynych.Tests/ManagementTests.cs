@@ -253,6 +253,74 @@ public sealed class ManagementTests
     }
 
     [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task Review_RestartRefusesWhileManagementStopIsWaiting()
+    {
+        await using var rig = new Rig();
+        await rig.Zed.InitializeAsync().WaitAsync(Wait);
+        var session = await rig.SessionAsync();
+        rig.Agent.Hold = true;
+        var turn = rig.Zed.PromptAsync(session, "held");
+        await LinkHarness.Until(() => rig.Zed.Text().Contains("started:held"), "the running turn");
+        var stopping = StopAsync(rig, wait: true, timeoutSeconds: 0.5, agents: ["turns"]);
+        await Until(() => rig.Service.IsStopping("turns"), "maintenance barrier");
+        var restart = await rig.Zed.Zed.SendRequestAsync(GorynychProtocol.MethodRestart,
+            new JsonObject { ["wait"] = false, ["force"] = false }).WaitAsync(Wait);
+        Assert.AreEqual(false, (bool?)restart?["restarted"], "Restart must not race a management stop.");
+        await stopping.WaitAsync(Wait);
+        rig.Agent.Release();
+        await turn.WaitAsync(Wait);
+    }
+
+    [TestMethod]
+    public async Task Review_AnOperationWithoutASessionBlocksStop()
+    {
+        await using var rig = new Rig();
+        await rig.Zed.InitializeAsync().WaitAsync(Wait);
+        using (rig.Service.RegisterAgentOperation("turns"))
+        {
+            var refused = await StopAsync(rig, agents: ["turns"]);
+            Assert.AreEqual(false, (bool?)refused?["stopped"]);
+            Assert.IsFalse(rig.Service.IsStopped("turns"));
+        }
+        Assert.AreEqual(true, (bool?)(await StopAsync(rig, agents: ["turns"]))?["stopped"]);
+        Assert.ThrowsExactly<JsonRpcException>(() => rig.Service.RegisterAgentOperation("turns"));
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task Review_InFlightCreationWithoutAFeedBlocksStop()
+    {
+        await using var rig = new Rig();
+        await rig.Zed.InitializeAsync().WaitAsync(Wait);
+        var gate = rig.Agent.SlowGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var creating = rig.SessionAsync();
+        try
+        {
+            await Until(() => Volatile.Read(ref rig.Agent.News) > 0, "native session/new");
+            Assert.AreEqual(false, (bool?)(await StopAsync(rig, agents: ["turns"]))?["stopped"]);
+            Assert.AreEqual(1, rig.Hosts.Alive("turns").Length, "the creating host must survive");
+        }
+        finally { gate.TrySetResult(); }
+        await creating.WaitAsync(Wait);
+        Assert.AreEqual(true, (bool?)(await StopAsync(rig, agents: ["turns"]))?["stopped"]);
+    }
+
+    [TestMethod]
+    public async Task Review_ANonDurableDraftBlocksStopUntilItsTabCloses()
+    {
+        await using var rig = new Rig();
+        rig.Agent.DraftsNotDurable = true;
+        await rig.Zed.InitializeAsync().WaitAsync(Wait);
+        var session = await rig.SessionAsync();
+        var refused = await StopAsync(rig, agents: ["turns"]);
+        Assert.AreEqual(false, (bool?)refused?["stopped"]);
+        StringAssert.Contains(refused!.ToJsonString(), "unsaved draft");
+        await rig.Zed.Zed.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = session });
+        Assert.AreEqual(true, (bool?)(await StopAsync(rig, agents: ["turns"]))?["stopped"]);
+    }
+
+    [TestMethod]
     public void ManagementState_RoundTrips_AndAMalformedFileMeansNothingStopped()
     {
         var data = TestDirs.New();

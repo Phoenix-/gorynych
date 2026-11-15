@@ -152,7 +152,10 @@ internal sealed class StagedPackage : IDisposable
         if (read >= 4 && magic[0] == (byte)'P' && magic[1] == (byte)'K')
             ExtractZip(stream, destination);
         else if (read >= 2 && magic[0] == 0x1F && magic[1] == 0x8B)
-            ExtractTar(stream, destination);
+        {
+            using var gzip = new GZipStream(stream, CompressionMode.Decompress, leaveOpen: true);
+            ExtractTar(gzip, destination);
+        }
         else if (read >= 2 && magic[0] == (byte)'B' && magic[1] == (byte)'Z')
             throw new PackageException("bzip2 archives are not supported; use .zip or .tar.gz");
         else
@@ -312,6 +315,10 @@ internal sealed class StagedPackage : IDisposable
             var entry = Text(rootElement, "entry") ?? DefaultServiceName(os);
             entry = SafeRelative(entry);
             if (!File.Exists(Path.Combine(root, entry))) throw new PackageException($"the package manifest's entry '{entry}' is not in the archive");
+            var binary = IdentifyBinary(Path.Combine(root, entry))
+                ?? throw new PackageException("the package entry is not a recognizable native service binary");
+            if (binary.Os != os || binary.Arch != arch)
+                throw new PackageException("the service binary's OS/architecture disagrees with its manifest");
             if (rootElement.TryGetProperty("files", out var filesElement))
             {
                 if (filesElement.ValueKind != JsonValueKind.Object) throw new PackageException("the package manifest's files is not an object");
