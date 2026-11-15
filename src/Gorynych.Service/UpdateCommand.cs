@@ -277,6 +277,11 @@ internal static class UpdateCommand
                 backups.Add((target, backup));
                 var staged = Path.Combine(newFiles, file.RelativePath);
                 File.Move(staged, target);
+                // A Unix package's executable bit is not carried by the extraction/copy path used
+                // here: make the service and its companion programs runnable again.
+                if (!OperatingSystem.IsWindows() && IsExecutable(file.RelativePath, plan.ServiceEntry))
+                    File.SetUnixFileMode(target, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                        | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
             }
             File.WriteAllText(Path.Combine(staging, "plan.txt"),
                 $"source {plan.Source}\npackage {plan.Package.Version} {plan.Package.Build}\n" +
@@ -322,6 +327,11 @@ internal static class UpdateCommand
             return FailedExitCode;
         }
     }
+
+    static bool IsExecutable(string relative, string serviceEntry) =>
+        relative == serviceEntry
+        || relative.StartsWith("outside/", StringComparison.Ordinal)
+        || relative.StartsWith("tools/", StringComparison.Ordinal);
 
     static string BackupName(string target, string stamp)
     {

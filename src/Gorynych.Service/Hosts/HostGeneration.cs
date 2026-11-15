@@ -73,7 +73,8 @@ public sealed class HostGeneration(string build, IReadOnlyList<string> options)
             version = info.ProductVersion ?? info.FileVersion;
             if (string.IsNullOrWhiteSpace(version)) version = null;
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException
+            or PlatformNotSupportedException or NotSupportedException)
         {
             version = null;
         }

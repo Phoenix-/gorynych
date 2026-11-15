@@ -134,6 +134,9 @@ public sealed class UpdateTests
         var old = Directory.GetFiles(install).Where(f => f.Contains(".old", StringComparison.OrdinalIgnoreCase)).ToList();
         Assert.AreEqual(1, old.Count, "the old service binary is kept for rollback");
         CollectionAssert.AreEqual(before, File.ReadAllBytes(old[0]));
+        if (!OperatingSystem.IsWindows())
+            Assert.IsTrue((File.GetUnixFileMode(Path.Combine(install, ServiceName)) & UnixFileMode.UserExecute) != 0,
+                "the updated service is executable on Unix");
     }
 
     [TestMethod]
