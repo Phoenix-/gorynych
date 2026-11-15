@@ -110,6 +110,8 @@ public sealed class ManagementCliTests
         Assert.IsNotNull(service["sessions"]);
         Assert.IsNotNull(service["maintenance"]);
         Assert.IsNotNull(service["adapters"]);
+        Assert.AreEqual((string?)service["build"], (string?)service["diskBuild"],
+            "An unchanged executable must have the same disk and running build even with Git version metadata.");
         Assert.IsNotNull(report["external"], "external processes are a separate, informational list");
 
         var tree = await cli.RunAsync("status", "--pipe", cli.Pipe, "--data", cli.Data, "--tree");

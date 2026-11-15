@@ -397,7 +397,7 @@ internal sealed class StagedPackage : IDisposable
             hash.AppendData(Encoding.UTF8.GetBytes(Path.GetFileName(file)));
             hash.AppendData(part.GetHashAndReset());
         }
-        return $"{version}+{Convert.ToHexString(hash.GetHashAndReset())[..16].ToLowerInvariant()}";
+        return $"{version.Split('+')[0]}+{Convert.ToHexString(hash.GetHashAndReset())[..16].ToLowerInvariant()}";
     }
 
     static void CheckPlatform(string os, string arch)

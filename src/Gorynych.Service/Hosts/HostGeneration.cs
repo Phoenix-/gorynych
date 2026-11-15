@@ -94,7 +94,8 @@ public sealed class HostGeneration(string build, IReadOnlyList<string> options)
                 hash.AppendData(Encoding.UTF8.GetBytes(Path.GetFileName(file)));
                 hash.AppendData(part.GetHashAndReset());
             }
-            var label = version ?? "unknown";
+            // ReadAtStart uses AgentHost.Version, which excludes informational Git metadata.
+            var label = (version ?? "unknown").Split('+')[0];
             return (version, $"{label}+{Convert.ToHexString(hash.GetHashAndReset())[..16].ToLowerInvariant()}", null);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
