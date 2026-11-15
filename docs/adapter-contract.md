@@ -235,7 +235,7 @@ it is; after an adapter restart, or a `session/close`, it is not.
     (`gorynych/openElsewhere`) when another app holds it; the service takes the flag from every
     open's answer, so an answer without it is `"full"`;
   - it reads the history without taking the session, and replays it as at any open, after the
-    mark (Codex: `thread/turns/list` and `thread/items/list` take no writer lock);
+    mark (Codex: `thread/turns/list` with `itemsView: full` takes no writer lock);
   - when the session can be written to again, or no longer, it sends a `session_info_update`
     whose `_meta` says `gorynych/interactivity` in full (`"full"` too), with the reason and holder
     while read-only. Writable again it does not take it yet: the service opens it again before its

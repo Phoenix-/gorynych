@@ -950,15 +950,18 @@ sealed class CodexAgent : IAsyncDisposable
         string? cursor = null;
         for (var page = 0; page < 1000; page++)
         {
-            var items = From(await app.SendRequestAsync(CodexMethods.Client.ThreadItemsList, ToNode(new ThreadItemsListParams
+            var turns = From(await app.SendRequestAsync(CodexMethods.Client.ThreadTurnsList, ToNode(new ThreadTurnsListParams
             {
                 ThreadId = id,
-                Limit = 100,
-                Cursor = cursor is null ? null : JsonValue.Create(cursor),
-            }, CodexJsonContext.Default.ThreadItemsListParams), ct), CodexJsonContext.Default.ThreadItemsListResponse);
-            foreach (var entry in items.Data)
-                if (ReplayOf(entry.Item) is { } update) await rpc.SendUpdateAsync(id, update);
-            cursor = items.NextCursor;
+                SortDirection = SortDirection.Asc,
+                ItemsView = TurnItemsView.Full,
+                Limit = 50,
+                Cursor = cursor,
+            }, CodexJsonContext.Default.ThreadTurnsListParams), ct), CodexJsonContext.Default.ThreadTurnsListResponse);
+            foreach (var turn in turns.Data)
+                foreach (var item in turn.Items)
+                    if (ReplayOf(item) is { } update) await rpc.SendUpdateAsync(id, update);
+            cursor = turns.NextCursor;
             if (cursor is null) return;
         }
     }
@@ -966,8 +969,8 @@ sealed class CodexAgent : IAsyncDisposable
     /// <summary>
     /// Replays the thread's turns after the mark, a turn ID (docs/adapter-contract.md, §4). Codex's
     /// turns are listed newest first without their items until the marked one; then the newer
-    /// ones are replayed oldest first, their items read turn by turn (<c>thread/items/list</c>), so
-    /// nothing before the mark is read and the replay is never held whole. When the mark is not among
+    /// ones are replayed oldest first, their pages read with <c>itemsView: full</c>, so
+    /// nothing before the marked page is read and the replay is never held whole. When the mark is not among
     /// them (a rollback dropped it) or none was given, every turn. Answers <c>gorynych/replay</c> with
     /// the newest completed turn as the new mark (none for a thread without turns), or null when the
     /// history could not be read: the service then keeps its journal as it is.
@@ -977,12 +980,14 @@ sealed class CodexAgent : IAsyncDisposable
         var mark = (string?)from["type"] == GorynychProtocol.ReplayAfterMark ? (string?)from["mark"] : null;
         try
         {
-            var newer = new List<string>();
+            var newer = new HashSet<string>(StringComparer.Ordinal);
+            var pages = new List<string?>();
             var found = false;
             string? newest = null;
             string? cursor = null;
             for (var page = 0; page < 100_000 && !found; page++)
             {
+                pages.Add(cursor);
                 var turns = From(await app.SendRequestAsync(CodexMethods.Client.ThreadTurnsList, ToNode(new ThreadTurnsListParams
                 {
                     ThreadId = id,
@@ -1004,28 +1009,31 @@ sealed class CodexAgent : IAsyncDisposable
                 cursor = turns.NextCursor;
                 if (cursor is null) break;
             }
-            newer.Reverse();
+            pages.Reverse();
             var sent = 0;
-            foreach (var turnId in newer)
+            // The item-list method exists in the schema but Codex 0.169 refuses it.
+            // Re-read the selected turn pages with full items, oldest page first. Keep
+            // at most one page of message bodies in memory and skip the marked/running turns.
+            foreach (var pageCursor in pages)
             {
-                string? itemsCursor = null;
-                for (var page = 0; page < 100_000; page++)
+                if (newer.Count == 0) break;
+                var turns = From(await app.SendRequestAsync(CodexMethods.Client.ThreadTurnsList, ToNode(new ThreadTurnsListParams
                 {
-                    var items = From(await app.SendRequestAsync(CodexMethods.Client.ThreadItemsList, ToNode(new ThreadItemsListParams
-                    {
-                        ThreadId = id,
-                        TurnId = turnId,
-                        Limit = 100,
-                        Cursor = itemsCursor is null ? null : JsonValue.Create(itemsCursor),
-                    }, CodexJsonContext.Default.ThreadItemsListParams), ct), CodexJsonContext.Default.ThreadItemsListResponse);
-                    foreach (var entry in items.Data)
-                        if (ReplayOf(entry.Item) is { } update)
+                    ThreadId = id,
+                    SortDirection = SortDirection.Desc,
+                    ItemsView = TurnItemsView.Full,
+                    Limit = 50,
+                    Cursor = pageCursor,
+                }, CodexJsonContext.Default.ThreadTurnsListParams), ct), CodexJsonContext.Default.ThreadTurnsListResponse);
+                foreach (var turn in turns.Data.AsEnumerable().Reverse())
+                {
+                    if (!newer.Contains(turn.Id) || turn.Status == TurnStatus.InProgress) continue;
+                    foreach (var item in turn.Items)
+                        if (ReplayOf(item) is { } update)
                         {
                             await rpc.SendUpdateAsync(id, update);
                             sent++;
                         }
-                    itemsCursor = items.NextCursor;
-                    if (itemsCursor is null) break;
                 }
             }
             Log($"codex: thread {id}: {newer.Count} turns ({sent} updates) replayed {(found ? "after " + mark : "from the start")}");

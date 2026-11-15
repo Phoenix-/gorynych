@@ -885,9 +885,53 @@ public sealed class CodexAdapterTests
         Assert.AreEqual("completed", (string?)Of(zed, "tool_call")[0]["status"]);
         Assert.IsTrue(zed.Snapshot().All(u => u["_meta"]?["gorynych/origin"] is null), "a first import is just that: not marked native");
         var listed = fake.Last("thread/turns/list");
-        Assert.AreEqual(("desc", "notLoaded"), ((string?)listed["sortDirection"], (string?)listed["itemsView"]), "turns listed without items");
-        Assert.AreEqual("turn-0", (string?)fake.Last("thread/items/list")["turnId"], "then its items, turn by turn");
+        Assert.AreEqual(("desc", "full"), ((string?)listed["sortDirection"], (string?)listed["itemsView"]), "history read through the supported full turn view");
+        Assert.AreEqual(0, fake.All("thread/items/list").Length, "the native server refuses this method");
         Assert.AreEqual("turn-0", conductor.Feed("t1").Journal.NativeMark, "the thread's newest turn");
+    }
+
+    [TestMethod]
+    public async Task ImportedHistory_PagesInOrder_AndSurvivesClientReopen()
+    {
+        JsonObject Resume(string id) => new() { ["sessionId"] = id, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() };
+        var fake = new FakeAppServer { PageSize = 2 };
+        var thread = fake.Existing("imported", Cwd, name: "Imported Claude session");
+        thread.Items.Clear();
+        var ids = Enumerable.Range(1, 5).Select(i => fake.AddTurn(thread.Id, $"Claude question {i}", $"Claude answer {i}")).ToArray();
+        await using var conductor = Conductor(fake);
+        string[] first;
+        await using (var client = await ZedAsync(conductor))
+        {
+            await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, Resume(thread.Id));
+            first = Texts(client.Snapshot());
+            CollectionAssert.AreEqual(Enumerable.Range(1, 5).SelectMany(i => new[] { $"user: Claude question {i}", $"agent: Claude answer {i}" }).ToArray(), first);
+        }
+        await using var reopened = await ZedAsync(conductor);
+        await reopened.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, Resume(thread.Id));
+        CollectionAssert.AreEqual(first, Texts(reopened.Snapshot()));
+        Assert.AreEqual(ids[^1], conductor.Feed(thread.Id).Journal.NativeMark);
+        Assert.AreEqual(0, fake.All("thread/items/list").Length);
+    }
+
+    [TestMethod]
+    public async Task DirectLoad_ReadsFullTurnPages_WithNativeItemListUnsupported()
+    {
+        var fake = new FakeAppServer { PageSize = 1 };
+        fake.Existing("imported", Cwd);
+        fake.AddTurn("imported", "Next question", "Next answer");
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var updates = new List<JsonObject>();
+        acp.NotificationHandler = (method, p) =>
+        {
+            if (method == AcpMethods.Client.SessionUpdate) lock (updates) updates.Add((JsonObject)p!["update"]!.DeepClone());
+            return Task.CompletedTask;
+        };
+        await acp.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject { ["sessionId"] = "imported", ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() });
+        lock (updates) CollectionAssert.AreEqual(new[] { "user: Fix the flaky test", "agent: Fixed it.", "user: Next question", "agent: Next answer" }, Texts(updates));
+        Assert.AreEqual(2, fake.All("thread/turns/list").Length);
+        Assert.AreEqual(0, fake.All("thread/items/list").Length);
     }
 
     // ---------------------------------------------------------------- the journal caught up with the thread
@@ -948,11 +992,11 @@ public sealed class CodexAdapterTests
 
         CollectionAssert.AreEqual(new[] { "user: Ask 4", "agent: Answer 4", "user: Ask 5", "agent: Answer 5" }, Texts(updates));
         Assert.AreEqual(("mark", turns[4]), ((string?)replay?["from"], (string?)replay?["mark"]));
-        var listed = fake.All("thread/turns/list");
+        var listed = fake.All("thread/turns/list").Where(l => (string?)l["itemsView"] == "notLoaded").ToArray();
         Assert.AreEqual(2, listed.Length, "newest first, until the marked turn: not the thread's six turns");
         Assert.IsTrue(listed.All(l => (string?)l["itemsView"] == "notLoaded"), "without their items");
-        CollectionAssert.AreEqual(new[] { turns[3], turns[4] }, fake.All("thread/items/list").Select(l => (string?)l["turnId"]).Distinct().ToArray(),
-            "items only of the turns after the mark");
+        Assert.AreEqual(2, fake.All("thread/turns/list").Count(l => (string?)l["itemsView"] == "full"), "only pages through the mark, with full items");
+        Assert.AreEqual(0, fake.All("thread/items/list").Length, "unsupported in native Codex");
         Assert.AreEqual($"{turns[3]}-u", (string?)updates[0]["messageId"], "Codex's own IDs");
     }
 
@@ -988,7 +1032,7 @@ public sealed class CodexAdapterTests
         Assert.AreEqual(0, Texts(updates).Length, "its messages are not whole yet: " + string.Join(" | ", Texts(updates)));
         Assert.AreEqual("available_commands_update", (string?)updates.Single()["sessionUpdate"]);
         Assert.AreEqual(("mark", done), ((string?)replay?["from"], (string?)replay?["mark"]), "the mark stays where it was");
-        Assert.IsFalse(fake.All("thread/items/list").Any(l => (string?)l["turnId"] == running), "its items are not read");
+        Assert.IsFalse(fake.All("thread/turns/list").Any(l => (string?)l["itemsView"] == "full"), "no completed turns to read");
 
         fake.Threads["t1"].Running.Remove(running);
         var (after, whole) = await ResumeDirectAsync(fake, "t1", After(done));

@@ -701,7 +701,7 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 | `session/new` | `thread/start {cwd, config, developerInstructions}`. Nothing is on disk before the first turn, and the thread is not listed until then (`gorynych/draftsNotDurable`: the service drops an unused draft instead of hiding it) |
 | `session/list` | `thread/list {cwd, cursor, limit 50, archived: false, sortKey: updated_at, useStateDbOnly: true}`; `title` is the thread's `name` (none until a name is set or generated: the service shows its provisional title), `updatedAt` from unix seconds |
 | `session/resume` | `thread/resume {threadId, excludeTurns: true, config, developerInstructions}`, or for a thread another Codex app holds, nothing: it opens for reading only (One writer, below); with `gorynych/replayFrom`, then the thread's turns after the mark (below), read the same either way. `gorynych/draft` changes nothing: the app-server names a thread, so a thread never prompted is not there after the adapter restarts |
-| `session/load` | the same, then the history from `thread/items/list`, page by page, as the updates below. The service no longer uses it: a thread the journal has not seen is imported through the replay from the start |
+| `session/load` | the same, then the history from `thread/turns/list` (`itemsView: full`), page by page, as the updates below. The service no longer uses it: a thread the journal has not seen is imported through the replay from the start |
 | `session/close` | `turn/interrupt` when a turn runs (ACP's close cancels it; `thread/unsubscribe` alone lets it run on), up to 5 s for the turn to end, then `thread/unsubscribe`. App-server is started with `-c thread_unload_delay_secs=0`, so it unloads the thread at once, and the close returns once `thread/closed` came (at most 10 s, else it fails, and the service counts the thread as still held there): the thread's writer lock is then free for another Codex app. A turn that has not ended by then ends `cancelled`: Codex sends nothing more of an unsubscribed thread |
 | `session/delete` | stops a running turn as `session/close` does, then `thread/delete`; a thread Codex no longer has answers `-32002` |
 | `_gorynych/set_title` | `thread/name/set` (works before the first turn too) |
@@ -747,7 +747,7 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     `CODEX_HOME` comes from the service's environment, else `~/.codex`.
   - **What it does with it.** `session/load` and `session/resume` of a held thread open it for
     reading only, without `thread/resume` (so the other app is left alone): the thread's history
-    is read with `thread/turns/list` and `thread/items/list`, after the journal's mark as at any
+    is read with `thread/turns/list` with full items, after the journal's mark as at any
     resume, and the answer says `_meta["gorynych/interactivity"]: "read-only"`, the reason
     (`This Codex thread is open in <holder>. Close it there to write here.`) and the holder
     (`gorynych/openElsewhere`); it has no `configOptions` (Codex reports a thread's settings only
@@ -760,17 +760,22 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     ([service-protocol.md](service-protocol.md#read-only-sessions)).
   - **Reading takes no lock.** Probed on 10 November 2026 with Codex 0.167
     (`research/probes/codex/read_held_probe.py`): with one app-server holding a thread (it ran a
-    turn and kept it loaded), a second one read it with `thread/read`, `thread/turns/list` and
-    `thread/items/list`. The lock file stayed open in the holder only, and the reader never had the
+    turn and kept it loaded), a second one read it with `thread/read` and `thread/turns/list`,
+    and also attempted `thread/items/list`. The lock file stayed open in the holder only, and the reader never had the
     thread loaded. The reader saw the holder's next turn as soon as it ended. Its `thread/resume` was
     refused (`already has an active writer`), and it took the thread 0.5 s after the holder's
     `thread/unsubscribe`. `thread/list` with `useStateDbOnly`, as the adapter lists, moves a
     thread's `updatedAt` at the end of each turn, also in another app-server's list; without it,
     `updatedAt` stays at the thread's start (`updated_at_probe.py`).
+    A read-only check on 15 November 2026 with Codex 0.169 confirmed that
+    `thread/items/list` returns `-32601` rather than history. `thread/turns/list` with
+    `itemsView: full` successfully reads imported Claude turns, including pagination.
+    `CodexImportedHistoryLiveTests` exercises this through the adapter and conductor and
+    checks that reopening replays the same messages, without resuming or prompting the thread.
   - **Writable again.** A thread open for reading only is not taken when its holder lets go: the
     adapter tells the service (`session_info_update` with `gorynych/interactivity: "full"`), which
     first reads what was made meanwhile with `_gorynych/catch_up` (`gorynych/catchUp`: the same
-    replay after the mark as at a resume, from `thread/turns/list` and `thread/items/list`, the
+    replay after the mark as at a resume, from `thread/turns/list` with full items, the
     thread not loaded), and the adapter takes the thread at the service's next resume, before the
     next turn. While it is read-only, the holder's turns reach the service only so; a thread's
     rollout (`Thread.path`) could be watched for them, which is not done. Taken back by the other app
@@ -824,10 +829,12 @@ over app-server's JSON-RPC. The design and the probes behind it are in
     every prompt's result carries the ID of the turn it ran.
   - A resume with a mark lists the thread's turns newest first without their items
     (`thread/turns/list`, `sortDirection: desc`, `itemsView: notLoaded`, 50 a page) until the
-    marked turn. Then it reads the items of the newer turns alone, turn by turn
-    (`thread/items/list` with `turnId`), and sends them as they come, mapped as `session/load`
-    maps items, with Codex's own IDs (a prompt of the service's under its
-    `clientUserMessageId`). Nothing before the mark is read, and a replay is never held whole. A
+    marked turn. Then it re-reads those pages with `itemsView: full`, oldest page first,
+    and replays only the newer completed turns, mapped as `session/load` maps items, with
+    Codex's own IDs (a prompt of the service's under its `clientUserMessageId`). Only one
+    page of item bodies is held at a time; the page containing the mark can also contain
+    older turns, which are not replayed. `thread/items/list` is present in the schema but
+    Codex 0.169 returns `-32601` (not supported yet); it must not be used for history. A
     mark Codex no longer has (a rollback) or none replays every turn.
   - The new mark is the newest completed turn, never one still running. A turn still running
     (in another Codex app) is not replayed either: its messages are not whole yet, and the

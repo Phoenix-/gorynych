@@ -89,7 +89,7 @@ sealed class FakeAppServer
     /// <summary>The answers the adapter gave to this server's requests, in order.</summary>
     public List<(string Method, JsonNode? Answer)> Answers { get; } = [];
 
-    /// <summary>The page size of <c>thread/items/list</c> and <c>thread/list</c>, small so paging is exercised.</summary>
+    /// <summary>The page size of <c>thread/turns/list</c> and <c>thread/list</c>, small so paging is exercised.</summary>
     public int PageSize { get; set; } = 2;
 
     public JsonRpcConnection? Rpc { get; private set; }
@@ -264,11 +264,7 @@ sealed class FakeAppServer
             }
             case "thread/items/list":
             {
-                var t = Threads[(string)p["threadId"]!];
-                var turn = (string?)p["turnId"];
-                var entries = t.Items.Where(i => turn is null || i.TurnId == turn)
-                    .Select(i => (JsonNode)new JsonObject { ["turnId"] = i.TurnId, ["item"] = i.Item.DeepClone() }).ToList();
-                return Done(Page(entries, (string?)p["cursor"]));
+                throw new JsonRpcException(JsonRpcException.MethodNotFound, "thread/items/list is not supported yet");
             }
             case "thread/turns/list":
             {

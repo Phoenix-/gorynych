@@ -431,14 +431,16 @@ public sealed class ReadOnlySessionsTests
         Assert.IsTrue(two >= 0 && two < full, $"the holder's turn came before the flag cleared ({two}, {full})");
         Assert.AreEqual(0, rig.Fake.All("thread/resume").Length, "read, not taken");
 
+        var fullReadsBeforePrompt = rig.Fake.All("thread/turns/list").Count(p => (string?)p["itemsView"] == "full");
+        Assert.AreEqual(2, fullReadsBeforePrompt, "the initial history and the holder's new turn were read");
         Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(zed, "three").WaitAsync(Wait)).StopReason);
         var users = HostTests.Journal(rig.Service, Thread).Where(u => (string?)u["sessionUpdate"] == "user_message_chunk")
             .Select(u => (string?)u["content"]?["text"]).ToArray();
         CollectionAssert.AreEqual(new[] { "Fix the flaky test", "two", "three" }, users, "one, two, three");
         Assert.AreEqual(1, HostTests.JournalText(rig.Service, Thread).Split("Desktop's two.").Length - 1, "once");
-        var reads = rig.Fake.All("thread/items/list").Where(p => p["cursor"] is null).GroupBy(p => (string?)p["turnId"]).ToDictionary(g => g.Key ?? "", g => g.Count());
-        Assert.IsTrue(reads.Count == 2 && reads.Values.All(n => n == 1),
-            "each turn read once: the catch-up after the mark, which it kept, so the prompt's open reads nothing again: " + string.Join(", ", reads));
+        Assert.AreEqual(fullReadsBeforePrompt, rig.Fake.All("thread/turns/list").Count(p => (string?)p["itemsView"] == "full"),
+            "the catch-up kept its mark, so the prompt's open reads no full history again");
+        Assert.AreEqual(0, rig.Fake.All("thread/items/list").Length, "unsupported in native Codex");
     }
 
     [TestMethod]
