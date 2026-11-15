@@ -129,6 +129,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     internal SemaphoreSlim TitleGenerationGate { get; } = new(1, 1);
     Task? fetching;
     readonly ConcurrentDictionary<string, Lazy<Task>> trustQuestions = new(StringComparer.OrdinalIgnoreCase);
+    readonly ConcurrentDictionary<string, Lazy<Task>> taskPrimes = new(StringComparer.Ordinal);
     readonly Lock consentGate = new();
     string? consentAsking; // the session whose development-channels question is open
     HookServer? hooks;
@@ -351,6 +352,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 var id = (string?)request.Params?["sessionId"] ?? "";
                 if (sessions.TryRemove(id, out var s)) await s.DisposeAsync();
                 marks.TryRemove(id, out _);
+                taskPrimes.TryRemove(id, out _);
                 return new JsonObject();
             }
             case GorynychProtocol.MethodOpinion:
@@ -364,6 +366,44 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     /// <summary>Where Claude keeps the session's transcript.</summary>
     public string TranscriptOf(IClaudeSession session) => TranscriptTitles.ExpectedPath(session.Cwd, session.Id, options.ProjectsDirectory);
+
+    /// <summary>
+    /// Reads Claude's whole transcript once into the session's task plan, so a task update that
+    /// names a task created before the process or the service last saw it can still be shown. A
+    /// replay that already read the task history marks the plan primed and this does nothing.
+    /// </summary>
+    public async Task EnsureTasksPrimedAsync(IClaudeSession session)
+    {
+        if (session.TasksPrimed) return;
+        var priming = taskPrimes.GetOrAdd(session.Id, _ => new Lazy<Task>(() => PrimeTasksAsync(session)));
+        try
+        {
+            await priming.Value;
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            // A plan is an addition to the feed: reading it must never fail a hook or a stream line.
+            Log($"claude {session.Id}: its task history could not be primed: {e.Message}");
+        }
+        finally
+        {
+            taskPrimes.TryRemove(new KeyValuePair<string, Lazy<Task>>(session.Id, priming));
+        }
+    }
+
+    async Task PrimeTasksAsync(IClaudeSession session)
+    {
+        var path = TranscriptOf(session);
+        var plan = await Task.Run(() => TranscriptHistory.ReadTasks(path, message => Log($"claude {session.Id}: {message}")));
+        if (plan is null)
+        {
+            Log($"claude {session.Id}: its task history could not be read; the plan stays as it is");
+            return;
+        }
+        session.TaskPlan.CopyFrom(plan);
+        session.TasksPrimed = true;
+        Log($"claude {session.Id}: task plan primed from Claude's transcript");
+    }
 
     /// <summary>
     /// <c>_meta</c> with the transcript's mark (<c>gorynych/historyMark</c>) at the end of a turn: the
@@ -395,12 +435,14 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     {
         var mark = (string?)from["type"] == GorynychProtocol.ReplayAfterMark ? (string?)from["mark"] : null;
         var path = TranscriptOf(session);
-        var replay = await TranscriptHistory.ReadAsync(path, mark, update => rpc.SendUpdateAsync(session.Id, update), m => Log($"claude {session.Id}: {m}"));
+        var replay = await TranscriptHistory.ReadAsync(path, mark, update => rpc.SendUpdateAsync(session.Id, update),
+            m => Log($"claude {session.Id}: {m}"), taskState: session.TaskPlan);
         if (replay is null)
         {
             Log($"claude {session.Id}: no readable transcript at {path}; the service's journal is not caught up");
             return null;
         }
+        if (replay.TasksPrimed) session.TasksPrimed = true;
         Log($"claude {session.Id}: {replay.Sent} updates replayed {(replay.FromMark ? "after the mark" : "from the start")} ({replay.BytesRead} bytes read)");
         Remember(session.Id, replay.Mark);
         return new JsonObject { ["from"] = replay.FromMark ? "mark" : "start", ["mark"] = replay.Mark };

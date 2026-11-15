@@ -70,6 +70,12 @@ internal sealed partial class ClaudeSession : IClaudeSession
     /// <summary>Message IDs this session's user messages already use (see <see cref="UserMessageId"/>).</summary>
     readonly HashSet<string> userMessageIds = new(StringComparer.Ordinal);
 
+    /// <summary>Claude's task checklist, reduced from its native task tools into ACP's plan.</summary>
+    public ClaudeTaskPlan TaskPlan { get; } = new();
+
+    /// <summary>Whether <see cref="TaskPlan"/> covers the whole native history (a replay or a lazy prime).</summary>
+    public bool TasksPrimed { get; set; }
+
     public bool IsRunning => pty is { Exited.IsCompleted: false };
 
     /// <summary>Whether the latest launch loaded the channel; without it messages for Claude go in as turns.</summary>
@@ -334,7 +340,7 @@ internal sealed partial class ClaudeSession : IClaudeSession
         catch (IOException) { }
     }
 
-    static Dictionary<string, string> LaunchEnvironment() => ClaudeEnvironment.Clean();
+    static Dictionary<string, string> LaunchEnvironment() => ClaudeEnvironment.ForSession();
 
     // ---------------------------------------------------------------- screens that need a key
 
@@ -393,6 +399,10 @@ internal sealed partial class ClaudeSession : IClaudeSession
         var name = ClaudeHooks.Name(e);
         if ((string?)e["transcript_path"] is { Length: > 0 } path) transcript?.Follow(path);
         if (name == "PermissionRequest") return await OnPermissionAsync(e, ct);
+        // A task hook may need the whole native history; read it before the emit gate, so other
+        // hooks are not held behind a transcript that happens to be long.
+        if (name is "PreToolUse" or "PostToolUse" or "PostToolUseFailure" && !IsSubagentHook(e) && IsTaskTool(e))
+            await agent.EnsureTasksPrimedAsync(this);
         await emitGate.WaitAsync();
         try { await OnEventAsync(name, e); }
         finally { emitGate.Release(); }
@@ -433,15 +443,23 @@ internal sealed partial class ClaudeSession : IClaudeSession
             {
                 var call = ClaudeHooks.ToolCall(e);
                 lock (stateGate) toolIds[ToolKey(e)] = call.ToolCallId;
+                if (!IsSubagentHook(e) && IsTaskTool(e) && TasksPrimed)
+                    TaskPlan.ObserveToolUse(call.ToolCallId, call.Name ?? "tool", e["tool_input"] as JsonObject);
                 await agent.EmitAsync(Id, call);
                 break;
             }
             case "PostToolUse":
+            {
                 await agent.EmitAsync(Id, ClaudeHooks.ToolCallFinished(e, failed: false));
+                await TaskPlanResultAsync(e, failed: false);
                 break;
+            }
             case "PostToolUseFailure":
+            {
                 await agent.EmitAsync(Id, ClaudeHooks.ToolCallFinished(e, failed: true));
+                await TaskPlanResultAsync(e, failed: true);
                 break;
+            }
             case "MessageDisplay":
                 lock (stateGate) if (turn is { } t) t.HadText = true;
                 await agent.EmitAsync(Id, ClaudeHooks.MessageChunk(e));
@@ -504,6 +522,22 @@ internal sealed partial class ClaudeSession : IClaudeSession
             agent.Log($"claude {Id}: approval failed: {ex.Message}");
             return ClaudeHooks.DenyReply("Gorynych could not reach the user for approval.");
         }
+    }
+
+    /// <summary>Hooks of a subagent carry the agent that fired them; its checklist is not the parent's.</summary>
+    static bool IsSubagentHook(JsonObject e) => (string?)e["agent_id"] is { Length: > 0 };
+
+    static bool IsTaskTool(JsonObject e) => ClaudeTaskPlan.IsTool((string?)e["tool_name"] ?? "");
+
+    /// <summary>A successful task tool result becomes the session's plan; a failure changes nothing.</summary>
+    async Task TaskPlanResultAsync(JsonObject e, bool failed)
+    {
+        if (IsSubagentHook(e) || !TasksPrimed) return;
+        var tool = (string?)e["tool_name"] ?? "";
+        if (!ClaudeTaskPlan.IsTool(tool)) return;
+        var id = (string?)e["tool_use_id"] ?? "";
+        if (TaskPlan.ObserveToolResult(id, tool, failed, e["tool_response"], text: null) is { } plan)
+            await agent.EmitAsync(Id, plan);
     }
 
     static string ToolKey(JsonObject e) => (string?)e["tool_name"] + "\n" + e["tool_input"]?.ToJsonString();

@@ -55,6 +55,28 @@ public sealed class StreamJsonTests
     }
 
     [TestMethod]
+    public void ToolResultDetails_CarryTheCallsToolAndItsStructuredOutput()
+    {
+        var user = J("""
+            {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"Task #1 created successfully","is_error":false}]},
+             "tool_use_result":{"task":{"id":"1","subject":"Probe"}}}
+            """);
+        var detail = StreamJson.ToolResultDetails(user, _ => "TaskCreate").Single();
+        Assert.AreEqual(("toolu_1", "TaskCreate", false), (detail.ToolCallId, detail.Tool, detail.Failed));
+        Assert.AreEqual("1", (string?)detail.Structured?["task"]?["id"]);
+        Assert.AreEqual("1", (string?)StreamJson.ToolResultUpdate(detail).RawOutput?["task"]?["id"]);
+
+        var parallel = J("""
+            {"type":"user","message":{"role":"user","content":[
+              {"type":"tool_result","tool_use_id":"a","content":"one"},
+              {"type":"tool_result","tool_use_id":"b","content":"two"}]},
+             "tool_use_result":{"task":{"id":"1"}}}
+            """);
+        Assert.IsTrue(StreamJson.ToolResultDetails(parallel, _ => "TaskCreate").All(d => d.Structured is null),
+            "the message-level structured output cannot be paired with one of several results");
+    }
+
+    [TestMethod]
     public void Results_EndTheTurn_WithTheRightStopReason()
     {
         var success = J("""{"type":"result","subtype":"success","is_error":false,"result":"pong","stop_reason":"end_turn","terminal_reason":"completed"}""");
@@ -87,6 +109,7 @@ public sealed class StreamJsonTests
             ["CLAUDE_CODE_CLIENT_KEY"] = "client-key.pem", ["CLAUDE_CODE_FUTURE_AUTH_OPTION"] = "opaque",
             ["CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS"] = "1", ["CLAUDE_CONFIG_DIR"] = "configured-home",
             ["CLAUDE_CODE_CHILD_SESSION"] = "1", ["CLAUDE_CODE_BRIDGE_SESSION_ID"] = "parent-bridge",
+            ["CLAUDE_CODE_ENABLE_TASKS"] = "0",
         };
         var cleaned = ClaudeEnvironment.Clean(source: source);
         foreach (var key in new[] { "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_BRIDGE_SESSION_ID" })
@@ -95,6 +118,13 @@ public sealed class StreamJsonTests
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY", "CLAUDE_CODE_FUTURE_AUTH_OPTION",
             "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS", "CLAUDE_CONFIG_DIR", "MCP_CONNECTION_NONBLOCKING", "PATH" })
             Assert.AreEqual(source[key], cleaned[key], key);
+
+        var session = ClaudeEnvironment.ForSession(source);
+        Assert.AreEqual("1", session["CLAUDE_CODE_ENABLE_TODO_TOOLS"], "the documented per-subprocess task-tool opt-in");
+        Assert.AreEqual("0", session["CLAUDE_CODE_ENABLE_TASKS"], "the inherited task-tool family is not forced");
+        foreach (var key in new[] { "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "PATH" })
+            Assert.AreEqual(source[key], session[key], key);
+        Assert.IsFalse(session.ContainsKey("CLAUDECODE"), "parent session markers stay out");
     }
 
     [TestMethod]

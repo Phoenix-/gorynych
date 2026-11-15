@@ -116,6 +116,12 @@ internal sealed class HeadlessSession : IClaudeSession
     /// <summary>The person's choices for this session and what Claude reported last.</summary>
     public ClaudeSettings Settings { get; } = new();
 
+    /// <summary>Claude's task checklist, reduced from its native task tools into ACP's plan.</summary>
+    public ClaudeTaskPlan TaskPlan { get; } = new();
+
+    /// <summary>Whether <see cref="TaskPlan"/> covers the whole native history (a replay or a lazy prime).</summary>
+    public bool TasksPrimed { get; set; }
+
     public bool IsRunning => process is { Exited.IsCompleted: false };
 
     string Folder => Path.Combine(options.DataDirectory, "sessions", Id);
@@ -836,7 +842,7 @@ internal sealed class HeadlessSession : IClaudeSession
         agent.Log($"claude {Id}: launching headless in {Cwd} ({(resume ? "resume" : "new")})");
         ClaudeProcess? started = null;
         // Lines of a process the session gave up (abandoned, or replaced) are dropped: they must not start turns or answer approvals.
-        var claude = ClaudeProcess.Start(exe, args, Cwd, ClaudeEnvironment.Clean(), Path.Combine(Folder, "stderr.log"),
+        var claude = ClaudeProcess.Start(exe, args, Cwd, ClaudeEnvironment.ForSession(), Path.Combine(Folder, "stderr.log"),
             m => IsCurrent(started!) ? OnMessageAsync(started!, m) : Task.CompletedTask, agent.Log);
         started = claude;
         lock (stateGate)
@@ -934,9 +940,14 @@ internal sealed class HeadlessSession : IClaudeSession
                     if (id is not null) streamed.Add(id);
                     await EmitAsync(ClaudeHooks.TextChunk(text, id ?? Guid.NewGuid().ToString()));
                 }
-                foreach (var (call, tool, _) in StreamJson.ToolUses(m))
+                foreach (var (call, tool, input) in StreamJson.ToolUses(m))
                 {
                     toolNames[call.ToolCallId] = tool;
+                    var task = ClaudeTaskPlan.IsTool(tool);
+                    if (task) await agent.EnsureTasksPrimedAsync(this);
+                    // Without the whole native history the plan would be partial: no plan is better
+                    // than one that drops tasks Claude still has.
+                    if (!task || TasksPrimed) TaskPlan.ObserveToolUse(call.ToolCallId, tool, input);
                     await EmitAsync(call);
                 }
                 return;
@@ -949,8 +960,15 @@ internal sealed class HeadlessSession : IClaudeSession
                     await OnReplayAsync(m);
                     return;
                 }
-                foreach (var update in StreamJson.ToolResults(m, id => toolNames.GetValueOrDefault(id)))
-                    await EmitAsync(update);
+                foreach (var detail in StreamJson.ToolResultDetails(m, id => toolNames.GetValueOrDefault(id)))
+                {
+                    var task = ClaudeTaskPlan.IsTool(detail.Tool);
+                    if (task) await agent.EnsureTasksPrimedAsync(this);
+                    await EmitAsync(StreamJson.ToolResultUpdate(detail));
+                    if (task && TasksPrimed
+                        && TaskPlan.ObserveToolResult(detail.ToolCallId, detail.Tool, detail.Failed, detail.Structured, detail.Text) is { } plan)
+                        await EmitAsync(plan);
+                }
                 return;
             }
             case "system" when StreamJson.Subtype(m) == "init":

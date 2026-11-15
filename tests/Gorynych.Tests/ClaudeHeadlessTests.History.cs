@@ -23,6 +23,66 @@ public sealed partial class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task ATaskUpdateFromTheHistory_SeesTheTaskCreatedBeforeTheMark()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.UnloadingAtOnce(dir, new ClaudeAdapter(Options(dir)));
+        string id;
+        await using (var client = await TestClient.ConnectAsync(conductor))
+        {
+            id = await NewAsync(client, dir);
+            await PromptAsync(client, id, "plan tasks please");
+            await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+        }
+        await conductor.CleanupsIdleAsync();
+        var transcript = TranscriptTitles.ExpectedPath(dir, id, Path.Combine(FakeRoot, "projects"));
+        var mark = TranscriptHistory.Mark(transcript)!;
+        var parent = mark[..mark.IndexOf('@')];
+
+        // A TaskUpdate written outside Gorynych after the mark: its task was created before it.
+        File.AppendAllText(transcript,
+            new JsonObject
+            {
+                ["type"] = "assistant", ["uuid"] = "terminal-task-update", ["parentUuid"] = parent, ["isSidechain"] = false,
+                ["message"] = new JsonObject
+                {
+                    ["id"] = "msg_terminal_task_update", ["role"] = "assistant",
+                    ["content"] = new JsonArray(new JsonObject
+                    {
+                        ["type"] = "tool_use", ["id"] = "terminal-call", ["name"] = "TaskUpdate",
+                        ["input"] = new JsonObject { ["taskId"] = "1", ["status"] = "in_progress" },
+                    }),
+                },
+            }.ToJsonString() + "\n" +
+            new JsonObject
+            {
+                ["type"] = "user", ["uuid"] = "terminal-task-result", ["parentUuid"] = "terminal-task-update", ["isSidechain"] = false,
+                ["message"] = new JsonObject
+                {
+                    ["role"] = "user",
+                    ["content"] = new JsonArray(new JsonObject
+                    {
+                        ["type"] = "tool_result", ["tool_use_id"] = "terminal-call", ["content"] = "Updated task #1 status",
+                    }),
+                },
+                ["toolUseResult"] = new JsonObject
+                {
+                    ["success"] = true, ["taskId"] = "1", ["updatedFields"] = new JsonArray("status"),
+                    ["statusChange"] = new JsonObject { ["from"] = "completed", ["to"] = "in_progress" },
+                },
+            }.ToJsonString() + "\n");
+
+        await using var viewer = await TestClient.ConnectAsync(conductor, "viewer");
+        await viewer.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject { ["sessionId"] = id, ["cwd"] = dir, ["mcpServers"] = new JsonArray() });
+        var plan = viewer.Snapshot().LastOrDefault(u => (string?)u["sessionUpdate"] == "plan");
+        CollectionAssert.AreEqual(new[] { "in_progress:medium:Planning the work" },
+            plan?["entries"]?.AsArray().Select(e => $"{e!["status"]}:{e!["priority"]}:{e!["content"]}").ToArray(),
+            "the replay primes the task created before the mark and applies only the later update");
+        Assert.AreEqual(TranscriptHistory.Mark(transcript), conductor.Feed(id).Journal.NativeMark);
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task ATurnTakenInTheTerminal_LandsInTheJournal_BeforeTheNextPrompt()
     {
         var dir = TestDirs.New();

@@ -142,6 +142,27 @@ public sealed class ClaudeAdapterTests
         Assert.AreEqual("V", (string?)mcp["other"]!["env"]!["K"]);
     }
 
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task TaskTools_ShowFullReplacementPlans_ThroughTheTuiHooks()
+    {
+        if (!OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, ChannelAdapter(dir, ChannelConsent.Accept));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewClaudeSessionAsync(client, dir);
+
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "plan tasks please")).StopReason);
+        var plan = client.Snapshot().LastOrDefault(u => (string?)u["sessionUpdate"] == "plan");
+        CollectionAssert.AreEqual(new[] { "in_progress:medium:Planning the work" },
+            plan?["entries"]?.AsArray().Select(e => $"{e!["status"]}:{e!["priority"]}:{e!["content"]}").ToArray());
+
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "plan todo please")).StopReason);
+        var todos = client.Snapshot().LastOrDefault(u => (string?)u["sessionUpdate"] == "plan");
+        CollectionAssert.AreEqual(new[] { "pending:medium:First todo", "in_progress:medium:Doing the second todo" },
+            todos?["entries"]?.AsArray().Select(e => $"{e!["status"]}:{e!["priority"]}:{e!["content"]}").ToArray());
+    }
+
     static string FakeFile(string sessionId, string extension) =>
         Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", sessionId + extension);
 

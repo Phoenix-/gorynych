@@ -97,6 +97,45 @@ async Task TurnAsync(string prompt)
             }));
         answer = allowed ? "wrote it" : "not allowed";
     }
+    else if (prompt.Contains("plan tasks", StringComparison.OrdinalIgnoreCase))
+    {
+        var createCall = $"toolu_fake{++tools}";
+        var createInput = new JsonObject { ["subject"] = "Plan the work", ["description"] = "Plan the work", ["activeForm"] = "Planning the work" };
+        await PostAsync(Hook("PreToolUse", promptId, new JsonObject { ["tool_name"] = "TaskCreate", ["tool_input"] = createInput.DeepClone(), ["tool_use_id"] = createCall }));
+        await PostAsync(Hook("PostToolUse", promptId, new JsonObject
+        {
+            ["tool_name"] = "TaskCreate", ["tool_input"] = createInput.DeepClone(), ["tool_use_id"] = createCall,
+            ["tool_response"] = new JsonObject { ["task"] = new JsonObject { ["id"] = "1", ["subject"] = "Plan the work" } },
+        }));
+        var updateCall = $"toolu_fake{++tools}";
+        var updateInput = new JsonObject { ["taskId"] = "1", ["status"] = "in_progress" };
+        await PostAsync(Hook("PreToolUse", promptId, new JsonObject { ["tool_name"] = "TaskUpdate", ["tool_input"] = updateInput.DeepClone(), ["tool_use_id"] = updateCall }));
+        await PostAsync(Hook("PostToolUse", promptId, new JsonObject
+        {
+            ["tool_name"] = "TaskUpdate", ["tool_input"] = updateInput.DeepClone(), ["tool_use_id"] = updateCall,
+            ["tool_response"] = new JsonObject
+            {
+                ["success"] = true, ["taskId"] = "1", ["updatedFields"] = new JsonArray("status"),
+                ["statusChange"] = new JsonObject { ["from"] = "pending", ["to"] = "in_progress" },
+            },
+        }));
+        answer = "planned it";
+    }
+    else if (prompt.Contains("plan todo", StringComparison.OrdinalIgnoreCase))
+    {
+        var call = $"toolu_fake{++tools}";
+        var todos = new JsonArray(
+            new JsonObject { ["content"] = "First todo", ["status"] = "pending", ["activeForm"] = "Doing the first todo" },
+            new JsonObject { ["content"] = "Second todo", ["status"] = "in_progress", ["activeForm"] = "Doing the second todo" });
+        var input = new JsonObject { ["todos"] = todos.DeepClone() };
+        await PostAsync(Hook("PreToolUse", promptId, new JsonObject { ["tool_name"] = "TodoWrite", ["tool_input"] = input.DeepClone(), ["tool_use_id"] = call }));
+        await PostAsync(Hook("PostToolUse", promptId, new JsonObject
+        {
+            ["tool_name"] = "TodoWrite", ["tool_input"] = input.DeepClone(), ["tool_use_id"] = call,
+            ["tool_response"] = new JsonObject { ["oldTodos"] = new JsonArray(), ["newTodos"] = todos.DeepClone() },
+        }));
+        answer = "todoed";
+    }
     else if (prompt.Contains("peers", StringComparison.OrdinalIgnoreCase))
     {
         // Calls the two gorynych peer tools the way Claude would: each asks PermissionRequest first.

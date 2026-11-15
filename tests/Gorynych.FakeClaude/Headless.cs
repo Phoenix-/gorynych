@@ -45,6 +45,7 @@ static partial class FakeHeadless
     static int messages;
     static int tools;
     static int asks;
+    static int taskIds;
 
     public static async Task<int> RunAsync(string[] args)
     {
@@ -253,6 +254,63 @@ static partial class FakeHeadless
                 allowed ? new JsonObject { ["type"] = "create", ["filePath"] = (string)input["file_path"]! } : null);
             answer = allowed ? "wrote it" : "not allowed";
         }
+        else if (prompt.Contains("plan tasks", StringComparison.OrdinalIgnoreCase))
+        {
+            var id = await CreateTaskAsync(sessionId, "Plan the work", "Planning the work");
+            await UpdateTaskAsync(sessionId, id, new JsonObject { ["taskId"] = id, ["status"] = "in_progress" },
+                "Updated task #" + id + " status",
+                new JsonObject
+                {
+                    ["success"] = true, ["taskId"] = id, ["updatedFields"] = new JsonArray("status"),
+                    ["statusChange"] = new JsonObject { ["from"] = "pending", ["to"] = "in_progress" },
+                });
+            // The stream may carry aliases: Claude Code repairs them before execution, not in the stream.
+            await UpdateTaskAsync(sessionId, id, new JsonObject { ["id"] = id, ["subject"] = "Plan the renamed work" },
+                "Updated task #" + id + " subject",
+                new JsonObject { ["success"] = true, ["taskId"] = id, ["updatedFields"] = new JsonArray("subject") });
+            await UpdateTaskAsync(sessionId, id, new JsonObject { ["taskId"] = id, ["status"] = "completed" },
+                "Updated task #" + id + " status",
+                new JsonObject
+                {
+                    ["success"] = true, ["taskId"] = id, ["updatedFields"] = new JsonArray("status"),
+                    ["statusChange"] = new JsonObject { ["from"] = "in_progress", ["to"] = "completed" },
+                });
+            answer = "planned it";
+        }
+        else if (prompt.Contains("plan todo clear", StringComparison.OrdinalIgnoreCase))
+        {
+            var call = await ToolUseAsync(sessionId, "TodoWrite", new JsonObject { ["todos"] = new JsonArray() });
+            await ToolResultAsync(sessionId, call, "Todos have been modified successfully", false,
+                new JsonObject { ["oldTodos"] = new JsonArray(), ["newTodos"] = new JsonArray() });
+            answer = "todos cleared";
+        }
+        else if (prompt.Contains("plan todo", StringComparison.OrdinalIgnoreCase))
+        {
+            var todos = new JsonArray(
+                new JsonObject { ["content"] = "First todo", ["status"] = "pending", ["activeForm"] = "Doing the first todo" },
+                new JsonObject { ["content"] = "Second todo", ["status"] = "in_progress", ["activeForm"] = "Doing the second todo" });
+            var call = await ToolUseAsync(sessionId, "TodoWrite", new JsonObject { ["todos"] = todos.DeepClone() });
+            await ToolResultAsync(sessionId, call, "Todos have been modified successfully", false,
+                new JsonObject { ["oldTodos"] = new JsonArray(), ["newTodos"] = todos.DeepClone() });
+            answer = "todoed";
+        }
+        else if (prompt.Contains("plan task failure", StringComparison.OrdinalIgnoreCase))
+        {
+            var call = await ToolUseAsync(sessionId, "TaskCreate", new JsonObject { ["subject"] = "Never created" });
+            await ToolResultAsync(sessionId, call, "The task was not created", true,
+                new JsonObject { ["task"] = new JsonObject { ["id"] = "99", ["subject"] = "Never created" } });
+            answer = "create failed";
+        }
+        else if (prompt.Contains("plan subagent", StringComparison.OrdinalIgnoreCase))
+        {
+            // A subagent's checklist must not become the parent's plan.
+            var parentTool = "toolu_fake_parent";
+            var subCall = await ToolUseAsync(sessionId, "TaskCreate", new JsonObject { ["subject"] = "Subagent task" }, parentTool);
+            await ToolResultAsync(sessionId, subCall, "Task #1 created successfully: Subagent task", false,
+                new JsonObject { ["task"] = new JsonObject { ["id"] = "1", ["subject"] = "Subagent task" } }, parentTool);
+            var main = await CreateTaskAsync(sessionId, "Parent task", "Doing the parent task");
+            answer = "subagent ignored " + main;
+        }
         else if (prompt.Contains("pick a color", StringComparison.OrdinalIgnoreCase))
         {
             var input = JsonNode.Parse("""
@@ -387,12 +445,12 @@ static partial class FakeHeadless
         return WriteAsync(replay);
     }
 
-    static async Task<string> ToolUseAsync(string sessionId, string tool, JsonObject input)
+    static async Task<string> ToolUseAsync(string sessionId, string tool, JsonObject input, string? parentToolUseId = null)
     {
         var id = $"toolu_fake{++tools}";
         await WriteAsync(new JsonObject
         {
-            ["type"] = "assistant", ["session_id"] = sessionId, ["parent_tool_use_id"] = null,
+            ["type"] = "assistant", ["session_id"] = sessionId, ["parent_tool_use_id"] = parentToolUseId,
             ["message"] = new JsonObject
             {
                 ["id"] = $"msg_fake{++messages}", ["role"] = "assistant",
@@ -400,6 +458,23 @@ static partial class FakeHeadless
             },
         });
         return id;
+    }
+
+    /// <summary>A TaskCreate call with the result shape Claude Code 2.1.302 writes: the ID is in the result, not the input.</summary>
+    static async Task<string> CreateTaskAsync(string sessionId, string subject, string activeForm)
+    {
+        var taskId = (++taskIds).ToString();
+        var call = await ToolUseAsync(sessionId, "TaskCreate",
+            new JsonObject { ["subject"] = subject, ["description"] = subject, ["activeForm"] = activeForm });
+        await ToolResultAsync(sessionId, call, $"Task #{taskId} created successfully: {subject}", false,
+            new JsonObject { ["task"] = new JsonObject { ["id"] = taskId, ["subject"] = subject } });
+        return taskId;
+    }
+
+    static async Task UpdateTaskAsync(string sessionId, string taskId, JsonObject input, string text, JsonObject output)
+    {
+        var call = await ToolUseAsync(sessionId, "TaskUpdate", input);
+        await ToolResultAsync(sessionId, call, text, false, output);
     }
 
     static async Task<JsonObject> AskAsync(string tool, JsonObject input, string toolUseId)
@@ -422,11 +497,12 @@ static partial class FakeHeadless
         return response["response"] as JsonObject ?? [];
     }
 
-    static Task ToolResultAsync(string sessionId, string toolUseId, string text, bool error, JsonObject? structured)
+    static Task ToolResultAsync(string sessionId, string toolUseId, string text, bool error, JsonObject? structured,
+        string? parentToolUseId = null)
     {
         var message = new JsonObject
         {
-            ["type"] = "user", ["session_id"] = sessionId, ["parent_tool_use_id"] = null,
+            ["type"] = "user", ["session_id"] = sessionId, ["parent_tool_use_id"] = parentToolUseId,
             ["message"] = new JsonObject
             {
                 ["role"] = "user",

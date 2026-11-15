@@ -27,8 +27,11 @@ namespace Gorynych.Adapters.Claude;
 /// </summary>
 internal static class TranscriptHistory
 {
-    /// <summary>Whether the updates sent follow the mark (else they are the whole conversation), the new mark, and how much was read.</summary>
-    public sealed record Replay(bool FromMark, string? Mark, long BytesRead, int Sent);
+    /// <summary>
+    /// Whether the updates sent follow the mark (else they are the whole conversation), the new
+    /// mark, how much was read, and whether Claude's task plan was derived from the native history.
+    /// </summary>
+    public sealed record Replay(bool FromMark, string? Mark, long BytesRead, int Sent, bool TasksPrimed = false);
 
     /// <summary>
     /// The most a catch-up reads of a transcript in one pass (from the mark on, or the whole file)
@@ -121,7 +124,8 @@ internal static class TranscriptHistory
     /// when the transcript cannot be read, or is larger than <paramref name="maxBytes"/>: the service
     /// then keeps its journal as it is.
     /// </summary>
-    public static async Task<Replay?> ReadAsync(string path, string? mark, Func<SessionUpdate, Task> send, Action<string>? log = null, long maxBytes = MaxBytes)
+    public static async Task<Replay?> ReadAsync(string path, string? mark, Func<SessionUpdate, Task> send, Action<string>? log = null,
+        long maxBytes = MaxBytes, ClaudeTaskPlan? taskState = null)
     {
         try
         {
@@ -130,19 +134,35 @@ internal static class TranscriptHistory
             var parsed = Parse(mark);
             var markUuid = parsed?.Uuid;
             if (parsed is { } at && Continuation(file, at.Uuid, at.Offset, ref read, maxBytes, log) is { } next)
-                return next.After.Count == 0
-                    ? new Replay(true, mark, read, 0)
-                    : new Replay(true, MarkOf(next.Last), read, await SendAsync(file, next.After, send, log));
+            {
+                if (next.After.Count == 0) return new Replay(true, mark, read, 0);
+                var (tasks, primed) = TaskPlanFor(file, null, next.After, at.Uuid, at.Offset, maxBytes, log);
+                var sent = await SendAsync(file, next.After, send, log, tasks);
+                if (primed) taskState?.CopyFrom(tasks!);
+                return new Replay(true, MarkOf(next.Last), read, sent, primed);
+            }
             var all = Entries(file, 0, ref read, maxBytes);
-            if (LastEntry(all, whole: true).Last is not { } last) return new Replay(false, null, read, 0);
+            if (LastEntry(all, whole: true).Last is not { } last)
+            {
+                taskState?.Reset();
+                return new Replay(false, null, read, 0, TasksPrimed: true);
+            }
             if (markUuid is not null)
             {
                 if (last.Uuid == markUuid) return new Replay(true, MarkOf(last), read, 0);
                 if (ChainBack(last, all, until: markUuid) is { } chain)
-                    return new Replay(true, MarkOf(last), read, await SendAsync(file, chain, send, log));
+                {
+                    var (tasks, primed) = TaskPlanFor(file, all, chain, markUuid, parsed?.Offset ?? 0, maxBytes, log);
+                    var sent = await SendAsync(file, chain, send, log, tasks);
+                    if (primed) taskState?.CopyFrom(tasks!);
+                    return new Replay(true, MarkOf(last), read, sent, primed);
+                }
                 log?.Invoke("the conversation does not reach the mark: replaying all of it");
             }
-            return new Replay(false, MarkOf(last), read, await SendAsync(file, ChainBack(last, all, until: null)!, send, log));
+            var full = new ClaudeTaskPlan();
+            var replayed = await SendAsync(file, ChainBack(last, all, until: null)!, send, log, full);
+            taskState?.CopyFrom(full);
+            return new Replay(false, MarkOf(last), read, replayed, TasksPrimed: true);
         }
         catch (TooLarge e)
         {
@@ -154,6 +174,159 @@ internal static class TranscriptHistory
             log?.Invoke($"the transcript could not be read: {e.Message}");
             return null;
         }
+    }
+
+    /// <summary>
+    /// The task plan for an after-mark slice: null when the slice mentions no task tool, a plan not
+    /// yet primed from before the mark when one does. The slice's plan updates are built on top of
+    /// the state the native history had before the mark, so a partial TaskUpdate of an old task is
+    /// complete rather than starting from an empty checklist.
+    /// </summary>
+    static (ClaudeTaskPlan? Tasks, bool Primed) TaskPlanFor(FileStream file, List<Entry>? all, List<Entry> slice, string markUuid,
+        long markOffset, long maxBytes, Action<string>? log)
+    {
+        if (!MentionsTaskTools(file, slice)) return (null, false);
+        var tasks = new ClaudeTaskPlan();
+        if (TryPrimeBefore(file, all, markUuid, markOffset, tasks, maxBytes, log)) return (tasks, true);
+        log?.Invoke("the task plan before the mark could not be read; the replay goes on without plan updates");
+        return (null, false);
+    }
+
+    /// <summary>
+    /// Reads the whole conversation into a plan without sending anything: the state a lazy live
+    /// prime needs after a process or service restart. Null when the transcript cannot be read or is
+    /// larger than a catch-up reads; the caller then keeps whatever plan it had.
+    /// </summary>
+    public static ClaudeTaskPlan? ReadTasks(string path, Action<string>? log = null, long maxBytes = MaxBytes)
+    {
+        try
+        {
+            using var file = Open(path);
+            long read = 0;
+            var all = Entries(file, 0, ref read, maxBytes);
+            if (LastEntry(all, whole: true).Last is not { } last) return new ClaudeTaskPlan();
+            if (ChainBack(last, all, until: null) is not { } chain) return new ClaudeTaskPlan();
+            var tasks = new ClaudeTaskPlan();
+            var tools = new Dictionary<string, string>(StringComparer.Ordinal);
+            var odd = ApplyEntries(file, chain, tools, tasks);
+            if (odd > 0) log?.Invoke($"{odd} transcript entries of an unexpected shape were left out of the task plan");
+            return tasks;
+        }
+        catch (TooLarge e)
+        {
+            log?.Invoke(e.Message);
+            return null;
+        }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
+        {
+            // A session that has not written its transcript yet has no native tasks either.
+            return new ClaudeTaskPlan();
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            log?.Invoke($"the task history could not be read: {e.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>Applies the conversation up to the mark's entry to <paramref name="tasks"/>, without sending its updates.</summary>
+    static bool TryPrimeBefore(FileStream file, List<Entry>? all, string markUuid, long markOffset, ClaudeTaskPlan tasks,
+        long maxBytes, Action<string>? log)
+    {
+        try
+        {
+            if (all is null)
+            {
+                long read = 0;
+                all = Entries(file, 0, ref read, maxBytes);
+            }
+            var mark = all.FirstOrDefault(entry => entry.Uuid == markUuid && entry.Start == markOffset);
+            if (mark.Uuid is null) mark = all.LastOrDefault(entry => entry.Uuid == markUuid);
+            if (mark.Uuid is null || ChainBack(mark, all, until: null) is not { } chain)
+            {
+                log?.Invoke("the mark's conversation could not be followed back");
+                return false;
+            }
+            var tools = new Dictionary<string, string>(StringComparer.Ordinal);
+            var odd = ApplyEntries(file, chain, tools, tasks);
+            if (odd > 0) log?.Invoke($"{odd} transcript entries of an unexpected shape were left out of the task plan");
+            return true;
+        }
+        catch (TooLarge e)
+        {
+            log?.Invoke($"the task history is larger than a catch-up reads: {e.Message}");
+            return false;
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            log?.Invoke($"the task history could not be read: {e.Message}");
+            return false;
+        }
+    }
+
+    static int ApplyEntries(FileStream file, List<Entry> chain, Dictionary<string, string> tools, ClaudeTaskPlan tasks)
+    {
+        var odd = 0;
+        foreach (var entry in chain)
+        {
+            try
+            {
+                ApplyEntry(file, entry, tools, tasks);
+            }
+            catch (Exception e) when (e is JsonException or InvalidOperationException or FormatException or KeyNotFoundException or IOException)
+            {
+                odd++;
+            }
+        }
+        return odd;
+    }
+
+    /// <summary>One transcript entry's task tool calls, applied to <paramref name="tasks"/> in file order.</summary>
+    static void ApplyEntry(FileStream file, Entry entry, Dictionary<string, string> tools, ClaudeTaskPlan tasks)
+    {
+        if (entry.Sidechain) return; // a subagent's checklist is not the parent's
+        var bytes = new byte[entry.Length];
+        file.Position = entry.Start;
+        file.ReadExactly(bytes);
+        if (JsonNode.Parse(bytes) is not JsonObject json) return;
+        var message = json["message"] as JsonObject;
+        switch (Str(json["type"]))
+        {
+            case "assistant" when message is not null && message["content"] is JsonArray blocks:
+                foreach (var block in blocks.OfType<JsonObject>())
+                {
+                    if (Str(block["type"]) != "tool_use") continue;
+                    if (Str(block["id"]) is not { } id || Str(block["name"]) is not { } name) continue;
+                    tools[id] = name;
+                    tasks.ObserveToolUse(id, name, block["input"] as JsonObject);
+                }
+                break;
+            case "user" when !Flag(json["isMeta"]) && !Flag(json["isCompactSummary"]) && message is not null:
+            {
+                var asStream = new JsonObject { ["message"] = WithoutReminders(message), ["tool_use_result"] = json["toolUseResult"]?.DeepClone() };
+                foreach (var detail in StreamJson.ToolResultDetails(asStream, id => tools.GetValueOrDefault(id)))
+                    tasks.ObserveToolResult(detail.ToolCallId, detail.Tool, detail.Failed, detail.Structured, detail.Text);
+                break;
+            }
+        }
+    }
+
+    /// <summary>Whether a slice of entries mentions a task tool, cheaply enough to avoid a whole-file read otherwise.</summary>
+    static bool MentionsTaskTools(FileStream file, List<Entry> entries)
+    {
+        if (entries.Count == 0) return false;
+        var bytes = new byte[entries.Max(entry => entry.Length)];
+        foreach (var entry in entries)
+        {
+            file.Position = entry.Start;
+            file.ReadExactly(bytes, 0, entry.Length);
+            var text = Encoding.UTF8.GetString(bytes, 0, entry.Length);
+            if (text.Contains("\"TaskCreate\"", StringComparison.Ordinal)
+                || text.Contains("\"TaskUpdate\"", StringComparison.Ordinal)
+                || text.Contains("\"TodoWrite\"", StringComparison.Ordinal))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -515,7 +688,8 @@ internal static class TranscriptHistory
     }
 
     /// <summary>Parses each entry of the chain in turn and sends its updates; an entry of an unexpected shape is left out.</summary>
-    static async Task<int> SendAsync(FileStream file, List<Entry> chain, Func<SessionUpdate, Task> send, Action<string>? log)
+    static async Task<int> SendAsync(FileStream file, List<Entry> chain, Func<SessionUpdate, Task> send, Action<string>? log,
+        ClaudeTaskPlan? tasks = null)
     {
         var tools = new Dictionary<string, string>(StringComparer.Ordinal);
         var sent = 0;
@@ -528,7 +702,7 @@ internal static class TranscriptHistory
                 var bytes = new byte[entry.Length];
                 file.Position = entry.Start;
                 file.ReadExactly(bytes);
-                updates = JsonNode.Parse(bytes) is JsonObject json ? UpdatesOf(json, entry.Uuid!, tools) : [];
+                updates = JsonNode.Parse(bytes) is JsonObject json ? UpdatesOf(json, entry.Uuid!, tools, tasks) : [];
             }
             catch (Exception e) when (e is JsonException or InvalidOperationException or FormatException or KeyNotFoundException or IOException)
             {
@@ -545,10 +719,14 @@ internal static class TranscriptHistory
         return sent;
     }
 
-    /// <summary>One entry's updates, as the live stream maps Claude's messages (HeadlessSession).</summary>
-    static List<SessionUpdate> UpdatesOf(JsonObject json, string uuid, Dictionary<string, string> tools)
+    /// <summary>
+    /// One entry's updates, as the live stream maps Claude's messages (HeadlessSession), including
+    /// a full replacement plan after a successful task tool result when <paramref name="tasks"/> is given.
+    /// </summary>
+    static List<SessionUpdate> UpdatesOf(JsonObject json, string uuid, Dictionary<string, string> tools, ClaudeTaskPlan? tasks = null)
     {
         var updates = new List<SessionUpdate>();
+        if (Flag(json["isSidechain"])) return updates;
         var message = json["message"] as JsonObject;
         switch (Str(json["type"]))
         {
@@ -557,7 +735,12 @@ internal static class TranscriptHistory
                 var asStream = new JsonObject { ["message"] = WithoutReminders(message), ["tool_use_result"] = json["toolUseResult"]?.DeepClone() };
                 if (StreamJson.UserText(asStream) is { Length: > 0 } text && !IsNotTyped(text))
                     updates.Add(new SessionUpdateUserMessageChunk { Content = new TextContent { Text = text }, MessageId = uuid });
-                updates.AddRange(StreamJson.ToolResults(asStream, id => tools.GetValueOrDefault(id)));
+                foreach (var detail in StreamJson.ToolResultDetails(asStream, id => tools.GetValueOrDefault(id)))
+                {
+                    updates.Add(StreamJson.ToolResultUpdate(detail));
+                    if (tasks?.ObserveToolResult(detail.ToolCallId, detail.Tool, detail.Failed, detail.Structured, detail.Text) is { } plan)
+                        updates.Add(plan);
+                }
                 break;
             }
             case "assistant" when message is not null && message["content"] is JsonArray blocks:
@@ -574,9 +757,10 @@ internal static class TranscriptHistory
                             updates.Add(ClaudeHooks.TextChunk(text, id));
                             break;
                         case "tool_use":
-                            foreach (var (call, tool, _) in StreamJson.ToolUses(new JsonObject { ["message"] = new JsonObject { ["content"] = new JsonArray(block.DeepClone()) } }))
+                            foreach (var (call, tool, input) in StreamJson.ToolUses(new JsonObject { ["message"] = new JsonObject { ["content"] = new JsonArray(block.DeepClone()) } }))
                             {
                                 tools[call.ToolCallId] = tool;
+                                tasks?.ObserveToolUse(call.ToolCallId, tool, input);
                                 updates.Add(call);
                             }
                             break;

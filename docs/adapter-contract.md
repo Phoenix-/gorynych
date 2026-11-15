@@ -300,6 +300,21 @@ field names the message that each `agent_message_chunk`, `agent_thought_chunk` a
 - The journal keeps the updates as they were published, so a replay on `session/load` has the
   live stream's IDs. When it compacts, it merges text chunks only when they share a `messageId`.
 
+**Plans.** An adapter whose agent has a native checklist SHOULD send ACP v1
+[`plan`](https://agentclientprotocol.com/protocol/v1/agent-plan) updates: every update is the
+complete list of entries, each with `content`, `priority` and a standard status (`pending`,
+`in_progress` or `completed`). An empty list clears the plan.
+
+- Use the agent's native task identity where it has one; a tool call ID is not a task ID.
+- Publish only a successful, applied change. A failed or denied call, an unknown task or a
+  malformed payload changes nothing and throws nothing.
+- Map only the standard statuses. A native model without priority uses one default
+  (`medium` for Claude); a native status outside the standard set is left out.
+- Native history replays as the live stream does: a replay after a mark primes the state from
+  before the mark and sends only the plan changes after it, so a partial update of an older
+  task stays whole and an already-journaled plan is not repeated.
+- A subagent's checklist is not the parent session's plan.
+
 **Commands.** The adapter MAY send `available_commands_update` at any time, as ACP allows; each
 list replaces the one before.
 

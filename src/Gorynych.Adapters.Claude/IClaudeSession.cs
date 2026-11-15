@@ -27,6 +27,15 @@ internal interface IClaudeSession : IAsyncDisposable
     /// <summary>The text of the ACP <c>systemPrompt</c> (append mode); it applies from the next launch.</summary>
     string? SystemPrompt { get; set; }
 
+    /// <summary>Claude's task checklist, reduced from its native task tools into ACP's plan.</summary>
+    ClaudeTaskPlan TaskPlan { get; }
+
+    /// <summary>
+    /// Whether <see cref="TaskPlan"/> was built from the whole native history, so a task update that
+    /// names an older task can be applied; false until a replay or a lazy prime reads it.
+    /// </summary>
+    bool TasksPrimed { get; set; }
+
     /// <summary>Whether Claude's process runs now.</summary>
     bool IsRunning { get; }
 
@@ -60,6 +69,21 @@ internal static class ClaudeEnvironment
         foreach (System.Collections.DictionaryEntry e in source ?? Environment.GetEnvironmentVariables())
             env[(string)e.Key] = (string?)e.Value ?? "";
         foreach (var key in env.Keys.Where(ParentSessionVariables.Contains).ToList()) env.Remove(key);
+        return env;
+    }
+
+    /// <summary>
+    /// The environment of a session's own Claude launch: <see cref="Clean"/> plus Claude Code's
+    /// documented per-subprocess opt-in for its task-tracking tools. The task tools are off by
+    /// default on newer models, and Gorynych reads them to show ACP's plan. Nothing else is
+    /// touched: inherited <c>CLAUDE_CODE_ENABLE_TASKS</c>, authentication and provider settings
+    /// stay as the person configured them, and no settings file is written.
+    /// </summary>
+    /// <param name="source">The variables to start from; this process's environment when null.</param>
+    public static Dictionary<string, string> ForSession(System.Collections.IDictionary? source = null)
+    {
+        var env = Clean(source);
+        env["CLAUDE_CODE_ENABLE_TODO_TOOLS"] = "1";
         return env;
     }
 }

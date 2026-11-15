@@ -348,7 +348,7 @@ public static class ClaudeHooks
         "Bash" or "PowerShell" => ToolKind.Execute,
         "Grep" or "Glob" or "ToolSearch" => ToolKind.Search,
         "WebFetch" or "WebSearch" => ToolKind.Fetch,
-        "Task" or "Agent" or "TodoWrite" => ToolKind.Think,
+        "Task" or "Agent" or "TodoWrite" or "TaskCreate" or "TaskGet" or "TaskList" or "TaskUpdate" => ToolKind.Think,
         "ExitPlanMode" or "EnterPlanMode" => ToolKind.SwitchMode,
         _ => ToolKind.Other,
     };

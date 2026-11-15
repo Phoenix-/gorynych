@@ -80,6 +80,14 @@ public sealed partial class ClaudeHeadlessTests
             },
         });
 
+    static string[] PlanEntries(JsonObject? update) =>
+        update?["entries"]?.AsArray().Select(e => $"{e!["status"]}:{e!["priority"]}:{e!["content"]}").ToArray() ?? [];
+
+    static string[] LastPlan(TestClient client) =>
+        PlanEntries(client.Snapshot().LastOrDefault(u => (string?)u["sessionUpdate"] == "plan"));
+
+    static int PlanCount(TestClient client) => client.Snapshot().Count(u => (string?)u["sessionUpdate"] == "plan");
+
     static bool Sleeping(TestClient c, int n) =>
         c.Snapshot().Count(u => (string?)u["sessionUpdate"] == "tool_call" && (string?)u["title"] is { } t && t.Contains("sleep", StringComparison.Ordinal)) >= n;
 
@@ -163,6 +171,71 @@ public sealed partial class ClaudeHeadlessTests
         await PromptAsync(client, sessionId, "write it again");
         StringAssert.Contains(client.Text(), "not allowed");
         Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call_update" && (string?)u["status"] == "failed"), "a denial fails the tool call");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task TaskTools_ShowFullReplacementPlans_AndKeepTheirToolCalls()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(client, sessionId, "plan tasks please")).StopReason);
+        StringAssert.Contains(client.Text(), "planned it");
+        CollectionAssert.AreEqual(new[] { "completed:medium:Plan the renamed work" }, LastPlan(client));
+        Assert.IsTrue(PlanCount(client) >= 4, "each successful task change replaces the whole plan");
+        Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call" && (string?)u["toolCallId"] == "toolu_fake1"),
+            "the ordinary TaskCreate tool call still shows");
+        Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call_update" && (string?)u["toolCallId"] == "toolu_fake1" && (string?)u["status"] == "completed"),
+            "the ordinary TaskCreate result still shows");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task TodoWrite_ShowsItsSnapshot_AndAnEmptyOneClearsThePlan()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+
+        await PromptAsync(client, sessionId, "plan todo please");
+        CollectionAssert.AreEqual(new[] { "pending:medium:First todo", "in_progress:medium:Doing the second todo" }, LastPlan(client));
+
+        await PromptAsync(client, sessionId, "plan todo clear please");
+        Assert.AreEqual(0, LastPlan(client).Length, "the empty native snapshot clears the plan");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task FailedTaskCreate_PublishesNoPlan()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+
+        await PromptAsync(client, sessionId, "plan task failure please");
+        Assert.AreEqual(0, PlanCount(client), "a failed call is not an applied plan");
+        Assert.IsFalse(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "plan"));
+        StringAssert.Contains(client.Text(), "create failed");
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task SubagentTaskTools_DoNotBecomeTheParentsPlan()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var sessionId = await NewAsync(client, dir);
+
+        await PromptAsync(client, sessionId, "plan subagent please");
+        CollectionAssert.AreEqual(new[] { "pending:medium:Parent task" }, LastPlan(client));
+        Assert.IsFalse(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "plan" && u.ToJsonString().Contains("Subagent task", StringComparison.Ordinal)),
+            "the subagent's checklist never reaches the parent's plan");
     }
 
     [TestMethod]

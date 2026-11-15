@@ -122,6 +122,11 @@ claude -p --input-format stream-json --output-format stream-json --verbose
   `session/resume`, and lives until `session/close` or the service's idle unload. It gets the
   TUI's cleaned environment, preserving the person's configured `ANTHROPIC_API_KEY`,
   `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL`. Claude Code chooses the authentication route.
+- The launch opts into Claude's task-tracking tools with `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` in
+  that per-process environment. Newer models have the tools off by default; Gorynych reads them
+  for ACP's plan. `CLAUDE_CODE_ENABLE_TASKS` is left as inherited, not forced: `0` gives the
+  legacy `TodoWrite` instead of `TaskCreate`/`TaskUpdate`. No settings file is written and the
+  authentication, provider and other environment stay unchanged.
 - A `session/resume` with `_meta["gorynych/draft"]: true` for a session the adapter does not
   know (it restarted before the draft's first prompt, which is when it records a session)
   opens it afresh under its ID, so its first prompt launches with `--session-id`. Without the
@@ -185,6 +190,8 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 | `assistant` with `tool_use` | `tool_call` (`pending`), `toolCallId` = the block's `id`, title, kind and locations as in the TUI |
 | `assistant` text no delta carried | `agent_message_chunk` with the whole text |
 | `user` with `tool_result` | `tool_call_update` `completed` / `failed`, `rawOutput` = `tool_use_result`, Bash output or the error as content |
+| `assistant` with `TaskCreate`, `TaskUpdate` or `TodoWrite` | `tool_call` as any other tool; nothing is published as a plan before its result |
+| a successful task tool result | also a `plan` with the whole list, when the result applied ([Task plans](#task-plans)) |
 | replay of the client's own prompt | nothing (ACP does not echo) |
 | replay of a live note | `user_message_chunk`, `messageId` = the note's `uuid`, the note's `_meta`, `gorynych/origin: "live"` |
 | replay of Claude's record of a command it ran (`<command-…>`, `<local-command-…>`) under a `uuid` the adapter did not write | nothing, and no turn starts: no `result` follows it ([below](#mode-model-and-effort-selectors)) |
@@ -195,6 +202,44 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 Output that arrives while no turn was counted is a turn Claude began itself (a background
 task ended): it is marked `gorynych/agentTurn: "started"` on its first update and `"ended"`
 with its `result`, so the service holds the session meanwhile.
+
+#### Task plans
+
+Claude's native checklist becomes ACP's [plan](https://agentclientprotocol.com/protocol/v1/agent-plan):
+each update is the complete list of entries, with `content`, `priority` and a status of
+`pending`, `in_progress` or `completed`. The tools are `TaskCreate` and `TaskUpdate` (Claude
+Code 2.1.268 and later, with the launch's `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`), or the legacy
+`TodoWrite` when the person's environment sets `CLAUDE_CODE_ENABLE_TASKS=0`; Gorynych does not
+force either family.
+
+- `TaskCreate` is applied only after its successful tool result, from the result's
+  `{"task":{"id":…,"subject":…}}`. The native task ID keys the plan, never the tool call ID.
+- `TaskUpdate` is applied from its successful
+  `{"success":true,"taskId":…,"updatedFields":[…],"statusChange":{…}}` result. Subject,
+  active-form and status changes are partial updates of the task with that native ID; a status
+  of `deleted` removes it. The stream's `id` and `task_id` aliases for `taskId`, and
+  `active_form` for `activeForm`, are read as Claude's own repair would name them.
+- `TodoWrite` is a full snapshot: the successful result's `newTodos` replaces the plan, and an
+  empty list clears it. The call's input is the fallback only when the result has no structured
+  list.
+- A failed, denied or malformed call changes nothing. A task the plan does not know is not
+  invented, an unknown status is not mapped, and a payload of the wrong shape throws nothing.
+  Deleting the last task sends an empty plan.
+- Entry content is the native `subject` (or TodoWrite `content`), or the `activeForm` while the
+  task is in progress, as Claude's own progress display names the work. The native tasks have no
+  priority, so every entry is `medium`.
+- Subagent tool calls are ignored: stream-json marks them with `parent_tool_use_id`, hooks with
+  `agent_id`. A subagent's checklist never becomes the parent's plan.
+- The TUI uses the same reducer through hooks: `PreToolUse` records the call,
+  `PostToolUse` applies its structured `tool_response`, and `PostToolUseFailure` changes nothing.
+- **History.** A replay after the mark primes the plan from the task calls before the mark, then
+  sends plan updates only for successful task results after it: a partial `TaskUpdate` of a task
+  created earlier is complete, and no earlier plan is sent again. A replay from the start derives
+  the whole plan from the chain. When the transcript has not been read yet, the first task event
+  after a restart primes the reducer from the whole conversation. A session whose journal
+  predates this change gets its plan with its next task event; an imported session gets it with
+  its history.
+- The plan state is bounded at 512 entries and pending calls per session.
 
 #### Approvals and questions
 
@@ -648,6 +693,9 @@ nothing of it.
 
 - Headless: subagent messages, background tasks and `/compact` are not mapped; MCP servers'
   elicitations are declined; not tried on Linux and macOS.
+- Task plans: a result without the structured native output (a `TaskCreate` without a task ID,
+  or a `TodoWrite` without a list) is not shown; history priming fails open for a transcript
+  over the catch-up limit, leaving the plan as it was.
 - TUI: a Unix PTY host (the transport reports "not supported" off Windows), `/rename` from the
   GUI, resizing the pseudo console.
 - Automatic discovery of Claude sessions the adapter did not start (`~/.claude/projects`).

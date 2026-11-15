@@ -153,6 +153,7 @@ file in `~/.claude` or in the project changes.
 | Need | Mechanism | What it gives |
 | --- | --- | --- |
 | Feed | `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages` | token deltas, thoughts, tool calls and results, a replay of every user message with the `uuid` the adapter gave it, one `result` per turn |
+| Task checklist | Claude's `TaskCreate`/`TaskUpdate`, or `TodoWrite` with `CLAUDE_CODE_ENABLE_TASKS=0`, opted in per launch with `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` | ACP v1 `plan` updates ([adapters.md](adapters.md#task-plans)) |
 | Approvals and questions | `--permission-prompt-tool=stdio` | `can_use_tool` control requests, answered `allow` or `deny`; `AskUserQuestion` exists only with this host |
 | Permission mode, model, effort | `--permission-mode`, `--model`, `--effort`; `set_permission_mode`, `set_model`, `apply_flag_settings` while running | the selectors |
 | Messages from other agents and the person | user messages on stdin | a message joins a running turn after its current tool, or starts one |
@@ -166,6 +167,7 @@ file in `~/.claude` or in the project changes.
 | Need | Mechanism | What it gives |
 | --- | --- | --- |
 | Feed | `--settings <file>` with hooks of type `http` | every event POSTed to the adapter: prompt, tool input and result, answer text (`MessageDisplay`), `Stop` with `last_assistant_message`. The person's global hooks keep working |
+| Task checklist | `PreToolUse`/`PostToolUse` of Claude's task tools | ACP v1 `plan` updates, by the same reducer as headless ([adapters.md](adapters.md#task-plans)) |
 | Approvals and questions | the `PermissionRequest` hook in the same settings | `allow` or `deny`; an `AskUserQuestion` answer through `updatedInput.answers` |
 | Permission mode | `--permission-mode default` | otherwise a global `defaultMode: auto` decides by itself and the approval never reaches the hook |
 | Messages from other agents | `--mcp-config` plus `--dangerously-load-development-channels server:gorynych` | a channel delivers messages into the live session. Claude shows a notice at every such launch that needs Enter; Gorynych confirms it only after the person agreed once ([adapters.md](adapters.md#consent-to-development-channels)) |

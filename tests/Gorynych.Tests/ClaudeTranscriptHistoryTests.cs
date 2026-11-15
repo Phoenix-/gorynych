@@ -15,14 +15,14 @@ public sealed class ClaudeTranscriptHistoryTests
 {
     static string NewTranscript() => Path.Combine(TestDirs.New(), "session.jsonl");
 
-    sealed record Got(bool FromMark, string? Mark, long BytesRead, List<SessionUpdate> Updates);
+    sealed record Got(bool FromMark, string? Mark, long BytesRead, List<SessionUpdate> Updates, bool TasksPrimed);
 
     /// <summary>The replay with the updates it sent, or null when the transcript could not be read.</summary>
     static Got? Read(string path, string? mark, long maxBytes = TranscriptHistory.MaxBytes)
     {
         var updates = new List<SessionUpdate>();
         var replay = TranscriptHistory.ReadAsync(path, mark, u => { updates.Add(u); return Task.CompletedTask; }, maxBytes: maxBytes).GetAwaiter().GetResult();
-        return replay is null ? null : new Got(replay.FromMark, replay.Mark, replay.BytesRead, updates);
+        return replay is null ? null : new Got(replay.FromMark, replay.Mark, replay.BytesRead, updates, replay.TasksPrimed);
     }
 
     static void Add(string path, params JsonObject[] entries) =>
@@ -62,13 +62,28 @@ public sealed class ClaudeTranscriptHistoryTests
         ["type"] = "system", ["subtype"] = "compact_boundary", ["uuid"] = uuid, ["parentUuid"] = null, ["logicalParentUuid"] = logicalParent, ["isSidechain"] = false,
     };
 
-    static JsonObject ToolResult(string uuid, string? parent, string toolUseId, string output) => new()
+    static JsonObject ToolResult(string uuid, string? parent, string toolUseId, string output, JsonObject? structured = null)
     {
-        ["type"] = "user", ["uuid"] = uuid, ["parentUuid"] = parent, ["isSidechain"] = false,
+        var entry = new JsonObject
+        {
+            ["type"] = "user", ["uuid"] = uuid, ["parentUuid"] = parent, ["isSidechain"] = false,
+            ["message"] = new JsonObject
+            {
+                ["role"] = "user",
+                ["content"] = new JsonArray(new JsonObject { ["type"] = "tool_result", ["tool_use_id"] = toolUseId, ["content"] = output }),
+            },
+        };
+        if (structured is not null) entry["toolUseResult"] = structured.DeepClone();
+        return entry;
+    }
+
+    static JsonObject ToolUse(string uuid, string? parent, string toolUseId, string tool, JsonObject input) => new()
+    {
+        ["type"] = "assistant", ["uuid"] = uuid, ["parentUuid"] = parent, ["isSidechain"] = false,
         ["message"] = new JsonObject
         {
-            ["role"] = "user",
-            ["content"] = new JsonArray(new JsonObject { ["type"] = "tool_result", ["tool_use_id"] = toolUseId, ["content"] = output }),
+            ["id"] = "msg_" + uuid, ["role"] = "assistant",
+            ["content"] = new JsonArray(new JsonObject { ["type"] = "tool_use", ["id"] = toolUseId, ["name"] = tool, ["input"] = input.DeepClone() }),
         },
     };
 
@@ -79,6 +94,7 @@ public sealed class ClaudeTranscriptHistoryTests
         SessionUpdateAgentThoughtChunk m => $"thought {m.MessageId}: {((TextContent)m.Content).Text}",
         ToolCall c => $"tool {c.ToolCallId}",
         SessionUpdateToolCallUpdate c => $"result {c.ToolCallId} {c.Status?.Value}",
+        Plan p => "plan " + string.Join(",", p.Entries.Select(e => $"{e.Status.Value}:{e.Content}")),
         _ => u.GetType().Name,
     }).ToArray();
 
@@ -330,6 +346,118 @@ public sealed class ClaudeTranscriptHistoryTests
 
         CollectionAssert.AreEqual(new[] { "user u2: Real question", "agent msg_2: Answer" }, Seen(replay.Updates));
         StringAssert.StartsWith(replay.Mark, "a2@");
+    }
+
+    [TestMethod]
+    public void ATaskCreatedBeforeTheMark_IsPrimed_AndOnlyItsLaterUpdateIsReplayed()
+    {
+        var path = NewTranscript();
+        Add(path,
+            User("u1", null, "Track this"),
+            ToolUse("a1", "u1", "toolu_create", "TaskCreate", new JsonObject { ["subject"] = "Draft", ["activeForm"] = "Drafting" }),
+            ToolResult("r1", "a1", "toolu_create", "Task #1 created successfully: Draft",
+                new JsonObject { ["task"] = new JsonObject { ["id"] = "1", ["subject"] = "Draft" } }));
+        var mark = TranscriptHistory.Mark(path)!;
+        Add(path,
+            ToolUse("a2", "r1", "toolu_update", "TaskUpdate", new JsonObject { ["taskId"] = "1", ["status"] = "completed" }),
+            ToolResult("r2", "a2", "toolu_update", "Updated task #1 status",
+                new JsonObject
+                {
+                    ["success"] = true, ["taskId"] = "1", ["updatedFields"] = new JsonArray("status"),
+                    ["statusChange"] = new JsonObject { ["from"] = "pending", ["to"] = "completed" },
+                }));
+
+        var replay = Read(path, mark)!;
+
+        CollectionAssert.AreEqual(new[]
+        {
+            "tool toolu_update", "result toolu_update completed", "plan completed:Draft",
+        }, Seen(replay.Updates), "the create was before the mark; its state primes the update, and no earlier plan is replayed");
+        Assert.IsFalse(Seen(replay.Updates).Any(s => s.Contains("plan pending", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public void WithoutAMark_TheWholeConversation_PlaysEveryTaskChange()
+    {
+        var path = NewTranscript();
+        Add(path,
+            User("u1", null, "Track this"),
+            ToolUse("a1", "u1", "toolu_create", "TaskCreate", new JsonObject { ["subject"] = "Draft" }),
+            ToolResult("r1", "a1", "toolu_create", "Task #1 created successfully: Draft",
+                new JsonObject { ["task"] = new JsonObject { ["id"] = "1", ["subject"] = "Draft" } }),
+            ToolUse("a2", "r1", "toolu_update", "TaskUpdate", new JsonObject { ["taskId"] = "1", ["status"] = "in_progress" }),
+            ToolResult("r2", "a2", "toolu_update", "Updated task #1 status",
+                new JsonObject
+                {
+                    ["success"] = true, ["taskId"] = "1", ["updatedFields"] = new JsonArray("status"),
+                    ["statusChange"] = new JsonObject { ["from"] = "pending", ["to"] = "in_progress" },
+                }));
+
+        var replay = Read(path, null)!;
+
+        CollectionAssert.AreEqual(new[]
+        {
+            "user u1: Track this", "tool toolu_create", "result toolu_create completed", "plan pending:Draft",
+            "tool toolu_update", "result toolu_update completed", "plan in_progress:Draft",
+        }, Seen(replay.Updates));
+        Assert.IsTrue(replay.TasksPrimed);
+    }
+
+    [TestMethod]
+    public void ReadTasks_RebuildsThePlanFromTheWholeConversation()
+    {
+        var path = NewTranscript();
+        Add(path,
+            User("u1", null, "Track this"),
+            ToolUse("a1", "u1", "toolu_create", "TaskCreate", new JsonObject { ["subject"] = "Draft" }),
+            ToolResult("r1", "a1", "toolu_create", "Task #1 created successfully: Draft",
+                new JsonObject { ["task"] = new JsonObject { ["id"] = "1", ["subject"] = "Draft" } }),
+            ToolUse("a2", "r1", "toolu_update", "TaskUpdate", new JsonObject { ["taskId"] = "1", ["status"] = "completed" }),
+            ToolResult("r2", "a2", "toolu_update", "Updated task #1 status",
+                new JsonObject
+                {
+                    ["success"] = true, ["taskId"] = "1", ["updatedFields"] = new JsonArray("status"),
+                    ["statusChange"] = new JsonObject { ["from"] = "pending", ["to"] = "completed" },
+                }));
+
+        var plan = TranscriptHistory.ReadTasks(path);
+
+        Assert.IsNotNull(plan);
+        CollectionAssert.AreEqual(new[] { "completed:medium:Draft" },
+            plan!.Snapshot().Entries.Select(e => $"{e.Status.Value}:{e.Priority.Value}:{e.Content}").ToArray());
+    }
+
+    [TestMethod]
+    public void SubagentTaskEntries_AreNotInThePlan()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "Track this"));
+        var sidechain = ToolUse("s1", "u1", "toolu_sub", "TaskCreate", new JsonObject { ["subject"] = "Subagent task" });
+        sidechain["isSidechain"] = true;
+        Add(path, sidechain,
+            ToolResult("s2", "s1", "toolu_sub", "Task #9 created successfully: Subagent task",
+                new JsonObject { ["task"] = new JsonObject { ["id"] = "9", ["subject"] = "Subagent task" } }));
+
+        var plan = TranscriptHistory.ReadTasks(path);
+
+        Assert.IsNotNull(plan);
+        Assert.AreEqual(0, plan!.Snapshot().Entries.Count);
+    }
+
+    [TestMethod]
+    public void MalformedTaskPayloads_AreLeftOut_WithoutThrowing()
+    {
+        var path = NewTranscript();
+        Add(path,
+            User("u1", null, "Track this"),
+            ToolUse("a1", "u1", "toolu_bad", "TaskCreate", new JsonObject { ["subject"] = 7 }),
+            ToolResult("r1", "a1", "toolu_bad", "not created",
+                new JsonObject { ["task"] = new JsonObject { ["id"] = 7 } }));
+
+        var plan = TranscriptHistory.ReadTasks(path);
+
+        Assert.IsNotNull(plan);
+        Assert.AreEqual(0, plan!.Snapshot().Entries.Count);
     }
 
     [TestMethod]

@@ -135,28 +135,46 @@ public static class StreamJson
     }
 
     /// <summary>
-    /// The <c>tool_result</c> blocks of a <c>user</c> message as ACP tool call updates. A message with
-    /// one result carries the tool's structured output in <c>tool_use_result</c>, which becomes
-    /// <c>rawOutput</c>; <paramref name="toolOf"/> names the tool of a <c>tool_use_id</c>.
+    /// One <c>tool_result</c> block of a <c>user</c> message, with the message's structured
+    /// <c>tool_use_result</c> when it carries exactly one result and the tool whose call it answers.
+    /// Kept apart from the ACP mapping so a stateful consumer (Claude's task plan) can pair the
+    /// result with its call by <c>ToolCallId</c> and read the native output.
     /// </summary>
-    public static IEnumerable<SessionUpdateToolCallUpdate> ToolResults(JsonObject user, Func<string, string?> toolOf)
+    public readonly record struct ToolResultDetail(string ToolCallId, string Tool, bool Failed, JsonNode? Structured, string? Text);
+
+    /// <summary>
+    /// The <c>tool_result</c> blocks of a <c>user</c> message. <paramref name="toolOf"/> names the
+    /// tool of a <c>tool_use_id</c>.
+    /// </summary>
+    public static IEnumerable<ToolResultDetail> ToolResultDetails(JsonObject user, Func<string, string?> toolOf)
     {
         var results = Blocks(user).Where(b => (string?)b["type"] == "tool_result").ToList();
         foreach (var block in results)
         {
-            var id = (string?)block["tool_use_id"] ?? "";
-            var failed = (bool?)block["is_error"] == true;
+            var id = Text(block["tool_use_id"]) ?? "";
+            var failed = Flag(block["is_error"]);
             var structured = results.Count == 1 ? user["tool_use_result"] : null;
-            var text = ResultText(block["content"]);
-            yield return ClaudeHooks.ToolCallFinished(new JsonObject
-            {
-                ["tool_name"] = toolOf(id) ?? "tool",
-                ["tool_use_id"] = id,
-                ["tool_response"] = failed ? null : (structured?.DeepClone() ?? (text is null ? null : JsonValue.Create(text))),
-                ["error"] = failed ? text ?? (string?)structured : null,
-            }, failed);
+            yield return new ToolResultDetail(id, toolOf(id) ?? "tool", failed, structured?.DeepClone(), ResultText(block["content"]));
         }
     }
+
+    /// <summary>
+    /// The <c>tool_result</c> blocks of a <c>user</c> message as ACP tool call updates. A message with
+    /// one result carries the tool's structured output in <c>tool_use_result</c>, which becomes
+    /// <c>rawOutput</c>; <paramref name="toolOf"/> names the tool of a <c>tool_use_id</c>.
+    /// </summary>
+    public static IEnumerable<SessionUpdateToolCallUpdate> ToolResults(JsonObject user, Func<string, string?> toolOf) =>
+        ToolResultDetails(user, toolOf).Select(ToolResultUpdate);
+
+    /// <summary>One tool result as its ACP update, with the structured output or the error text.</summary>
+    public static SessionUpdateToolCallUpdate ToolResultUpdate(ToolResultDetail detail) =>
+        ClaudeHooks.ToolCallFinished(new JsonObject
+        {
+            ["tool_name"] = detail.Tool,
+            ["tool_use_id"] = detail.ToolCallId,
+            ["tool_response"] = detail.Failed ? null : (detail.Structured ?? (detail.Text is null ? null : JsonValue.Create(detail.Text))),
+            ["error"] = detail.Failed ? detail.Text ?? (string?)detail.Structured : null,
+        }, detail.Failed);
 
     /// <summary>The text of a replayed user message, or null when it carries none (a tool result).</summary>
     public static string? UserText(JsonObject user) => user["message"]?["content"] switch
@@ -204,6 +222,10 @@ public static class StreamJson
     }
 
     static IEnumerable<JsonObject> Blocks(JsonObject m) => (m["message"]?["content"] as JsonArray)?.OfType<JsonObject>() ?? [];
+
+    static string? Text(JsonNode? node) => node is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+
+    static bool Flag(JsonNode? node) => node is JsonValue value && value.TryGetValue<bool>(out var flag) && flag;
 
     static string? ResultText(JsonNode? content) => content switch
     {
