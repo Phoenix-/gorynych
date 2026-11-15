@@ -1034,6 +1034,9 @@ public sealed class Conductor : IAsyncDisposable
     /// </summary>
     internal async Task<JsonNode?> StopAsync(JsonRpcRequest request)
     {
+        if (Draining)
+            throw new JsonRpcException(JsonRpcException.InternalError,
+                "A restart is in progress; a management stop would race it. Try again after the restart finishes or is called off.");
         static bool Flag(JsonNode? node, bool otherwise) =>
             node is JsonValue v && v.TryGetValue<bool>(out var b) ? b : otherwise;
         var all = Flag(request.Params?["all"], false);
@@ -1271,6 +1274,9 @@ public sealed class Conductor : IAsyncDisposable
         }
         lock (maintenanceGate)
         {
+            if (names.Any(stoppingAgents.Contains))
+                throw new JsonRpcException(JsonRpcException.InternalError,
+                    "A management stop of that adapter is in progress; let it finish, then start it.");
             if (all)
             {
                 stoppedAgents.Clear();
