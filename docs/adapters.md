@@ -241,6 +241,12 @@ force either family.
   its history.
 - The plan state is bounded at 512 entries and pending calls per session.
 
+Checked with Claude Code 2.1.302: `opus` resolved to `claude-opus-5-5`; its default tool set
+omitted the four Task checklist tools, while the per-launch opt-in exposed them. The bounded
+comparison is reproducible with `research/probes/claude-headless/task-availability.py`.
+The opt-in live regression `Claude_NativeTaskTools_ReachTheClientAsFullReplacementPlans`
+checks real task creation and status updates through the adapter to an ACP client.
+
 #### Approvals and questions
 
 - `can_use_tool` control requests become `session/request_permission` with the TUI's two
@@ -693,8 +699,8 @@ nothing of it.
 
 - Headless: subagent messages, background tasks and `/compact` are not mapped; MCP servers'
   elicitations are declined; not tried on Linux and macOS.
-- Task plans: a result without the structured native output (a `TaskCreate` without a task ID,
-  or a `TodoWrite` without a list) is not shown; history priming fails open for a transcript
+- Task plans: a `TaskCreate` without a structured task ID or a `TaskUpdate` without a structured
+  successful result is not shown; history priming fails open for a transcript
   over the catch-up limit, leaving the plan as it was.
 - TUI: a Unix PTY host (the transport reports "not supported" off Windows), `/rename` from the
   GUI, resizing the pseudo console.

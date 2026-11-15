@@ -99,6 +99,25 @@ public sealed class ClaudeTranscriptHistoryTests
     }).ToArray();
 
     [TestMethod]
+    public void TaskResultAfterTheMark_ReplaysTheCallBeforeTheMark()
+    {
+        var path = NewTranscript();
+        Add(path, User("u1", null, "Track work"),
+            ToolUse("a1", "u1", "create", "TaskCreate", new JsonObject { ["subject"] = "Draft" }),
+            ToolResult("r1", "a1", "create", "Created", new JsonObject { ["task"] = new JsonObject { ["id"] = "1", ["subject"] = "Draft" } }),
+            ToolUse("a2", "r1", "update", "TaskUpdate", new JsonObject { ["taskId"] = "1", ["status"] = "completed" }));
+        var mark = TranscriptHistory.Mark(path)!;
+        Add(path, ToolResult("r2", "a2", "update", "Updated", new JsonObject
+        {
+            ["success"] = true, ["taskId"] = "1", ["updatedFields"] = new JsonArray("status"),
+            ["statusChange"] = new JsonObject { ["from"] = "pending", ["to"] = "completed" },
+        }));
+        var replay = Read(path, mark)!;
+        Assert.IsTrue(replay.TasksPrimed);
+        Assert.AreEqual("plan completed:Draft", Seen(replay.Updates).Last());
+    }
+
+    [TestMethod]
     public void AfterTheMark_OnlyWhatFollowsIsRead_AndMappedAsTheLiveStreamMapsIt()
     {
         var path = NewTranscript();

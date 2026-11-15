@@ -170,6 +170,22 @@ public sealed class ClaudeTaskPlanTests
     }
 
     [TestMethod]
+    public void MalformedStructuredResults_DoNotApplyTheRequestedChange()
+    {
+        var plan = new ClaudeTaskPlan();
+        Create(plan, "create", "1", "Keep me");
+        foreach (var json in new[] { "null", "{}", "{\"success\":\"yes\",\"taskId\":\"1\"}" })
+        {
+            plan.ObserveToolUse("update", "TaskUpdate", J("""{"taskId":"1","status":"completed"}"""));
+            Assert.IsNull(Result(plan, "update", "TaskUpdate", JsonNode.Parse(json)), json);
+            Assert.AreEqual("pending", plan.Snapshot().Entries.Single().Status.Value, json);
+        }
+        plan.ObserveToolUse("todo", "TodoWrite", J("""{"todos":[]}"""));
+        Assert.IsNull(Result(plan, "todo", "TodoWrite", J("""{"newTodos":"bad"}""")));
+        Assert.AreEqual("Keep me", plan.Snapshot().Entries.Single().Content);
+    }
+
+    [TestMethod]
     public void AResultWithoutItsCall_StillPublishesAnAuthoritativeTaskCreateOrDeletion()
     {
         var plan = new ClaudeTaskPlan();

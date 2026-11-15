@@ -197,7 +197,7 @@ internal sealed class ClaudeTaskPlan
     {
         // The native result's newTodos is the list Claude actually applied. The call's input is
         // the fallback for a harness that sends no structured result.
-        var list = TodoList(structured) ?? operation.Todos;
+        var list = structured is null ? operation.Todos : TodoList(structured);
         return list is null ? null : ApplyTodoList(list);
     }
 
@@ -243,15 +243,18 @@ internal sealed class ClaudeTaskPlan
 
     Plan? ApplyUpdate(Pending operation, JsonNode? structured)
     {
-        var result = structured as JsonObject;
-        var id = Text(result?["taskId"]) ?? operation.TaskId;
+        if (structured is not JsonObject result
+            || result["success"] is not JsonValue successValue
+            || !successValue.TryGetValue<bool>(out var success) || !success
+            || result["updatedFields"] is not JsonArray updatedFields
+            || updatedFields.Any(field => field is not JsonValue value || !value.TryGetValue<string>(out _))) return null;
+        var id = Text(result["taskId"]);
         if (string.IsNullOrEmpty(id)) return null;
-        if (result?["success"] is JsonValue successValue && successValue.TryGetValue<bool>(out var success) && !success) return null;
         if (Text(result?["error"]) is { Length: > 0 }) return null;
         var fields = Fields(result?["updatedFields"]);
         var to = Text((result?["statusChange"] as JsonObject)?["to"]);
         var deleted = to == "deleted" || fields.Contains("deleted")
-            || (to is null && operation.Status == "deleted" && (fields.Count == 0 || fields.Contains("status")));
+            || (to is null && operation.Status == "deleted" && fields.Contains("status"));
         if (deleted)
         {
             // A primed state may already lack it; the full replacement is still what the client needs.
@@ -266,7 +269,7 @@ internal sealed class ClaudeTaskPlan
             applied = true;
         }
         else if (to is null && operation.Status is ("pending" or "in_progress" or "completed")
-                 && (fields.Count == 0 || fields.Contains("status")))
+                 && fields.Contains("status"))
         {
             item.Status = operation.Status;
             applied = true;
@@ -275,7 +278,7 @@ internal sealed class ClaudeTaskPlan
         {
             applied = true; // a primed state already holds a change the result does not repeat
         }
-        if (!string.IsNullOrWhiteSpace(operation.Subject) && (fields.Count == 0 || fields.Contains("subject")))
+        if (!string.IsNullOrWhiteSpace(operation.Subject) && fields.Contains("subject"))
         {
             item.Subject = operation.Subject;
             applied = true;
@@ -285,7 +288,7 @@ internal sealed class ClaudeTaskPlan
             applied = true;
         }
         if (!string.IsNullOrWhiteSpace(operation.ActiveForm)
-            && (fields.Count == 0 || fields.Contains("activeForm") || fields.Contains("active_form")))
+            && (fields.Contains("activeForm") || fields.Contains("active_form")))
         {
             item.ActiveForm = operation.ActiveForm;
             applied = true;
@@ -311,14 +314,15 @@ internal sealed class ClaudeTaskPlan
     {
         if (node is not JsonArray array) return null;
         var list = new List<Todo>();
-        foreach (var entry in array.OfType<JsonObject>())
+        foreach (var nodeEntry in array)
         {
             if (list.Count >= MaxEntries) break;
+            if (nodeEntry is not JsonObject entry) return null;
             var content = Text(entry["content"]);
             var active = Text(entry["activeForm"] ?? entry["active_form"]);
             var status = Text(entry["status"]);
-            if (status is not ("pending" or "in_progress" or "completed")) continue;
-            if (string.IsNullOrWhiteSpace(content) && string.IsNullOrWhiteSpace(active)) continue;
+            if (status is not ("pending" or "in_progress" or "completed")) return null;
+            if (string.IsNullOrWhiteSpace(content) && string.IsNullOrWhiteSpace(active)) return null;
             list.Add(new Todo(content ?? active ?? "", active, status));
         }
         return list;

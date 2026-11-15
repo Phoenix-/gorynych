@@ -323,7 +323,13 @@ internal static class TranscriptHistory
             var text = Encoding.UTF8.GetString(bytes, 0, entry.Length);
             if (text.Contains("\"TaskCreate\"", StringComparison.Ordinal)
                 || text.Contains("\"TaskUpdate\"", StringComparison.Ordinal)
-                || text.Contains("\"TodoWrite\"", StringComparison.Ordinal))
+                || text.Contains("\"TodoWrite\"", StringComparison.Ordinal)
+                // A catch-up can begin after tool_use but before tool_result. Native outputs
+                // still identify these task tools, whose pending calls are primed before the mark.
+                || (text.Contains("\"toolUseResult\"", StringComparison.Ordinal)
+                    && (text.Contains("\"taskId\"", StringComparison.Ordinal)
+                        || text.Contains("\"newTodos\"", StringComparison.Ordinal)
+                        || text.Contains("\"task\"", StringComparison.Ordinal))))
                 return true;
         }
         return false;
