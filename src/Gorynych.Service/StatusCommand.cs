@@ -481,7 +481,7 @@ internal static class StatusCommand
         Console.WriteLine("external harness processes (informational; never stopped by Gorynych):");
         foreach (var row in external.OfType<JsonObject>())
         {
-            if (row["truncated"] is JsonValue) 
+            if (row["truncated"] is JsonValue)
             {
                 Console.WriteLine($"  … {row["truncated"]} more not listed (status is bounded)");
                 continue;
