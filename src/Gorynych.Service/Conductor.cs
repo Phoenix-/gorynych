@@ -472,7 +472,7 @@ public sealed partial class Conductor : IAsyncDisposable
         Done,
         /// <summary>Its agent runs a turn of its own in it, asks something in it, or a turn of a client's runs or waits: it moves once that ends.</summary>
         Wait,
-        /// <summary>It stays where it is for now: a draft its agent cannot open elsewhere, or a host that goes only as a whole while another session of it is busy.</summary>
+        /// <summary>It stays where it is for now: retained background work, a draft its agent cannot open elsewhere, or a host that goes only as a whole while another session of it is busy.</summary>
         Stay,
     }
 
@@ -493,7 +493,8 @@ public sealed partial class Conductor : IAsyncDisposable
     /// <summary>
     /// Moves a session open in a host of an earlier generation to one of the current, if it is idle
     /// there: no turn runs or waits in it (or this caller holds its turn, to run one in the new host),
-    /// its agent asks nothing in it, and it could open elsewhere (<see cref="OpensElsewhere"/>). It is
+    /// its agent asks nothing in it, no observed background work retains it, and it could open
+    /// elsewhere (<see cref="OpensElsewhere"/>). It is
     /// closed in the old host (Codex lets go of the thread's writer lock before the close answers), and
     /// the next use opens it in a host of the current generation, which catches its journal up from its
     /// mark (<see cref="OpenAsync"/>): what the journal has is not sent again, and what it lacks is
@@ -519,11 +520,15 @@ public sealed partial class Conductor : IAsyncDisposable
                 turnTaken = true;
             }
             if (feed.AgentTurnRunning || feed.Asking > 0) return Move.Wait;
+            // Background work may outlive its foreground turn and an unavailable snapshot.
+            // Keep using its old host until the work ends rather than blocking new prompts.
+            if (feed.HasBackgroundWork) return Move.Stay;
             await feed.OpenGate.WaitAsync(ct);
             try
             {
                 if (host.RouteOf(sessionId) is not { Current: false } on) return Move.Done;
                 if (!OpensElsewhere(on, feed)) return Move.Stay;
+                if (feed.HasBackgroundWork) return Move.Stay;
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeout.CancelAfter(MoveCloseTimeout);
                 if (await CloseInAgentAsync(host, on.Rpc, sessionId, ct, timeout.Token))
@@ -584,6 +589,7 @@ public sealed partial class Conductor : IAsyncDisposable
                 }
                 held.Add((feed, !mine));
                 if (feed.AgentTurnRunning || feed.Asking > 0) return busy;
+                if (feed.HasBackgroundWork) return Move.Stay;
                 if (!OpensElsewhere(link, feed)) return Move.Stay;
             }
             await host.StopAndForgetAsync(link, "none of its sessions is busy, and its agent cannot close them one by one");
@@ -611,6 +617,7 @@ public sealed partial class Conductor : IAsyncDisposable
         var feed = Feed(sessionId);
         if (feed.TurnRunning || feed.AgentTurnRunning) return "a turn runs in it: it moves once the turn ends";
         if (feed.Asking > 0) return "its agent asks something in it: it moves once that is answered";
+        if (feed.HasBackgroundWork) return "background work is active or awaiting confirmation: it moves once completion is confirmed";
         if (!OpensElsewhere(link, feed))
             return "a draft its agent cannot open in another host: it moves after its first turn there, or goes when its client lets go of it";
         if (!link.CanClose) return "its agent cannot close one session: the host goes as a whole once none of its sessions is busy";

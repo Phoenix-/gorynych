@@ -2128,8 +2128,9 @@ An answer no asker came back for is dropped 10 minutes after it came, and a ques
 answered after a day: the service looks for such every minute.
 
 **A host with no conductor** (an orphan: the service crashed, or was uninstalled, or the next one
-does not start) keeps trying to connect. With nothing running (no prompt, no open question) it exits after 2 minutes, with code
-2. With a turn running it waits up to 10 minutes, and exits as soon as nothing runs any more and 2
+does not start) keeps trying to connect. With nothing running (no prompt, no open question,
+no agent-initiated foreground work, and no retained background hold) it exits after 2 minutes, with code
+2. With a turn or background work running it waits up to 10 minutes, and exits as soon as nothing runs any more and 2
 minutes have passed; at 10 minutes it cancels what still runs (`session/cancel`), gives it 10
 seconds, and exits. What its agent did meanwhile reaches no journal; it is in the agent's own
 history, where the [native catch-up](#history-made-outside-gorynych) finds it. The next service
@@ -2223,6 +2224,11 @@ no new session and, below, no new turn.
 **Moving a session.** A session open in a stale host moves when it is idle there: no turn runs or
 waits in it, and its agent asks nothing in it (an approval, a form; a question counts from the
 moment the conductor reads it until its answer is written back, so a move never overtakes it).
+Observed background work also keeps the session in its current host, including a
+retained hold whose latest snapshot is unknown. This applies both to closing one
+session and to stopping a whole host. New foreground prompts may still run in that
+old host while background work prevents migration; `status` explains the hold.
+Once background completion is confirmed, ordinary migration resumes.
 
 1. Under the session's gates, the conductor closes it in the stale host (`session/close`). Codex
    answers once its app-server let go of the thread (`thread/closed`), so its writer lock is free.
@@ -2253,8 +2259,8 @@ It moves:
 
 - when a stale host connects, every idle session of it;
 - when a session goes idle (its turn ends, its agent's question is answered, a use of it ends);
-- when a prompt comes for it, before its turn starts: also a prompt that waited behind a turn, so
-  that a stale host runs only the turns it had when it went stale. A prompt that finds the agent
+- when a prompt comes for it, before its turn starts: also a prompt that waited behind a turn,
+  except when background work retains the old host. A prompt that finds the agent
   running a turn of its own in the session, or asking something in it, waits for that to end, and
   then the session moves;
 - and every 30 seconds, every idle session of a stale host, should a moment have been missed.

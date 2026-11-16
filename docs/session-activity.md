@@ -105,3 +105,25 @@ Claude uses no session persistence; Codex uses an ephemeral thread. Both termina
 their owned app-server process on completion or timeout. These tests consume model
 usage and require native CLI access and a working account. A runtime may choose not
 to start background work, in which case the smoke fails rather than inventing proof.
+
+### Native idle-unload regression
+
+`NativeBackgroundUnloadLiveTests` also runs the real adapters through the conductor.
+On Windows, build the tests, set `GORYNYCH_LIVE=1`, and run the test executable with
+`--filter FullyQualifiedName~NativeBackgroundUnloadLiveTests`. Each case creates a
+new session and a bounded PowerShell worker in a new temporary folder. The worker
+uses the system PowerShell executable (inline for Codex), without changing
+ExecutionPolicy or depending on the native sandbox's PATH. After the
+native foreground turn ends with background work still present, the client
+disconnects and the service's test clock advances through three unload periods.
+The test checks that the actual worker survives, releases it, observes its completion
+and empty native background state, and checks that a full new idle grace precedes
+unload. The native harness and worker use real time; only conductor timers are
+accelerated. It neither installs Gorynych nor touches existing sessions.
+
+The `*RestartAndHostRotation` cases use the same real harnesses through in-process
+adapter hosts and their reconnect protocol. They restart the conductor with a new
+expected host generation while the native worker remains alive, verify that its old
+host stays loaded, then release the worker and verify that the old host can retire.
+This checks native process survival across protocol-level host rotation; it does
+not install or replace production host executables.

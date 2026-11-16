@@ -772,7 +772,8 @@ public sealed class AdapterHost
         .Select(id => new KeyValuePair<string, JsonNode?>(id, activities[id].DeepClone())));
 
     static bool ActivityRunning(JsonObject activity) => (bool?)activity["agentTurn"] == true
-        || Text(activity["foreground"]) is "running" or "requires_action";
+        || Text(activity["foreground"]) is "running" or "requires_action"
+        || (bool?)activity["backgroundHeld"] == true || (bool?)activity["backgroundKnownHeld"] == true;
 
     internal JsonObject Report()
     {

@@ -17,6 +17,10 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     bool backgroundUse;
     bool knownBackgroundUse;
     readonly Lock nativeActivityGate = new();
+    public bool HasBackgroundWork
+    {
+        get { lock (nativeActivityGate) return backgroundUse || knownBackgroundUse; }
+    }
     public void PinBackground()
     {
         lock (nativeActivityGate)
