@@ -966,7 +966,8 @@ sealed class CodexAgent : IAsyncDisposable
                     tasks = null;
                     completeEmpty = false;
                 }
-                if (!thread.Loaded || !threads.TryGetValue(thread.Id, out current) || !ReferenceEquals(current, thread) || Volatile.Read(ref disposed) != 0) return;
+                if (options.BeforeBackgroundPublish is { } beforePublish) await beforePublish(stopped);
+                if (stopped.IsCancellationRequested || !thread.Loaded || !threads.TryGetValue(thread.Id, out current) || !ReferenceEquals(current, thread) || Volatile.Read(ref disposed) != 0) return;
                 try
                 {
                     if ((reported || tasks is not null) && (!reported || !JsonNode.DeepEquals(previous, tasks) || previousEmpty != completeEmpty))
@@ -987,7 +988,7 @@ sealed class CodexAgent : IAsyncDisposable
         }
         finally
         {
-            if (Volatile.Read(ref backgroundUnsupported) != 0 && previous is not null && thread.Loaded && Volatile.Read(ref disposed) == 0)
+            if (!stopped.IsCancellationRequested && Volatile.Read(ref backgroundUnsupported) != 0 && previous is not null && thread.Loaded && Volatile.Read(ref disposed) == 0)
                 try { await Update(thread.Id, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaBackgroundKnown] = null } }); }
                 catch (Exception e) when (e is IOException or ObjectDisposedException or JsonRpcException) { }
             thread.DisposeBackground();

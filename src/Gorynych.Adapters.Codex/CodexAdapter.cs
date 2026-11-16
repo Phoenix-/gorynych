@@ -58,6 +58,9 @@ public sealed class CodexAdapterOptions
     /// <summary>Background terminal refresh cadence; shortened in deterministic adapter tests.</summary>
     internal TimeSpan BackgroundPollInterval { get; init; } = TimeSpan.FromSeconds(5);
 
+    // Test gate for the race between a completed refresh and thread closure.
+    internal Func<CancellationToken, Task>? BeforeBackgroundPublish { get; init; }
+
     /// <summary>
     /// Advertises native title generation to the service (<c>gorynych/autoTitle</c>). The service
     /// turns it on; an adapter constructed by a harness or a test keeps it off.

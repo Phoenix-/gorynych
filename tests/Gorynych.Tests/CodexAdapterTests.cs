@@ -28,7 +28,8 @@ public sealed class CodexAdapterTests
     }, [new CodexAdapter(codex ?? Options(fake)), .. more ?? []]);
 
     static CodexAdapterOptions Options(FakeAppServer fake, List<string>? log = null, Func<IEnumerable<string>, IReadOnlyDictionary<string, string>>? holders = null,
-        TimeSpan? unloadWait = null, TimeSpan? turnEndWait = null, bool autoTitle = false, TimeSpan? backgroundPollInterval = null) => new()
+        TimeSpan? unloadWait = null, TimeSpan? turnEndWait = null, bool autoTitle = false, TimeSpan? backgroundPollInterval = null,
+        Func<CancellationToken, Task>? beforeBackgroundPublish = null) => new()
     {
         Launch = fake.StartAsync,
         AutoTitle = autoTitle,
@@ -36,6 +37,7 @@ public sealed class CodexAdapterTests
         TurnEndWait = turnEndWait ?? TimeSpan.FromMilliseconds(200),
         UnloadWait = unloadWait ?? new CodexAdapterOptions().UnloadWait,
         BackgroundPollInterval = backgroundPollInterval ?? TimeSpan.FromSeconds(5),
+        BeforeBackgroundPublish = beforeBackgroundPublish,
         Log = log is null ? null : m => { lock (log) log.Add(m); },
         // No other Codex app holds a fake thread; the user's own Codex folder is never read.
         FindHolders = holders ?? (_ => new Dictionary<string, string>()),
@@ -204,6 +206,51 @@ public sealed class CodexAdapterTests
             Assert.IsFalse(observed.Skip(beforeLateResponse).Any(items => items.Count > 0), "the old held result must not overwrite the reopened thread");
         }
         finally { stale.TrySetResult(); }
+    }
+
+    [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task BackgroundPolling_CloseAfterRefreshBeforePublish_DoesNotPublishCancelledSnapshot()
+    {
+        var heldResponse = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var beforePublish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePublish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer
+        {
+            HoldBackgroundResponse = heldResponse,
+            BackgroundListing = _ => new JsonObject { ["data"] = new JsonArray(new JsonObject
+            { ["itemId"] = "old", ["processId"] = "p", ["command"] = "sleep", ["cwd"] = Cwd }) },
+        };
+        async Task Gate(CancellationToken stopped)
+        {
+            using var registration = stopped.Register(() => cancelled.TrySetResult());
+            beforePublish.TrySetResult();
+            await releasePublish.Task;
+        }
+        var (agent, acp) = await DirectAsync(fake, options: Options(fake, beforeBackgroundPublish: Gate));
+        await using var _ = agent;
+        await using var __ = acp;
+        var observed = new System.Collections.Concurrent.ConcurrentQueue<JsonArray>();
+        acp.NotificationHandler = (_, p) =>
+        {
+            if (p?["update"]?["_meta"]?[GorynychProtocol.MetaBackgroundKnown] is JsonArray tasks)
+                observed.Enqueue(tasks.DeepClone().AsArray());
+            return Task.CompletedTask;
+        };
+        try
+        {
+            var id = await NewDirectAsync(acp);
+            await fake.BackgroundResponseHeld.Task.WaitAsync(Wait);
+            heldResponse.TrySetResult();
+            await beforePublish.Task.WaitAsync(Wait);
+            var close = acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
+            await cancelled.Task.WaitAsync(Wait);
+            releasePublish.TrySetResult();
+            await close.WaitAsync(Wait);
+            Assert.IsFalse(observed.Any(items => items.Count > 0), "a completed refresh must not publish after close cancels it");
+        }
+        finally { heldResponse.TrySetResult(); releasePublish.TrySetResult(); }
     }
 
     [TestMethod]
