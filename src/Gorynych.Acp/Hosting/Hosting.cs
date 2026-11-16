@@ -200,6 +200,13 @@ public static class GorynychProtocol
     public const string MethodSessionState = "_gorynych/session_state";
     /// <summary>Adapter's authoritative foreground state, never inferred from a pending permission.</summary>
     public const string MetaForegroundState = "gorynych/foregroundState";
+    public const string MetaBackgroundWork = "gorynych/backgroundWork";
+    /// <summary>A partial live observation; it does not establish the complete background snapshot.</summary>
+    public const string MetaBackgroundKnown = "gorynych/backgroundKnown";
+    /// <summary>The native process ended; releases its resource pin without claiming a known-empty snapshot.</summary>
+    public const string MetaBackgroundProcessExited = "gorynych/backgroundProcessExited";
+    // Retained for source compatibility with adapters until their background implementation is updated.
+    public const string MetaBackgroundEmpty = "gorynych/backgroundObservedEmpty";
 
     /// <summary>
     /// In <c>agentCapabilities._meta</c> of the <c>initialize</c> result: the service keeps an archive

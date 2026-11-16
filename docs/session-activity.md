@@ -15,6 +15,26 @@ Each `session/list` entry and successful `session/new`, `session/load` and
 {"state": "running", "epoch": "opaque-process-id", "revision": 12}
 ```
 
+Snapshots carry `background`, a complete live snapshot modeled on ACP v2's
+background references. Missing or null means unreported or unavailable; an empty
+array means confirmed empty. A malformed array is unknown in its entirety. Known
+references use `{"type":"terminal","terminalId":"..."}`,
+`{"type":"tool_call","toolCallId":"..."}`, or
+`{"type":"subagent","sessionId":"..."}`. IDs are nonempty, stable within the
+session and must name the corresponding native or ACP entity; type-specific IDs
+must not repeat. Future or implementation-specific types remain valid and count as
+work; implementation-specific details belong in `_meta`. The extension does not
+itself promise that native references have been announced as ACP entities.
+
+An adapter that observes only a subset cannot report that subset as a complete
+background snapshot. It can instead send `_meta["gorynych/backgroundKnown"]`
+with the same reference format. The service carries it separately as
+`backgroundKnown`: null means unavailable, `[]` means that observed subset is
+empty, and a nonempty array names at least that much work. It never makes
+`background` known. An observed nonempty subset pins the session; an unknown
+observation retains that pin and a confirmed empty subset releases it. Foreground `idle` and background work may coexist. Clients
+must not infer that the agent will resume responding when a task ends.
+
 The service sends `_gorynych/session_state` notifications to initialized clients
 whose agent scope covers the session, including clients that have not loaded its
 conversation. Parameters are the same snapshot plus `sessionId`:
@@ -27,6 +47,10 @@ Adapter hosts retain authoritative native and agent-initiated activity separatel
 from their bounded replay buffer. On reattachment they publish a current
 `sessionActivities` snapshot through the existing host-state notification, so
 evicting an old start event cannot turn ongoing work into idle after a restart.
+The host also retains whether the session was pinned by a prior nonempty snapshot.
+If the latest observation is unknown, reconnect restores that pin without presenting
+the old tasks as confirmed live. A lost adapter connection is not proof that its
+native process exited. Adapters must not put live activity metadata in history replay.
 
 These notifications are live observations, not journal entries. Listing state
 does not load an agent or refresh a session's last-interaction time.
@@ -46,8 +70,8 @@ permission cards remain available through ACP's ordinary interaction APIs.
 
 ## Reconciliation
 
-`revision` is a nonnegative integer increasing on each state transition for that
-session within an `epoch`. Repeated identical state is idempotent. An epoch is
+`revision` is a nonnegative integer increasing on each foreground or background
+snapshot change for that session within an `epoch`. Repeated identical state is idempotent. An epoch is
 opaque and changes with the conductor process; it is not a timestamp or an ordered
 version. Compare revisions only within one epoch. In-flight list/open responses
 must not overwrite a more recent live notification from that epoch.
@@ -67,3 +91,17 @@ action, idle, and unconfirmed state, including on unopened imported session rows
 
 * [ACP v1 extensibility](https://agentclientprotocol.com/protocol/v1/extensibility)
 * [ACP v2 foreground lifecycle](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle)
+* [ACP v2 background work schema](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/schema/v2/schema.json)
+* [Claude SDK background snapshots](https://code.claude.com/docs/en/agent-sdk/typescript#sdkbackgroundtaskschangedmessage)
+
+## Opt-in native smoke
+
+On Windows, from the repository root, `python tests/NativeSmoke/claude-background.py`
+and `python tests/NativeSmoke/codex-background.py` each start one isolated native
+session, request a short background sleep with a bounded model turn, and wait for a
+nonempty snapshot followed by an empty one. They use the user's native authentication,
+disable MCP for the test, and do not change its configuration or install anything.
+Claude uses no session persistence; Codex uses an ephemeral thread. Both terminate
+their owned app-server process on completion or timeout. These tests consume model
+usage and require native CLI access and a working account. A runtime may choose not
+to start background work, in which case the smoke fails rather than inventing proof.

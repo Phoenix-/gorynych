@@ -28,6 +28,7 @@ internal sealed class HeadlessSession : IClaudeSession
     readonly ClaudeAdapterOptions options;
     readonly SemaphoreSlim promptGate = new(1, 1);
     readonly SemaphoreSlim launchGate = new(1, 1);
+    readonly SemaphoreSlim backgroundGate = new(1, 1);
     readonly SemaphoreSlim inputGate = new(1, 1); // orders writes against interrupts
     readonly Lock stateGate = new();
     readonly CancellationTokenSource lifetime = new();
@@ -61,6 +62,7 @@ internal sealed class HeadlessSession : IClaudeSession
     long generation;
     long lastOutput;
     bool processUp;         // the current process said system/init: it is up, its MCP servers too
+    bool backgroundReported;
     string? authenticationError; // a native auth or billing error of the running turn
     string? lastResultError;
 
@@ -766,6 +768,7 @@ internal sealed class HeadlessSession : IClaudeSession
                 OnExited(previous, previous.Exited.Result); // whichever runs first resets the state
             }
             await agent.EnsureTrustedAsync(Id, Cwd, ct);
+            await ReportBackgroundAsync(null);
             var claude = Launch();
             try
             {
@@ -791,6 +794,9 @@ internal sealed class HeadlessSession : IClaudeSession
                         "(permissions.disableBypassPermissionsMode). Choose another mode, or allow it in Claude itself.");
                 Settings.ReportedMode = (string?)init["current_permission_mode"] ?? Settings.ReportedMode;
                 agent.Log($"claude {Id}: Claude Code {(string?)init["claude_code_version"]}");
+                var versionText = ((string?)init["claude_code_version"])?.Split('-', '+')[0];
+                if (Version.TryParse(versionText, out var version) && version >= new Version(2, 1, 203))
+                    await ReportBackgroundAsync(new JsonArray(), claude, initial: true);
                 await agent.OnInitializeAsync(this, init);
                 string? title;
                 lock (stateGate) { title = pendingTitle; pendingTitle = null; }
@@ -849,6 +855,7 @@ internal sealed class HeadlessSession : IClaudeSession
         {
             process = claude;
             processUp = false;
+            backgroundReported = false;
             active = activeOwn = activeMarked = false;
             ownOpen = false;
             taken.Clear();
@@ -900,6 +907,50 @@ internal sealed class HeadlessSession : IClaudeSession
             try { cts.Cancel(); }
             catch (ObjectDisposedException) { }
         if (own) _ = MarkOwnTurnAsync("ended");
+        _ = ReportBackgroundAsync(null, exited: true);
+    }
+
+    internal static JsonArray? ParseBackgroundTasks(JsonObject message)
+    {
+        if (message["tasks"] is not JsonArray tasks) return null;
+        var result = new JsonArray();
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var task in tasks)
+        {
+            if (task is not JsonObject item || item["task_id"] is not JsonValue value ||
+                !value.TryGetValue<string>(out var id) || string.IsNullOrWhiteSpace(id) || !ids.Add(id) ||
+                item["task_type"] is not JsonValue type || !type.TryGetValue<string>(out _) ||
+                item["description"] is not JsonValue description || !description.TryGetValue<string>(out _)) return null;
+            var mapped = new JsonObject { ["type"] = "_claude_task", ["_meta"] = new JsonObject
+            {
+                ["gorynych/nativeTaskId"] = id,
+                ["gorynych/nativeTaskType"] = type.DeepClone(),
+                ["gorynych/description"] = description.DeepClone(),
+                ["gorynych/nativeTask"] = item.DeepClone(),
+            } };
+            result.Add((JsonNode)mapped);
+        }
+        return result;
+    }
+
+    async Task ReportBackgroundAsync(JsonArray? tasks, ClaudeProcess? owner = null, bool exited = false, bool initial = false)
+    {
+        await backgroundGate.WaitAsync();
+        try
+        {
+            lock (stateGate)
+            {
+                if ((owner is not null && !ReferenceEquals(process, owner)) || (exited && process is not null)) return;
+                if (initial && backgroundReported) return;
+                if (owner is not null && !initial) backgroundReported = true;
+            }
+            await EmitAsync(new SessionInfoUpdate { Meta = new JsonObject
+            {
+                [GorynychProtocol.MetaBackgroundWork] = tasks,
+                [GorynychProtocol.MetaBackgroundProcessExited] = exited,
+            } });
+        }
+        finally { backgroundGate.Release(); }
     }
 
     // ---------------------------------------------------------------- the stream
@@ -982,6 +1033,9 @@ internal sealed class HeadlessSession : IClaudeSession
                 await agent.OnSettingsReportedAsync(this);
                 return;
             }
+            case "system" when StreamJson.Subtype(m) == "background_tasks_changed":
+                await ReportBackgroundAsync(ParseBackgroundTasks(m), claude);
+                return;
             case "result":
                 await OnResultAsync(m);
                 return;

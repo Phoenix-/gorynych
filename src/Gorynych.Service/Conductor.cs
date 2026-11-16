@@ -1487,7 +1487,11 @@ public sealed partial class Conductor : IAsyncDisposable
                     if (!removed.ContainsKey(id) && store.Get(id) is { } record && record.Agent == host.Name && activity is JsonObject snapshot)
                     {
                         var restoredFeed = Feed(id);
+                        if (snapshot["backgroundHeld"] is JsonValue held && held.TryGetValue<bool>(out var pinned) && pinned) restoredFeed.PinBackground();
+                        if (snapshot["backgroundKnownHeld"] is JsonValue knownHeld && knownHeld.TryGetValue<bool>(out var knownPinned) && knownPinned) restoredFeed.PinKnownBackground();
                         if ((string?)snapshot["foreground"] is { } foreground) NativeActivity(restoredFeed, foreground);
+                        if (snapshot.ContainsKey("background")) NativeBackground(restoredFeed, snapshot["background"], snapshot["backgroundProcessExited"] is JsonValue exited && exited.TryGetValue<bool>(out var stopped) && stopped);
+                        if (snapshot.ContainsKey("backgroundKnown")) NativeKnownBackground(restoredFeed, snapshot["backgroundKnown"]);
                         if (snapshot["agentTurn"] is JsonValue value && value.TryGetValue<bool>(out var active))
                             AgentTurn(restoredFeed, new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaAgentTurn] = active ? "started" : "ended" } });
                     }
@@ -1533,6 +1537,29 @@ public sealed partial class Conductor : IAsyncDisposable
             }
             // From a host: taken once, though a host that comes back sends what it kept again.
             if (update["_meta"]?[GorynychProtocol.MetaHostSeq] is JsonValue s && s.TryGetValue<string>(out var hostSeq) && !feed.TakeFromHost(hostSeq)) return;
+            var activityTurnHandled = false;
+            if ((string?)update["sessionUpdate"] == "session_info_update" && update["_meta"] is JsonObject activityMeta && (activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork) || activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundKnown)))
+            {
+                if (activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork))
+                    NativeBackground(feed, activityMeta[GorynychProtocol.MetaBackgroundWork], activityMeta[GorynychProtocol.MetaBackgroundProcessExited] is JsonValue exited && exited.TryGetValue<bool>(out var stopped) && stopped);
+                if (activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundKnown)) NativeKnownBackground(feed, activityMeta[GorynychProtocol.MetaBackgroundKnown]);
+                if ((string?)activityMeta[GorynychProtocol.MetaForegroundState] is { } accompanyingForeground) NativeActivity(feed, accompanyingForeground);
+                if (activityMeta.ContainsKey(GorynychProtocol.MetaAgentTurn))
+                {
+                    AgentTurn(feed, update);
+                    activityTurnHandled = true;
+                }
+                activityMeta.Remove(GorynychProtocol.MetaBackgroundWork);
+                activityMeta.Remove(GorynychProtocol.MetaBackgroundKnown);
+                activityMeta.Remove(GorynychProtocol.MetaBackgroundProcessExited);
+                activityMeta.Remove(GorynychProtocol.MetaBackgroundEmpty);
+                activityMeta.Remove(GorynychProtocol.MetaForegroundState);
+                if (update.All(pair => pair.Key is "sessionUpdate" or "_meta")
+                    && activityMeta.All(pair => pair.Key is GorynychProtocol.MetaHostSeq or GorynychProtocol.MetaAgentTurn))
+                {
+                    return;
+                }
+            }
             // Activity snapshots are live observations, never conversation history.
             if ((string?)update["_meta"]?[GorynychProtocol.MetaForegroundState] is { } foreground)
             {
@@ -1552,7 +1579,7 @@ public sealed partial class Conductor : IAsyncDisposable
             }
             feed.ApplyStateUpdate(update);
             feed.Active(options.Time.GetUtcNow()); // an agent that sends something is not idle (UnloadIfIdleAsync)
-            AgentTurn(feed, update);
+            if (!activityTurnHandled) AgentTurn(feed, update);
             if (feed.CollectReplay(update)) return; // the agent's history, replayed for a catch-up (OpenAsync)
             if (SessionJournal.IsCommands(update))
             {
@@ -1580,6 +1607,21 @@ public sealed partial class Conductor : IAsyncDisposable
         if (foreground is "running" or "requires_action") feed.BeginNativeActivity();
         feed.Activity.Report(foreground);
         if (foreground == "idle" && feed.EndNativeActivity()) IdleFromNow(feed.SessionId);
+    }
+
+    void NativeBackground(SessionFeed feed, JsonNode? value, bool processExited)
+    {
+        var valid = BackgroundWorkSnapshot.TryParse(value, out var snapshot);
+        var released = valid && value is null && processExited
+            ? feed.ReleaseBackground()
+            : feed.ReportBackground(valid ? snapshot : null);
+        if (released) IdleFromNow(feed.SessionId);
+    }
+
+    void NativeKnownBackground(SessionFeed feed, JsonNode? value)
+    {
+        var valid = BackgroundWorkSnapshot.TryParse(value, out var snapshot);
+        if (feed.ReportKnownBackground(valid ? snapshot : null)) IdleFromNow(feed.SessionId);
     }
 
     /// <summary>
@@ -1624,6 +1666,10 @@ public sealed partial class Conductor : IAsyncDisposable
             {
                 feed.Activity.Report("idle");
                 feed.EndNativeActivity();
+                // A lost adapter connection does not prove its native work exited. Keep the
+                // resource pin until an authoritative empty snapshot or native-exit report.
+                feed.ReportBackground(null);
+                feed.ReportKnownBackground(null);
             }
             if (its && feed.EndAgentTurn())
             {

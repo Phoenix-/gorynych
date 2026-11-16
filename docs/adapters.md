@@ -400,7 +400,7 @@ session still has only its provisional first-prompt title. The adapter runs an i
 `--strict-mcp-config` with an empty config (no MCP server), and runs in Gorynych's own scratch
 folder with `--safe-mode` (no user hooks, skills or plugins; native authentication still
 works), `--no-session-persistence`,
-`--permission-prompts none` and `--json-schema` for `{title}`. The first task is the only input,
+  `--permission-prompts none` and `--json-schema` for `{title}`. The first task is the only input,
 cut at 2 KB; the answer is cut at 60 characters. One helper runs at a time per adapter, and the
 30 s deadline includes waiting for that slot and for the normal session launch to pass its trust,
 native startup and permission checks. A failed launch starts no title model call. Closing the session
@@ -702,7 +702,7 @@ nothing of it.
 
 ### Not done yet
 
-- Headless: subagent messages, background tasks and `/compact` are not mapped; MCP servers'
+- Headless: subagent messages and `/compact` are not mapped; MCP servers'
   elicitations are declined; not tried on Linux and macOS.
 - Task plans: a `TaskCreate` without a structured task ID or a `TaskUpdate` without a structured
   successful result is not shown; history priming fails open for a transcript
@@ -723,11 +723,18 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 `research/probes/codex`. Built and checked against Codex 0.167.0 on 8 November 2026.
 
 - **Types** are generated from the app-server schema that `codex app-server
-  generate-json-schema` writes, kept in `schema/codex/0.167.0`, by `tools/Gorynych.CodexGen`.
+  generate-json-schema --experimental` writes, kept in `schema/codex/0.169.0`, by `tools/Gorynych.CodexGen`.
   It works the way `Gorynych.AcpGen` does for ACP: open enums, tagged unions with an `Unknown`
   variant, and a source-generated `CodexJsonContext` for Native AOT. Only the types the adapter
   uses and those they reach are generated (the list is `Roots` in the generator). To move to a
   new Codex, generate the schema into a new folder and run the generator with its version.
+- **Background work.** Claude headless reports complete native `background_tasks_changed`
+  snapshots as `_claude_task` references, with native identities in `_meta`. Claude's task
+  checklist tools remain ACP plans. Loaded Codex threads poll the experimental paginated
+  terminal registry as a partial `backgroundKnown` observation, with stable native identities;
+  an empty terminal registry does not establish that other work is absent. Unsupported native
+  methods disable polling for that app-server; failed observations are unknown. Saved or
+  archived threads are never loaded just for polling. See [session-activity.md](session-activity.md).
 - **Process.** `codex` is found on PATH. On Windows the native `codex.exe` that npm's
   `codex.cmd` shim would start through node is used directly. The adapter starts it as
   `codex app-server` (stdio), and app-server starts the threads' MCP servers as its own

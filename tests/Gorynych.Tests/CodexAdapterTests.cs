@@ -100,6 +100,20 @@ public sealed class CodexAdapterTests
     // ---------------------------------------------------------------- initialize, new, prompt
 
     [TestMethod]
+    public async Task UnsupportedBackgroundListingIsDisabledForThisAppServer()
+    {
+        var fake = new FakeAppServer();
+        var log = new List<string>();
+        await using var conductor = Conductor(fake, codex: Options(fake, log));
+        await using var client = await ZedAsync(conductor);
+        await NewAsync(client);
+        await Until(() => Logged(log, "background terminal listing is not supported"), "unsupported listing recognized");
+        await NewAsync(client);
+        await Task.Delay(TimeSpan.FromSeconds(6));
+        Assert.AreEqual(1, fake.All("thread/backgroundTerminals/list").Length);
+    }
+
+    [TestMethod]
     public async Task Initialize_SaysWhatTheServiceNeeds_AndIdentifiesGorynych()
     {
         var fake = new FakeAppServer();

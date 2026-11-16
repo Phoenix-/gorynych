@@ -52,6 +52,11 @@ sealed class CodexThread
     public string Id { get; }
     public string Cwd { get; }
     public volatile bool Loaded = true;
+    readonly CancellationTokenSource backgroundStop = new();
+    public Task? BackgroundTask { get; set; }
+    public CancellationToken BackgroundToken => backgroundStop.Token;
+    public void StopBackground() { try { backgroundStop.Cancel(); } catch (ObjectDisposedException) { } }
+    public void DisposeBackground() => backgroundStop.Dispose();
 
     // ---------------------------------------------------------------- generated titles
 
@@ -519,6 +524,7 @@ sealed class CodexAgent : IAsyncDisposable
     HashSet<string> userServers = [];
     string version = "";
     int disposed;
+    int backgroundUnsupported;
 
     public CodexAgent(CodexAdapterOptions options, JsonRpcConnection rpc, AgentInstance appServer,
         Func<IEnumerable<string>, IReadOnlyDictionary<string, string>> holders, string locksDirectory)
@@ -576,7 +582,7 @@ sealed class CodexAgent : IAsyncDisposable
         var init = From(await app.SendRequestAsync(CodexMethods.Client.Initialize, ToNode(new InitializeParams
         {
             ClientInfo = new ClientInfo { Name = "gorynych", Title = "Gorynych", Version = options.ClientVersion },
-            Capabilities = new InitializeCapabilities { OptOutNotificationMethods = Unused },
+            Capabilities = new InitializeCapabilities { ExperimentalApi = true, OptOutNotificationMethods = Unused },
         }, CodexJsonContext.Default.InitializeParams), ct), CodexJsonContext.Default.InitializeResponse);
         await app.SendNotificationAsync("initialized", null);
         version = init.UserAgent;
@@ -797,6 +803,7 @@ sealed class CodexAgent : IAsyncDisposable
         var t = new CodexThread(started.Thread.Id, started.Cwd,
             SettingsOf(started.Model, started.ReasoningEffort, started.ApprovalPolicy, started.Sandbox, started.ApprovalsReviewer));
         threads[t.Id] = t;
+        t.BackgroundTask = PollBackgroundAsync(t);
         Log($"codex: new thread {t.Id} in {started.Cwd}");
         await PublishCommandsAsync(t.Id);
         return AcpJson.ToNode(new NewSessionResponse { SessionId = t.Id, ConfigOptions = ConfigOptions(t.Settings, models) });
@@ -924,7 +931,96 @@ sealed class CodexAgent : IAsyncDisposable
         }
         var t = new CodexThread(id, resumed.Cwd, SettingsOf(resumed.Model, resumed.ReasoningEffort, resumed.ApprovalPolicy, resumed.Sandbox, resumed.ApprovalsReviewer));
         threads[id] = t;
+        t.BackgroundTask = PollBackgroundAsync(t);
         return t;
+    }
+
+    async Task PollBackgroundAsync(CodexThread thread)
+    {
+        var stopped = thread.BackgroundToken;
+        JsonArray? previous = null;
+        var reported = false;
+        var previousEmpty = false;
+        try
+        {
+            while (!stopped.IsCancellationRequested && Volatile.Read(ref disposed) == 0 && Volatile.Read(ref backgroundUnsupported) == 0 && thread.Loaded && threads.TryGetValue(thread.Id, out var current) && ReferenceEquals(current, thread))
+            {
+                JsonArray? tasks = null;
+                var completeEmpty = false;
+                try
+                {
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stopped);
+                    timeout.CancelAfter(TimeSpan.FromSeconds(5));
+                    (tasks, completeEmpty) = await ReadBackgroundAsync((cursor, ct) => app.SendRequestAsync(CodexMethods.Client.ThreadBackgroundTerminalsList,
+                        ToNode(new ThreadBackgroundTerminalsListParams { ThreadId = thread.Id, Cursor = cursor, Limit = 100 }, CodexJsonContext.Default.ThreadBackgroundTerminalsListParams), ct), timeout.Token);
+                }
+                catch (JsonRpcException e) when (e.Code == JsonRpcException.MethodNotFound)
+                {
+                    Interlocked.Exchange(ref backgroundUnsupported, 1);
+                    Log("codex: background terminal listing is not supported by this app-server");
+                }
+                catch (Exception e) when (e is JsonRpcException or IOException or OperationCanceledException or InvalidOperationException)
+                {
+                    if (stopped.IsCancellationRequested) return;
+                    Log($"codex: background terminals for {thread.Id} unavailable: {e.Message}");
+                    tasks = null;
+                    completeEmpty = false;
+                }
+                if (!thread.Loaded || !threads.TryGetValue(thread.Id, out current) || !ReferenceEquals(current, thread) || Volatile.Read(ref disposed) != 0) return;
+                try
+                {
+                    if ((reported || tasks is not null) && (!reported || !JsonNode.DeepEquals(previous, tasks) || previousEmpty != completeEmpty))
+                    {
+                        previous = tasks?.DeepClone().AsArray();
+                        previousEmpty = completeEmpty;
+                        reported = true;
+                        await Update(thread.Id, new SessionInfoUpdate { Meta = new JsonObject
+                        {
+                            [GorynychProtocol.MetaBackgroundKnown] = tasks,
+                        } });
+                    }
+                    if (Volatile.Read(ref backgroundUnsupported) != 0) return;
+                    await Task.Delay(TimeSpan.FromSeconds(5), stopped);
+                }
+                catch (Exception e) when (e is IOException or ObjectDisposedException or OperationCanceledException or JsonRpcException) { return; }
+            }
+        }
+        finally
+        {
+            if (Volatile.Read(ref backgroundUnsupported) != 0 && previous is not null && thread.Loaded && Volatile.Read(ref disposed) == 0)
+                try { await Update(thread.Id, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaBackgroundKnown] = null } }); }
+                catch (Exception e) when (e is IOException or ObjectDisposedException or JsonRpcException) { }
+            thread.DisposeBackground();
+        }
+    }
+
+    internal static async Task<(JsonArray? Tasks, bool Empty)> ReadBackgroundAsync(Func<string?, CancellationToken, Task<JsonNode?>> read, CancellationToken ct)
+    {
+        var found = new SortedDictionary<string, JsonObject>(StringComparer.Ordinal);
+        var cursors = new HashSet<string>(StringComparer.Ordinal);
+        string? cursor = null;
+        for (var page = 0; page < 100; page++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var raw = await read(cursor, ct);
+            if (raw?["data"] is not JsonArray data) throw new InvalidDataException("missing terminal data");
+            foreach (var entry in data)
+            {
+                if (entry is not JsonObject terminal || terminal["itemId"] is not JsonValue item || !item.TryGetValue<string>(out var itemId) || string.IsNullOrEmpty(itemId) ||
+                    terminal["processId"] is not JsonValue process || !process.TryGetValue<string>(out var processId) || string.IsNullOrEmpty(processId) ||
+                    terminal["command"] is not JsonValue command || !command.TryGetValue<string>(out var commandText) ||
+                    terminal["cwd"] is not JsonValue cwd || !cwd.TryGetValue<string>(out _)) throw new InvalidDataException("invalid terminal");
+                var id = $"{itemId.Length}:{itemId}{processId}";
+                if (!found.TryAdd(id, new JsonObject { ["type"] = "_codex_terminal", ["_meta"] = new JsonObject
+                { ["gorynych/nativeId"] = id, ["gorynych/itemId"] = itemId, ["gorynych/processId"] = processId, ["gorynych/description"] = commandText } }))
+                    throw new InvalidDataException("duplicate terminal");
+            }
+            if (raw["nextCursor"] is null)
+                return found.Count == 0 ? (new JsonArray(), true) : (new JsonArray(found.Values.Cast<JsonNode?>().ToArray()), false);
+            if (raw["nextCursor"] is not JsonValue next || !next.TryGetValue<string>(out cursor) || string.IsNullOrEmpty(cursor) || !cursors.Add(cursor))
+                throw new InvalidDataException("invalid terminal cursor");
+        }
+        throw new InvalidDataException("too many terminal pages");
     }
 
     /// <summary>The holder named when app-server refuses a thread whose holder could not be told.</summary>
@@ -1099,6 +1195,8 @@ sealed class CodexAgent : IAsyncDisposable
         if (!threads.TryGetValue(id, out var t)) return;
         t.CancelTitleJob();
         if (!t.Loaded) return;
+        t.StopBackground();
+        if (t.BackgroundTask is { } backgroundTask) await backgroundTask;
         await StopTurnAsync(t);
         var closed = unloading.GetOrAdd(id, _ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
         var unsubscribed = false;
@@ -1112,6 +1210,7 @@ sealed class CodexAgent : IAsyncDisposable
         {
             // Also when unsubscribing fails (app-server going away): the turn has had its time.
             t.Loaded = false;
+            t.StopBackground();
             Abandon(t);
             if (!unsubscribed) unloading.TryRemove(id, out _);
         }
@@ -1127,7 +1226,7 @@ sealed class CodexAgent : IAsyncDisposable
     {
         readOnly.TryRemove(id, out _);
         threads.TryGetValue(id, out var t);
-        if (t is not null) { t.CancelTitleJob(); await StopTurnAsync(t); }
+        if (t is not null) { t.CancelTitleJob(); t.StopBackground(); if (t.BackgroundTask is { } backgroundTask) await backgroundTask; await StopTurnAsync(t); }
         try
         {
             await app.SendRequestAsync(CodexMethods.Client.ThreadDelete, ToNode(new ThreadDeleteParams { ThreadId = id },
@@ -1143,6 +1242,7 @@ sealed class CodexAgent : IAsyncDisposable
             if (t is not null)
             {
                 t.Loaded = false;
+                t.StopBackground();
                 Abandon(t);
             }
         }
@@ -1779,7 +1879,10 @@ sealed class CodexAgent : IAsyncDisposable
         {
             using var limit = new CancellationTokenSource(options.TurnEndWait);
             var loaded = await app.SendRequestAsync(CodexMethods.Client.ThreadLoadedList, new JsonObject(), limit.Token);
-            if ((loaded?["data"] as JsonArray)?.Any(x => (string?)x == t.Id) == true)
+            if (loaded?["data"] is not JsonArray loadedThreads) throw new InvalidDataException("invalid loaded thread list");
+            if (loadedThreads.Any(x => x is not JsonValue value || !value.TryGetValue<string>(out _)))
+                throw new InvalidDataException("invalid loaded thread identity");
+            if (loadedThreads.Any(x => (string?)x == t.Id))
             {
                 Log($"codex {t.Id}: {what}, but Codex still has the thread loaded; ignored");
                 return;
@@ -1790,6 +1893,14 @@ sealed class CodexAgent : IAsyncDisposable
             Log($"codex {t.Id}: {what}; loaded threads not read ({e.Message}), so taken as unloaded");
         }
         t.Loaded = false;
+        t.StopBackground();
+        if (t.BackgroundTask is { } backgroundTask) await backgroundTask;
+        if (threads.TryGetValue(t.Id, out var current) && ReferenceEquals(current, t))
+        try { await Update(t.Id, new SessionInfoUpdate { Meta = new JsonObject
+        {
+            [GorynychProtocol.MetaBackgroundKnown] = null,
+        } }); }
+        catch (Exception e) when (e is IOException or ObjectDisposedException) { Log($"codex {t.Id}: background state not sent: {e.Message}"); }
         if (t.Turn is not null) Log($"codex {t.Id}: Codex unloaded the thread during a turn; the turn ends as cancelled");
         Abandon(t);
     });
@@ -2211,7 +2322,13 @@ sealed class CodexAgent : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-        foreach (var t in threads.Values) t.CancelTitleJob();
+        foreach (var t in threads.Values) { t.CancelTitleJob(); t.StopBackground(); }
+        foreach (var t in threads.Values) if (t.BackgroundTask is { } backgroundTask) await backgroundTask;
+        if (appServer.Exited.IsCompleted)
+            foreach (var t in threads.Values)
+                try { await Update(t.Id, new SessionInfoUpdate { Meta = new JsonObject
+                { [GorynychProtocol.MetaBackgroundWork] = null, [GorynychProtocol.MetaBackgroundProcessExited] = true } }); }
+                catch (Exception e) when (e is IOException or ObjectDisposedException or JsonRpcException) { }
         foreach (var job in titleHelpers.Values) job.Fail(new IOException("Codex's app-server stopped during title generation."));
         foreach (var t in threads.Values)
             t.Fail(new JsonRpcException(JsonRpcException.InternalError, "Codex's app-server stopped during the turn."));

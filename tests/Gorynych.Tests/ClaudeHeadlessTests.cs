@@ -102,6 +102,29 @@ public sealed partial class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task BackgroundSnapshot_TracksProcessLifecycleIndependentlyOfForeground()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        try
+        {
+            await PromptAsync(client, id, "background snapshot probe");
+            await Until(() => conductor.Feed(id).Activity.Snapshot()["background"] is JsonArray { Count: 1 });
+            var live = conductor.Feed(id).Activity.Snapshot();
+            Assert.AreEqual("idle", (string?)live["state"]);
+            Assert.AreEqual("_claude_task", (string?)live["background"]?[0]?["type"]);
+            Assert.AreEqual(1, conductor.Feed(id).Users);
+            File.WriteAllText(Path.Combine(dir, "release-background"), "");
+            await Until(() => conductor.Feed(id).Activity.Snapshot()["background"] is JsonArray { Count: 0 });
+            Assert.AreEqual(0, conductor.Feed(id).Users);
+        }
+        finally { File.WriteAllText(Path.Combine(dir, "release-background"), ""); }
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task FirstPrompt_AsksTrustOnce_StreamsText_AndKeepsOneProcess()
     {
         var dir = TestDirs.New();

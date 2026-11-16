@@ -12,7 +12,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 
 var root = args.Length > 0 ? Path.GetFullPath(args[0]) : FindRepoRoot();
-var version = args.Length > 1 ? args[1] : "0.167.0";
+var version = args.Length > 1 ? args[1] : "0.169.0";
 var schemaPath = Path.Combine(root, "schema", "codex", version, "codex_app_server_protocol.schemas.json");
 var bundle = JsonNode.Parse(File.ReadAllText(schemaPath))!.AsObject();
 var output = Path.Combine(root, "src", "Gorynych.Adapters.Codex", "Generated", "Codex.g.cs");
@@ -47,6 +47,7 @@ sealed class Generator(JsonObject bundle, string version)
         "ThreadStartParams", "ThreadStartResponse", "ThreadResumeParams", "ThreadResumeResponse",
         "ThreadListParams", "ThreadListResponse", "ThreadReadParams", "ThreadReadResponse",
         "ThreadItemsListParams", "ThreadItemsListResponse", "ThreadTurnsListParams", "ThreadTurnsListResponse",
+        "ThreadBackgroundTerminalsListParams", "ThreadBackgroundTerminalsListResponse",
         "ThreadUnsubscribeParams", "ThreadUnsubscribeResponse", "ThreadDeleteParams", "ThreadDeleteResponse",
         "ThreadSetNameParams", "ThreadSetNameResponse",
         "TurnStartParams", "TurnStartResponse", "TurnSteerParams", "TurnSteerResponse", "TurnInterruptParams", "TurnInterruptResponse",

@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using Gorynych.Acp.Hosting;
 
 namespace Gorynych.Service;
 
@@ -9,6 +10,8 @@ internal sealed class SessionActivity(string epoch, Action<JsonObject>? changed 
     int work;
     string native = "idle";
     string state = "idle";
+    JsonArray? background;
+    JsonArray? backgroundKnown;
     long revision;
 
     public JsonObject Snapshot()
@@ -16,7 +19,40 @@ internal sealed class SessionActivity(string epoch, Action<JsonObject>? changed 
         lock (gate) return SnapshotLocked();
     }
 
-    JsonObject SnapshotLocked() => new() { ["state"] = state, ["epoch"] = epoch, ["revision"] = revision };
+    JsonObject SnapshotLocked() => new() { ["state"] = state, ["epoch"] = epoch, ["revision"] = revision, ["background"] = background?.DeepClone(), ["backgroundKnown"] = backgroundKnown?.DeepClone() };
+
+    public void ReportKnownBackground(BackgroundWorkSnapshot? tasks)
+    {
+        JsonObject? snapshot = null;
+        var next = tasks?.ToJson();
+        lock (gate)
+        {
+            if (!JsonNode.DeepEquals(backgroundKnown, next))
+            {
+                backgroundKnown = next;
+                revision++;
+                snapshot = SnapshotLocked();
+            }
+        }
+        if (snapshot is not null) changed?.Invoke(snapshot);
+    }
+
+    /// <summary>Replaces the live background snapshot; null means it is unavailable.</summary>
+    public void ReportBackground(BackgroundWorkSnapshot? tasks)
+    {
+        JsonObject? snapshot = null;
+        var next = tasks?.ToJson();
+        lock (gate)
+        {
+            if (!JsonNode.DeepEquals(background, next))
+            {
+                background = next;
+                revision++;
+                snapshot = SnapshotLocked();
+            }
+        }
+        if (snapshot is not null) changed?.Invoke(snapshot);
+    }
 
     public void Begin() => Change(() => work++);
     public void End() => Change(() => { if (work > 0) work--; });

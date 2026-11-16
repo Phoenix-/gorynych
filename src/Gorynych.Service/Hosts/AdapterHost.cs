@@ -303,6 +303,10 @@ public sealed class AdapterHost
                 live.Add(opened);
                 Configuration(opened).Capture(result);
                 break;
+            case AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionResume when result is null && request.SessionId is { } failed && !live.Contains(failed):
+                activities.Remove(failed);
+                configurations.Remove(failed);
+                break;
             case AcpMethods.Agent.SessionSetConfigOption when result is not null && request.SessionId is { } configured:
                 Configuration(configured).Capture(result);
                 break;
@@ -433,33 +437,81 @@ public sealed class AdapterHost
         var @params = message["params"] as JsonObject;
         var sessionId = Text(@params?["sessionId"]);
         if (Text(message["method"]) == AcpMethods.Client.SessionUpdate && sessionId is not null
-            && live.Contains(sessionId) && @params?["update"] is JsonObject update)
+            && (live.Contains(sessionId) || forwarded.Values.Any(request => request.SessionId == sessionId && request.Method is AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionResume))
+            && @params?["update"] is JsonObject update)
         {
             Configuration(sessionId).Apply(update);
             if (update["_meta"] is JsonObject activityMeta)
             {
                 var foreground = Text(activityMeta[GorynychProtocol.MetaForegroundState]);
                 var turn = Text(activityMeta[GorynychProtocol.MetaAgentTurn]);
-                if (foreground is "running" or "idle" or "requires_action" || turn is "started" or "ended")
+                var hasBackground = Text(update["sessionUpdate"]) == "session_info_update" && activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork);
+                var hasKnown = Text(update["sessionUpdate"]) == "session_info_update" && activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundKnown);
+                var processExited = activityMeta[GorynychProtocol.MetaBackgroundProcessExited] is JsonValue exitValue && exitValue.TryGetValue<bool>(out var exited) && exited;
+                if (foreground is "running" or "idle" or "requires_action" || turn is "started" or "ended" || hasBackground || hasKnown)
                 {
                     if (!activities.TryGetValue(sessionId, out var activity)) activities[sessionId] = activity = [];
                     if (foreground is "running" or "idle" or "requires_action") activity["foreground"] = foreground;
                     if (turn is "started" or "ended") activity["agentTurn"] = turn == "started";
+                    if (hasBackground)
+                    {
+                        var raw = activityMeta[GorynychProtocol.MetaBackgroundWork];
+                        var valid = BackgroundWorkSnapshot.TryParse(raw, out var background);
+                        activity["background"] = valid ? background?.ToJson() : null;
+                        activity["backgroundProcessExited"] = valid && raw is null && processExited;
+                        if (valid && background is not null) activity["backgroundHeld"] = background.Count > 0;
+                        else if (valid && raw is null && processExited) activity["backgroundHeld"] = false;
+                        if (valid && raw is null && processExited) { activity["backgroundKnown"] = null; activity["backgroundKnownHeld"] = false; }
+                    }
+                    if (hasKnown)
+                    {
+                        var valid = BackgroundWorkSnapshot.TryParse(activityMeta[GorynychProtocol.MetaBackgroundKnown], out var known);
+                        activity["backgroundKnown"] = valid ? known?.ToJson() : null;
+                        if (valid && known is not null) activity["backgroundKnownHeld"] = known.Count > 0;
+                    }
                 }
             }
         }
         var number = ++seq;
         var carrier = Text(message["method"]) == AcpMethods.Client.SessionUpdate ? @params?["update"] as JsonObject : @params;
-        var kept = carrier is not null && sessionId is not null;
+        // Retain the snapshot separately; preserve any unrelated update in replay.
+        var backgroundSnapshot = Text(message["method"]) == AcpMethods.Client.SessionUpdate
+            && Text(carrier?["sessionUpdate"]) == "session_info_update"
+            && carrier?["_meta"] is JsonObject backgroundMeta && (backgroundMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork) || backgroundMeta.ContainsKey(GorynychProtocol.MetaBackgroundKnown));
+        var replayMessage = backgroundSnapshot ? (JsonObject)message.DeepClone() : message;
+        var replayCarrier = Text(message["method"]) == AcpMethods.Client.SessionUpdate ? replayMessage["params"]?["update"] as JsonObject : replayMessage["params"] as JsonObject;
+        if (backgroundSnapshot && replayCarrier?["_meta"] is JsonObject replayMeta)
+        {
+            replayMeta.Remove(GorynychProtocol.MetaBackgroundWork);
+            replayMeta.Remove(GorynychProtocol.MetaBackgroundKnown);
+            replayMeta.Remove(GorynychProtocol.MetaBackgroundProcessExited);
+            replayMeta.Remove(GorynychProtocol.MetaBackgroundEmpty);
+            replayMeta.Remove(GorynychProtocol.MetaForegroundState);
+            if (Text(replayMeta[GorynychProtocol.MetaAgentTurn]) == "started"
+                || (Text(replayMeta[GorynychProtocol.MetaAgentTurn]) == "ended"
+                    && !replayMeta.ContainsKey(GorynychProtocol.MetaHistoryMark)
+                    && !replayMeta.ContainsKey(GorynychProtocol.MetaPromptId)))
+                replayMeta.Remove(GorynychProtocol.MetaAgentTurn);
+            if (replayMeta.Count == 0) replayCarrier.Remove("_meta");
+        }
+        var emptyActivity = backgroundSnapshot && Text(replayCarrier?["sessionUpdate"]) == "session_info_update"
+            && replayCarrier!.Count == 1;
+        var kept = carrier is not null && sessionId is not null && !emptyActivity;
         if (kept)
         {
             if (carrier!["_meta"] is not JsonObject meta) carrier["_meta"] = meta = [];
             meta[GorynychProtocol.MetaHostSeq] = $"{options.HostId}/{number}";
+            if (backgroundSnapshot && replayCarrier is not null)
+            {
+                if (replayCarrier["_meta"] is not JsonObject stampedMeta) replayCarrier["_meta"] = stampedMeta = [];
+                stampedMeta[GorynychProtocol.MetaHostSeq] = $"{options.HostId}/{number}";
+            }
         }
         var line = message.ToJsonString(Wire);
         if (!kept) return line;
-        buffer.Enqueue(new Kept(number, sessionId!, line));
-        bufferedBytes += line.Length;
+        var replayLine = backgroundSnapshot ? replayMessage.ToJsonString(Wire) : line;
+        buffer.Enqueue(new Kept(number, sessionId!, replayLine));
+        bufferedBytes += replayLine.Length;
         while (buffer.Count > options.BufferLimit || (bufferedBytes > options.BufferBytes && buffer.Count > 1))
         {
             var old = buffer.Dequeue();

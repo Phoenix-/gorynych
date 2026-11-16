@@ -524,6 +524,16 @@ in the middle of one.
   keeps the session loaded until the agent's connection closes. Fallback without the marks: the
   service unloads a session only once the idle time has passed since the agent's last update,
   so only a turn quiet for longer than that can be stopped.
+- **Background work.** An adapter may send a live `session_info_update` with
+  `_meta["gorynych/backgroundWork"]`: the complete ACP v2-style reference array
+  described in [session-activity.md](session-activity.md), or null when unavailable.
+  A nonempty observation pins the session independently of foreground state. Unknown
+  never releases that pin; a confirmed empty array does. If the native process has
+  exited, an adapter may send null together with `gorynych/backgroundProcessExited: true`
+  to release the pin without claiming a known-empty snapshot. Hosts retain observations
+  and the last pin separately from replay. Partial registries are not complete snapshots.
+  Adapters may report their partial registry separately as `gorynych/backgroundKnown`;
+  its empty array releases only the pin for that observed subset.
 - Fallback without it: before a delete the service sends `session/cancel` instead, and nothing
   is ever unloaded until the adapter restarts.
 

@@ -401,6 +401,36 @@ public sealed class DisconnectTests
     // ---------------------------------------------------------------- the agent's own turns
 
     [TestMethod]
+    public async Task BackgroundWorkPinsIdleSessionUntilEmptyThenGetsFullGrace()
+    {
+        var time = new ManualTime();
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(time, kimi.Adapter);
+        var id = await SavedSessionAsync(conductor, time, "kimi", "Fix the flaky test");
+        var zed = await TestClient.ConnectAsync(conductor, "zed");
+        await LoadAsync(zed, id);
+        await QuitAsync(conductor, zed);
+        async Task Report(JsonNode? tasks) => await kimi.Adapter.Current!.Rpc.SendNotificationAsync(AcpMethods.Client.SessionUpdate,
+            new JsonObject { ["sessionId"] = id, ["update"] = new JsonObject { ["sessionUpdate"] = "session_info_update",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaBackgroundWork] = tasks } } });
+        await Report(new JsonArray(new JsonObject { ["type"] = "terminal", ["terminalId"] = "term" }));
+        await Until(() => conductor.Feed(id).Users == 1, "background pin");
+        Assert.AreEqual("idle", (string?)conductor.Feed(id).Activity.Snapshot()["state"]);
+        await AdvanceAsync(conductor, time, Idle * 3);
+        Assert.AreEqual(Resume, kimi.CallsFor(id).Last());
+        await Report(new JsonArray(new JsonObject { ["type"] = "terminal" }));
+        await Until(() => conductor.Feed(id).Activity.Snapshot()["background"] is null, "invalid snapshot becomes unknown");
+        Assert.AreEqual(1, conductor.Feed(id).Users, "unknown does not release known work");
+        await Report(new JsonArray());
+        await Until(() => time.Waiting == 1, "idle timer after background ends");
+        await AdvanceAsync(conductor, time, Idle - Second);
+        Assert.AreEqual(Resume, kimi.CallsFor(id).Last());
+        await Report(new JsonArray()); // repeated empty is idempotent and must not extend the grace
+        await AdvanceAsync(conductor, time, Second);
+        Assert.AreEqual(Close, kimi.CallsFor(id).Last());
+    }
+
+    [TestMethod]
     public async Task ATurnTheAgentRunsOnItsOwn_KeepsTheSessionLoaded_AndItsEndStartsTheTimer()
     {
         var time = new ManualTime();

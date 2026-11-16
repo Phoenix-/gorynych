@@ -14,7 +14,53 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
 {
     public SessionActivity Activity { get; init; } = new("standalone");
     int nativeActivity;
+    bool backgroundUse;
+    bool knownBackgroundUse;
     readonly Lock nativeActivityGate = new();
+    public void PinBackground()
+    {
+        lock (nativeActivityGate)
+            if (!backgroundUse) { EnterUse(); backgroundUse = true; }
+    }
+    public void PinKnownBackground()
+    {
+        lock (nativeActivityGate)
+            if (!knownBackgroundUse) { EnterUse(); knownBackgroundUse = true; }
+    }
+    public bool ReportKnownBackground(BackgroundWorkSnapshot? tasks)
+    {
+        lock (nativeActivityGate)
+        {
+            var needed = tasks is null ? knownBackgroundUse : tasks.Count > 0;
+            if (needed && !knownBackgroundUse) { EnterUse(); knownBackgroundUse = true; }
+            Activity.ReportKnownBackground(tasks);
+            if (!needed && knownBackgroundUse) { knownBackgroundUse = false; ExitUse(); return true; }
+            return false;
+        }
+    }
+    public bool ReportBackground(BackgroundWorkSnapshot? tasks)
+    {
+        lock (nativeActivityGate)
+        {
+            var needed = tasks is null ? backgroundUse : tasks.Count > 0;
+            if (needed && !backgroundUse) { EnterUse(); backgroundUse = true; }
+            Activity.ReportBackground(tasks);
+            if (!needed && backgroundUse) { backgroundUse = false; ExitUse(); return true; }
+            return false;
+        }
+    }
+    public bool ReleaseBackground()
+    {
+        lock (nativeActivityGate)
+        {
+            Activity.ReportBackground(null);
+            Activity.ReportKnownBackground(null);
+            var released = backgroundUse || knownBackgroundUse;
+            if (backgroundUse) { backgroundUse = false; ExitUse(); }
+            if (knownBackgroundUse) { knownBackgroundUse = false; ExitUse(); }
+            return released;
+        }
+    }
     public void BeginNativeActivity()
     {
         lock (nativeActivityGate)

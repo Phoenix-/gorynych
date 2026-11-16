@@ -225,6 +225,10 @@ static partial class FakeHeadless
         var apiKey = File.Exists(Path.Combine(Environment.CurrentDirectory, "api-key-init")) ? "ANTHROPIC_API_KEY" : "none";
         await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "init", ["session_id"] = sessionId, ["model"] = model, ["permissionMode"] = mode, ["apiKeySource"] = apiKey });
         await ReplayAsync(first, sessionId);
+        var backgroundProbe = prompt.Contains("background snapshot probe", StringComparison.OrdinalIgnoreCase);
+        if (backgroundProbe)
+            await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "background_tasks_changed", ["session_id"] = sessionId,
+                ["tasks"] = new JsonArray(new JsonObject { ["task_id"] = "fake-background", ["task_type"] = "local_agent", ["description"] = "fake work" }) });
         var failurePath = Path.Combine(Environment.CurrentDirectory, "auth-failure");
         if (File.Exists(failurePath))
         {
@@ -392,6 +396,11 @@ static partial class FakeHeadless
         }
         await AnswerAsync(sessionId, answer, prompt.Contains("think", StringComparison.OrdinalIgnoreCase));
         await ResultAsync(sessionId, answer);
+        if (backgroundProbe)
+        {
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-background"))) await Task.Delay(20);
+            await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "background_tasks_changed", ["session_id"] = sessionId, ["tasks"] = new JsonArray() });
+        }
         foreach (var asked in new[] { prompt }.Concat(joined))
             if (OpinionId().Match(asked) is { Success: true } opinion && replyUrl is not null)
                 await http.PostAsync(replyUrl + "/reply", new StringContent(
