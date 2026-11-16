@@ -130,6 +130,12 @@ internal sealed class ClientConnection
                 return await conductor.DeleteAsync(RequireSession(request), ct);
             case GorynychProtocol.MethodStatus:
                 return conductor.Status();
+            case GorynychProtocol.MethodAttributesGet:
+            case GorynychProtocol.MethodAttributesPatch:
+            case GorynychProtocol.MethodGroupsList:
+            case GorynychProtocol.MethodGroupsSet:
+            case GorynychProtocol.MethodGroupsDelete:
+                return await conductor.UiMetadataAsync(request.Method, request.Params, ct);
             case GorynychProtocol.MethodStop:
                 ServiceLog.Info($"{Rpc.Name}: asked for a management stop");
                 return await conductor.StopAsync(request);
@@ -208,6 +214,8 @@ internal sealed class ClientConnection
     static JsonObject Extensions()
     {
         var flags = DeprecatedFlags();
+        flags[GorynychProtocol.CapSessionAttributes] = true;
+        flags[GorynychProtocol.CapGroups] = true;
         flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
         flags[GorynychProtocol.MetaSessionState] = 1;
         return flags;

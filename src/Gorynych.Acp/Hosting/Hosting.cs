@@ -179,6 +179,16 @@ public static class GorynychProtocol
 
     /// <summary>A notification to clients: <c>{sessionId, change}</c>, change <c>added</c>, <c>updated</c> or <c>removed</c>.</summary>
     public const string MethodSessionsChanged = "_gorynych/sessions_changed";
+    public const string MethodAttributesGet = "_gorynych/session_attributes/get";
+    public const string MethodAttributesPatch = "_gorynych/session_attributes/patch";
+    public const string MethodGroupsList = "_gorynych/groups/list";
+    public const string MethodGroupsSet = "_gorynych/groups/set";
+    public const string MethodGroupsDelete = "_gorynych/groups/delete";
+    public const string MethodGroupsChanged = "_gorynych/groups_changed";
+    public const string MetaAttributes = "gorynych/attributes";
+    public const string MetaGroup = "gorynych/group";
+    public const string CapSessionAttributes = "gorynych/sessionAttributes";
+    public const string CapGroups = "gorynych/groups";
 
     /// <summary>
     /// In <c>agentCapabilities._meta</c> of the <c>initialize</c> result: the service sends

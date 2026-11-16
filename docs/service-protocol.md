@@ -2336,3 +2336,32 @@ commands is no activity and stamps nothing.
 The service reports aggregate running, waiting, and idle state through the optional
 [ACP v1 session activity extension](session-activity.md), including work started by
 other clients or the service and activity in sessions a client has not opened.
+
+## Session attributes and UI groups
+
+The service advertises `gorynych/sessionAttributes` and `gorynych/groups` in
+`agentCapabilities._meta`. A `session/list` row carries the complete object in
+`_meta["gorynych/attributes"]`, including `{}`. An attribute edit sends the same full
+snapshot in `session_info_update._meta` to attached clients and `_gorynych/sessions_changed`
+to clients listing the session. These changes do not update conversation activity time.
+
+`_gorynych/session_attributes/get {sessionId}` returns `{attributes}`.
+`_gorynych/session_attributes/patch {sessionId, patch}` returns `{attributes}` and applies
+[RFC 7396 JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7396): the patch root is an
+object, null removes a key, objects merge recursively, and scalars and arrays replace values.
+`session/new` accepts the initial complete object in `_meta["gorynych/attributes"]`;
+it is persisted before the answer and is not sent to the adapter. Attributes are service
+metadata, survive archive and restart, and can be edited without loading a native session.
+
+`_gorynych/groups/list {projectKey}` returns `{groups: [{groupId, name}]}`;
+`_gorynych/groups/set {projectKey, groupId, name}` creates or renames and returns
+`{group: {groupId, name}}`; `_gorynych/groups/delete {projectKey, groupId}` returns `{}`.
+IDs are client-chosen, scoped to the opaque project key, and can be reused in other projects.
+The catalog is shared across agent scopes. A change sends `_gorynych/groups_changed
+{projectKey}` to every initialized client. The optional attribute `gorynych/group` contains
+`{projectKey, groupId}` and must refer to an existing group. Removing a group atomically
+clears that matching attribute from all sessions, including drafts and archived sessions,
+without deleting conversations or changing unrelated attributes. Project detection, nesting,
+and ordering are client concerns. The catalog and attributes use one atomic file; write
+failure leaves the prior in-memory state and emits no change notice. Individual attribute
+objects are limited to 64 KiB, fields to 1024 characters, and the document to 4 MiB.

@@ -143,6 +143,10 @@ public sealed partial class Conductor : IAsyncDisposable
     readonly ConductorOptions options;
     readonly Dictionary<string, AgentHost> agents = new(StringComparer.Ordinal);
     readonly SessionStore store;
+    readonly UiMetadataStore uiMetadata;
+    internal UiMetadataStore UiMetadata => uiMetadata;
+    readonly SemaphoreSlim uiMetadataGate = new(1, 1);
+    const string AttributesKey = GorynychProtocol.MetaAttributes;
     readonly string journalDirectory;
     readonly ConcurrentDictionary<string, SessionFeed> feeds = new(StringComparer.Ordinal);
     readonly ConcurrentDictionary<ClientConnection, byte> clients = new();
@@ -200,6 +204,7 @@ public sealed partial class Conductor : IAsyncDisposable
         journalDirectory = Path.Combine(options.DataDirectory, "journal");
         Directory.CreateDirectory(journalDirectory);
         store = new SessionStore(Path.Combine(options.DataDirectory, "sessions.json"));
+        uiMetadata = new UiMetadataStore(Path.Combine(options.DataDirectory, "ui-metadata.json"));
         startupDrafts = store.All().Where(r => r.Draft).Select(r => r.SessionId).ToList();
         foreach (var a in adapters) agents[a.Name] = new AgentHost(a, this);
         DefaultAgent = options.DefaultAgent ?? agents.Keys.FirstOrDefault() ?? throw new ArgumentException("no adapters");
@@ -1844,6 +1849,7 @@ public sealed partial class Conductor : IAsyncDisposable
             }
             else PutInteractivity(meta, state);
         }
+        meta[AttributesKey] = uiMetadata.Get(r.SessionId);
         meta[GorynychProtocol.MetaAgent] = r.Agent;
         meta[GorynychProtocol.MetaSessionState] = Feed(r.SessionId).Activity.Snapshot();
         if (r.ParentSessionId is not null) meta[GorynychProtocol.MetaParentSessionId] = r.ParentSessionId;
@@ -1863,6 +1869,13 @@ public sealed partial class Conductor : IAsyncDisposable
     /// <param name="afterAnswer">Runs an action once the answer is written to the client (<see cref="JsonRpcRequest.AfterResult"/>).</param>
     internal async Task<NewSessionResponse> NewSessionAsync(ClientConnection client, NewSessionRequest request, Action<Func<Task>> afterAnswer, CancellationToken ct)
     {
+        JsonObject? initialAttributes = null;
+        if (request.Meta?.ContainsKey(AttributesKey) == true)
+        {
+            initialAttributes = request.Meta[AttributesKey] as JsonObject ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "gorynych/attributes must be an object");
+            initialAttributes = initialAttributes.DeepClone().AsObject();
+            request.Meta.Remove(AttributesKey);
+        }
         // An explicit choice in the request wins; otherwise the agent the connection is scoped to.
         RefuseSystemPrompt(request.SystemPrompt);
         var host = Agent((string?)request.Meta?[GorynychProtocol.MetaAgent] ?? client.AgentScope);
@@ -1905,6 +1918,13 @@ public sealed partial class Conductor : IAsyncDisposable
                 var state = await ApplyConfigOptionsAsync(host, rpc, response.SessionId, choices, AcpJson.ToNode(response)!.AsObject(), ct);
                 response.ConfigOptions = SessionOptionsOf(state);
             }
+            if (initialAttributes is not null)
+            {
+                await uiMetadataGate.WaitAsync(ct);
+                try { uiMetadata.SetInitial(response.SessionId, initialAttributes); }
+                catch (ArgumentException e) { throw new JsonRpcException(JsonRpcException.InvalidParams, e.Message); }
+                finally { uiMetadataGate.Release(); }
+            }
             BindToken(token, response.SessionId);
         }
         catch
@@ -1930,6 +1950,66 @@ public sealed partial class Conductor : IAsyncDisposable
         response.Meta[GorynychProtocol.MetaSessionSteering] = host.Steers;
         ServiceLog.Info($"{host.Name}: new session {response.SessionId} in {request.Cwd}");
         return response;
+    }
+
+    internal async Task<JsonNode> UiMetadataAsync(string method, JsonNode? parameters, CancellationToken ct)
+    {
+        static string Required(JsonNode? p, string key) => p?[key] is JsonValue v && v.TryGetValue<string>(out var s) && !string.IsNullOrEmpty(s)
+            ? s : throw new JsonRpcException(JsonRpcException.InvalidParams, $"{key} is required");
+        await uiMetadataGate.WaitAsync(ct);
+        try
+        {
+            switch (method)
+            {
+                case GorynychProtocol.MethodAttributesGet:
+                case GorynychProtocol.MethodAttributesPatch:
+                {
+                    var id = Required(parameters, "sessionId");
+                    var record = store.Get(id);
+                    if (record is null || record.Deleted || removed.ContainsKey(id)) throw new JsonRpcException(JsonRpcException.InvalidParams, "Unknown session");
+                    if (method == GorynychProtocol.MethodAttributesGet) return new JsonObject { ["attributes"] = uiMetadata.Get(id) };
+                    var patch = parameters?["patch"] as JsonObject ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "patch must be an object");
+                    var attributes = uiMetadata.Patch(id, patch);
+                    await PublishAttributesAsync(record, attributes);
+                    return new JsonObject { ["attributes"] = attributes };
+                }
+                case GorynychProtocol.MethodGroupsList:
+                    return new JsonObject { ["groups"] = uiMetadata.List(Required(parameters, "projectKey")) };
+                case GorynychProtocol.MethodGroupsSet:
+                {
+                    var project = Required(parameters, "projectKey");
+                    var id = Required(parameters, "groupId");
+                    var name = Required(parameters, "name");
+                    if (uiMetadata.Set(project, id, name)) NotifyGroups(project);
+                    return new JsonObject { ["group"] = new JsonObject { ["groupId"] = id, ["name"] = name } };
+                }
+                case GorynychProtocol.MethodGroupsDelete:
+                {
+                    var project = Required(parameters, "projectKey");
+                    var affected = uiMetadata.Delete(project, Required(parameters, "groupId"), out var changed);
+                    foreach (var id in affected)
+                        if (store.Get(id) is { Deleted: false } record) await PublishAttributesAsync(record, uiMetadata.Get(id));
+                    if (changed) NotifyGroups(project);
+                    return new JsonObject();
+                }
+                default: throw new JsonRpcException(JsonRpcException.MethodNotFound, method);
+            }
+        }
+        catch (ArgumentException e) { throw new JsonRpcException(JsonRpcException.InvalidParams, e.Message); }
+        finally { uiMetadataGate.Release(); }
+    }
+
+    void NotifyGroups(string project)
+    {
+        foreach (var client in clients.Keys)
+            if (client.Init is not null) client.Notify(GorynychProtocol.MethodGroupsChanged, new JsonObject { ["projectKey"] = project });
+    }
+
+    async Task PublishAttributesAsync(SessionRecord record, JsonObject attributes)
+    {
+        if (feeds.TryGetValue(record.SessionId, out var feed))
+            await feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "session_info_update", ["_meta"] = new JsonObject { [AttributesKey] = attributes.DeepClone() } }, except: null, () => { }, journal: false);
+        if (record.Listed) AnnounceList(record.SessionId, record.Agent, "updated", activity: false);
     }
 
     /// <summary>A client's explicit <c>gorynych/configOptions</c> map, or none; a wrong shape is a bad request.</summary>
@@ -3386,6 +3466,11 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         var id = record.SessionId;
         removed[id] = 0;
+        // Metadata cleanup is best effort: a failed write leaves the previous snapshot intact.
+        uiMetadataGate.Wait();
+        try { uiMetadata.Remove(id); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { ServiceLog.Warn($"UI metadata of {id} not deleted: {e.Message}"); }
+        finally { uiMetadataGate.Release(); }
         feed.Retire();
         feeds.TryRemove(new KeyValuePair<string, SessionFeed>(id, feed));
         if (sessionTokens.TryRemove(id, out var token)) peerTokens.TryRemove(token, out _);

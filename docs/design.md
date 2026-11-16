@@ -1057,3 +1057,7 @@ Risks:
 - **Formats change with releases.** Hook payloads and protocols are versioned by their vendors;
   contract tests on recorded fixtures are kept per agent version, and each new version is
   checked against them.
+
+Session attributes and project groups are a service-owned UI overlay shared across adapter
+scopes. Their atomic persistence, ACP extension methods and notification contract are in
+[service-protocol.md](service-protocol.md#session-attributes-and-ui-groups).
