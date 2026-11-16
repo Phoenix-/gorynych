@@ -318,8 +318,8 @@ public sealed class ArchiveTests
         var self = $"session_id {asker} (claude, \"Coordinate the release\") (this session)";
 
         Assert.AreEqual($"Archived {who}. It is now hidden from list_agents and from the user's session list; nothing in it is lost. " +
-            "ask_agent still reaches it, and restore_session brings it back.", Text(await ArchiveAsync(zed, other, true, token)));
-        Assert.AreEqual($"{who} was already archived, so nothing changed. ask_agent still reaches it, and restore_session brings it back.",
+            "send_message still reaches it, and restore_session brings it back.", Text(await ArchiveAsync(zed, other, true, token)));
+        Assert.AreEqual($"{who} was already archived, so nothing changed. send_message still reaches it, and restore_session brings it back.",
             Text(await ArchiveAsync(zed, other, true, token)));
         Assert.AreEqual($"Restored {who}. It is back in list_agents and in the user's session list.", Text(await ArchiveAsync(zed, other, false, token)));
         Assert.AreEqual($"{who} is not archived, so nothing changed. It is in list_agents and in the user's session list.",
@@ -352,6 +352,7 @@ public sealed class ArchiveTests
         CollectionAssert.AreEquivalent(new[]
         {
             "mcp__gorynych__reply", "mcp__gorynych__list_agents", "mcp__gorynych__ask_agent",
+            "mcp__gorynych__send_message", "mcp__gorynych__reply_message",
             "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", "mcp__gorynych__spawn_session",
         }, ChannelHost.PreAllowedTools.ToArray());
         CollectionAssert.AreEquivalent(ChannelHost.PreAllowedTools.Where(t => t != "mcp__gorynych__spawn_session").ToArray(), ChannelHost.AllowedTools);

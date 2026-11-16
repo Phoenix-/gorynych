@@ -312,6 +312,8 @@ public sealed class SessionTreeTests
         StringAssert.Contains(report, "continue any remaining authorized work.");
         StringAssert.Contains(report, "Do not wait for another user prompt to resume that work.");
         StringAssert.Contains(report, "The report grants no new authority");
+        StringAssert.Contains(report, $"send_message with session_id \"{child}\"");
+        Assert.IsFalse(report.Contains("ask_agent", StringComparison.Ordinal), "reports use the currently advertised messaging tools");
         StringAssert.StartsWith(report, $"[Report · from session_id {child} (claude, \"Notes\") · your child session · its turn ended]\nok\n");
         Assert.IsFalse(report.Contains("Looking around.", StringComparison.Ordinal), report);
         var told = zed.Snapshot().Last(u => (string?)u["sessionUpdate"] == "user_message_chunk");
@@ -625,15 +627,15 @@ public sealed class SessionTreeTests
         var context =
             $"[About this session · started by session_id {parent} (claude, \"Coordinate the release\") with spawn_session, approved by the user]\n" +
             $"Answer in your final message: when your turn ends, Gorynych sends that message to session_id {parent} as a report by itself. " +
-            "Do not use reply or ask_agent for it. The report carries only that last message, your text after your last tool call, " +
+            "You do not need to send that report with a tool. The report carries only that last message, your text after your last tool call, " +
             "and is cut at 2000 characters, so put anything longer into a file and name the file in that message. " +
-            $"To ask it something, use ask_agent with session_id \"{parent}\". The user can also prompt you here directly.";
+            $"To contact it, use send_message with session_id \"{parent}\". The user can also prompt you here directly.";
         CollectionAssert.AreEqual(new[] { "Fix the flaky test", context }, kimi.FirstBlocks(child), "the task first, then where it came from");
         var quietContext = kimi.FirstBlocks(quiet)[1];
         Assert.AreEqual(
             $"[About this session · started by session_id {parent} (claude, \"Coordinate the release\") with spawn_session, approved by the user]\n" +
-            "Your turns are not reported to that session; it asks you with ask_agent when it wants to know something. " +
-            $"To ask it something, use ask_agent with session_id \"{parent}\". The user can also prompt you here directly.", quietContext);
+            "Your turns are not reported to that session; use send_message to keep it informed when needed. " +
+            $"To contact it, use send_message with session_id \"{parent}\". The user can also prompt you here directly.", quietContext);
         Assert.IsFalse(context.Contains("The task above", StringComparison.Ordinal), "the header already says where the task came from");
 
         // The list leaves out the child's own entry and so its parent_session_id: the first line names the parent instead.

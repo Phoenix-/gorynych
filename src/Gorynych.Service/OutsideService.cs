@@ -75,7 +75,7 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
     {
         var name = (string?)call?["name"];
         var args = call?["arguments"] as JsonObject ?? [];
-        if (name is not ("list_sessions" or "read_session" or "ask_agent"))
+        if (name is not ("list_sessions" or "read_session" or "ask_agent" or "send_message" or "reply_message" or "receive_messages"))
             throw new JsonRpcException(JsonRpcException.InvalidParams, $"Unknown tool: {name}");
         try
         {
@@ -83,7 +83,8 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
             {
                 "list_sessions" => await ListSessionsAsync(args, ct),
                 "read_session" => await ReadSessionAsync(args, ct),
-                _ => await AskAsync(client, requestId, call!, args, host, meta, ct),
+                "ask_agent" => await AskAsync(client, requestId, call!, args, host, meta, ct),
+                _ => await MailboxAsync(name!, args, meta, ct),
             };
             return OutsideTools.ToolResult(text, isError: false, modern);
         }
@@ -92,7 +93,8 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
             return OutsideTools.ToolResult(e.Message, isError: true, modern);
         }
         catch (JsonRpcException e) when (e.ErrorData?[GorynychProtocol.MetaAskLost] is null
-                                         && (e.ErrorData?[GorynychProtocol.MetaRestarting] is null || meta?[GorynychProtocol.MetaReclaim] is null))
+                                         && (e.ErrorData?[GorynychProtocol.MetaRestarting] is null ||
+                                             (meta?[GorynychProtocol.MetaReclaim] is null && name is not ("send_message" or "reply_message" or "receive_messages"))))
         {
             // A question that went with a restart is the outside server's to say: it knows how it lost it;
             // and a reclaim this service refuses as it restarts too is the outside server's to send again.
@@ -101,6 +103,49 @@ internal sealed class OutsideService(Conductor conductor, TimeSpan progressInter
     }
 
     sealed class ToolInputException(string message) : Exception(message);
+
+    async Task<string> MailboxAsync(string name, JsonObject args, JsonObject? meta, CancellationToken ct)
+    {
+        var token = meta is null ? null : Text(meta, GorynychProtocol.MetaOutsideMailbox);
+        if (token is not { Length: 32 } || token.Any(c => c is not (>= '0' and <= '9') and not (>= 'a' and <= 'f')))
+            throw new ToolInputException("A valid outside mailbox identity is required from the Gorynych shim.");
+        var sender = "outside:" + token;
+        JsonNode? result;
+        if (name == "receive_messages")
+        {
+            long after = 0;
+            int limit = 50, wait = 0;
+            if (args.ContainsKey("after") && (args["after"] is not JsonValue a || !a.TryGetValue<long>(out after) || after < 0))
+                throw new ToolInputException("after must be a nonnegative integer cursor.");
+            if (args.ContainsKey("limit") && (args["limit"] is not JsonValue l || !l.TryGetValue<int>(out limit) || limit is < 1 or > 100))
+                throw new ToolInputException("limit must be an integer from 1 to 100.");
+            if (args.ContainsKey("wait_ms") && (args["wait_ms"] is not JsonValue w || !w.TryGetValue<int>(out wait) || wait is < 0 or > 60000))
+                throw new ToolInputException("wait_ms must be an integer from 0 to 60000.");
+            result = await conductor.ReceiveOutsideMessagesAsync(sender, after, limit, wait, ct);
+            // Addresses are bearer credentials, not model-facing sender names.
+            foreach (var message in (result?["messages"] as JsonArray ?? []).OfType<JsonObject>())
+            {
+                message.Remove("recipient");
+                message.Remove("approvedFullAccess");
+                message.Remove("started");
+                message.Remove("delivered");
+                if ((string?)message["sender"] is { } from && from.StartsWith("outside:", StringComparison.Ordinal))
+                    message["sender"] = "outside agent";
+            }
+        }
+        else
+        {
+            var reply = name == "reply_message";
+            var field = reply ? "message_id" : "session_id";
+            var target = Text(args, field) ?? throw new ToolInputException($"{field} is required.");
+            var text = Text(args, "text") ?? throw new ToolInputException("text is required.");
+            var id = meta is null ? null : Text(meta, GorynychProtocol.MetaMessageRequestId);
+            if (id is null || !Guid.TryParseExact(id, "N", out _))
+                throw new ToolInputException("A valid message request ID is required from the Gorynych shim.");
+            result = await conductor.AcceptMailboxAsync(sender, target, text, id, reply, ct);
+        }
+        return result?.ToJsonString(Gorynych.Acp.AcpJson.TextOptions) ?? throw new JsonRpcException(JsonRpcException.InternalError, "Mailbox returned no result");
+    }
 
     /// <summary><c>list_sessions</c>: every session with history, rendered as <c>list_agents</c> renders its list, with no caller.</summary>
     async Task<string> ListSessionsAsync(JsonObject args, CancellationToken ct)

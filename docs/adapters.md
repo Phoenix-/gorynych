@@ -362,6 +362,11 @@ adapter's own default is never Full access (a configured `bypassPermissions` is 
 
 #### The gorynych tools
 
+New managed sessions discover `send_message`/`reply_message`; both return on durable
+acceptance. The service queues native prompt turns and automatically wakes idle recipients.
+See [messaging.md](messaging.md), including old-session compatibility. Opinion-specific
+paths and probes below remain relevant to legacy `ask_agent`/`reply` calls.
+
 They run without asking the person, in every mode ([service-protocol.md](service-protocol.md#approvals)):
 
 - Every launch's `--settings` allows `mcp__gorynych__list_agents`, `reply`, `ask_agent`,

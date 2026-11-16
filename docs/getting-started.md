@@ -230,10 +230,12 @@ More in [adapters.md](adapters.md#deepseek-harness).
 Every session gets a `gorynych` MCP server with these tools:
 
 - `list_agents`: see the other sessions.
-- `ask_agent`: ask one for its opinion, without asking you. The one exception is a session
+- `send_message`: send and return after durable acceptance; replies arrive separately and
+  automatically wake the sender. The one exception is a session
   that is not in full access asking one that is (Claude's, Codex's or DeepSeek's
   `Full access`): that session could act on the question without asking you, so Gorynych asks
   you first, in the asking session's thread.
+- `reply_message`: reply to a received message; no reply is required for every message.
 - `archive_session` and `restore_session`: hide a session from the lists or bring it back,
   without asking you; nothing in it is lost.
 - `spawn_session`: start a child session in another agent. When you ask for it yourself, in

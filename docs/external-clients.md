@@ -387,6 +387,11 @@ approval, and their sessions appeared in the service's list.
 
 ## Agents outside Gorynych
 
+New discovery uses the [pull mailbox](messaging.md#outside-agents): `send_message`,
+`reply_message` and `receive_messages`, alongside list/read. Outside agents explicitly
+receive incoming messages and may long-poll. The `ask_agent` examples and old approval
+observations below describe retained legacy compatibility.
+
 An agent outside Gorynych, such as Claude Code in Claude Desktop or in a terminal, Codex, or
 Kimi Code, can list Gorynych's sessions, read what they said and ask one for its opinion
 through the `gorynych-outside` MCP server

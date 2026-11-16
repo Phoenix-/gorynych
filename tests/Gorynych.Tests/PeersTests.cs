@@ -150,9 +150,9 @@ public sealed class PeersTests
         StringAssert.Contains(text, "\"updated_at\": \"2026-11-08T10:00:00.0000000+00:00\"");
         Assert.IsFalse(text.Contains("\\u", StringComparison.Ordinal), "no \\u escapes for an agent to read: " + text);
 
-        Assert.AreEqual("You are session_id s1 (claude).\nNo other sessions to ask. spawn_session starts one.",
+        Assert.AreEqual("You are session_id s1 (claude).\nNo other sessions to message. spawn_session starts one.",
             PeersServer.ListAgentsText(new JsonObject { ["caller"] = "session_id s1 (claude)", ["sessions"] = new JsonArray(), ["hiddenArchived"] = 0 }));
-        Assert.AreEqual("You are session_id s1 (claude).\nNo other sessions to ask. spawn_session starts one.\n" +
+        Assert.AreEqual("You are session_id s1 (claude).\nNo other sessions to message. spawn_session starts one.\n" +
             "2 archived sessions are not shown; pass include_archived: true to list them.",
             PeersServer.ListAgentsText(new JsonObject { ["caller"] = "session_id s1 (claude)", ["sessions"] = new JsonArray(), ["hiddenArchived"] = 2 }));
     }
@@ -176,13 +176,13 @@ public sealed class PeersTests
         var tools = PeersServer.Tools(peers: true).ToDictionary(t => (string)t["name"]!);
         string Description(string tool) => (string)tools[tool]["description"]!;
 
-        StringAssert.Contains(Description("ask_agent"), "Start a new question");
-        StringAssert.Contains(Description("ask_agent"), "To answer a request you received (its header names a message_id), use reply instead.");
-        StringAssert.Contains(Description("ask_agent"),
-            "If that session runs in full access and this one does not, the user approves the question first; if they decline, the call fails and nothing is sent.");
-        StringAssert.Contains((string?)tools["ask_agent"]["inputSchema"]!["properties"]!["session_id"]!["description"],
+        StringAssert.Contains(Description("send_message"), "durable acceptance");
+        StringAssert.Contains(Description("send_message"), "Use reply_message to reply to a received message_id.");
+        StringAssert.Contains(Description("send_message"),
+            "If the recipient has full access and you do not, the user approves first.");
+        StringAssert.Contains((string?)tools["send_message"]["inputSchema"]!["properties"]!["session_id"]!["description"],
             "never an agent name, a title or a sender label");
-        StringAssert.Contains(Description("reply"), "Use it only to answer; to start a question of your own, use ask_agent.");
+        StringAssert.Contains(Description("reply_message"), "Reply to a received message by its message_id.");
         StringAssert.Contains(Description("spawn_session"), "sends this session a short report with the child's final message by itself");
         StringAssert.Contains(Description("spawn_session"), "The user approves each spawn first, unless they asked for it themselves in this turn (initiation user_asked)");
         StringAssert.Contains(Description("spawn_session"), "config_options holds the native model-related values the child actually runs with");
@@ -200,14 +200,14 @@ public sealed class PeersTests
         StringAssert.Contains(Description("list_agents"), "Each entry has session_id, agent, title, cwd, status, updated_at and parent_session_id");
         StringAssert.Contains(Description("list_agents"), "status \"open\": the session's agent has it loaded right now.");
         StringAssert.Contains(Description("list_agents"),
-            "status \"saved\": it is saved but not loaded; asking it starts it, so it answers more slowly, and it is unloaded again once it has been idle with no client for some minutes.");
+            "status \"saved\": it is saved but not loaded; a message wakes it, and it is unloaded again once it has been idle with no client for some minutes.");
         StringAssert.Contains(Description("list_agents"), "status has nothing to do with archived.");
         Assert.IsFalse(Description("list_agents").Contains("Claude session can", StringComparison.Ordinal), "every agent is started the same way now");
         StringAssert.Contains(Description("list_agents"), "Archived sessions are left out unless include_archived is true; when some are left out, the result's last line says how many.");
         Assert.AreEqual("boolean", (string?)tools["list_agents"]["inputSchema"]!["properties"]!["include_archived"]!["type"]);
         StringAssert.Contains(Description("archive_session"), "this one included");
-        StringAssert.Contains(Description("archive_session"), "Archiving is not deleting: the session keeps all its history, ask_agent still reaches it");
-        StringAssert.Contains(Description("restore_session"), "To ask an archived session something, use ask_agent: it need not be restored first.");
+        StringAssert.Contains(Description("archive_session"), "Archiving is not deleting: the session keeps all its history, send_message still reaches it");
+        StringAssert.Contains(Description("restore_session"), "To message an archived session, use send_message: it need not be restored first.");
         foreach (var tool in new[] { "archive_session", "restore_session" })
         {
             Assert.IsFalse(Description(tool).Contains("approve", StringComparison.Ordinal), "reversible, so never asked");
@@ -250,7 +250,7 @@ public sealed class PeersTests
             var init = await mcp.SendRequestAsync("initialize", new JsonObject { ["protocolVersion"] = "2025-06-18", ["capabilities"] = new JsonObject() });
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "ask_agent", "spawn_session", "archive_session", "restore_session", "reply" },
+            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "spawn_session", "archive_session", "restore_session", "reply_message" },
                 tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
 
             var listed = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_agents", ["arguments"] = new JsonObject() });
@@ -331,7 +331,7 @@ public sealed class PeersTests
             }
             var who = "session_id answering (answerer, \"Pick a database for the cockpit\")";
             Assert.AreEqual($"Archived {who}. It is now hidden from list_agents and from the user's session list; nothing in it is lost. " +
-                "ask_agent still reaches it, and restore_session brings it back.", (string?)await Call("archive_session", new JsonObject { ["session_id"] = "answering" }));
+                "send_message still reaches it, and restore_session brings it back.", (string?)await Call("archive_session", new JsonObject { ["session_id"] = "answering" }));
             var hidden = await Listed(includeArchived: false);
             CollectionAssert.AreEquivalent(new[] { "child-2" }, hidden.Sessions);
             Assert.AreEqual("\n1 archived session is not shown; pass include_archived: true to list it.", hidden.Last);

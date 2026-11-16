@@ -138,6 +138,10 @@ internal sealed class ClientConnection
                 return conductor.Start(request);
             case GorynychProtocol.MethodOpinion:
                 return await conductor.OpinionAsync(request, ct, linkGone: () => Rpc.IsClosed);
+            case GorynychProtocol.MethodSendMessage:
+                return await conductor.SendMessageAsync(request, reply: false, ct);
+            case GorynychProtocol.MethodReplyMessage:
+                return await conductor.SendMessageAsync(request, reply: true, ct);
             case GorynychProtocol.MethodPeers:
                 return await conductor.PeersAsync(request, ct);
             case GorynychProtocol.MethodReply:

@@ -1,0 +1,109 @@
+# Inter-session messages
+
+New managed sessions use `send_message {session_id,text}` to start an exchange and
+`reply_message {message_id,text}` to reply. Reviews, clarifications and notifications share
+this interface. There is no separate opinion tool, mandatory acknowledgement or internal
+waiting tool. `list_agents`, spawn, archive and restore remain available.
+
+Both calls return `{"messageId":"...","status":"accepted"}` after durable service
+acceptance, without waiting for recipient work. Opening an unloaded recipient and required
+full-access consent precede acceptance, so these steps can still take time or fail. After
+acceptance, cancelling the sending call does not withdraw its message. A lost response is
+uncertain; the shim retries with the same transport-generated request ID.
+
+## Delivery and authority
+
+This first implementation serializes delivery through ordinary ACP `session/prompt`
+turns, including for adapters that support steering. Messages wait for an occupied turn;
+they never cancel a tool or turn. Idle recipients are opened and started automatically.
+Replies are new correlated messages and wake their original sender in the same way.
+The message names its sender and ID, and a reply also names the original ID.
+
+A peer message is not from the user and grants no new authority. Existing user constraints
+and narrower message restrictions apply. A review request permits read-only investigation,
+not edits. Both send and reply preserve the existing restricted-to-full-access approval
+boundary. Delivery rechecks this boundary if modes changed while the message waited.
+Outside sender addresses are private bearer identities and never appear in model-facing
+messages or journal sender labels.
+
+An agent with no independent work ends its turn; later messages resume it. Turn completion
+does not declare task completion. Child reports still describe completed turns, which may
+say that the child is awaiting replies. An acknowledgement need not be acknowledged again.
+
+## Outside agents
+
+Outside discovery retains `list_sessions` and `read_session` and exposes `send_message`,
+`reply_message`, and `receive_messages {after?,limit?,wait_ms?}`. Outside agents have no
+Gorynych-owned input channel and explicitly receive their replies:
+
+```text
+receive_messages {after: 0, limit: 50, wait_ms: 0}
+receive_messages {after: <previous nextCursor>, wait_ms: 30000}
+```
+
+Defaults are `after:0`, `limit:50` (1–100), `wait_ms:0` (0–60000). Zero reads immediately;
+a positive wait long-polls until a page arrives or its timeout expires. The result has
+`messages`, `nextCursor` and `historyTrimmed`. Items contain IDs, sequence, sender, text and
+optional `replyTo`; private mailbox addresses are omitted. Cancellation stops receiving,
+not message delivery. Repeating the same cursor replays the same retained page. Advancing
+the cursor acknowledges older messages, allowing their retention eviction. Generating a
+response does not acknowledge the returned page, so a lost response is safe to retry.
+`historyTrimmed` conservatively indicates that eviction may have passed the cursor.
+
+A random private identity belongs to each outside shim process and survives service
+reconnects. Different shims do not share an inbox by cwd or client name. Optional
+`--mailbox-file <path>` saves the identity with private file permissions for shim restarts;
+the parent directory must exist. Use a separate file per outside agent; deliberately
+sharing the file shares the inbox. Without it, a shim restart starts a fresh mailbox.
+Gorynych does not change harness configuration to enable this option. The shim supplies
+identity in trusted outer metadata, never from model arguments. The same-user service pipe
+remains the local trust boundary.
+
+## Persistence and failure
+
+Atomic `mailbox.json` in the service data folder retains at most 5000 entries of up to
+32000 text characters. The oldest terminal entries are evicted to admit new messages;
+pending entries are never evicted. A store full of pending messages refuses acceptance.
+Deduplication and reply ownership are available while their entries remain in this bounded
+history. A retained reply receipt can be retried even after its original was evicted.
+
+A restart resumes messages queued before handoff. A durable started claim precedes writing
+a native prompt and stays pending until the adapter answers. If a crash leaves only that
+claim, delivery is reported as uncertain and is not blindly replayed. A failed delivery and
+its notice to the sender commit together; notices do not generate recursive failure notices.
+Acceptance is durable, but this is not an exactly-once model-processing guarantee. A turn
+already handed to a surviving host continues under the existing host recovery mechanism.
+
+## Wire and compatibility
+
+ACP remains v1. Peer methods `_gorynych/send_message {sessionId,text,_meta}` and
+`_gorynych/reply_message {messageId,text,_meta}` carry the peer token and a stable
+`gorynych/messageRequestId` in `_meta`. Prompt updates use `gorynych/mailboxMessage`.
+Outside tools retain `_gorynych/mcp_message`, with private `gorynych/outsideMailbox` and
+write request IDs in its outer `_meta`. New custom data stays in ACP extension points.
+
+This follows [ACP v1 extensibility](https://agentclientprotocol.com/protocol/v1/extensibility).
+[MCP Tasks](https://modelcontextprotocol.io/extensions/tasks/overview) supplies asynchronous
+operation handles, not mailbox routing. ACP v2 remains a draft, and its
+[session-directed messages](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle#session-directed-messages)
+describe transcript presentation. This change upgrades neither protocol nor harnesses.
+
+Legacy `ask_agent`/`reply` handlers and `_gorynych/opinion`/`_gorynych/reply` remain for
+already running sessions and in-flight requests, but new discovery uses the new tools.
+Channel-only legacy Claude servers still expose `reply`. New `reply_message` bridges legacy
+service requests and Claude channel IDs, returning `status:"legacy_delivered",durable:false`
+for direct legacy delivery; those old replies do not promise mailbox retry durability.
+Legacy asks retain their synchronous waiting/reclaim semantics and nested-ask restriction.
+New mailbox exchanges have no such restriction. Native sessions can retain cached old tools
+until their next launch/resume. Codex preserves the developer instructions from thread
+creation even after resume; new tool discovery and per-message envelopes carry the current
+messaging contract, while new threads receive current creation instructions. Host rotation
+does not rewrite historical native instructions. Updating an install is a separate explicit
+deployment through the existing update command.
+
+The 16 November 2026 Windows upgrade probe confirmed that an existing Codex thread moved to
+the new host generation and discovered send/reply tools, while retaining its old creation
+instructions. The installed outside shim sent it a message, long-polled, and received a
+correlated reply produced by the thread's real `reply_message` call. The conductor restart
+kept the running parent turn in its old host. A Codex draft can keep an old host alive until
+its first turn or closure, as described in the existing host-generation lifecycle.

@@ -30,12 +30,13 @@ internal static class OutsideTools
 
     public const string Instructions =
         "Gorynych runs the user's Claude, Codex, Kimi and DeepSeek coding sessions on this machine. list_sessions lists them, read_session shows " +
-        "what one said, and ask_agent asks one for its opinion. They cannot ask you anything back.";
+        "what one said, send_message and reply_message send messages, and receive_messages reads your mailbox. " +
+        "Messages do not wake outside agents: call receive_messages explicitly and continue with its nextCursor.";
 
     /// <summary>What the server says, and every tool call returns, when it runs under a Gorynych service.</summary>
     public const string InsideGorynych =
         "This is the gorynych-outside server, for agents outside Gorynych. This session runs inside Gorynych: use list_agents " +
-        "and ask_agent of its gorynych server instead.";
+        "and send_message of its gorynych server instead.";
 
     /// <summary>A tool call's result while the service cannot be reached.</summary>
     public static string ServiceDown(string reason) =>
@@ -102,7 +103,7 @@ internal static class OutsideTools
         {
             ["name"] = "list_sessions",
             ["description"] = "List the user's coding-agent sessions in Gorynych, which runs Claude, Codex, Kimi and DeepSeek sessions on this machine. " +
-                "Pass a session_id to read_session to see what that session said, or to ask_agent to ask it something. Each entry has " +
+                "Pass a session_id to read_session to see what that session said, or to send_message to message it. Each entry has " +
                 "session_id, agent, title, cwd, status, updated_at and parent_session_id (set when another session started it with " +
                 "spawn_session), and open_elsewhere when another app, such as Codex Desktop, has the session open: it cannot be asked " +
                 "until it is closed there. Pass a session_id exactly as listed, never adding or stripping a prefix: Claude's, Codex's " +
@@ -145,11 +146,9 @@ internal static class OutsideTools
         },
         new JsonObject
         {
-            ["name"] = "ask_agent",
-            ["description"] = "Ask one of the user's Gorynych sessions for its opinion and wait for the answer. It answers from its own " +
-                "session and context; it does not run tools or act for you, and it cannot ask you back, so put everything it needs " +
-                "into the question. A session that is not loaded is started to answer, and a session in the middle of a turn answers " +
-                "after it, so this can take minutes. To see what a session already said, use read_session: it costs that session nothing.",
+            ["name"] = "send_message",
+            ["description"] = "Send to an exact session_id. Returns after durable acceptance, without waiting for delivery or an answer. " +
+                "Outside agents must call receive_messages explicitly to get replies; use the returned nextCursor for the next read.",
             ["inputSchema"] = new JsonObject
             {
                 ["type"] = "object",
@@ -158,12 +157,35 @@ internal static class OutsideTools
                     ["session_id"] = new JsonObject
                     {
                         ["type"] = "string",
-                        ["description"] = "the exact session_id of the session to ask, from list_sessions; never an agent name or a title",
+                        ["description"] = "the exact session_id from list_sessions; never an agent name or a title",
                     },
-                    ["question"] = new JsonObject { ["type"] = "string", ["description"] = "the question, with all the context the other agent needs" },
+                    ["text"] = new JsonObject { ["type"] = "string", ["description"] = "the message, with the context the other agent needs" },
                 },
-                ["required"] = new JsonArray("session_id", "question"),
+                ["required"] = new JsonArray("session_id", "text"),
             },
+        },
+        new JsonObject
+        {
+            ["name"] = "reply_message",
+            ["description"] = "Reply to a received message_id. Returns after durable acceptance, not delivery or processing. " +
+                "Call receive_messages explicitly for further messages; pass the returned nextCursor to the next read.",
+            ["inputSchema"] = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject
+            {
+                ["message_id"] = new JsonObject { ["type"] = "string" }, ["text"] = new JsonObject { ["type"] = "string" },
+            }, ["required"] = new JsonArray("message_id", "text") },
+        },
+        new JsonObject
+        {
+            ["name"] = "receive_messages",
+            ["description"] = "Read your outside mailbox explicitly; incoming messages do not automatically wake you. " +
+                "Pass the returned nextCursor as after on the next read. Repeating the same cursor safely reads the same page. " +
+                "wait_ms 0 reads immediately; a positive value waits up to 60000 ms.",
+            ["inputSchema"] = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject
+            {
+                ["after"] = new JsonObject { ["type"] = "integer", ["minimum"] = 0, ["default"] = 0 },
+                ["limit"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1, ["maximum"] = 100, ["default"] = 50 },
+                ["wait_ms"] = new JsonObject { ["type"] = "integer", ["minimum"] = 0, ["maximum"] = 60000, ["default"] = 0 },
+            } },
         },
     ];
 

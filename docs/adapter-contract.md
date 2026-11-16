@@ -364,6 +364,13 @@ after it has taken the message for the running turn (Queue admission, not model 
 
 ## 6. Service turns: opinions and reports
 
+Current mailbox messages are also service turns, sent through ordinary queued
+`session/prompt` with `_meta["gorynych/mailboxMessage"]` and existing prompt/message
+correlation. The adapter needs no new wire method. Send/reply return after durable service
+acceptance; see [messaging.md](messaging.md). Child reports describe completed turns, which
+may be awaiting replies, not necessarily completed tasks. Opinion-specific rules below
+apply to the legacy synchronous path.
+
 A *service turn* is a turn the service runs on a session on another session's behalf: an
 opinion request asked as a turn (`ask_agent`), or a child's report to its parent. A user's
 prompt and a spawned session's first turn are not service turns.

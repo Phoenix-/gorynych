@@ -573,7 +573,7 @@ public sealed class OutsideTests
         Assert.AreEqual(OutsideTools.Instructions, (string?)discover["instructions"]);
         var tools = (await McpAsync(zed, "tools/list", modern.DeepClone().AsObject()))!["result"]!;
         Assert.AreEqual("complete", (string?)tools["resultType"]);
-        CollectionAssert.AreEqual(new[] { "list_sessions", "read_session", "ask_agent" }, tools["tools"]!.AsArray().Select(t => (string?)t!["name"]).ToArray());
+        CollectionAssert.AreEqual(new[] { "list_sessions", "read_session", "send_message", "reply_message", "receive_messages" }, tools["tools"]!.AsArray().Select(t => (string?)t!["name"]).ToArray());
         Assert.IsNull((await McpAsync(zed, "tools/list", null))!["result"]!["resultType"], "a legacy result has no resultType");
 
         var old = new JsonObject { ["_meta"] = new JsonObject { [OutsideTools.MetaProtocolVersion] = "1900-01-01" } };
@@ -683,7 +683,7 @@ public sealed class OutsideTests
                 Assert.AreEqual("complete", (string?)discover!["resultType"]);
                 Assert.AreEqual(OutsideTools.ServerName, (string?)discover["_meta"]![OutsideTools.MetaServerInfo]!["name"]);
                 var tools = await modern.Host.SendRequestAsync("tools/list", new JsonObject { ["_meta"] = Modern() });
-                Assert.AreEqual(3, tools!["tools"]!.AsArray().Count);
+                Assert.AreEqual(5, tools!["tools"]!.AsArray().Count);
                 var listed = await modern.Host.SendRequestAsync("tools/call", ModernCall("list_sessions", []));
                 Assert.AreEqual("complete", (string?)listed!["resultType"]);
                 StringAssert.Contains((string?)listed["content"]![0]!["text"], target);
@@ -824,7 +824,7 @@ public sealed class OutsideTests
         await using var shim = new Shim(pipe);
 
         var tools = await shim.Host.SendRequestAsync("tools/list", new JsonObject { ["_meta"] = Modern() });
-        CollectionAssert.AreEqual(new[] { "list_sessions", "read_session", "ask_agent" }, tools!["tools"]!.AsArray().Select(t => (string?)t!["name"]).ToArray());
+        CollectionAssert.AreEqual(new[] { "list_sessions", "read_session", "send_message", "reply_message", "receive_messages" }, tools!["tools"]!.AsArray().Select(t => (string?)t!["name"]).ToArray());
         var down = await shim.Host.SendRequestAsync("tools/call", ModernCall("list_sessions", []));
         Assert.AreEqual(true, (bool?)down!["isError"]);
         // From an ssh login or session 0 (a CI runner may run there) it starts nothing, and says why.

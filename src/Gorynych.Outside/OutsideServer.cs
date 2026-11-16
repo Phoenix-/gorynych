@@ -14,7 +14,7 @@ namespace Gorynych.Outside;
 /// <c>ping</c> and a legacy <c>initialize</c>; inside Gorynych it offers no tools; and while the
 /// service cannot be reached it answers from its own copy of the tools.
 /// </summary>
-internal sealed class OutsideServer(string pipe, string serviceExe, bool inside, string version)
+internal sealed class OutsideServer(string pipe, string serviceExe, bool inside, string version, string? mailboxToken = null)
 {
     static readonly TimeSpan StartRetry = TimeSpan.FromMinutes(1);
     readonly string folder = Environment.CurrentDirectory;
@@ -23,6 +23,12 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
     long lastStart = long.MinValue / 2;
     string? lastStartFailure;
     JsonObject? legacyClient;
+    readonly string mailbox = ValidMailbox(mailboxToken) ? mailboxToken! : mailboxToken is null
+        ? Convert.ToHexStringLower(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16))
+        : throw new ArgumentException("Invalid outside mailbox token", nameof(mailboxToken));
+
+    internal static bool ValidMailbox(string? token) => token is { Length: 32 } &&
+        token.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
 
     /// <summary>Serves the host until it closes stdin. Never exits on an error: a host does not restart a server that died.</summary>
     public async Task RunAsync(Stream input, Stream output)
@@ -56,8 +62,12 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
         // An ask_agent gets a name of its own: should the service restart while the session answers, the
         // answer is taken from the next one by it, and the session is not asked again.
         var askId = request.Method == "tools/call" && (string?)@params?["name"] == "ask_agent" ? Guid.NewGuid().ToString("N") : null;
+        var tool = request.Method == "tools/call" ? (string?)@params?["name"] : null;
+        var isMailbox = tool is "send_message" or "reply_message" or "receive_messages";
+        var messageId = tool is "send_message" or "reply_message" ? Guid.NewGuid().ToString("N") : null;
         try
         {
+            if (isMailbox) return await ForwardMailboxAsync(host, request, @params, messageId, ct);
             try
             {
                 return await ForwardAsync(host, request, @params, askId, reclaim: false, ct);
@@ -75,12 +85,33 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
         {
             // The service went once the call was on its way (a restart): it may have been done, or not.
             var target = (string?)@params?["arguments"]?["session_id"];
-            var text = (string?)@params?["name"] == "ask_agent"
+            var text = messageId is not null
+                ? $"Acceptance is unknown for request {messageId}; the message may have been accepted. Do not assume it was not sent."
+                : tool == "receive_messages" ? "The mailbox read did not return. Repeat receive_messages with the same after cursor."
+                : (string?)@params?["name"] == "ask_agent"
                 ? $"Gorynych restarted while session_id {target} was answering, so its answer was lost. Ask again in a moment: " +
                   $"ask_agent with session_id {target} and the same question."
                 : "Gorynych restarted while it handled this call, so its answer was lost. Call the tool again in a moment.";
             if (request.Method == "tools/call") return OutsideTools.ToolResult(text, isError: true, modern);
             throw new JsonRpcException(JsonRpcException.InternalError, text);
+        }
+    }
+
+    async Task<JsonNode?> ForwardMailboxAsync(JsonRpcConnection host, JsonRpcRequest request, JsonObject? args, string? id, CancellationToken ct)
+    {
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        var uncertain = false;
+        while (true)
+        {
+            try { return await ForwardAsync(host, request, args, null, false, ct, id); }
+            catch (ServiceLostException) { uncertain = true; }
+            catch (ServiceUnreachableException) when (elapsed.Elapsed < TimeSpan.FromSeconds(30)) { }
+            catch (JsonRpcException e) when (e.ErrorData?[GorynychProtocol.MetaRestarting] is not null && elapsed.Elapsed < TimeSpan.FromSeconds(30)) { }
+            catch (ServiceUnreachableException e) when (uncertain) { throw new ServiceLostException(e.Message); }
+            catch (JsonRpcException e) when (uncertain && e.ErrorData?[GorynychProtocol.MetaRestarting] is not null) { throw new ServiceLostException(e.Message); }
+            if (elapsed.Elapsed >= TimeSpan.FromSeconds(30))
+                throw uncertain ? new ServiceLostException("Service connection lost") : new ServiceUnreachableException("service restart timed out");
+            await Task.Delay(500, ct);
         }
     }
 
@@ -126,7 +157,7 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
         }
     }
 
-    async Task<JsonNode?> ForwardAsync(JsonRpcConnection host, JsonRpcRequest request, JsonObject? @params, string? askId, bool reclaim, CancellationToken ct)
+    async Task<JsonNode?> ForwardAsync(JsonRpcConnection host, JsonRpcRequest request, JsonObject? @params, string? askId, bool reclaim, CancellationToken ct, string? mailboxRequestId = null)
     {
         // The host's id as a string; the answer goes back under the host's own id.
         var requestId = request.Id is JsonValue v && v.TryGetValue<string>(out var text) ? text : request.Id.ToJsonString();
@@ -145,8 +176,9 @@ internal sealed class OutsideServer(string pipe, string serviceExe, bool inside,
             ["requestId"] = requestId,
             ["method"] = request.Method,
             ["params"] = @params?.DeepClone(),
-            ["_meta"] = new JsonObject { [GorynychProtocol.MetaOutside] = HostObject(@params) },
+            ["_meta"] = new JsonObject { [GorynychProtocol.MetaOutside] = HostObject(@params), [GorynychProtocol.MetaOutsideMailbox] = mailbox },
         };
+        if (mailboxRequestId is not null) envelope["_meta"]![GorynychProtocol.MetaMessageRequestId] = mailboxRequestId;
         if (askId is not null) envelope["_meta"]![GorynychProtocol.MetaAskId] = askId;
         if (reclaim) envelope["_meta"]![GorynychProtocol.MetaReclaim] = true;
         JsonNode? answer;
