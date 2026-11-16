@@ -83,6 +83,9 @@ sealed class FakeAppServer
 
     public ConcurrentDictionary<string, FakeThread> Threads { get; } = new();
     public Func<JsonObject, JsonNode?>? BackgroundListing { get; set; }
+    public TaskCompletionSource? HoldBackgroundResponse { get; set; }
+    public TaskCompletionSource BackgroundResponseHeld { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource BackgroundResponseReleased { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>The MCP servers of the user's own Codex config, as <c>config/read</c> shows them.</summary>
     public HashSet<string> UserServers { get; set; } = ["other-tool"];
@@ -206,6 +209,14 @@ sealed class FakeAppServer
         lock (calls) calls.Add((request.Method, (JsonObject)p.DeepClone()));
         if (request.Method == "turn/start" && HoldTurnStart is { } hold) await hold.Task;
         if (request.Method == "account/rateLimits/read" && HoldAccountRateLimits is { } usage) await usage.Task;
+        if (request.Method == "thread/backgroundTerminals/list" && HoldBackgroundResponse is { } background)
+        {
+            var response = await AnswerAsync(request.Method, p);
+            BackgroundResponseHeld.TrySetResult();
+            await background.Task;
+            BackgroundResponseReleased.TrySetResult();
+            return response;
+        }
         if (request.Method == "thread/start" && (bool?)p["ephemeral"] == true && HoldHelperThreadStart is { } start)
             await start.Task;
         return await AnswerAsync(request.Method, p);

@@ -157,6 +157,50 @@ public sealed class CodexAdapterTests
     }
 
     [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task BackgroundPolling_CloseCancelsHeldRefresh_AndLateOldResultCannotOverwriteReopen()
+    {
+        var stale = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var phase = 0;
+        var fake = new FakeAppServer
+        {
+            BackgroundListing = _ => new JsonObject { ["data"] = Volatile.Read(ref phase) == 0
+                ? new JsonArray(new JsonObject { ["itemId"] = "old", ["processId"] = "p", ["command"] = "sleep", ["cwd"] = Cwd })
+                : new JsonArray() },
+        };
+        var (agent, acp) = await DirectAsync(fake);
+        await using var _ = agent;
+        await using var __ = acp;
+        var observed = new System.Collections.Concurrent.ConcurrentQueue<JsonArray>();
+        acp.NotificationHandler = (_, p) =>
+        {
+            if (p?["update"]?["_meta"]?[GorynychProtocol.MetaBackgroundKnown] is JsonArray tasks)
+                observed.Enqueue(tasks.DeepClone().AsArray());
+            return Task.CompletedTask;
+        };
+        var id = await NewDirectAsync(acp);
+        try
+        {
+            await PromptDirectAsync(acp, id, "hello"); // make the native thread resumable
+            await Until(() => observed.Any(items => items.Count == 1), "initial terminal snapshot");
+            fake.HoldBackgroundResponse = stale;
+            await fake.BackgroundResponseHeld.Task.WaitAsync(TimeSpan.FromSeconds(12));
+            await acp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id }).WaitAsync(Wait);
+            fake.HoldBackgroundResponse = null;
+            Volatile.Write(ref phase, 1);
+            await acp.SendRequestAsync(AcpMethods.Agent.SessionResume,
+                new JsonObject { ["sessionId"] = id, ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() }).WaitAsync(Wait);
+            await Until(() => observed.Any(items => items.Count == 0), "new generation empty snapshot");
+            var beforeLateResponse = observed.Count;
+            stale.TrySetResult();
+            await fake.BackgroundResponseReleased.Task.WaitAsync(Wait);
+            await Task.Delay(500);
+            Assert.IsFalse(observed.Skip(beforeLateResponse).Any(items => items.Count > 0), "the old held result must not overwrite the reopened thread");
+        }
+        finally { stale.TrySetResult(); }
+    }
+
+    [TestMethod]
     public async Task Initialize_SaysWhatTheServiceNeeds_AndIdentifiesGorynych()
     {
         var fake = new FakeAppServer();
