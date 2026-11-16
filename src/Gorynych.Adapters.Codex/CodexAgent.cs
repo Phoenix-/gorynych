@@ -980,7 +980,7 @@ sealed class CodexAgent : IAsyncDisposable
                         } });
                     }
                     if (Volatile.Read(ref backgroundUnsupported) != 0) return;
-                    await Task.Delay(TimeSpan.FromSeconds(5), stopped);
+                    await Task.Delay(options.BackgroundPollInterval, stopped);
                 }
                 catch (Exception e) when (e is IOException or ObjectDisposedException or OperationCanceledException or JsonRpcException) { return; }
             }

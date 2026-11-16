@@ -1,13 +1,14 @@
-import json, subprocess, queue, threading, time, os
+import json, subprocess, queue, threading, time, os, shutil
 from pathlib import Path
-matches = list((Path(os.environ['APPDATA']) / 'npm/node_modules/@openai/codex').glob('node_modules/@openai/codex-win32-*/vendor/*/bin/codex.exe'))
-if len(matches) != 1: raise RuntimeError('Could not uniquely locate the native Codex executable')
-exe = str(matches[0])
+if os.name != 'nt': raise RuntimeError('This smoke requires Windows')
+matches = list((Path(os.environ.get('APPDATA', '')) / 'npm/node_modules/@openai/codex').glob('node_modules/@openai/codex-win32-*/vendor/*/bin/codex.exe'))
+exe = shutil.which('codex.exe') or (str(matches[0]) if len(matches) == 1 else None)
+if not exe: raise RuntimeError('Could not uniquely locate the native Codex executable')
 p = subprocess.Popen([exe, 'app-server'], cwd=os.getcwd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      stderr=subprocess.DEVNULL, encoding='utf-8', errors='replace', creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
 lines = queue.Queue()
 threading.Thread(target=lambda: [lines.put(line) for line in p.stdout], daemon=True).start()
-pending = {}; next_id = 0; foreground_ended = False
+pending = {}; next_id = 0; foreground_ended = False; owned_thread = None
 def send(method, params):
     global next_id
     next_id += 1
@@ -19,7 +20,10 @@ def receive(deadline):
         try: msg=json.loads(lines.get(timeout=1))
         except queue.Empty: continue
         except ValueError: continue
-        if msg.get('method') == 'turn/completed': foreground_ended = True; print('foreground ended', flush=True)
+        if msg.get('method') == 'turn/completed':
+            params = msg.get('params', {})
+            if params.get('threadId') == owned_thread and params.get('turn', {}).get('status') == 'completed':
+                foreground_ended = True; print('foreground ended', flush=True)
         if 'id' in msg and ('result' in msg or 'error' in msg): pending[msg['id']] = msg
         return
     raise TimeoutError('native response timeout')
@@ -37,13 +41,16 @@ try:
     overrides={name:{'enabled':False} for name in servers}
     thread=request('thread/start',{'cwd':os.getcwd(),'ephemeral':True,'approvalPolicy':'never',
                                   'config':{'mcp_servers':overrides}})['thread']['id']
+    owned_thread = thread
     request('turn/start',{'threadId':thread,'input':[{'type':'text','text':'Run exactly one shell command `Start-Sleep -Seconds 15` with a one second yield, letting it continue in the background, then respond immediately. Do not use any other tools.'}]})
-    seen=False; success=False; deadline=time.monotonic()+100
+    seen=False; ended_with_background=False; success=False; deadline=time.monotonic()+100
     while time.monotonic()<deadline:
         result=request('thread/backgroundTerminals/list',{'threadId':thread,'limit':100},timeout=15)
         count=len(result['data']); print('terminals:',count,'foreground ended:',foreground_ended,flush=True)
         if count: seen=True
-        if seen and count==0: print('PASS: nonempty then empty',flush=True); success=True; break
+        if count and foreground_ended: ended_with_background=True
+        if seen and ended_with_background and count==0:
+            print('PASS: foreground completed while background remained, then empty',flush=True); success=True; break
         end=min(deadline,time.monotonic()+1)
         while time.monotonic()<end:
             try: receive(end)

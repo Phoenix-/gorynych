@@ -55,6 +55,9 @@ public sealed class CodexAdapterOptions
     /// <summary>How long closing a thread waits for app-server to unload it (<c>thread/closed</c>).</summary>
     internal TimeSpan UnloadWait { get; init; } = TimeSpan.FromSeconds(10);
 
+    /// <summary>Background terminal refresh cadence; shortened in deterministic adapter tests.</summary>
+    internal TimeSpan BackgroundPollInterval { get; init; } = TimeSpan.FromSeconds(5);
+
     /// <summary>
     /// Advertises native title generation to the service (<c>gorynych/autoTitle</c>). The service
     /// turns it on; an adapter constructed by a harness or a test keeps it off.

@@ -1,5 +1,9 @@
-import json, subprocess, queue, threading, time, os
-exe = r'C:\Users\micha\AppData\Local\Microsoft\WinGet\Links\claude.exe'
+import json, subprocess, queue, threading, time, os, shutil
+from pathlib import Path
+if os.name != 'nt': raise RuntimeError('This smoke requires Windows')
+fallback = Path(os.environ.get('LOCALAPPDATA', '')) / 'Microsoft/WinGet/Links/claude.exe'
+exe = shutil.which('claude.exe') or (str(fallback) if fallback.is_file() else None)
+if not exe: raise RuntimeError('Could not locate the native Claude executable')
 args = [exe, '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
         '--no-session-persistence', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
         '--tools', 'Bash', '--permission-mode', 'bypassPermissions']
@@ -9,6 +13,8 @@ lines = queue.Queue()
 threading.Thread(target=lambda: [lines.put(line) for line in p.stdout], daemon=True).start()
 threading.Thread(target=lambda: [None for _ in p.stderr], daemon=True).start()
 seen = False
+nonempty = False
+foreground_while_nonempty = False
 success = False
 deadline = time.monotonic() + 90
 try:
@@ -23,9 +29,14 @@ try:
         if msg.get('type') == 'system' and msg.get('subtype') == 'background_tasks_changed':
             tasks = msg.get('tasks')
             print('background snapshot:', json.dumps(tasks), flush=True)
-            if isinstance(tasks, list) and tasks: seen = True
-            if seen and tasks == []: print('PASS: nonempty then empty', flush=True); success = True; break
-        if msg.get('type') == 'result': print('foreground result:', msg.get('subtype'), flush=True)
+            if isinstance(tasks, list):
+                nonempty = bool(tasks)
+                if nonempty: seen = True
+            if seen and tasks == [] and foreground_while_nonempty:
+                print('PASS: foreground completed while background remained, then empty', flush=True); success = True; break
+        if msg.get('type') == 'result':
+            print('foreground result:', msg.get('subtype'), flush=True)
+            if msg.get('subtype') == 'success' and nonempty: foreground_while_nonempty = True
     if not success: raise RuntimeError('No complete nonempty-to-empty Claude lifecycle observed')
 finally:
     p.stdin.close()

@@ -28,13 +28,14 @@ public sealed class CodexAdapterTests
     }, [new CodexAdapter(codex ?? Options(fake)), .. more ?? []]);
 
     static CodexAdapterOptions Options(FakeAppServer fake, List<string>? log = null, Func<IEnumerable<string>, IReadOnlyDictionary<string, string>>? holders = null,
-        TimeSpan? unloadWait = null, TimeSpan? turnEndWait = null, bool autoTitle = false) => new()
+        TimeSpan? unloadWait = null, TimeSpan? turnEndWait = null, bool autoTitle = false, TimeSpan? backgroundPollInterval = null) => new()
     {
         Launch = fake.StartAsync,
         AutoTitle = autoTitle,
         ClientVersion = "test",
         TurnEndWait = turnEndWait ?? TimeSpan.FromMilliseconds(200),
         UnloadWait = unloadWait ?? new CodexAdapterOptions().UnloadWait,
+        BackgroundPollInterval = backgroundPollInterval ?? TimeSpan.FromSeconds(5),
         Log = log is null ? null : m => { lock (log) log.Add(m); },
         // No other Codex app holds a fake thread; the user's own Codex folder is never read.
         FindHolders = holders ?? (_ => new Dictionary<string, string>()),
@@ -104,12 +105,12 @@ public sealed class CodexAdapterTests
     {
         var fake = new FakeAppServer();
         var log = new List<string>();
-        await using var conductor = Conductor(fake, codex: Options(fake, log));
+        await using var conductor = Conductor(fake, codex: Options(fake, log, backgroundPollInterval: TimeSpan.FromMilliseconds(50)));
         await using var client = await ZedAsync(conductor);
         await NewAsync(client);
         await Until(() => Logged(log, "background terminal listing is not supported"), "unsupported listing recognized");
         await NewAsync(client);
-        await Task.Delay(TimeSpan.FromSeconds(6));
+        await Task.Delay(TimeSpan.FromMilliseconds(350));
         Assert.AreEqual(1, fake.All("thread/backgroundTerminals/list").Length);
     }
 
@@ -133,7 +134,7 @@ public sealed class CodexAdapterTests
                 };
             },
         };
-        await using var conductor = Conductor(fake);
+        await using var conductor = Conductor(fake, codex: Options(fake, backgroundPollInterval: TimeSpan.FromMilliseconds(50)));
         await using var client = await ZedAsync(conductor);
         var id = await NewAsync(client);
         async Task WaitFor(Func<bool> condition, string label)
@@ -147,6 +148,11 @@ public sealed class CodexAdapterTests
         Assert.AreEqual("idle", (string?)feed.Activity.Snapshot()["state"]);
         Assert.IsNull(feed.Activity.Snapshot()["background"]);
         Assert.AreEqual(1, feed.Users);
+        await PromptAsync(client, id, "persist for listing");
+        var listed = await client.Rpc.RequestAsync<ListSessionsRequest, ListSessionsResponse>(AcpMethods.Agent.SessionList, new ListSessionsRequest());
+        var session = listed.Sessions.Single(s => s.SessionId == id);
+        Assert.IsNull(session.Meta![GorynychProtocol.MetaSessionState]!["background"]);
+        Assert.AreEqual(2, session.Meta[GorynychProtocol.MetaSessionState]!["backgroundKnown"]!.AsArray().Count);
         Volatile.Write(ref phase, 1);
         await WaitFor(() => feed.Activity.Snapshot()["backgroundKnown"] is null, "failed refresh becomes unknown");
         Assert.AreEqual(1, feed.Users, "failed refresh retains the resource pin");
@@ -168,7 +174,7 @@ public sealed class CodexAdapterTests
                 ? new JsonArray(new JsonObject { ["itemId"] = "old", ["processId"] = "p", ["command"] = "sleep", ["cwd"] = Cwd })
                 : new JsonArray() },
         };
-        var (agent, acp) = await DirectAsync(fake);
+        var (agent, acp) = await DirectAsync(fake, options: Options(fake, backgroundPollInterval: TimeSpan.FromMilliseconds(50)));
         await using var _ = agent;
         await using var __ = acp;
         var observed = new System.Collections.Concurrent.ConcurrentQueue<JsonArray>();
