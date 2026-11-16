@@ -485,7 +485,6 @@ public sealed class AdapterHost
             replayMeta.Remove(GorynychProtocol.MetaBackgroundWork);
             replayMeta.Remove(GorynychProtocol.MetaBackgroundKnown);
             replayMeta.Remove(GorynychProtocol.MetaBackgroundProcessExited);
-            replayMeta.Remove(GorynychProtocol.MetaBackgroundEmpty);
             replayMeta.Remove(GorynychProtocol.MetaForegroundState);
             if (Text(replayMeta[GorynychProtocol.MetaAgentTurn]) == "started"
                 || (Text(replayMeta[GorynychProtocol.MetaAgentTurn]) == "ended"

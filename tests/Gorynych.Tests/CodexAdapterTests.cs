@@ -114,6 +114,49 @@ public sealed class CodexAdapterTests
     }
 
     [TestMethod]
+    [Timeout(60_000, CooperativeCancellation = true)]
+    public async Task BackgroundPolling_RefreshesAllPages_AndFailuresDoNotReleaseWork()
+    {
+        var phase = 0;
+        var fake = new FakeAppServer
+        {
+            BackgroundListing = request =>
+            {
+                var current = Volatile.Read(ref phase);
+                if (current == 1) throw new JsonRpcException(JsonRpcException.InternalError, "temporary failure");
+                if (current == 2) return new JsonObject { ["data"] = new JsonArray() };
+                var second = (string?)request["cursor"] == "next";
+                return new JsonObject
+                {
+                    ["data"] = new JsonArray(new JsonObject { ["itemId"] = second ? "two" : "one", ["processId"] = second ? "p2" : "p1", ["command"] = "sleep", ["cwd"] = Cwd }),
+                    ["nextCursor"] = second ? null : "next",
+                };
+            },
+        };
+        await using var conductor = Conductor(fake);
+        await using var client = await ZedAsync(conductor);
+        var id = await NewAsync(client);
+        async Task WaitFor(Func<bool> condition, string label)
+        {
+            var end = DateTime.UtcNow.AddSeconds(15);
+            while (!condition() && DateTime.UtcNow < end) await Task.Delay(25);
+            Assert.IsTrue(condition(), label);
+        }
+        var feed = conductor.Feed(id);
+        await WaitFor(() => feed.Activity.Snapshot()["backgroundKnown"] is JsonArray { Count: 2 }, "both native pages");
+        Assert.AreEqual("idle", (string?)feed.Activity.Snapshot()["state"]);
+        Assert.IsNull(feed.Activity.Snapshot()["background"]);
+        Assert.AreEqual(1, feed.Users);
+        Volatile.Write(ref phase, 1);
+        await WaitFor(() => feed.Activity.Snapshot()["backgroundKnown"] is null, "failed refresh becomes unknown");
+        Assert.AreEqual(1, feed.Users, "failed refresh retains the resource pin");
+        Volatile.Write(ref phase, 2);
+        await WaitFor(() => feed.Activity.Snapshot()["backgroundKnown"] is JsonArray { Count: 0 }, "terminal disappearance");
+        Assert.IsNull(feed.Activity.Snapshot()["background"], "empty partial coverage is not known-empty aggregate");
+        Assert.AreEqual(0, feed.Users);
+    }
+
+    [TestMethod]
     public async Task Initialize_SaysWhatTheServiceNeeds_AndIdentifiesGorynych()
     {
         var fake = new FakeAppServer();

@@ -82,6 +82,7 @@ sealed class FakeAppServer
     public string? SteerRefusal { get; set; }
 
     public ConcurrentDictionary<string, FakeThread> Threads { get; } = new();
+    public Func<JsonObject, JsonNode?>? BackgroundListing { get; set; }
 
     /// <summary>The MCP servers of the user's own Codex config, as <c>config/read</c> shows them.</summary>
     public HashSet<string> UserServers { get; set; } = ["other-tool"];
@@ -237,6 +238,8 @@ sealed class FakeAppServer
                 {
                     ["config"] = new JsonObject { ["mcp_servers"] = new JsonObject(UserServers.Select(n => KeyValuePair.Create(n, (JsonNode?)new JsonObject { ["command"] = n }))) },
                 });
+            case "thread/backgroundTerminals/list" when BackgroundListing is { } listing:
+                return Task.FromResult(listing(p));
             case "thread/start":
             {
                 var ephemeral = (bool?)p["ephemeral"] == true;

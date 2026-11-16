@@ -265,7 +265,7 @@ public sealed class SessionActivityTests
             new JsonObject { ["sessionId"] = id, ["update"] = new JsonObject { ["sessionUpdate"] = "session_info_update", ["_meta"] = meta } });
         await Send(new JsonObject { [GorynychProtocol.MetaBackgroundWork] = new JsonArray(Terminal("task")) });
         await Next(states, "idle");
-        await Send(new JsonObject { [GorynychProtocol.MetaBackgroundWork] = null, [GorynychProtocol.MetaBackgroundEmpty] = true });
+        await Send(new JsonObject { [GorynychProtocol.MetaBackgroundWork] = null });
         Assert.IsNull((await Next(states, "idle"))["background"]);
         Assert.AreEqual(1, conductor.Feed(id).Users, "a partial or failed observation cannot release the pin");
         await Send(new JsonObject { [GorynychProtocol.MetaBackgroundWork] = null, [GorynychProtocol.MetaBackgroundProcessExited] = true });

@@ -205,8 +205,6 @@ public static class GorynychProtocol
     public const string MetaBackgroundKnown = "gorynych/backgroundKnown";
     /// <summary>The native process ended; releases its resource pin without claiming a known-empty snapshot.</summary>
     public const string MetaBackgroundProcessExited = "gorynych/backgroundProcessExited";
-    // Retained for source compatibility with adapters until their background implementation is updated.
-    public const string MetaBackgroundEmpty = "gorynych/backgroundObservedEmpty";
 
     /// <summary>
     /// In <c>agentCapabilities._meta</c> of the <c>initialize</c> result: the service keeps an archive

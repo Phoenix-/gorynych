@@ -1552,7 +1552,6 @@ public sealed partial class Conductor : IAsyncDisposable
                 activityMeta.Remove(GorynychProtocol.MetaBackgroundWork);
                 activityMeta.Remove(GorynychProtocol.MetaBackgroundKnown);
                 activityMeta.Remove(GorynychProtocol.MetaBackgroundProcessExited);
-                activityMeta.Remove(GorynychProtocol.MetaBackgroundEmpty);
                 activityMeta.Remove(GorynychProtocol.MetaForegroundState);
                 if (update.All(pair => pair.Key is "sessionUpdate" or "_meta")
                     && activityMeta.All(pair => pair.Key is GorynychProtocol.MetaHostSeq or GorynychProtocol.MetaAgentTurn))
