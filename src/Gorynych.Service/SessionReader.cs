@@ -217,7 +217,7 @@ internal static partial class SessionReader
         if (i.RawInput is not { } raw || PeerTool(i.Title) is not { } tool) return null;
         var kept = new JsonObject();
         foreach (var (key, value) in raw)
-            kept[key] = value is JsonValue v && v.TryGetValue<string>(out var text) && (tool, key) is not (("reply", "text") or ("ask_agent", "question"))
+            kept[key] = value is JsonValue v && v.TryGetValue<string>(out var text) && (tool, key) is not (("reply", "text") or ("ask_agent", "question") or ("send_message", "text") or ("reply_message", "text"))
                 ? CutAtWord(text, PeerInputLimit)
                 : value?.DeepClone();
         return kept;
@@ -252,7 +252,7 @@ internal static partial class SessionReader
 
     /// <summary>The gorynych server's tool a title names whose input says what a session decided; null for any other.</summary>
     public static string? PeerTool(string? title) =>
-        ToolName(title) is ("ask_agent" or "reply" or "spawn_session" or "archive_session" or "restore_session", "gorynych") and var (tool, _) ? tool : null;
+        ToolName(title) is ("ask_agent" or "reply" or "send_message" or "reply_message" or "spawn_session" or "archive_session" or "restore_session", "gorynych") and var (tool, _) ? tool : null;
 
     [GeneratedRegex("^mcp__(.+?)__(.+)$")]
     private static partial Regex McpName();

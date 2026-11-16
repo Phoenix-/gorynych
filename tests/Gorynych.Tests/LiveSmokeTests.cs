@@ -229,7 +229,7 @@ public sealed class LiveSmokeTests
 
     [TestMethod]
     [Timeout(600_000, CooperativeCancellation = true)]
-    public async Task Opinions_BothWays_ClaudeAsksKimi_KimiAsksClaude()
+    public async Task Messages_BothWays_ClaudeAndKimi_SendAndReply()
     {
         RequireLive();
         if (LiveClaudeTransport() == ClaudeTransport.Tui && !OperatingSystem.IsWindows()) Assert.Inconclusive("ConPTY is Windows only");
@@ -267,51 +267,62 @@ public sealed class LiveSmokeTests
         })).SessionId;
         try
         {
-            // Claude asks Kimi: the request reaches Kimi as a marked turn, Kimi answers with reply.
+            // Claude sends to Kimi and ends its turn; the correlated reply wakes it later.
             var mark = client.Text().Length;
             var asked = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt, new PromptRequest
             {
                 SessionId = claude,
                 Prompt = [new TextContent { Text =
-                    $"Use the gorynych ask_agent tool to ask the agent session {kimi} this question: " +
-                    "\"Tabs or spaces for C#, and why? One sentence.\" Then reply with ANSWER: followed by the answer you got." }],
+                    $"Use gorynych send_message to send session_id {kimi} this text: " +
+                    "\"Please reply using reply_message with exactly ANSWER_FROM_KIMI.\" Then finish this turn. " +
+                    "When the reply arrives, report its text without sending another acknowledgement." }],
             });
             Assert.AreEqual(StopReason.EndTurn, asked.StopReason);
-            var claudeText = client.Text()[mark..];
+            async Task WaitForReply(string marker)
+            {
+                var until = DateTime.UtcNow.AddSeconds(120);
+                while (DateTime.UtcNow < until)
+                {
+                    if (client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "user_message_chunk" &&
+                        ((string?)u["content"]?["text"] ?? "") is var text && text.Contains("reply_to ", StringComparison.Ordinal) &&
+                        text.Contains(marker, StringComparison.Ordinal))) return;
+                    await Task.Delay(100);
+                }
+                Assert.Fail("A real reply_message must reach the original sender: " + marker);
+            }
+            await WaitForReply("ANSWER_FROM_KIMI");
+            var claudeText = client.Text("user_message_chunk");
             StringAssert.Contains(claudeText, "ANSWER");
-            Assert.IsFalse(client.Approvals.Any(a => a.ToolCall.Title?.Contains("ask_agent", StringComparison.Ordinal) == true),
-                "Claude's ask_agent asks nobody: " + string.Join(" | ", client.Approvals.Select(a => a.ToolCall.Title)));
+            Assert.IsFalse(client.Approvals.Any(a => a.ToolCall.Title?.Contains("send_message", StringComparison.Ordinal) == true),
+                "Claude's send_message asks nobody: " + string.Join(" | ", client.Approvals.Select(a => a.ToolCall.Title)));
             var request = client.Snapshot().FirstOrDefault(u => (string?)u["sessionUpdate"] == "user_message_chunk"
                 && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == "peer");
             Assert.IsNotNull(request, "the question reached Kimi as a marked turn");
-            Assert.AreEqual("peer_claude", (string?)request["_meta"]![GorynychProtocol.MetaSender]);
-            var opinion = (string?)request["_meta"]![GorynychProtocol.MetaOpinion];
-            var replied = client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call"
-                && (string?)u["_meta"]?[GorynychProtocol.MetaOpinion] == opinion && ((string?)u["title"] ?? "").Contains("reply", StringComparison.Ordinal));
-            Console.WriteLine($"Claude asked Kimi; Kimi answered {(replied ? "with the reply tool" : "in the turn's text")}: {claudeText.Trim()}");
+            Assert.AreEqual(claude, (string?)request["_meta"]![GorynychProtocol.MetaSender]);
+            Assert.IsNotNull(request["_meta"]![GorynychProtocol.MetaMailboxMessage]);
+            Console.WriteLine("Claude sent to Kimi; Kimi's reply_message woke Claude.");
 
-            // Kimi asks Claude: the question reaches Claude through its live-note path.
+            // Kimi sends to Claude through the same queued mailbox path.
             var before = client.Text().Length;
             var result = await client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt, new PromptRequest
             {
                 SessionId = kimi,
                 Prompt = [new TextContent { Text =
-                    $"Use the ask_agent tool (gorynych MCP server) to ask the agent session {claude} this question: " +
-                    "\"For a single-user desktop app, is SQLite or PostgreSQL the better local store? One sentence.\" " +
-                    "Then reply with ANSWER: followed by the answer you got." }],
+                    $"Use gorynych send_message to send session_id {claude} this text: " +
+                    "\"Please reply using reply_message with exactly ANSWER_FROM_CLAUDE.\" Then finish this turn. " +
+                    "When the reply arrives, report its text without sending another acknowledgement." }],
             });
             Assert.AreEqual(StopReason.EndTurn, result.StopReason);
-            var kimiText = client.Text()[before..];
+            await WaitForReply("ANSWER_FROM_CLAUDE");
+            var kimiText = client.Text("user_message_chunk");
             StringAssert.Contains(kimiText, "ANSWER");
-            Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call" && ((string?)u["title"] ?? "").Contains("ask_agent", StringComparison.OrdinalIgnoreCase)),
-                "Kimi called ask_agent");
-            Assert.IsFalse(client.Approvals.Any(a => a.ToolCall.Title?.Contains("ask_agent", StringComparison.Ordinal) == true),
-                "Kimi's approval of ask_agent is answered by the service: " + string.Join(" | ", client.Approvals.Select(a => a.ToolCall.Title)));
-            // Its live-note path: the channel in the TUI, its input (gorynych/origin "live") headless.
-            var origin = LiveClaudeTransport() == ClaudeTransport.Tui ? "channel" : "live";
+            Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "tool_call" && ((string?)u["title"] ?? "").Contains("send_message", StringComparison.OrdinalIgnoreCase)),
+                "a native agent called send_message");
+            Assert.IsFalse(client.Approvals.Any(a => a.ToolCall.Title?.Contains("send_message", StringComparison.Ordinal) == true),
+                "Kimi's messaging tool is pre-allowed: " + string.Join(" | ", client.Approvals.Select(a => a.ToolCall.Title)));
             Assert.IsTrue(client.Snapshot().Any(u => (string?)u["sessionUpdate"] == "user_message_chunk"
-                && (string?)u["_meta"]?[GorynychProtocol.MetaOrigin] == origin && ((string?)u["content"]?["text"] ?? "").Contains($"from session_id {kimi}")),
-                $"the question reached Claude through its live-note path ({origin}), naming Kimi's session");
+                && (string?)u["_meta"]?[GorynychProtocol.MetaMailboxMessage] is not null && ((string?)u["content"]?["text"] ?? "").Contains($"from session_id {kimi}")),
+                "the mailbox message reached Claude and names Kimi's session");
         }
         finally
         {
@@ -441,7 +452,7 @@ public sealed class LiveSmokeTests
             var tools = lines.First(l => (string?)l["type"] == "system" && (string?)l["subtype"] == "init")["tools"]!.AsArray().Select(t => (string?)t).ToArray();
             var answer = (string?)lines.Last(l => (string?)l["type"] == "result")["result"] ?? "";
             Console.WriteLine($"outside tools: {string.Join(", ", tools.Where(t => t!.Contains("gorynych", StringComparison.Ordinal)))}; answer: {answer}; stderr: {await stderr}");
-            CollectionAssert.IsSubsetOf(new[] { "mcp__gorynych-outside__list_sessions", "mcp__gorynych-outside__read_session", "mcp__gorynych-outside__ask_agent" }, tools);
+            CollectionAssert.IsSubsetOf(new[] { "mcp__gorynych-outside__list_sessions", "mcp__gorynych-outside__read_session", "mcp__gorynych-outside__send_message", "mcp__gorynych-outside__reply_message", "mcp__gorynych-outside__receive_messages" }, tools);
             StringAssert.Contains(answer, sessionId, "it listed the session inside");
             Assert.IsTrue(Log().Any(l => l.Contains("outside Gorynych (", StringComparison.Ordinal)));
         }

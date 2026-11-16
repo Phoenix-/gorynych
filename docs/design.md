@@ -365,11 +365,19 @@ Titles and archive live in the harness when it has them; otherwise in the servic
 
 Every session gets a `gorynych` MCP server through ACP's `mcpServers`:
 `Gorynych.Service peers --pipe <pipe> --token <token>`, with a random token per session that
-tells the service who is calling. Its tools: `list_agents`, `ask_agent`, `spawn_session`,
-`archive_session`, `restore_session` and `reply`. All **done**; the exact texts agents see are
+tells the service who is calling. Its tools: `list_agents`, `send_message`, `reply_message`,
+`spawn_session`, `archive_session` and `restore_session`. The asynchronous mailbox,
+automatic wake, external pull reception and recovery are specified in [messaging.md](messaging.md).
+All **done**; the exact texts agents see are
 in [service-protocol.md](service-protocol.md#what-agents-are-told).
 
-### Asking another session
+### Legacy synchronous opinions
+
+New send/reply calls return on durable acceptance. Managed delivery queues a normal prompt
+turn, and replies wake their original sender. There is no separate opinion or internal wait
+tool. An agent ends its turn when independent work is exhausted; that is not task completion.
+Outside agents explicitly receive messages with optional long-polling. The sequence below
+describes the retained legacy `ask_agent` compatibility path only.
 
 ```mermaid
 sequenceDiagram
@@ -394,7 +402,7 @@ sequenceDiagram
 
 - The asked session is woken if it is not loaded ([below](#waking-and-idle-unload)); a turn
   waits for the session's running turn, because ACP cannot inject into a turn.
-- A session that is answering a request cannot ask another meanwhile, so two agents cannot wait
+- A session answering a legacy request cannot make another legacy ask meanwhile, so two agents cannot wait
   on each other.
 - No gorynych tool needs the agent's own approval. The service asks the person itself before a
   spawn they did not ask for in their own turn, and before a session that is not in full access

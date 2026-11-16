@@ -162,6 +162,29 @@ public sealed partial class OpinionTurnTests
     }
 
     [TestMethod]
+    public async Task NewReplyTool_AnswersAnInFlightLegacyRequest_WithAnExplicitLegacyReceipt()
+    {
+        var asker = new TurnAgent { Name = "claude", SessionId = "asking" };
+        var kimi = new TurnAgent { Name = "kimi", SessionId = "kimi-1" };
+        await using var conductor = Conductor(asker.Adapter(), kimi.Adapter());
+        await using var client = await TestClient.ConnectAsync(conductor);
+        await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("kimi"));
+        await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew, New("claude"));
+        kimi.OnPrompt = async (_, _, text) =>
+        {
+            var receipt = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodReplyMessage, new JsonObject
+            {
+                ["messageId"] = MessageId(text), ["text"] = "legacy answer",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = kimi.Token,
+                    [GorynychProtocol.MetaMessageRequestId] = Guid.NewGuid().ToString("N") },
+            });
+            Assert.AreEqual("legacy_delivered", (string?)receipt!["status"]);
+            Assert.AreEqual(false, (bool?)receipt["durable"]);
+        };
+        Assert.AreEqual("legacy answer", (string?)(await Ask(client, asker.Token!, kimi.SessionId, "legacy question"))!["text"]);
+    }
+
+    [TestMethod]
     public async Task Request_WaitsForTheRunningTurn()
     {
         var asker = new TurnAgent { Name = "claude", SessionId = "asking" };
@@ -200,6 +223,7 @@ public sealed partial class OpinionTurnTests
         var tools = new[]
         {
             "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent", "mcp__gorynych__archive_session", "mcp__gorynych__restore_session",
+            "mcp__gorynych__send_message", "mcp__gorynych__reply_message",
         };
         kimi.OnPrompt = async (agent, p, _) =>
         {

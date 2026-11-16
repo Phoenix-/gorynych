@@ -138,7 +138,7 @@ public sealed class ConductorOptions
 /// replays it on <c>session/load</c> and relays the agents' requests (approvals) to a
 /// client attached to the session, holding them until one attaches.
 /// </summary>
-public sealed class Conductor : IAsyncDisposable
+public sealed partial class Conductor : IAsyncDisposable
 {
     readonly ConductorOptions options;
     readonly Dictionary<string, AgentHost> agents = new(StringComparer.Ordinal);
@@ -215,6 +215,7 @@ public sealed class Conductor : IAsyncDisposable
                 peerTokens[token] = r.SessionId;
                 sessionTokens[r.SessionId] = token;
             }
+        InitializeMailbox();
     }
 
     public string DefaultAgent { get; }
@@ -970,6 +971,7 @@ public sealed class Conductor : IAsyncDisposable
             restart = null;
         }
         foreach (var c in clients.Keys) c.Notify(GorynychProtocol.MethodRestartAborted, new JsonObject { ["restart"] = number });
+        foreach (var recipient in mailbox.PendingRecipients()) QueueMailbox(recipient);
     }
 
     /// <summary>A session a restart did not wait out: <c>{sessionId, agent, title}</c>.</summary>
@@ -4341,7 +4343,7 @@ public sealed class Conductor : IAsyncDisposable
         return $"[Report · from {Who(child)} · your child session · its turn {outcome}]\n" +
             $"{message}\n\n" +
             "This comes from a session you started with spawn_session, not from the user. " + PeersServer.ReportGuidance + " " +
-            $"To ask that session more, use ask_agent with session_id \"{child.SessionId}\".";
+            $"To continue with that session, use send_message with session_id \"{child.SessionId}\".";
     }
 
     /// <summary>
@@ -4355,11 +4357,11 @@ public sealed class Conductor : IAsyncDisposable
         $"[About this session · started by {Who(parent)} with spawn_session, {(approved ? "approved by the user" : "at the user's request")}]\n" +
         (report
             ? $"Answer in your final message: when your turn ends, Gorynych sends that message to session_id {parent.SessionId} as a " +
-              "report by itself. Do not use reply or ask_agent for it. The report carries only that last message, your text after " +
+              "report by itself. You do not need to send that report with a tool. The report carries only that last message, your text after " +
               $"your last tool call, and is cut at {ReportLimit} characters, so put anything longer into a file and name the file " +
               "in that message. "
-            : "Your turns are not reported to that session; it asks you with ask_agent when it wants to know something. ") +
-        $"To ask it something, use ask_agent with session_id \"{parent.SessionId}\". The user can also prompt you here directly.";
+            : "Your turns are not reported to that session; use send_message to keep it informed when needed. ") +
+        $"To contact it, use send_message with session_id \"{parent.SessionId}\". The user can also prompt you here directly.";
 
     // ---------------------------------------------------------------- archive
 
@@ -4430,8 +4432,8 @@ public sealed class Conductor : IAsyncDisposable
         return (archived, changed) switch
         {
             (true, true) => $"Archived {who}. It is now hidden from list_agents and from the user's session list; nothing in it is lost. " +
-                "ask_agent still reaches it, and restore_session brings it back.",
-            (true, false) => $"{who} was already archived, so nothing changed. ask_agent still reaches it, and restore_session brings it back.",
+                "send_message still reaches it, and restore_session brings it back.",
+            (true, false) => $"{who} was already archived, so nothing changed. send_message still reaches it, and restore_session brings it back.",
             (false, true) => $"Restored {who}. It is back in list_agents and in the user's session list.",
             (false, false) => $"{who} is not archived, so nothing changed. It is in list_agents and in the user's session list.",
         };
@@ -5669,6 +5671,7 @@ public sealed class Conductor : IAsyncDisposable
                 if (record.HostSeen != seen || !SameList(record.HostPrompts, left) || record.HostOf != hostOf || record.HostSlot != hostSlot)
                     store.Update(feed.SessionId, record.Agent, r => { r.HostSeen = seen; r.HostPrompts = left; r.HostOf = hostOf; r.HostSlot = hostSlot; });
             }
+        await StopMailboxAsync();
         store.Flush();
         shutdown.Dispose();
         cleanupStop.Dispose();

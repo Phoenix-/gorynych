@@ -97,6 +97,13 @@ public static class GorynychProtocol
     /// <summary>Asks a session's agent for an opinion: <c>{sessionId, text, sender?}</c> → <c>{text}</c>.</summary>
     public const string MethodOpinion = "_gorynych/opinion";
 
+    /// <summary>Durably enqueue an inter-session message without waiting for a reply.</summary>
+    public const string MethodSendMessage = "_gorynych/send_message";
+    public const string MethodReplyMessage = "_gorynych/reply_message";
+    public const string MetaMessageRequestId = "gorynych/messageRequestId";
+    public const string MetaMailboxMessage = "gorynych/mailboxMessage";
+    public const string MetaOutsideMailbox = "gorynych/outsideMailbox";
+
     /// <summary>An answer to an opinion request that was delivered as a turn: <c>{messageId, text}</c>.</summary>
     public const string MethodReply = "_gorynych/reply";
 
@@ -385,6 +392,7 @@ public static class GorynychProtocol
     public static readonly IReadOnlyList<string> PeerTools =
     [
         "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent",
+        "mcp__gorynych__send_message", "mcp__gorynych__reply_message",
         "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", SpawnTool,
     ];
 

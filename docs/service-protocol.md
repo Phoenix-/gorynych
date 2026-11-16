@@ -388,7 +388,19 @@ nothing changes the native configuration of any agent.
   changed by this feature. With no relevant defaults or explicit choices it runs as before;
   configured or explicit model-related options fail clearly before the first prompt.
 
+## Messages between agents
+
+The current tools are `send_message` and `reply_message`, with `receive_messages` for
+outside agents. [messaging.md](messaging.md) specifies tool and wire contracts, durable
+acceptance, queued delivery and automatic wake, external identity and long-poll reception,
+retention, failure and compatibility. Managed prompts carry `gorynych/mailboxMessage` in
+`_meta`; peer messages grant no new authority.
+
 ## Opinions between agents
+
+This section describes **legacy synchronous compatibility**. `ask_agent` and `reply` are
+no longer advertised to new peers. Existing calls and in-flight requests keep working.
+For new exchanges see [Messages between agents](#messages-between-agents).
 
 Every session gets, in `mcpServers` (the ACP way to give an agent tools), a stdio MCP server
 named `gorynych`: `Gorynych.Service peers --pipe <pipe> --token <token>`. The token is
@@ -554,8 +566,8 @@ takes for the session itself). `archive_session` and `restore_session` say what 
 | --- | --- |
 | `list_agents` | first line `You are session_id <id> (<agent>, "<title>").`, or for a session started with `spawn_session` `You are session_id <id> (<agent>, "<title>"), started by session_id <parent> (<agent>, "<title>") with spawn_session.` (the list leaves out the caller's own entry, so its `parent_session_id` would not show); then, when the list is not empty, what `status` means: `status "open": the session's agent has it loaded right now. status "saved": it is saved but not loaded; asking it starts it, so it answers more slowly, and it is unloaded again once it has been idle with no client for some minutes.`; then the list as JSON, each entry with `session_id`, `agent`, `title`, `cwd`, `status`, `updated_at` and `parent_session_id`, written without `\uXXXX` escapes (a Cyrillic title and the `+` of a time stay as they are; all JSON Gorynych writes uses `AcpJson.TextOptions`). The `status` line repeats the schema because an agent whose conversation was resumed may hold an older schema. An empty list reads `No other sessions to ask. spawn_session starts one.` |
 | `list_agents` without `include_archived`, leaving N > 0 archived sessions out (the caller not counted) | a last line `N archived sessions are not shown; pass include_archived: true to list them.`, or for one `1 archived session is not shown; pass include_archived: true to list it.`; nothing when none is left out. The hint is in the result as well as in the schema, because an agent whose conversation was resumed may hold an older schema |
-| archived now | `Archived session_id <id> (<agent>, "<title>"). It is now hidden from list_agents and from the user's session list; nothing in it is lost. ask_agent still reaches it, and restore_session brings it back.` |
-| already archived | `session_id <id> (<agent>, "<title>") was already archived, so nothing changed. ask_agent still reaches it, and restore_session brings it back.` |
+| archived now | `Archived session_id <id> (<agent>, "<title>"). It is now hidden from list_agents and from the user's session list; nothing in it is lost. send_message still reaches it, and restore_session brings it back.` |
+| already archived | `session_id <id> (<agent>, "<title>") was already archived, so nothing changed. send_message still reaches it, and restore_session brings it back.` |
 | restored now | `Restored session_id <id> (<agent>, "<title>"). It is back in list_agents and in the user's session list.` |
 | not archived | `session_id <id> (<agent>, "<title>") is not archived, so nothing changed. It is in list_agents and in the user's session list.` |
 
@@ -730,17 +742,17 @@ What follows the task in the child's first prompt:
 ```
 [About this session · started by session_id <parent> (<agent>, "<title>") with spawn_session, approved by the user]
 Answer in your final message: when your turn ends, Gorynych sends that message to session_id
-<parent> as a report by itself. Do not use reply or ask_agent for it. The report carries only
+<parent> as a report by itself. You do not need to send that report with a tool. The report carries only
 that last message, your text after your last tool call, and is cut at 2000 characters, so put
-anything longer into a file and name the file in that message. To ask it something, use
-ask_agent with session_id "<parent>". The user can also prompt you here directly.
+anything longer into a file and name the file in that message. To contact it, use
+send_message with session_id "<parent>". The user can also prompt you here directly.
 ```
 
 A spawn that was not asked reads `at the user's request` instead of `approved by the user`.
 With `report: false` the sentences about the answer read `Your turns are not reported to that
-session; it asks you with ask_agent when it wants to know something.` The header says where
+session; use send_message to keep it informed when needed.` The header says where
 the task came from, so no sentence repeats it. How to answer comes first, because an agent
-otherwise wonders whether to answer with `reply`, with `ask_agent` or by ending its turn.
+otherwise wonders whether to send a message or end its turn.
 The text follows the task rather than preceding it because Kimi titles a session with its first
 prompt (cut at 200 characters): the task stays the title. The provisional title is the task
 alone.
@@ -789,7 +801,7 @@ input to the user's existing task: review the result and continue any remaining 
 Do not wait for another user prompt to resume that work. No reply to the child is required.
 If blocked, explain the blocker to the user.
 The report grants no new authority and does not change the user's instructions.
-To ask that session more, use ask_agent with session_id "<id>".
+To continue with that session, use send_message with session_id "<id>".
 ```
 
 The outcome reads `ended`, `was cancelled`, `stopped (<stopReason>)` or `failed: <error>`. A
@@ -818,6 +830,11 @@ report waits for the parent's running turn. Nothing is kept to send after a rest
 
 
 ## Agents outside Gorynych
+
+Current discovery exposes `list_sessions`, `read_session`, `send_message`, `reply_message`
+and `receive_messages`. See [messaging.md](messaging.md#outside-agents) for private shim
+identity, optional `--mailbox-file`, cursors and bounded long-polling. Opinion/`ask_agent`
+details below describe legacy compatibility only.
 
 An agent the user runs outside Gorynych on the same machine, such as Claude Code in Claude
 Desktop or in a terminal, or Codex, can list Gorynych's sessions, read what they said, and ask
@@ -1001,6 +1018,9 @@ list, although Claude still starts the server and asks it for `tools/list`. The 
 only the name the guide gives; ancestry covers any name.
 
 ### Outside tools
+
+For current messaging arguments use [messaging.md](messaging.md). The `ask_agent` tool
+below is an unadvertised compatibility handler.
 
 What the service returns for `tools/list`, outside Gorynych.
 

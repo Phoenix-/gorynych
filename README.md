@@ -20,7 +20,7 @@ other for opinions and start child sessions.
   adapters: to a client it is one ACP agent with many sessions, to the agents an ACP client.
   Its own additions go only through ACP's extension points (`_meta`, `_`-prefixed methods).
 - **Sessions that talk to each other.** Every session gets a `gorynych` MCP server: it can list
-  the others, ask one for its opinion (`ask_agent`), and spawn a child session, which reports
+  the others, exchange messages (`send_message`, `reply_message`), and spawn a child session, which reports
   each finished turn to its parent.
 - **Zed as the GUI.** Any ACP client can use the service through a stdio bridge. Stage one uses
   [Zed](https://zed.dev): stock Zed works today; a [Zed fork](https://github.com/Phoenix-/zed) that picks up sessions
@@ -51,11 +51,13 @@ The design, its decisions and the probes behind them: [docs/design.md](docs/desi
 - **DeepSeek Harness** through `dsh --profile acp` (a developer preview, on your own DeepSeek
   API key): feed, model and effort, resume. Its shell is read-only in Gorynych, and every file
   write asks you, so DSH's Windows sandbox never changes a folder's ACL.
-- **Peers:** `list_agents`, `ask_agent` in both directions, `spawn_session` with reports to the
+- **Peers:** `list_agents`, asynchronous `send_message`/`reply_message` with automatic wake,
+  `spawn_session` with reports to the
   parent, archive and restore.
 - **Outside access:** the `gorynych-outside` MCP server lets agents outside Gorynych (Claude Code
   in a terminal or Claude Desktop, Codex, Kimi Code) list Gorynych's sessions, read them and ask
-  one for its opinion.
+  exchange messages using an explicit pull mailbox, including bounded blocking reception.
+  See [messaging](docs/messaging.md).
 - **Idle unload:** a session nobody uses is unloaded from its agent after 10 minutes
   (`--unload-after`) and woken again when a client, a question or a report needs it.
 - **Zed** through the bridge, `Gorynych.Service acp --agent claude|kimi|codex|dsh`.
