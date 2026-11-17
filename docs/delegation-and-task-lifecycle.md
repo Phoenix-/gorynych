@@ -7,6 +7,11 @@ This records the discussion following the background-work and host-lifecycle fix
 It is a reference for implementation and review, not a new advertised tool or wire
 contract. Conceptual record and event names below are not API names.
 
+**Implementation status:** iteration 1 (explicit direct-child delegation and stable
+correlation) is built. Its current contract is in [messaging.md](messaging.md).
+The lifecycle, dependency supervision and full-result guarantees below remain
+future work, introduced through the separate iterations listed below.
+
 Gorynych sessions are persistent conversations. The user can talk to a child
 directly, peers can exchange questions, and native background work can outlive a
 foreground turn. A coordinator with two reviewers and four coders therefore needs
@@ -396,18 +401,28 @@ host and restart boundaries; reducer tests alone do not prove native recovery.
 
 ## Implementation sequence and open decisions
 
-The following order is a proposal for follow-up work:
+The user approved six independently reviewable rollout iterations:
 
-1. Specify service-owned identities, authority checks, transitions and invariants.
-   Add explicit delegation and full correlated reports while preserving broad
-   automatic delivery and current wake semantics.
-2. Add explicit correlated reply waits and observable dependency diagnostics.
-3. Add guarded reminder/escalation scheduling with bounded budgets, including
-   restart, cancellation and uncertain native handoff tests.
-4. Add explicit assignment outcomes and background/user-action continuation paths
-   over the same reducer. Enable general completion reminders only once legitimate
-   waiting is representable.
-5. Measure real team workflows before considering coalescing or other noise policy.
+| Iteration | Deliverable | Acceptance boundary |
+| --- | --- | --- |
+| 1. Explicit delegation (**built**) | Managed `delegate_task`, immediate-parent validation, trusted envelope and durable correlation, including initial spawn | New/existing session instructions, rejected relationships, retained retry/restart, queued access checks and failed spawn persistence; existing messaging and reports preserved |
+| 2. Reliable complete reports | Immutable full result identity/retrieval, cause/outcome correlation and durable delivery or visible failure | Long results, revised reviews, restart during publication/delivery, unavailable or archived parent; broad automatic report eligibility preserved |
+| 3. Observable reply waits | Explicit response dependency on message M, persistence, resolution and diagnostics | Mutual waits remain visible and receive new input; restart restores edges; ordinary notifications acquire no reply obligation; no new automatic reminders yet |
+| 4. Targeted reply reminders | Fresh activity checks, bounded recipient reminders and owner escalation | Reply/deadline races, cancellation, maintenance and uncertain handoff; enable first on an opted-in test group; disabling reminders preserves messaging and wait records |
+| 5. Assignment outcomes and other waits | Explicit completed/blocked/cancelled outcomes and background/child/user-action continuations | Partial final text does not complete work; unrelated native work grants no blanket exemption; initially observe without the general completion watchdog |
+| 6. General completion supervision | Detect an open admitted assignment left without execution, valid waiting or an exposed obstacle | Seven-agent team scenario, native background work, mutual waiting, user intervention and restart; only now enable completion reminders |
+
+Each iteration must be usable and reviewable without deploying the next one. The
+first two are standalone improvements. Preserve running hosts and native threads
+across service updates; cached creation instructions require fresh tool and
+per-message guidance rather than rewriting native configuration. Early steps can
+ship on the service/MCP side; a dependency-graph GUI is a later presentation choice.
+
+Specify exact tool/wire contracts and capability compatibility for each iteration
+before implementing it. Use deterministic tests and scoped runtime checks, then
+review the change independently. Enable scheduling only after its passive state
+and cancellation/recovery behavior have been observed. Measure real team workflows
+before considering coalescing or other noise policy.
 
 Open decisions include exact tools/wire and capability negotiation; completion and
 reply-expectation registration; assignment cardinality; review intervals and reminder
