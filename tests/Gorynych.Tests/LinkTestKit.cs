@@ -16,7 +16,6 @@ namespace Gorynych.Tests;
 /// </summary>
 sealed class TurnAgent(string name) : IAgentAdapter
 {
-    readonly ConcurrentDictionary<string, CancellationTokenSource> cancels = new(StringComparer.Ordinal);
     readonly TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
     int sessions;
 
@@ -98,10 +97,11 @@ sealed class TurnAgent(string name) : IAgentAdapter
 
     public Task<AgentInstance> StartAsync(CancellationToken ct)
     {
+        var cancels = new ConcurrentDictionary<string, CancellationTokenSource>(StringComparer.Ordinal);
         var link = new DuplexLink();
         var (ai, ao) = link.AgentEnd;
         var agent = new ScriptedAgent(new JsonRpcConnection(ai, ao, name + "-agent"));
-        agent.Rpc.RequestHandler = (req, token) => HandleAsync(agent, req);
+        agent.Rpc.RequestHandler = (req, token) => HandleAsync(agent, cancels, req);
         agent.Rpc.NotificationHandler = (method, p) =>
         {
             if (method == AcpMethods.Agent.SessionCancel) Interlocked.Increment(ref Cancels);
@@ -115,7 +115,7 @@ sealed class TurnAgent(string name) : IAgentAdapter
         return Task.FromResult(new AgentInstance(ci, co, agent.Rpc.Completion, () => agent.Rpc.DisposeAsync()));
     }
 
-    async Task<JsonNode?> HandleAsync(ScriptedAgent agent, JsonRpcRequest req)
+    async Task<JsonNode?> HandleAsync(ScriptedAgent agent, ConcurrentDictionary<string, CancellationTokenSource> cancels, JsonRpcRequest req)
     {
         switch (req.Method)
         {
