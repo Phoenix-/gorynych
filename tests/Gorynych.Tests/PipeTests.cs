@@ -22,6 +22,46 @@ public sealed class PipeTests
     static string Name() => "gorynych-test-" + Guid.NewGuid().ToString("N");
 
     [TestMethod]
+    [Timeout(30_000, CooperativeCancellation = true)]
+    public async Task AClientGoneBeforeAccept_DoesNotStopTheListener()
+    {
+        var name = Name();
+        var created = 0;
+        var served = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var stop = new CancellationTokenSource();
+        var listening = PipeListener.RunAsync(name, "client", (server, _) =>
+        {
+            server.Dispose();
+            served.TrySetResult();
+            return Task.CompletedTask;
+        }, stop.Token, pipe =>
+        {
+            var server = PipeListener.Create(pipe);
+            if (++created == 1)
+            {
+                // Windows permits the client to connect and close before the server starts accepting.
+                using var abandoned = new NamedPipeClientStream(".", pipe, PipeDirection.InOut, PipeOptions.Asynchronous);
+                abandoned.Connect((int)Wait.TotalMilliseconds);
+            }
+            return server;
+        });
+        try
+        {
+            if (listening.IsFaulted) await listening;
+            await using var client = await ServicePipe.ConnectAsync(name, Wait);
+            Assert.IsNotNull(client, "the listener accepts a new client after the abandoned connection");
+            await served.Task.WaitAsync(Wait);
+            Assert.IsFalse(listening.IsCompleted, "one abandoned client cannot end the accept loop");
+            Assert.IsGreaterThanOrEqualTo(2, created);
+        }
+        finally
+        {
+            stop.Cancel();
+            await listening;
+        }
+    }
+
+    [TestMethod]
     public async Task ThePipe_IsOwnedByTheTokensDefaultOwner_AndOpenToThatOwnerOnly_WithNoDenyForTheNetworkGroup()
     {
         var name = Name();

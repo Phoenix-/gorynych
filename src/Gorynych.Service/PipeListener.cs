@@ -18,12 +18,13 @@ public static partial class PipeListener
     public static Task RunHostsAsync(Conductor conductor, string pipeName, CancellationToken ct) =>
         RunAsync(pipeName, "host", (server, name) => conductor.ServeHostAsync(server, server, name), ct);
 
-    static async Task RunAsync(string pipeName, string label, Func<NamedPipeServerStream, string, Task> serve, CancellationToken ct)
+    internal static async Task RunAsync(string pipeName, string label, Func<NamedPipeServerStream, string, Task> serve, CancellationToken ct,
+        Func<string, NamedPipeServerStream>? create = null)
     {
         var count = 0;
         while (!ct.IsCancellationRequested)
         {
-            var server = Create(pipeName);
+            var server = create is null ? Create(pipeName) : create(pipeName);
             try
             {
                 await server.WaitForConnectionAsync(ct);
@@ -32,6 +33,13 @@ public static partial class PipeListener
             {
                 await server.DisposeAsync();
                 break;
+            }
+            catch (IOException e)
+            {
+                // A client can connect and leave between Create and WaitForConnectionAsync.
+                await server.DisposeAsync();
+                ServiceLog.Warn($"{label}: a client left before its pipe was accepted: {e.Message}");
+                continue;
             }
             var name = $"{label}{++count}";
             _ = Task.Run(() => serve(server, name), CancellationToken.None);
