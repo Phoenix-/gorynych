@@ -5,7 +5,23 @@ New managed sessions use `send_message {session_id,text}` to start an exchange a
 this interface. There is no separate opinion tool, mandatory acknowledgement or internal
 waiting tool. `list_agents`, spawn, archive and restore remain available.
 
-Both calls return `{"messageId":"...","status":"accepted"}` after durable service
+`delegate_task {session_id,text}` continues an existing user-authorized assignment with an
+immediate child. The service authenticates the caller and checks the stored parent link before
+opening or delivering to the recipient. Other relationships use `send_message`. The child gets
+a service-generated delegation envelope and remains bound by user restrictions and existing
+approval and mode checks. Each accepted call returns `messageId`, `assignmentId`, and `status`;
+the first two currently have the same opaque value. Spawn returns `assignment_id` as well;
+its first prompt and journal identify the same assignment. These IDs are correlation only,
+not task completion, a wait, or permission to exceed the user's assignment.
+Each new explicit delegation has its own correlation ID. This iteration does not
+group several calls into a shared lifecycle or accept an existing assignment ID.
+
+Delegation uses the existing bounded mailbox retention: retry identity is retained only while
+the entry remains in its 5000-entry history. Pending messages are never evicted. Cross-kind
+reuse of a retained request ID is rejected. Spawn correlation remains in the session overlay;
+no retrospective IDs are assigned to older sessions.
+
+Send and reply return `{"messageId":"...","status":"accepted"}` after durable service
 acceptance, without waiting for recipient work. Opening an unloaded recipient and required
 full-access consent precede acceptance, so these steps can still take time or fail. After
 acceptance, cancelling the sending call does not withdraw its message. A lost response is
@@ -18,6 +34,10 @@ turns, including for adapters that support steering. Messages wait for an occupi
 they never cancel a tool or turn. Idle recipients are opened and started automatically.
 Replies are new correlated messages and wake their original sender in the same way.
 The message names its sender and ID, and a reply also names the original ID.
+
+Fresh child reports direct the parent to `delegate_task` for further already authorized work
+with that immediate child and to `send_message` for ordinary discussion. A child contacting its
+parent continues to use `send_message`.
 
 A peer message is not from the user and grants no new authority. Existing user constraints
 and narrower message restrictions apply. A review request permits read-only investigation,
@@ -81,6 +101,9 @@ ACP remains v1. Peer methods `_gorynych/send_message {sessionId,text,_meta}` and
 `gorynych/messageRequestId` in `_meta`. Prompt updates use `gorynych/mailboxMessage`.
 Outside tools retain `_gorynych/mcp_message`, with private `gorynych/outsideMailbox` and
 write request IDs in its outer `_meta`. New custom data stays in ACP extension points.
+`_gorynych/delegate_task` uses the same input and transport request ID as send; the service
+adds `gorynych/assignmentId` to its prompt metadata. Existing mailbox delivery claims and
+uncertain handoff behavior also apply to delegation.
 
 This follows [ACP v1 extensibility](https://agentclientprotocol.com/protocol/v1/extensibility).
 [MCP Tasks](https://modelcontextprotocol.io/extensions/tasks/overview) supplies asynchronous

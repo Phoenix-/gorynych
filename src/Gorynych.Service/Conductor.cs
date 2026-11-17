@@ -3721,10 +3721,11 @@ public sealed partial class Conductor : IAsyncDisposable
             throw new JsonRpcException(JsonRpcException.InvalidRequest, "The calling session was deleted, so the session was not started.");
         string childId;
         JsonObject childConfig;
+        var assignmentId = Guid.NewGuid().ToString("N");
         try
         {
             (childId, childConfig) = await CreateChildAsync(parent, host, cwd, prompt, title, report, mode, configChoices,
-                mode is null ? null : ConfirmAsync, () => asks, ct);
+                mode is null ? null : ConfirmAsync, () => asks, assignmentId, ct);
         }
         catch (Exception e)
         {
@@ -3733,7 +3734,7 @@ public sealed partial class Conductor : IAsyncDisposable
         }
         await EndCardAsync(ToolCallStatus.Completed, $"Started {host.DisplayName} session {childId}.");
         ServiceLog.Info($"{parent.Agent} {parent.SessionId}: spawned {host.Name} session {childId} in {cwd}" + (asks ? "" : ", as the user asked"));
-        var result = new JsonObject { ["sessionId"] = childId };
+        var result = new JsonObject { ["sessionId"] = childId, ["assignmentId"] = assignmentId };
         // What the child actually runs with, as its agent confirmed it: the parent need not guess.
         if (childConfig.Count > 0) result["config"] = childConfig;
         if (askedAnyway is not null) result["note"] = AskedAnywayNote(askedAnyway).TrimStart();
@@ -3966,7 +3967,7 @@ public sealed partial class Conductor : IAsyncDisposable
     /// </summary>
     async Task<(string Id, JsonObject Config)> CreateChildAsync(SessionRecord parent, AgentHost host, string cwd, string prompt, string? title,
         bool report, string? mode, IReadOnlyList<SessionConfigChoice> configChoices,
-        Func<JsonObject?, Task>? confirm, Func<bool> approved,
+        Func<JsonObject?, Task>? confirm, Func<bool> approved, string assignmentId,
         CancellationToken ct)
     {
         using var operation = RegisterAgentOperation(host.Name);
@@ -4054,7 +4055,7 @@ public sealed partial class Conductor : IAsyncDisposable
             }
             await feed.PublishAsync(info, except: null, () => { });
             // Listed from here: announced as added, with its parent and name in the one change.
-            record = store.Update(id, host.Name, rec => rec.Draft = false) ?? throw NotFound(id);
+            record = store.CommitSpawnAssignment(id, assignmentId);
             if (title is not null && host.CanSetTitle) await SetNativeTitleAsync(host, rpc, id, title);
         }
         catch
@@ -4134,12 +4135,13 @@ public sealed partial class Conductor : IAsyncDisposable
             // The task, then what the child needs to know about where it came from: two blocks, so
             // the task stays the first one; the journal keeps both as the one message the agent got.
             var task = new TextContent { Text = prompt };
-            var context = new TextContent { Text = SpawnContext(store.Get(parent.SessionId) ?? parent, use.Record.ReportToParent, approved) };
+            var context = new TextContent { Text = SpawnContext(store.Get(parent.SessionId) ?? parent, use.Record.ReportToParent, approved) + $"\nAssignment ID: {record.SpawnAssignmentId}. This is an already user-authorized assignment; retain all user restrictions and existing approval requirements." };
             var meta = new JsonObject
             {
                 [GorynychProtocol.MetaOrigin] = "spawn",
                 [GorynychProtocol.MetaSender] = $"parent_{parent.Agent}",
                 [GorynychProtocol.MetaParentSessionId] = parent.SessionId,
+                [GorynychProtocol.MetaAssignmentId] = record.SpawnAssignmentId,
             };
             var shown = new TextContent { Text = $"{task.Text}\n\n{context.Text}" };
             var messageId = SessionFeed.NewMessageId();
@@ -4161,7 +4163,7 @@ public sealed partial class Conductor : IAsyncDisposable
                     WithMessageId(AcpJson.ToNode(new PromptRequest
                     {
                         SessionId = record.SessionId, Prompt = [task, context],
-                        Meta = new JsonObject { [GorynychProtocol.MetaPromptId] = id },
+                        Meta = new JsonObject { [GorynychProtocol.MetaPromptId] = id, [GorynychProtocol.MetaAssignmentId] = record.SpawnAssignmentId },
                     }), messageId),
                     CancellationToken.None);
                 handed = true;
@@ -4480,7 +4482,8 @@ public sealed partial class Conductor : IAsyncDisposable
         return $"[Report · from {Who(child)} · your child session · its turn {outcome}]\n" +
             $"{message}\n\n" +
             "This comes from a session you started with spawn_session, not from the user. " + PeersServer.ReportGuidance + " " +
-            $"To continue with that session, use send_message with session_id \"{child.SessionId}\".";
+            $"To continue already user-authorized work with this immediate child, use delegate_task with session_id \"{child.SessionId}\". " +
+            "For ordinary discussion, use send_message.";
     }
 
     /// <summary>

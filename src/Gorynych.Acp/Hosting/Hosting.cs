@@ -97,6 +97,12 @@ public static class GorynychProtocol
     /// <summary>Asks a session's agent for an opinion: <c>{sessionId, text, sender?}</c> → <c>{text}</c>.</summary>
     public const string MethodOpinion = "_gorynych/opinion";
 
+    /// <summary>Durably delegate already authorized work to an immediate child.</summary>
+    public const string MethodDelegateTask = "_gorynych/delegate_task";
+    /// <summary>Advertises support for <see cref="MethodDelegateTask"/>.</summary>
+    public const string CapDelegateTask = "gorynych/delegateTask";
+    /// <summary>Correlation ID for a delegated or spawned assignment.</summary>
+    public const string MetaAssignmentId = "gorynych/assignmentId";
     /// <summary>Durably enqueue an inter-session message without waiting for a reply.</summary>
     public const string MethodSendMessage = "_gorynych/send_message";
     public const string MethodReplyMessage = "_gorynych/reply_message";

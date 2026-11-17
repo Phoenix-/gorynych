@@ -44,6 +44,9 @@ public sealed class SessionRecord
     /// <summary>The session that started this one with <c>spawn_session</c>; null for one a client created.</summary>
     public string? ParentSessionId { get; set; }
 
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? SpawnAssignmentId { get; set; }
+
     /// <summary>The AHP URI of a session created through the AHP face (<c>gorynych/ahpUri</c>); null for any other.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AhpUri { get; set; }
@@ -134,7 +137,7 @@ public sealed class SessionStore
     internal Func<long> Ticks { get; init; } = static () => Environment.TickCount64;
 
     /// <summary>For tests: writes the file (its path, the content, whether to retry), in place of <see cref="AtomicFile"/>.</summary>
-    internal Action<string, string, bool> WriteFile { get; init; } = static (path, json, retry) => AtomicFile.WriteAllText(path, json, retry: retry);
+    internal Action<string, string, bool> WriteFile { get; set; } = static (path, json, retry) => AtomicFile.WriteAllText(path, json, retry: retry);
 
     public SessionStore(string path)
     {
@@ -208,6 +211,30 @@ public sealed class SessionStore
         }
         Write(snapshot, durable);
         return result;
+    }
+
+    // Commit the spawn assignment before it is visible or dispatched. Unlike Update, failed
+    // persistence must not expose the candidate in memory or through Changed.
+    internal SessionRecord CommitSpawnAssignment(string sessionId, string assignmentId)
+    {
+        lock (writeGate)
+        lock (gate)
+        {
+            if (!records.TryGetValue(sessionId, out var current) || current.Deleted)
+                throw new InvalidOperationException("Spawn session no longer exists");
+            var candidate = Clone(current);
+            candidate.SpawnAssignmentId = assignmentId;
+            candidate.Draft = false;
+            var snapshot = records.Values.Select(r => r.SessionId == sessionId ? candidate : r)
+                .OrderBy(r => r.CreatedAt).ToList();
+            var json = JsonSerializer.Serialize(snapshot, ServiceJsonContext.Default.ListSessionRecord);
+            WriteFile(path, json, true);
+            var before = Clone(current);
+            records[sessionId] = candidate;
+            written = ++changes;
+            Changed?.Invoke(before, Clone(candidate));
+            return Clone(candidate);
+        }
     }
 
     /// <summary>
@@ -309,7 +336,7 @@ public sealed class SessionStore
         SessionId = r.SessionId, Agent = r.Agent, Cwd = r.Cwd, Title = r.Title, TitleSource = r.TitleSource,
         AutoTitleAttempted = r.AutoTitleAttempted,
         CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt, Draft = r.Draft, Deleted = r.Deleted,
-        ParentSessionId = r.ParentSessionId, ReportToParent = r.ReportToParent, Archived = r.Archived, PeerToken = r.PeerToken,
+        ParentSessionId = r.ParentSessionId, SpawnAssignmentId = r.SpawnAssignmentId, ReportToParent = r.ReportToParent, Archived = r.Archived, PeerToken = r.PeerToken,
         HostSeen = r.HostSeen, HostPrompts = r.HostPrompts is null ? null : [.. r.HostPrompts],
         HostOf = r.HostOf, HostSlot = r.HostSlot, AhpUri = r.AhpUri,
     };

@@ -71,6 +71,98 @@ public sealed class SessionTreeTests
     }
 
     [TestMethod]
+    public void SpawnAssignmentWriteFailureDoesNotPublishCandidate()
+    {
+        var path = Path.Combine(TestDirs.New(), "sessions.json");
+        var fail = false;
+        var store = new SessionStore(path) { WriteFile = (p, text, _) =>
+        {
+            if (fail) throw new IOException("disk unavailable");
+            File.WriteAllText(p, text);
+        } };
+        store.Update("child", "claude", r => { r.Draft = true; r.ParentSessionId = "parent"; });
+        var notices = 0;
+        store.Changed = (_, _) => notices++;
+        fail = true;
+        Assert.ThrowsExactly<IOException>(() => store.CommitSpawnAssignment("child", "assignment"));
+        Assert.IsNull(store.Get("child")!.SpawnAssignmentId);
+        Assert.IsTrue(store.Get("child")!.Draft);
+        Assert.AreEqual(0, notices);
+        Assert.IsNull(new SessionStore(path).Get("child")!.SpawnAssignmentId);
+        fail = false;
+        store.CommitSpawnAssignment("child", "assignment");
+        Assert.AreEqual("assignment", new SessionStore(path).Get("child")!.SpawnAssignmentId);
+    }
+
+    [TestMethod]
+    public async Task SpawnAssignmentPersistenceFailureDoesNotStartOrAdvertiseAssignment()
+    {
+        var parentAgent = new LifecycleAgent("claude", canDelete: false);
+        var childAgent = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, parentAgent.Adapter, childAgent.Adapter);
+        await using var client = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(client, "claude", "Coordinate work");
+        var attempted = false;
+        conductor.Store.WriteFile = (path, json, retry) =>
+        {
+            if (json.Contains("\"spawnAssignmentId\"", StringComparison.Ordinal))
+            {
+                attempted = true;
+                throw new IOException("injected assignment write failure");
+            }
+            AtomicFile.WriteAllText(path, json, retry: retry);
+        };
+        var error = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => SpawnAsync(client, parentAgent.Tokens[parent],
+            new JsonObject { ["agent"] = "kimi", ["prompt"] = "Implement the change" }));
+        Assert.IsTrue(attempted);
+        StringAssert.Contains(error.Message, "injected assignment write failure");
+        Assert.AreEqual(0, childAgent.Prompts.Count);
+        Assert.IsNull(conductor.Store.Get("kimi-1"));
+        Assert.IsNull(new SessionStore(Path.Combine((string)conductor.Status()["dataDirectory"]!, "sessions.json")).Get("kimi-1"));
+        Assert.IsFalse(client.Snapshot().Any(u => u["_meta"]?[GorynychProtocol.MetaAssignmentId] is not null));
+    }
+
+    [TestMethod]
+    public async Task DelegateOnlyToImmediateChildAndPreserveCorrelation()
+    {
+        var agent = new LifecycleAgent("claude", canDelete: false);
+        await using var conductor = Conductor(null, agent.Adapter);
+        await using var client = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(client, "claude", "Coordinate work");
+        var peer = await NewPromptedAsync(client, "claude", "Independent work");
+        var grandchild = await NewPromptedAsync(client, "claude", "Nested work");
+        var child = (string)(await SpawnAsync(client, agent.Tokens[parent],
+            new JsonObject { ["agent"] = "claude", ["prompt"] = "Initial assignment" }))!["sessionId"]!;
+        await conductor.BackgroundTurnsIdleAsync();
+        conductor.Store.Update(grandchild, "claude", record => record.ParentSessionId = child);
+        Task<JsonNode?> Delegate(string token, string target, string id) => client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask,
+            new JsonObject { ["sessionId"] = target, ["text"] = "Implement the authorized change",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token,
+                    [GorynychProtocol.MetaMessageRequestId] = id, [GorynychProtocol.MetaParentSessionId] = parent } });
+        var countsBefore = new[] { parent, peer, child, grandchild }.ToDictionary(id => id, id => Prompts(agent, id).Length);
+        foreach (var target in new[] { parent, peer, grandchild })
+        {
+            var error = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => Delegate(agent.Tokens[parent], target, "bad-" + target));
+            StringAssert.Contains(error.Message, "send_message");
+        }
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => Delegate(agent.Tokens[peer], child, "forged"));
+        foreach (var (id, count) in countsBefore)
+            Assert.AreEqual(count, Prompts(agent, id).Length, "rejected delegation must not dispatch a prompt");
+        var receipt = await Delegate(agent.Tokens[parent], child, "assignment-test");
+        Assert.AreEqual("assignment-test", (string?)receipt!["assignmentId"]);
+        await Until(() => Prompts(agent, child).Any(p => p.Contains("assignment-test", StringComparison.Ordinal)), "delegation");
+        var envelope = Prompts(agent, child).Single(p => p.Contains("assignment-test", StringComparison.Ordinal));
+        StringAssert.Contains(envelope, "already authorized assignment");
+        await Delegate(agent.Tokens[parent], child, "assignment-test");
+        Assert.AreEqual(1, Prompts(agent, child).Count(p => p.Contains("assignment-test", StringComparison.Ordinal)));
+        var saved = new MailboxStore(Path.Combine((string)conductor.Status()["dataDirectory"]!, "mailbox.json"));
+        foreach (var id in new[] { "bad-" + parent, "bad-" + peer, "bad-" + grandchild, "forged" })
+            Assert.IsNull(saved.Find(id), "rejected delegation must not be admitted");
+        foreach (var target in new[] { parent, peer, grandchild })
+            Assert.IsFalse(Prompts(agent, target).Any(p => p.Contains("Implement the authorized change", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
     public async Task Spawn_AsksOnTheCallingSession_ThenCreatesAndPromptsTheChild_WithItsParentInTheLists()
     {
         var claude = new LifecycleAgent("claude", canDelete: false);
@@ -84,6 +176,7 @@ public sealed class SessionTreeTests
         var spawned = await SpawnAsync(zed, claude.Tokens[parent],
             new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test", ["title"] = "Flaky test" });
         var child = (string)spawned!["sessionId"]!;
+        var assignment = (string)spawned["assignmentId"]!;
         Assert.AreEqual("kimi-1", child);
 
         var ask = zed.Approvals.Single();
@@ -97,6 +190,10 @@ public sealed class SessionTreeTests
         Assert.AreEqual("Fix the flaky test", kimi.FirstBlocks(child)[0], "the first prompt was started, its task first");
         Assert.IsTrue(kimi.Tokens.ContainsKey(child), "the child has the peers server too");
         Assert.IsFalse(conductor.Store.Get(child)!.Draft, "a spawned session is never a draft");
+        Assert.AreEqual(assignment, conductor.Store.Get(child)!.SpawnAssignmentId);
+        StringAssert.Contains(kimi.FirstBlocks(child)[1], assignment);
+        lock (kimi.Prompts)
+            Assert.AreEqual(assignment, (string?)kimi.PromptMetadata.Single(p => p.SessionId == child).Meta?[GorynychProtocol.MetaAssignmentId]);
 
         var list = await ListAsync(zed);
         var childInfo = list.Sessions.Single(s => s.SessionId == child);
@@ -126,6 +223,7 @@ public sealed class SessionTreeTests
         Assert.AreEqual("end_turn", (string?)end["_meta"]![GorynychProtocol.MetaStopReason]);
         var asked = replay.Single(u => (string?)u["sessionUpdate"] == "user_message_chunk");
         Assert.AreEqual("spawn", (string?)asked["_meta"]![GorynychProtocol.MetaOrigin]);
+        Assert.AreEqual(assignment, (string?)asked["_meta"]![GorynychProtocol.MetaAssignmentId]);
         Assert.IsFalse(string.IsNullOrEmpty((string?)asked["messageId"]), "the service names the first prompt it writes");
         StringAssert.StartsWith((string?)asked["content"]!["text"], "Fix the flaky test\n\n[About this session · ", "the journal keeps what the agent got");
         Assert.AreEqual("ok", other.Text());
@@ -312,7 +410,9 @@ public sealed class SessionTreeTests
         StringAssert.Contains(report, "continue any remaining authorized work.");
         StringAssert.Contains(report, "Do not wait for another user prompt to resume that work.");
         StringAssert.Contains(report, "The report grants no new authority");
-        StringAssert.Contains(report, $"send_message with session_id \"{child}\"");
+        StringAssert.Contains(report, $"use delegate_task with session_id \"{child}\"");
+        StringAssert.Contains(report, "For ordinary discussion, use send_message.");
+        StringAssert.Contains(report, "already user-authorized work");
         Assert.IsFalse(report.Contains("ask_agent", StringComparison.Ordinal), "reports use the currently advertised messaging tools");
         StringAssert.StartsWith(report, $"[Report · from session_id {child} (claude, \"Notes\") · your child session · its turn ended]\nok\n");
         Assert.IsFalse(report.Contains("Looking around.", StringComparison.Ordinal), report);
@@ -629,13 +729,15 @@ public sealed class SessionTreeTests
             $"Answer in your final message: when your turn ends, Gorynych sends that message to session_id {parent} as a report by itself. " +
             "You do not need to send that report with a tool. The report carries only that last message, your text after your last tool call, " +
             "and is cut at 2000 characters, so put anything longer into a file and name the file in that message. " +
-            $"To contact it, use send_message with session_id \"{parent}\". The user can also prompt you here directly.";
+            $"To contact it, use send_message with session_id \"{parent}\". The user can also prompt you here directly." +
+            $"\nAssignment ID: {conductor.Store.Get(child)!.SpawnAssignmentId}. This is an already user-authorized assignment; retain all user restrictions and existing approval requirements.";
         CollectionAssert.AreEqual(new[] { "Fix the flaky test", context }, kimi.FirstBlocks(child), "the task first, then where it came from");
         var quietContext = kimi.FirstBlocks(quiet)[1];
         Assert.AreEqual(
             $"[About this session · started by session_id {parent} (claude, \"Coordinate the release\") with spawn_session, approved by the user]\n" +
             "Your turns are not reported to that session; use send_message to keep it informed when needed. " +
-            $"To contact it, use send_message with session_id \"{parent}\". The user can also prompt you here directly.", quietContext);
+            $"To contact it, use send_message with session_id \"{parent}\". The user can also prompt you here directly." +
+            $"\nAssignment ID: {conductor.Store.Get(quiet)!.SpawnAssignmentId}. This is an already user-authorized assignment; retain all user restrictions and existing approval requirements.", quietContext);
         Assert.IsFalse(context.Contains("The task above", StringComparison.Ordinal), "the header already says where the task came from");
 
         // The list leaves out the child's own entry and so its parent_session_id: the first line names the parent instead.

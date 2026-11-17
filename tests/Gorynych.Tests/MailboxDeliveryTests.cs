@@ -59,6 +59,56 @@ public sealed class MailboxDeliveryTests
         });
 
     [TestMethod]
+    public async Task DelegationWaitsForBusyTurnWithoutCancellingIt()
+    {
+        var parent = new Peer("alpha"); var child = new Peer("beta");
+        await using var service = Create(TestDirs.New(), parent, child);
+        await using var client = await TestClient.ConnectAsync(service);
+        await New(client, parent, child);
+        service.Store.Update(child.Id, "beta", r => r.ParentSessionId = parent.Id);
+        var busy = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        string? promptAssignment = null;
+        child.Prompt = async (_, prompt, text) =>
+        {
+            if (text == "busy") { busy.TrySetResult(); await release.Task; }
+            else if (text.Contains("assignment_id task-1", StringComparison.Ordinal))
+            {
+                promptAssignment = (string?)prompt.Meta?[GorynychProtocol.MetaAssignmentId];
+                delivered.TrySetResult();
+            }
+        };
+        var running = client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = child.Id, Prompt = [new TextContent { Text = "busy" }] });
+        try
+        {
+            await busy.Task.WaitAsync(Wait);
+            var receipt = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject
+            {
+                ["sessionId"] = child.Id, ["text"] = "Implement the change",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = parent.Token,
+                    [GorynychProtocol.MetaMessageRequestId] = "task-1" },
+            });
+            Assert.AreEqual("task-1", (string?)receipt!["assignmentId"]);
+            Assert.IsFalse(running.IsCompleted);
+            Assert.AreEqual(1, child.Prompts.Count);
+            release.TrySetResult();
+            Assert.AreEqual(StopReason.EndTurn, (await running.WaitAsync(Wait)).StopReason);
+            await delivered.Task.WaitAsync(Wait);
+            Assert.AreEqual("task-1", promptAssignment, "adapter receives assignment metadata");
+            await using var replayClient = await TestClient.ConnectAsync(service);
+            await replayClient.Rpc.SendRequestAsync(AcpMethods.Agent.SessionLoad, new JsonObject
+                { ["sessionId"] = child.Id, ["cwd"] = Path.GetTempPath(), ["mcpServers"] = new JsonArray() });
+            var journal = replayClient.Snapshot().Single(u =>
+                (string?)u["_meta"]?[GorynychProtocol.MetaMailboxMessage] == "task-1" &&
+                (string?)u["sessionUpdate"] == "user_message_chunk");
+            Assert.AreEqual("task-1", (string?)journal["_meta"]?[GorynychProtocol.MetaAssignmentId]);
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [TestMethod]
     public async Task BusyRecipient_DoesNotBlockSend_AndReplyWakesOriginalSender()
     {
         var a = new Peer("alpha"); var b = new Peer("beta");
@@ -132,14 +182,18 @@ public sealed class MailboxDeliveryTests
         }
         var stored = new MailboxStore(Path.Combine(directory, "mailbox.json"));
         stored.Accept("pending", a.Id, b.Id, "recover me");
+        stored.Accept("pending-delegation", a.Id, b.Id, "recover assignment", delegation: true);
         stored.Accept("uncertain", a.Id, b.Id, "do not duplicate me");
         stored.MarkStarted("uncertain", b.Id);
         var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delegated = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var failure = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        b.Prompt = (_, _, text) => { if (text.Contains("recover me", StringComparison.Ordinal)) delivered.TrySetResult(); return Task.CompletedTask; };
+        b.Prompt = (_, _, text) => { if (text.Contains("recover me", StringComparison.Ordinal)) delivered.TrySetResult();
+            if (text.Contains("assignment_id pending-delegation", StringComparison.Ordinal)) delegated.TrySetResult(); return Task.CompletedTask; };
         a.Prompt = (_, _, text) => { if (text.Contains("processing is uncertain", StringComparison.Ordinal)) failure.TrySetResult(); return Task.CompletedTask; };
         await using var next = Create(directory, a, b);
         await delivered.Task.WaitAsync(Wait);
+        await delegated.Task.WaitAsync(Wait);
         await failure.Task.WaitAsync(Wait);
         Assert.IsFalse(b.Prompts.Any(p => p.Contains("do not duplicate me", StringComparison.Ordinal)));
     }
@@ -254,5 +308,47 @@ public sealed class MailboxDeliveryTests
         await Message(a.Tokens[aid], bid, "allowed-send", false);
         await LinkHarness.Until(() => { lock (b.Prompts) return b.Prompts.Count >= 2; }, "approved message delivered");
         Assert.AreEqual(2, client.Approvals.Count, "consent is preserved across the delivery queue");
+    }
+
+    [TestMethod]
+    public async Task QueuedDelegationRechecksModeBeforeDelivery()
+    {
+        var parent = new LifecycleAgent("dsh", canDelete: false) { ReportsModes = true };
+        var child = new LifecycleAgent("kimi", canDelete: true) { ReportsModes = true };
+        await using var service = new Conductor(new ConductorOptions { DataDirectory = TestDirs.New(), ServiceId = "delegation-mode",
+            PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"] }, [parent.Adapter, child.Adapter]);
+        await using var client = await TestClient.ConnectAsync(service);
+        async Task<string> Make(string agent) => (await client.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+            new NewSessionRequest { Cwd = Path.GetTempPath(), Meta = new JsonObject { [GorynychProtocol.MetaAgent] = agent } })).SessionId;
+        Task Mode(string id, string mode) => client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionSetConfigOption,
+            new JsonObject { ["sessionId"] = id, ["configId"] = "mode", ["value"] = mode });
+        var parentId = await Make("dsh"); var childId = await Make("kimi");
+        service.Store.Update(childId, "kimi", r => { r.ParentSessionId = parentId; r.ReportToParent = false; });
+        await Mode(parentId, "ask"); await Mode(childId, "ask");
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        child.DuringPrompt = async (_, _) => { entered.TrySetResult(); await release.Task; };
+        var busy = client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = childId, Prompt = [new TextContent { Text = "busy" }] });
+        try
+        {
+            await entered.Task.WaitAsync(Wait);
+            var result = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject
+            {
+                ["sessionId"] = childId, ["text"] = "authorized work",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = parent.Tokens[parentId],
+                    [GorynychProtocol.MetaMessageRequestId] = "mode-delegation" },
+            });
+            Assert.AreEqual("accepted", (string?)result!["status"]);
+            Assert.AreEqual(0, client.Approvals.Count);
+            await Mode(childId, "full");
+            client.Approve = _ => Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = "decline" });
+            release.TrySetResult();
+            await busy.WaitAsync(Wait);
+            await LinkHarness.Until(() => client.Approvals.Count == 1, "delivery-time approval");
+            await LinkHarness.Until(() => { lock (parent.Prompts) return parent.Prompts.Any(p => p.Text.Contains("mode-delegation", StringComparison.Ordinal)); }, "delivery failure notice");
+            lock (child.Prompts) Assert.IsFalse(child.Prompts.Any(p => p.Text.Contains("mode-delegation", StringComparison.Ordinal)));
+        }
+        finally { release.TrySetResult(); }
     }
 }

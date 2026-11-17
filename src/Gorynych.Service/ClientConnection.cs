@@ -144,6 +144,8 @@ internal sealed class ClientConnection
                 return conductor.Start(request);
             case GorynychProtocol.MethodOpinion:
                 return await conductor.OpinionAsync(request, ct, linkGone: () => Rpc.IsClosed);
+            case GorynychProtocol.MethodDelegateTask:
+                return await conductor.DelegateTaskAsync(request, ct);
             case GorynychProtocol.MethodSendMessage:
                 return await conductor.SendMessageAsync(request, reply: false, ct);
             case GorynychProtocol.MethodReplyMessage:
@@ -216,6 +218,7 @@ internal sealed class ClientConnection
         var flags = DeprecatedFlags();
         flags[GorynychProtocol.CapSessionAttributes] = true;
         flags[GorynychProtocol.CapGroups] = true;
+        flags[GorynychProtocol.CapDelegateTask] = true;
         flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
         flags[GorynychProtocol.MetaSessionState] = 1;
         return flags;

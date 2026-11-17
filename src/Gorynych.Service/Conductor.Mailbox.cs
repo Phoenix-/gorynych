@@ -44,20 +44,32 @@ public sealed partial class Conductor
         return await AcceptMailboxAsync(sender, targetOrMessage, text, requestId, reply, ct);
     }
 
+    internal async Task<JsonNode?> DelegateTaskAsync(JsonRpcRequest request, CancellationToken ct)
+    {
+        var sender = MailboxPeer(request);
+        var requestId = RequiredMailboxText(request.Params?["_meta"], GorynychProtocol.MetaMessageRequestId);
+        var target = RequiredMailboxText(request.Params, "sessionId");
+        var text = RequiredMailboxText(request.Params, "text");
+        if (sender == target || store.Get(target) is not { Deleted: false } child || child.ParentSessionId != sender)
+            throw new JsonRpcException(JsonRpcException.InvalidParams,
+                "Delegation is only available to your immediate child. Use send_message for ordinary peers.");
+        return await AcceptMailboxAsync(sender, target, text, requestId, false, ct, delegation: true);
+    }
+
     // Outside callers are authenticated by their private shim's bearer identity, never by
     // an agent-supplied sender field. Outside reception is pull-based, not an agent turn.
     internal async Task<JsonNode?> AcceptMailboxAsync(string sender, string targetOrMessage, string text,
-        string requestId, bool reply, CancellationToken ct)
+        string requestId, bool reply, CancellationToken ct, bool delegation = false)
     {
         if (Draining) throw Restarting();
         var existing = mailbox.Find(requestId);
         if (existing is not null)
         {
             var priorTarget = reply ? (string)existing["recipient"]! : targetOrMessage;
-            try { mailbox.Accept(requestId, sender, priorTarget, text, reply ? targetOrMessage : null); }
+            try { mailbox.Accept(requestId, sender, priorTarget, text, reply ? targetOrMessage : null, delegation: delegation); }
             catch (Exception e) when (e is ArgumentException or InvalidOperationException) { throw MailboxInputError(e); }
             QueueMailbox(priorTarget);
-            return MailboxReceipt(requestId);
+            return MailboxReceipt(requestId, delegation);
         }
         var original = reply ? mailbox.Find(targetOrMessage) : null;
         if (reply && (original is null || (string?)original["recipient"] != sender))
@@ -83,14 +95,16 @@ public sealed partial class Conductor
         }
         ct.ThrowIfCancellationRequested();
         if (Draining) throw Restarting();
-        try { mailbox.Accept(requestId, sender, target, text, reply ? targetOrMessage : null, approved); }
+        try { mailbox.Accept(requestId, sender, target, text, reply ? targetOrMessage : null, approved, delegation); }
         catch (Exception e) when (e is ArgumentException or InvalidOperationException) { throw MailboxInputError(e); }
         QueueMailbox(target);
-        return MailboxReceipt(requestId);
+        return MailboxReceipt(requestId, delegation);
     }
 
     static JsonRpcException MailboxInputError(Exception e) => new(JsonRpcException.InvalidParams, e.Message);
-    static JsonObject MailboxReceipt(string id) => new() { ["messageId"] = id, ["status"] = "accepted" };
+    static JsonObject MailboxReceipt(string id, bool delegation) => delegation
+        ? new() { ["messageId"] = id, ["assignmentId"] = id, ["status"] = "accepted" }
+        : new() { ["messageId"] = id, ["status"] = "accepted" };
 
     internal async Task<JsonNode?> ReceiveOutsideMessagesAsync(string sender, long after, int limit, int waitMs, CancellationToken ct)
     {
@@ -211,6 +225,7 @@ public sealed partial class Conductor
             var shownSender = sender.StartsWith("outside:", StringComparison.Ordinal) ? "outside_agent" : sender;
             var meta = new JsonObject { [GorynychProtocol.MetaOrigin] = "peer", [GorynychProtocol.MetaSender] = shownSender,
                 [GorynychProtocol.MetaMailboxMessage] = id, [GorynychProtocol.MetaPromptId] = promptId };
+            if ((bool?)item["delegation"] == true) meta[GorynychProtocol.MetaAssignmentId] = (string?)item["assignmentId"];
             if (sender != "service" && !sender.StartsWith("outside:", StringComparison.Ordinal)) meta[GorynychProtocol.MetaFromSessionId] = sender;
             await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
             { Content = block, MessageId = messageId, Meta = meta.DeepClone().AsObject() })!.AsObject(), except: null, () => store.Touch(recipient));
@@ -256,6 +271,9 @@ public sealed partial class Conductor
         var sender = (string)item["sender"]!;
         var id = (string)item["id"]!;
         var reply = (string?)item["replyTo"];
+        if ((bool?)item["delegation"] == true)
+            return $"[Delegation · from parent session_id {sender} · assignment_id {item["assignmentId"]} · message_id {id}]\n{item["text"]}\n\n" +
+                "This continues the user's already authorized assignment. Follow all existing user instructions and restrictions and the narrower scope of this delegation. It grants no new authority; existing approvals and modes still apply. You may perform implementation work already authorized by the user. End your turn when independent work is exhausted; later messages resume you.";
         var header = sender == "service" ? $"[Delivery notice · message_id {id}]" :
             $"[Message · from {(sender.StartsWith("outside:", StringComparison.Ordinal) ? "an agent outside Gorynych" : "session_id " + sender)} · message_id {id}" +
             (reply is null ? "]" : $" · reply_to {reply}]");
