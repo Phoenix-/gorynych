@@ -591,10 +591,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         foreach (var link in Links.Where(l => l.Rpc.IsClosed)) OnClosed(link);
     }
 
-    public bool IsLive(string sessionId)
-    {
-        lock (linksGate) return route.ContainsKey(sessionId);
-    }
+    public bool IsLive(string sessionId) => RouteOf(sessionId) is not null;
 
     /// <summary>The sessions open in an instance now.</summary>
     internal string[] SessionsOf(HostLink link)
@@ -605,7 +602,8 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// <summary>The instance the session is open in, if any.</summary>
     internal HostLink? RouteOf(string sessionId)
     {
-        lock (linksGate) return route.GetValueOrDefault(sessionId);
+        // Closing the RPC can wake a prompt before its completion callback removes this route.
+        lock (linksGate) return route.TryGetValue(sessionId, out var link) && !link.Rpc.IsClosed ? link : null;
     }
 
     /// <summary>The session is open in a host of an earlier generation: it moves once it is idle.</summary>
