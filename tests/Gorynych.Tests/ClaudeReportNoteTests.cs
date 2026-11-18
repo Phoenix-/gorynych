@@ -683,10 +683,12 @@ public sealed partial class ClaudeHeadlessTests
     public async Task HostTrackedResolvedReceiptRemainsBoundedUntilFutureAck()
     {
         var dir = TestDirs.New(); var adapter = new ClaudeAdapter(Options(dir, liveNotes: true, fetchCatalog: false, reportNoteLimit: 1));
-        var hosts = new InProcessHosts(_ => adapter); await using var service = hosts.Conductor(dir, adapter); hosts.Service = service;
+        var store = new ReportStore(Path.Combine(dir, "host-protocol-reports"));
+        var hosts = new InProcessHosts(_ => adapter) { HostReportStore = store };
+        await using var service = hosts.Conductor(dir, adapter); hosts.Service = service;
         await using var client = await TestClient.ConnectAsync(service);
         var parent = await NewAsync(client, dir); await PromptAsync(client, parent, "warmup");
-        var route = service.Agents["claude"].RouteOf(parent)!; var store = service.ReportStorage;
+        var route = service.Agents["claude"].RouteOf(parent)!;
         (string Id, ReportDeliveryClaim Claim, JsonObject Request) Prepare(string key, string text)
         {
             var id = store.Reserve(new ReportIdentity(key, "child", parent, ReportCause.User, "child-prompt")).ReportId;
@@ -715,17 +717,18 @@ public sealed partial class ClaudeHeadlessTests
             Assert.AreEqual("receipt_capacity", (string?)duplicate["noInputProof"]);
             Assert.AreEqual(before, File.ReadAllLines(inputFile).Length, "capacity refusal wrote no second input");
             File.WriteAllText(Path.Combine(dir, "release-report-result"), "");
-            await LinkHarness.Until(() => store.GetReport(first.Id).Status == "completed" &&
-                !store.NoteNeedsAck(first.Id, parent, route.HostId!, route.Generation!.Key, first.Claim.AttemptId),
-                "first tracked result and ACK").WaitAsync(TimeSpan.FromSeconds(15));
+            await LinkHarness.Until(() => (string?)store.ReadNoteReceipt(first.Id, parent, route.HostId!, route.Generation!.Key,
+                first.Claim.AttemptId)?["cycleResult"] == "ended", "first tracked result").WaitAsync(TimeSpan.FromSeconds(15));
             var facts = store.ReadNoteReceipt(first.Id, parent, route.HostId!, route.Generation!.Key, first.Claim.AttemptId)!;
-            Assert.AreEqual("ended", (string?)facts["cycleResult"]);
             var revision = (long)facts["revision"]!;
+            Assert.IsTrue(store.TrySettleNoteReceipt(first.Id, parent, route.HostId!, route.Generation!.Key, first.Claim.AttemptId, revision));
+            Assert.IsTrue(store.NoteNeedsAck(first.Id, parent, route.HostId!, route.Generation!.Key, first.Claim.AttemptId));
             var ack = new JsonObject { ["sessionId"] = parent, ["_meta"] = new JsonObject {
                 [GorynychProtocol.MetaReportNote] = new JsonObject { ["reportId"] = first.Id, ["attemptId"] = first.Claim.AttemptId,
                     ["nativeMessageId"] = uuid, ["revision"] = revision } } };
             var acked = Receipt(await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostReportNoteAck, ack.DeepClone()));
             Assert.AreEqual(true, (bool?)acked["acknowledged"]);
+            Assert.IsFalse(store.NoteNeedsAck(first.Id, parent, route.HostId!, route.Generation!.Key, first.Claim.AttemptId));
             var repeated = Receipt(await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostReportNoteAck, ack.DeepClone()));
             Assert.AreEqual(true, (bool?)repeated["acknowledged"]);
             var third = Prepare("pin-third", "new report after ack");
@@ -742,10 +745,12 @@ public sealed partial class ClaudeHeadlessTests
     public async Task HostReturnsDurableNoInputProofWhenNativeHasNotStarted()
     {
         var dir = TestDirs.New(); var adapter = new ClaudeAdapter(Options(dir, liveNotes: true, fetchCatalog: false));
-        var hosts = new InProcessHosts(_ => adapter); await using var service = hosts.Conductor(dir, adapter); hosts.Service = service;
+        var store = new ReportStore(Path.Combine(dir, "host-protocol-reports"));
+        var hosts = new InProcessHosts(_ => adapter) { HostReportStore = store };
+        await using var service = hosts.Conductor(dir, adapter); hosts.Service = service;
         await using var client = await TestClient.ConnectAsync(service);
         var parent = await NewAsync(client, dir);
-        var route = service.Agents["claude"].RouteOf(parent)!; var store = service.ReportStorage;
+        var route = service.Agents["claude"].RouteOf(parent)!;
         var id = store.Reserve(new ReportIdentity("host-cold", "child", parent, ReportCause.User, "child-prompt")).ReportId;
         using (var capture = store.OpenCapture(id)) { capture.Append("result"); capture.Seal("ended"); store.Commit(id, capture); }
         store.AcknowledgeProducer(id);

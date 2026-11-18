@@ -158,15 +158,9 @@ public sealed class ConductorReportRecoveryTests
         const string child = "probe-child", parent = "probe-parent", prompt = "probe-prompt";
         service.Store.Update(parent, "turns", r => { r.Archived = true; r.Cwd = Path.GetTempPath(); });
         service.Store.Update(child, "turns", r => { r.ParentSessionId = parent; r.ReportToParent = true; r.Cwd = Path.GetTempPath(); });
-        var output = new DirectoryInfo(AppContext.BaseDirectory);
-        var root = output.Parent!.Parent!.Parent!.Parent!.FullName;
-        var executable = "Gorynych.ReportHostProbe" + (OperatingSystem.IsWindows() ? ".exe" : "");
-        var exe = Path.Combine(root, "Gorynych.ReportHostProbe", "bin", output.Parent.Name, output.Name, executable);
         var hostId = "probe-" + Guid.NewGuid().ToString("N");
-        var start = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true,
-            WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
-        foreach (var arg in new[] { Path.Combine(directory, "reports"), hostId, child, prompt, mode is "unsealed" or "corrupt" ? "unsealed" : mode }) start.ArgumentList.Add(arg);
-        using var process = System.Diagnostics.Process.Start(start) ?? throw new InvalidOperationException("Could not start test host");
+        using var process = ReportHostProbe.Start(Path.Combine(directory, "reports"), hostId, child, prompt,
+            mode is "unsealed" or "corrupt" ? "unsealed" : mode);
         var stderr = process.StandardError.ReadToEndAsync();
         try
         {
@@ -504,14 +498,9 @@ public sealed class ConductorReportRecoveryTests
         var id = first.ReportStorage.Reserve(new ReportIdentity("note-process-" + settled, child, parent, ReportCause.User, "source")).ReportId;
         using (var capture = first.ReportStorage.OpenCapture(id)) { capture.Append("immutable host result"); capture.Seal("ended"); first.ReportStorage.Commit(id, capture); }
         first.ReportStorage.AcknowledgeProducer(id);
-        var output = new DirectoryInfo(AppContext.BaseDirectory); var root = output.Parent!.Parent!.Parent!.Parent!.FullName;
-        var exe = Path.Combine(root, "Gorynych.ReportHostProbe", "bin", output.Parent.Name, output.Name,
-            "Gorynych.ReportHostProbe" + (OperatingSystem.IsWindows() ? ".exe" : ""));
         var host = "note-probe-" + Guid.NewGuid().ToString("N");
-        var start = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true,
-            WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
-        foreach (var arg in new[] { Path.Combine(directory, "reports"), host, parent, "unused", settled ? "note-settled" : "note-unsettled" }) start.ArgumentList.Add(arg);
-        using var process = System.Diagnostics.Process.Start(start) ?? throw new InvalidOperationException("Could not start owned host");
+        using var process = ReportHostProbe.Start(Path.Combine(directory, "reports"), host, parent, "unused",
+            settled ? "note-settled" : "note-unsettled");
         var stderr = process.StandardError.ReadToEndAsync(); var firstDisposed = false;
         try
         {

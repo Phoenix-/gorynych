@@ -5,6 +5,12 @@ using Gorynych.Acp.JsonRpc;
 using Gorynych.Service;
 using Gorynych.Service.Hosts;
 
+if (args is ["wait-for-exit"])
+{
+    await Console.In.ReadLineAsync();
+    return;
+}
+
 var data = args[0]; var hostId = args[1]; var session = args[2]; var promptId = args[3]; var mode = args[4];
 if (mode is "note-settled" or "note-unsettled")
 {

@@ -484,9 +484,7 @@ public sealed class ConductorReportDeliveryTests
     [Timeout(120_000, CooperativeCancellation = true)]
     public async Task SettledReceiptCanReleasePinOnlyAfterExactHostProcessExit()
     {
-        var psi = new System.Diagnostics.ProcessStartInfo("powershell.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true };
-        foreach (var arg in new[] { "-NoProfile", "-NonInteractive", "-Command", "$null = [Console]::In.ReadLine()" }) psi.ArgumentList.Add(arg);
-        using var process = System.Diagnostics.Process.Start(psi) ?? throw new AssertFailedException("Could not start owned process fixture");
+        using var process = ReportHostProbe.Start("wait-for-exit");
         var pid = process.Id; var start = process.StartTime.ToUniversalTime().ToString("O", System.Globalization.CultureInfo.InvariantCulture);
         var agent = new TurnAgent("turns"); var hosts = new InProcessHosts(_ => agent);
         await using var service = hosts.Conductor(TestDirs.New(), agent); hosts.Service = service;

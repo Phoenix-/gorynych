@@ -1,9 +1,28 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using Gorynych.Acp.Hosting;
 using Gorynych.Service;
 using Gorynych.Service.Hosts;
 
 namespace Gorynych.Tests;
+
+static class ReportHostProbe
+{
+    public static Process Start(params string[] args)
+    {
+        var output = new DirectoryInfo(AppContext.BaseDirectory);
+        var root = output.Parent!.Parent!.Parent!.Parent!.FullName;
+        var exe = Path.Combine(root, "Gorynych.ReportHostProbe", "bin", output.Parent.Name, output.Name, TestDirs.Exe("Gorynych.ReportHostProbe"));
+        Assert.IsTrue(File.Exists(exe), $"Build the report host probe for {output.Parent.Name}: {exe}");
+        var start = new ProcessStartInfo(exe)
+        {
+            UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden,
+            RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+        };
+        foreach (var arg in args) start.ArgumentList.Add(arg);
+        return Process.Start(start) ?? throw new InvalidOperationException("Could not start the report host probe");
+    }
+}
 
 /// <summary>
 /// Adapter hosts in the test's process: each runs a fake adapter and dials whichever conductor
@@ -27,6 +46,8 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
     public TimeSpan CancelGrace { get; set; } = TimeSpan.FromSeconds(10);
     public long BufferBytes { get; set; } = 32 << 20;
     public bool CaptureReports { get; set; } = true;
+    // Host protocol tests can drive the receipt store without the conductor scheduling delivery.
+    public ReportStore? HostReportStore { get; set; }
     public Action<ReportCapture>? CaptureOpened { get; set; }
     public Action? BeforeProducerEvidence { get; set; }
     public List<string> Said { get; } = [];
@@ -74,7 +95,7 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
             Adapter = adapter, Token = Token, RetryDelays = [TimeSpan.FromMilliseconds(50)], Slot = slot,
             Generation = new HostGeneration(Build, Options(adapter)),
             OrphanIdle = OrphanIdle, OrphanBusy = OrphanBusy, CancelGrace = CancelGrace, BufferBytes = BufferBytes,
-            ReportStore = CaptureReports ? Service?.ReportStorage : null, CaptureOpened = CaptureOpened,
+            ReportStore = CaptureReports ? HostReportStore ?? Service?.ReportStorage : null, CaptureOpened = CaptureOpened,
             BeforeProducerEvidence = BeforeProducerEvidence,
             Log = m => { lock (Said) Said.Add(m); },
         });
