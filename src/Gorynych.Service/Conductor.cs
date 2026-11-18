@@ -220,7 +220,9 @@ public sealed partial class Conductor : IAsyncDisposable
                 peerTokens[token] = r.SessionId;
                 sessionTokens[r.SessionId] = token;
             }
+        reports = new ReportStore(Path.Combine(options.DataDirectory, "reports"));
         InitializeMailbox();
+        Track(Task.Run(() => { QueueReportDeliveries(); return ReconcileReportInventoryAsync(); }));
     }
 
     public string DefaultAgent { get; }
@@ -304,6 +306,8 @@ public sealed partial class Conductor : IAsyncDisposable
     /// </summary>
     internal async Task AdoptAsync(AgentHost host, HostLink link, JsonObject report, CancellationToken ct)
     {
+        if ((string?)report["_meta"]?[GorynychProtocol.CapHostReportNote]?["failure"] is { } receiptFailure)
+            Volatile.Write(ref reportRecoveryFailure, receiptFailure);
         // The questions it is answering for an earlier service: their askers come back for the answers.
         foreach (var ask in (report["asks"] as JsonArray ?? []).OfType<JsonObject>())
             if ((string?)ask["askId"] is { } askId && (string?)ask["sessionId"] is { } asked && !removed.ContainsKey(asked) && !IsOwn(askId))
@@ -322,9 +326,23 @@ public sealed partial class Conductor : IAsyncDisposable
                 ServiceLog.Warn($"{host.Name} {sessionId}: the session's turn stayed taken for {AdoptWait.TotalSeconds:0} s; its turn in the host is not taken back");
                 continue;
             }
+            var kind = (string?)turn["_meta"]?[GorynychProtocol.MetaHostTurnKind] ?? "unknown";
+            var reportId = (string?)turn["_meta"]?[GorynychProtocol.MetaReportId];
+            if (kind == "unknown" && promptId is not null)
+            {
+                try
+                {
+                    var candidates = reports.FindByPrompt(sessionId, promptId).Where(r => r.Identity.HostId == link.HostId && !r.EndJournaled).ToArray();
+                    if (candidates.Length == 1) { kind = "work"; reportId = candidates[0].ReportId; }
+                }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or System.Text.Json.JsonException)
+                {
+                    Volatile.Write(ref reportRecoveryFailure, "Cannot read adopted report identity: " + e.Message);
+                }
+            }
             var key = feed.BeginPrompt(promptId);
             feed.Handed(key);
-            if (!feed.Adopt(new SessionFeed.AdoptedTurn(key, promptId, host.Name, hostTurn, link.HostId)))
+            if (!feed.Adopt(new SessionFeed.AdoptedTurn(key, promptId, host.Name, hostTurn, link.HostId, kind, reportId)))
             {
                 feed.EndPrompt(key);
                 feed.TurnGate.Release();
@@ -402,12 +420,28 @@ public sealed partial class Conductor : IAsyncDisposable
     async Task SettlePromptsAsync(AgentHost host, SessionRecord record, HashSet<string> running, bool keepHost)
     {
         var feed = Feed(record.SessionId);
+        var unresolved = new List<string>();
         foreach (var promptId in record.HostPrompts ?? [])
         {
             if (running.Contains(promptId) || feed.HasEndMark(promptId)) continue;
+            ReportInfo[] retained;
+            try { retained = reports.FindByPrompt(record.SessionId, promptId).Where(r => r.Identity.HostId is not null).ToArray(); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or System.Text.Json.JsonException)
+            {
+                Volatile.Write(ref reportRecoveryFailure, "Cannot settle report identity: " + e.Message);
+                unresolved.Add(promptId);
+                continue;
+            }
+            if (retained.Length > 0)
+            {
+                foreach (var report in retained) await ReconcileReportInventoryAsync(report.Identity.HostId);
+                if (!feed.HasEndMark(promptId)) unresolved.Add(promptId);
+                continue; // unresolved report persistence is not native cancellation
+            }
             ServiceLog.Warn($"{host.Name} {record.SessionId}: prompt {promptId} went on in a host that is gone; it ends cancelled");
             await MarkPromptEndAsync(feed, promptId, null, new IOException("its host went"));
         }
+        if (unresolved.Count > 0) { store.Update(record.SessionId, record.Agent, r => r.HostPrompts = unresolved); return; }
         if (keepHost && record.HostPrompts is null) return;
         store.Update(record.SessionId, record.Agent, r =>
         {
@@ -426,6 +460,8 @@ public sealed partial class Conductor : IAsyncDisposable
     internal void HostAttached(AgentHost host, HostLink link)
     {
         host.Reap();
+        // This runs after routes become visible; earlier inventory may have run during handshake.
+        QueueReportDeliveries();
         if (host.Links.Any(l => !l.Current)) RunCleanup(() => MoveIdleAsync(host));
         if (Interlocked.Exchange(ref sweeping, 1) == 0) Track(Task.Run(SweepStaleAsync));
     }
@@ -728,6 +764,7 @@ public sealed partial class Conductor : IAsyncDisposable
         var update = new JsonObject { ["sessionUpdate"] = "session_info_update", ["_meta"] = PutInteractivity(new JsonObject(), state) };
         await feed.PublishAsync(update, except: null, () => { }, journal: false);
         await feed.SendLiveAsync(NoticeOf(state), c => c.TakesNotices && c.Tell(feed.SessionId, state));
+        if (state is null) QueueReportDeliveries(feed.SessionId);
     }
 
     /// <summary>The notice that tells a person the session is read-only now, and why, or that it can be written to again.</summary>
@@ -751,7 +788,14 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         var after = new JsonObject();
         foreach (var sessionId in sessions)
-            if (!removed.ContainsKey(sessionId)) after[sessionId] = Feed(sessionId).HostCursor(hostId);
+            if (!removed.ContainsKey(sessionId))
+            {
+                // A later ordinary event may have advanced the journal cursor past an
+                // unresolved report-delivery terminal retained by this host.
+                try { after[sessionId] = NeedsDeliveryReplay(sessionId, hostId) ? 0 : Feed(sessionId).HostCursor(hostId); }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or System.Text.Json.JsonException)
+                { Volatile.Write(ref reportRecoveryFailure, "Report replay inventory failed: " + e.Message); after[sessionId] = 0; }
+            }
         return after;
     }
 
@@ -773,7 +817,22 @@ public sealed partial class Conductor : IAsyncDisposable
         if ((string?)report["sessionId"] is not { } sessionId || removed.ContainsKey(sessionId)) return;
         var feed = Feed(sessionId);
         var hostSeq = (string?)report["_meta"]?[GorynychProtocol.MetaHostSeq];
-        if (!hostSeqTaken && hostSeq is not null && !feed.TakeFromHost(hostSeq)) return; // marked already
+        if (!ImportTerminal(report, sessionId)) return; // no cursor or end mark before durable import and ACK
+        if (!hostSeqTaken && hostSeq is not null && SessionJournal.TryParseHostSeq(hostSeq, out var streamHost, out var sequence) &&
+            sequence <= feed.HostCursor(streamHost))
+        {
+            try
+            {
+                var oldPrompt = (string?)report["promptId"];
+                if (HasUnresolvedDeliveryTerminal(report, sessionId, oldPrompt, hostSeq))
+                    ObserveReportDeliveryTerminal(report, sessionId, oldPrompt!, hostSeq);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException or System.Text.Json.JsonException)
+            { Volatile.Write(ref reportRecoveryFailure, "Report terminal reconciliation failed: " + e.Message); }
+            // This is an older event. It can settle only its delivery; it must not
+            // touch the current turn's mark, activity or adopted-turn state.
+            return;
+        }
         if (!hostSeqTaken && feed.HasSteeringInFlight)
         {
             // A steer accepted just before the native turn ended is journaled first: the end marker
@@ -792,11 +851,42 @@ public sealed partial class Conductor : IAsyncDisposable
             : null;
         if ((string?)report["askId"] is { } askId && !IsOwn(askId)) EndAskTurn(askId, feed, (string?)report["opinion"], (string?)report["from"], failure);
         KeepMark(feed, result);
-        if (promptId is not null) await MarkPromptEndAsync(feed, promptId, result, failure, hostSeq); // its answer, if it comes here, marks it no more
+        if (promptId is not null)
+        {
+            var admission = admittedReports.Values.FirstOrDefault(a => a.Session == sessionId && a.PromptId == promptId);
+            try
+            {
+                // Delivery disposition must be durable before the terminal cursor can be
+                // journaled. Otherwise a failed disposition write would hide this terminal
+                // from replay after a service restart.
+                var deliveryTerminal = report["_meta"]?[GorynychProtocol.MetaReportDelivery] is not null ||
+                    reports.FindDeliveryByPrompt(sessionId, promptId).Length != 0;
+                var marked = await MarkPromptEndAsync(feed, promptId, result, failure, deliveryTerminal ? null : hostSeq);
+                if (!marked && !feed.HasEndMark(promptId)) throw new InvalidOperationException("terminal journal mark failed");
+                var matching = reports.FindByPrompt(sessionId, promptId).Where(item => item.ProducerAck).ToArray();
+                var reportId = (string?)report["_meta"]?[GorynychProtocol.MetaReportId];
+                var persisted = reportId is null ? matching.SingleOrDefault() : matching.FirstOrDefault(item => item.ReportId == reportId);
+                if (persisted is not null) reports.RecordEndJournaled(persisted.ReportId);
+                if (!ObserveReportDeliveryTerminal(report, sessionId, promptId, hostSeq))
+                    throw new InvalidOperationException("Report delivery terminal lacks matching durable host correlation");
+                admission?.EndReady.TrySetResult();
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException or System.Text.Json.JsonException)
+            {
+                Volatile.Write(ref reportRecoveryFailure, $"Report terminal journal for {sessionId} remains unresolved: {e.Message}");
+                admission?.EndReady.TrySetException(new ReportPersistenceException($"Report {admission.Id} was imported but its terminal journal mark failed: {e.Message}; recovery required.", e));
+                return; // retain cursor on journal or journal-evidence failure
+            }
+        }
+        if (hostSeq is not null) feed.TakeFromHost(hostSeq);
         long? hostTurn = report["turn"] is JsonValue t && t.TryGetValue<long>(out var number) ? number : null;
+        if (feed.Adopted is { HostId: { } adoptedHost } &&
+            (hostSeq is null || !SessionJournal.TryParseHostSeq(hostSeq, out var actualHost, out _) || actualHost != adoptedHost)) return;
         if (feed.EndAdopted(hostTurn) is not { } turn) return;
-        if (store.Get(sessionId)?.ParentSessionId is not null)
+        if (turn.TurnKind == "work" && store.Get(sessionId)?.ParentSessionId is not null)
             ReportTurnEnd(sessionId, failure is null ? Outcome(result) : $"failed: {failure.Message}", feed.EndTurnText());
+        else if (turn.TurnKind == "unknown" && store.Get(sessionId) is { ParentSessionId: not null, ReportToParent: true })
+            await ReportPersistenceNoticeAsync(feed, new ReportPersistenceException("An adopted legacy turn ended with unknown provenance; report eligibility and full output could not be observed."));
         EndAdopted(feed, turn);
         ServiceLog.Info($"{host.Name} {sessionId}: the turn it took back from its host ended{(promptId is null ? "" : $" (prompt {promptId})")}");
     }
@@ -984,6 +1074,7 @@ public sealed partial class Conductor : IAsyncDisposable
         }
         foreach (var c in clients.Keys) c.Notify(GorynychProtocol.MethodRestartAborted, new JsonObject { ["restart"] = number });
         foreach (var recipient in mailbox.PendingRecipients()) QueueMailbox(recipient);
+        QueueReportDeliveries();
     }
 
     /// <summary>A session a restart did not wait out: <c>{sessionId, agent, title}</c>.</summary>
@@ -1353,6 +1444,7 @@ public sealed partial class Conductor : IAsyncDisposable
             SaveMaintenanceLocked();
         }
         ServiceLog.Info($"start {string.Join(",", names)}: available again");
+        QueueReportDeliveries();
         return new JsonObject
         {
             ["started"] = true,
@@ -1485,6 +1577,12 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         if (method == GorynychProtocol.MethodHostState)
         {
+            if ((string?)@params?["_meta"]?[GorynychProtocol.CapHostReportNote]?["failure"] is { } receiptFailure)
+                Volatile.Write(ref reportRecoveryFailure, receiptFailure);
+            if ((string?)@params?["_meta"]?[GorynychProtocol.CapHostReportNote]?["reportId"] is { } noteReport &&
+                (string?)@params?["_meta"]?[GorynychProtocol.CapHostReportNote]?["sessionId"] is { } noteParent &&
+                store.Get(noteParent) is { Deleted: false } noteOwner && noteOwner.Agent == host.Name)
+                QueueReportDelivery(noteReport);
             if (@params?["sessionStates"] is JsonObject states)
                 foreach (var (id, configuration) in states)
                     if (!removed.ContainsKey(id) && store.Get(id) is { } record && record.Agent == host.Name)
@@ -1500,7 +1598,9 @@ public sealed partial class Conductor : IAsyncDisposable
                         if (snapshot.ContainsKey("background")) NativeBackground(restoredFeed, snapshot["background"], snapshot["backgroundProcessExited"] is JsonValue exited && exited.TryGetValue<bool>(out var stopped) && stopped);
                         if (snapshot.ContainsKey("backgroundKnown")) NativeKnownBackground(restoredFeed, snapshot["backgroundKnown"]);
                         if (snapshot["agentTurn"] is JsonValue value && value.TryGetValue<bool>(out var active))
-                            AgentTurn(restoredFeed, new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaAgentTurn] = active ? "started" : "ended" } });
+                            AgentTurn(restoredFeed, new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaAgentTurn] = active ? "started" : "ended",
+                                [GorynychProtocol.MetaOrigin] = (string?)snapshot["agentTurnKind"] == "report" ? "report" : "unknown",
+                                [GorynychProtocol.MetaReportDelivery] = snapshot["agentReportDelivery"]?.DeepClone() } });
                     }
             return;
         }
@@ -1638,6 +1738,21 @@ public sealed partial class Conductor : IAsyncDisposable
     /// session loaded until the agent stops (<see cref="OnAgentStopped"/>). Never waits for the
     /// session's gate: the agent's notifications must keep flowing while a close waits for it.
     /// </summary>
+    bool IsTrustedLiveReportTurn(string sessionId, JsonObject update)
+    {
+        var meta = update["_meta"];
+        if ((string?)meta?[GorynychProtocol.MetaOrigin] != "report" ||
+            (string?)meta?[GorynychProtocol.MetaReportDelivery]?["reportId"] is not { } id ||
+            (string?)meta?[GorynychProtocol.MetaReportDelivery]?["attemptId"] is not { } attempt) return false;
+        try
+        {
+            var report = reports.GetReport(id);
+            return report.Identity.Parent == sessionId && report.Delivery is { Route: "note", DispatchStarted: true } delivery && delivery.AttemptId == attempt;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException or KeyNotFoundException)
+        { return false; }
+    }
+
     void AgentTurn(SessionFeed feed, JsonObject update)
     {
         var mark = update["_meta"] is JsonObject meta && meta[GorynychProtocol.MetaAgentTurn] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
@@ -1646,6 +1761,11 @@ public sealed partial class Conductor : IAsyncDisposable
         if (mark == "started" && feed.BeginAgentTurn())
         {
             feed.EnterUse();
+            if (!IsTrustedLiveReportTurn(feed.SessionId, update) &&
+                !feed.ClientTurn && feed.TurnGate.CurrentCount != 0 && feed.Adopted is null && feed.PromptsInProgress().Length == 0 &&
+                store.Get(feed.SessionId) is { ParentSessionId: not null, ReportToParent: true })
+                Track(Task.Run(() => ReportPersistenceNoticeAsync(feed, new ReportPersistenceException(
+                    "An agent-initiated turn was observed outside a controlled prompt; full report capture and assignment correlation are unavailable."))));
         }
         else if (mark == "ended" && feed.EndAgentTurn())
         {
@@ -1662,6 +1782,7 @@ public sealed partial class Conductor : IAsyncDisposable
     /// </summary>
     internal void OnAgentStopped(AgentHost host, HostLink link, IReadOnlyCollection<string> sessions)
     {
+        ObserveNoteHostExit(link);
         var open = sessions.ToHashSet(StringComparer.Ordinal);
         foreach (var feed in feeds.Values)
         {
@@ -1682,13 +1803,22 @@ public sealed partial class Conductor : IAsyncDisposable
                 feed.TurnEnded();
                 feed.ExitUse();
             }
+            if (feed.Adopted is { } still && link.HostId is not null && still.HostId == link.HostId &&
+                still.PromptId is { } heldPrompt && (HasRetainedProducer(feed.SessionId, heldPrompt, link.HostId) ||
+                    store.Get(feed.SessionId) is { ParentSessionId: not null, ReportToParent: true }))
+            {
+                // A broken RPC alone does not prove the producer process died. Inventory can
+                // settle it once a sealed result or independent process-exit evidence exists.
+                Track(Task.Run(() => ReconcileAfterHostExitAsync(link)));
+                continue;
+            }
             if (feed.Adopted is { } adopted && (link.HostId is null || adopted.HostId == link.HostId) && feed.EndAdopted(any: true) is { } turn)
             {
                 ServiceLog.Warn($"{host.Name} {feed.SessionId}: its host went in the middle of a turn it had brought back");
                 Track(Task.Run(async () =>
                 {
                     if (turn.PromptId is { } promptId) await MarkPromptEndAsync(feed, promptId, null, new IOException("the host went"));
-                    if (store.Get(feed.SessionId)?.ParentSessionId is not null)
+                    if (turn.TurnKind == "work" && store.Get(feed.SessionId)?.ParentSessionId is not null)
                         ReportTurnEnd(feed.SessionId, "failed: its host went", feed.EndTurnText());
                     EndAdopted(feed, turn);
                 }));
@@ -2600,6 +2730,14 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         if (Draining) throw Restarting();
         var prompt = request.ParamsAs<PromptRequest>();
+        // Client metadata cannot claim service provenance, report identity or assignment ownership.
+        if (request.Params is JsonObject raw && raw["_meta"] is JsonObject untrusted)
+        {
+            foreach (var name in new[] { GorynychProtocol.MetaReportId, GorynychProtocol.MetaReportCapture, GorynychProtocol.MetaReportDelivery,
+                GorynychProtocol.MetaAssignmentId, GorynychProtocol.MetaOrigin, GorynychProtocol.MetaMailboxMessage,
+                GorynychProtocol.MetaSender, GorynychProtocol.MetaParentSessionId, GorynychProtocol.MetaFromSessionId }) untrusted.Remove(name);
+            prompt.Meta = untrusted.DeepClone().AsObject();
+        }
         var promptId = PromptIdOf(prompt);
         if (promptId is null)
         {
@@ -2653,6 +2791,7 @@ public sealed partial class Conductor : IAsyncDisposable
         catch (Exception e)
         {
             failure = e;
+            if (e is ReportPersistenceException persistence) await ReportPersistenceNoticeAsync(use.Feed, persistence);
             throw;
         }
         finally
@@ -2666,7 +2805,7 @@ public sealed partial class Conductor : IAsyncDisposable
             // A steer accepted just before the native turn ended is journaled before its end marker.
             if (!IsRestartingRefusal(failure) && !livesOn)
                 await use.Feed.WaitForSteeringAsync();
-            if (!IsRestartingRefusal(failure) && !livesOn)
+            if (!IsRestartingRefusal(failure) && !livesOn && failure is not ReportPersistenceException)
                 await MarkPromptEndAsync(use.Feed, promptId, result, failure);
             use.Feed.EndPrompt(key);
             // A fallback steering call waits only for the handoff; if the turn never got that far, it
@@ -2876,13 +3015,16 @@ public sealed partial class Conductor : IAsyncDisposable
     /// a report after a service ended it for a host it took for gone.
     /// </summary>
     /// <param name="hostSeq">The host's report it comes from, journaled with it so that it is marked once.</param>
-    async Task MarkPromptEndAsync(SessionFeed feed, string promptId, JsonNode? result, Exception? failure, string? hostSeq = null)
+    async Task<bool> MarkPromptEndAsync(SessionFeed feed, string promptId, JsonNode? result, Exception? failure, string? hostSeq = null)
     {
-        if (promptId.Length == 0) return;
+        if (promptId.Length == 0) return false;
+        await feed.EndMarkGate.WaitAsync();
+        try
+        {
         if (!feed.ClaimEndMark(promptId))
         {
             ServiceLog.Info($"{feed.SessionId}: the end of prompt {promptId} is marked already");
-            return;
+            return false;
         }
         var meta = new JsonObject { [GorynychProtocol.MetaAgentTurn] = "ended", [GorynychProtocol.MetaPromptId] = promptId };
         if (hostSeq is not null) meta[GorynychProtocol.MetaHostSeq] = hostSeq;
@@ -2901,11 +3043,16 @@ public sealed partial class Conductor : IAsyncDisposable
         try
         {
             await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(new SessionInfoUpdate { Meta = meta })!.AsObject(), except: null, () => { });
+            return true;
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
+            feed.ReleaseEndMark(promptId);
             ServiceLog.Warn($"{feed.SessionId}: the end of prompt {promptId} could not be journaled: {e.Message}");
+            return false;
         }
+        }
+        finally { feed.EndMarkGate.Release(); }
     }
 
     /// <summary>
@@ -2966,7 +3113,7 @@ public sealed partial class Conductor : IAsyncDisposable
             {
                 // One that goes on in a host this service leaves running for a restart: the next one reports its end.
                 var hostWent = e is IOException && options.Hosts is not null;
-                if (!hostWent || StopHostsOnExit) ReportTurnEnd(record.SessionId, hostWent ? "failed: its host went" : $"failed: {e.Message}", feed.EndTurnText());
+                if (e is not ReportPersistenceException && (!hostWent || StopHostsOnExit)) ReportTurnEnd(record.SessionId, hostWent ? "failed: its host went" : $"failed: {e.Message}", feed.EndTurnText());
                 throw;
             }
             ReportTurnEnd(record.SessionId, Outcome(result), feed.EndTurnText());
@@ -3008,23 +3155,37 @@ public sealed partial class Conductor : IAsyncDisposable
         // A turn outlives the client that started it: closing the GUI must not stop the agent.
         // Stopping a turn is an explicit session/cancel, which must reach the agent after the
         // prompt, so both go through the session's forward gate.
-        Task<JsonNode?> response;
-        await feed.ForwardGate.WaitAsync(CancellationToken.None);
+        ReportAdmission? report = null;
         try
         {
-            if (handedSignal is not null) ct.ThrowIfCancellationRequested();
-            if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
-            response = await rpc.StartRequestAsync(request.Method, WithMessageId(request.Params, messageId), CancellationToken.None);
-            handed();
-            handedSignal?.TrySetResult();
+            Task<JsonNode?> response;
+            var startAttempted = false;
+            await feed.ForwardGate.WaitAsync(CancellationToken.None);
+            try
+            {
+                if (handedSignal is not null) ct.ThrowIfCancellationRequested();
+                if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
+                report = AdmitReport(record, rpc, promptId!, "user:" + messageId, ReportCause.User, null, messageId);
+                var forwarded = WithReport(WithMessageId(request.Params, messageId), report);
+                startAttempted = true;
+                response = await rpc.StartRequestAsync(request.Method, forwarded, CancellationToken.None);
+                handed();
+                handedSignal?.TrySetResult();
+            }
+            finally
+            {
+                try { if (!startAttempted) AbandonUnstarted(report); }
+                finally { feed.ForwardGate.Release(); }
+            }
+            JsonNode? result;
+            try { result = await response; }
+            catch (JsonRpcException error) { ImportLocalReport(report, feed, null, error); await HandleReportResponseErrorAsync(report, error); throw; }
+            ImportLocalReport(report, feed, result);
+            await RequireImportedAsync(report);
+            KeepMark(feed, result);
+            return result;
         }
-        finally
-        {
-            feed.ForwardGate.Release();
-        }
-        var result = await response;
-        KeepMark(feed, result);
-        return result;
+        finally { ForgetAdmission(report); }
     }
 
     /// <summary>
@@ -4127,6 +4288,8 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         string? promptId = null; // once its user message is out
         var handed = false; // its prompt went to the agent
+        ReportAdmission? report = null;
+        var startAttempted = false;
         try
         {
             using var use = await UseAsync(record.SessionId, CancellationToken.None);
@@ -4159,20 +4322,26 @@ public sealed partial class Conductor : IAsyncDisposable
             await feed.ForwardGate.WaitAsync(CancellationToken.None);
             try
             {
-                response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt,
-                    WithMessageId(AcpJson.ToNode(new PromptRequest
+                report = AdmitReport(record, rpc, id, "spawn:" + messageId, ReportCause.Spawn, record.SpawnAssignmentId, messageId);
+                var forwarded = WithReport(WithMessageId(AcpJson.ToNode(new PromptRequest
                     {
                         SessionId = record.SessionId, Prompt = [task, context],
                         Meta = new JsonObject { [GorynychProtocol.MetaPromptId] = id, [GorynychProtocol.MetaAssignmentId] = record.SpawnAssignmentId },
-                    }), messageId),
-                    CancellationToken.None);
+                    }), messageId), report);
+                startAttempted = true;
+                response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, forwarded, CancellationToken.None);
                 handed = true;
             }
             finally
             {
-                feed.ForwardGate.Release();
+                try { if (!startAttempted) AbandonUnstarted(report); }
+                finally { feed.ForwardGate.Release(); }
             }
-            var result = await response;
+            JsonNode? result;
+            try { result = await response; }
+            catch (JsonRpcException error) { ImportLocalReport(report, feed, null, error); await HandleReportResponseErrorAsync(report, error); throw; }
+            ImportLocalReport(report, feed, result);
+            await RequireImportedAsync(report);
             KeepMark(feed, result);
             await MarkPromptEndAsync(feed, id, result, null);
             ReportTurnEnd(record.SessionId, Outcome(result), feed.EndTurnText());
@@ -4180,12 +4349,19 @@ public sealed partial class Conductor : IAsyncDisposable
         catch (Exception e)
         {
             ServiceLog.Warn($"{record.Agent} {record.SessionId}: the spawned session's first turn failed: {e.Message}");
-            if (promptId is not null && !(handed && LivesOnInHost(e))) await MarkPromptEndAsync(feed, promptId, null, e);
-            // The parent holds the child's ID and may wait for news of it, so a turn that never got going is reported too.
-            ReportTurnEnd(record.SessionId, $"failed: {e.Message}", feed.EndTurnText());
+            if (e is ReportPersistenceException persistence) await ReportPersistenceNoticeAsync(feed, persistence);
+            if (e is not ReportPersistenceException && promptId is not null && !(handed && LivesOnInHost(e))) await MarkPromptEndAsync(feed, promptId, null, e);
+            // A persistence failure cannot advertise an uncommitted report as a native outcome.
+            if (e is not ReportPersistenceException)
+            {
+                if (!startAttempted || e is JsonRpcException refused && HostRefusedBeforeDispatch(report, refused))
+                    PublishUnstartedSpawnFailure(record, parent, promptId, e);
+                ReportTurnEnd(record.SessionId, $"failed: {e.Message}", feed.EndTurnText());
+            }
         }
         finally
         {
+            ForgetAdmission(report);
             feed.Activity.End();
             feed.TurnEnded();
             feed.TurnGate.Release();
@@ -4215,8 +4391,8 @@ public sealed partial class Conductor : IAsyncDisposable
     /// </summary>
     void ReportTurnEnd(string childId, string outcome, string finalMessage)
     {
-        if (store.Get(childId) is not { ParentSessionId: not null, ReportToParent: true }) return;
-        Track(Task.Run(() => ReportAsync(childId, outcome, finalMessage)));
+        // The immutable outbox is the source of truth, including after a missed scheduling step.
+        QueueReportDeliveries();
     }
 
     static string Outcome(JsonNode? promptResponse) => (string?)promptResponse?["stopReason"] switch
@@ -4225,55 +4401,6 @@ public sealed partial class Conductor : IAsyncDisposable
         "cancelled" => "was cancelled",
         var reason => $"stopped ({reason})",
     };
-
-    /// <summary>
-    /// Delivers a report like an opinion request, but expects no answer: through the parent
-    /// agent's own way in (<c>_gorynych/note</c>, Claude's channel), otherwise as a marked turn
-    /// of the parent session, which waits for the parent's running turn.
-    /// </summary>
-    async Task ReportAsync(string childId, string outcome, string finalMessage)
-    {
-        try
-        {
-            if (store.Get(childId) is not { ParentSessionId: { } parentId } child || child.Deleted) return;
-            if (store.Get(parentId) is not { Deleted: false } parent) return;
-            if (parent.Archived)
-            {
-                // Out of sight: a report would start a turn, and a channel note would wake Claude as well.
-                ServiceLog.Info($"report: {childId} -> {parentId} dropped: the parent is archived");
-                return;
-            }
-            var text = ReportText(child, outcome, finalMessage);
-            var sender = $"child_{child.Agent}";
-            using var use = await UseAsync(parentId, cleanupStop.Token); // its end starts the parent's idle timer
-            var (rpc, _) = await EnsureLiveAsync(use.Record, cleanupStop.Token);
-            // Marked before it is sent, so the agent cannot act on it first (SpawnAsync).
-            var markedBefore = use.Feed.MarkOtherSessionText();
-            try
-            {
-                await rpc.SendRequestAsync(GorynychProtocol.MethodNote, new JsonObject
-                {
-                    ["sessionId"] = parentId, ["text"] = text, ["sender"] = sender, ["fromSessionId"] = childId,
-                    // for the user message the agent reports for it
-                    ["_meta"] = new JsonObject { [GorynychProtocol.MetaSender] = sender, [GorynychProtocol.MetaFromSessionId] = childId },
-                }, cleanupStop.Token);
-                ServiceLog.Info($"report: {childId} -> {parentId} (note)");
-                return;
-            }
-            catch (JsonRpcException e) when (e.Code is JsonRpcException.MethodNotFound or JsonRpcException.InvalidRequest)
-            {
-                // No live-note path, or the session's agent is not running (Claude): a turn reaches it
-                // either way, and in the second case starts the agent just for it.
-                use.Feed.UnmarkOtherSessionText(markedBefore);
-            }
-            await ReportTurnAsync(use, rpc, sender, childId, text);
-            ServiceLog.Info($"report: {childId} -> {parentId} (turn)");
-        }
-        catch (Exception e)
-        {
-            ServiceLog.Warn($"report of {childId} to its parent not delivered: {e.Message}");
-        }
-    }
 
     /// <summary>
     /// Something that held the session let go of it: a client detached, or an operation registered
@@ -4406,86 +4533,6 @@ public sealed partial class Conductor : IAsyncDisposable
         ServiceLog.Info($"{record.Agent} {sessionId}: unloaded from its agent, {why(host)}");
     }
 
-    async Task ReportTurnAsync(SessionUse use, JsonRpcConnection rpc, string sender, string childId, string text)
-    {
-        var feed = use.Feed;
-        await feed.TurnGate.WaitAsync(cleanupStop.Token);
-        feed.Activity.Begin();
-        try
-        {
-            if (feed.Retired) return;
-            rpc = await RpcForTurnAsync(use.Record, rpc, cleanupStop.Token, forAgent: true);
-            if (store.Get(use.Record.SessionId) is { Archived: true })
-            {
-                ServiceLog.Info($"report: {childId} -> {use.Record.SessionId} dropped: the parent was archived while the report waited for its turn");
-                return;
-            }
-            var meta = new JsonObject
-            {
-                [GorynychProtocol.MetaOrigin] = "report",
-                [GorynychProtocol.MetaSender] = sender,
-                [GorynychProtocol.MetaFromSessionId] = childId,
-            };
-            var block = new TextContent { Text = text };
-            var messageId = SessionFeed.NewMessageId();
-            var promptId = ServicePromptId(messageId);
-            meta[GorynychProtocol.MetaPromptId] = promptId;
-            var told = AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
-            {
-                Content = block, MessageId = messageId, Meta = meta,
-            })!.AsObject();
-            await feed.PublishAsync(told, except: null, () => store.Touch(use.Record.SessionId));
-            var handed = false;
-            try
-            {
-                Task<JsonNode?> response;
-                await feed.ForwardGate.WaitAsync(CancellationToken.None);
-                try
-                {
-                    response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, WithMessageId(AcpJson.ToNode(new PromptRequest
-                    {
-                        SessionId = use.Record.SessionId,
-                        Prompt = [block],
-                        Meta = meta.DeepClone().AsObject(),
-                    }), messageId), CancellationToken.None);
-                    handed = true;
-                }
-                finally
-                {
-                    feed.ForwardGate.Release();
-                }
-                var result = await response;
-                KeepMark(feed, result);
-                await MarkPromptEndAsync(feed, promptId, result, null);
-            }
-            catch (Exception e)
-            {
-                // Its message is out: a prompt that never reached the agent ends its turn too; one that
-                // goes on in a host a restart leaves running is marked by the next service.
-                if (!(handed && LivesOnInHost(e))) await MarkPromptEndAsync(feed, promptId, null, e);
-                throw;
-            }
-        }
-        finally
-        {
-            feed.Activity.End();
-            feed.TurnEnded();
-            feed.TurnGate.Release();
-        }
-    }
-
-    static string ReportText(SessionRecord child, string outcome, string finalMessage)
-    {
-        var message = finalMessage.Trim();
-        if (message.Length > ReportLimit) message = Cut(message, ReportLimit) + "…";
-        if (message.Length == 0) message = "(no final message)";
-        return $"[Report · from {Who(child)} · your child session · its turn {outcome}]\n" +
-            $"{message}\n\n" +
-            "This comes from a session you started with spawn_session, not from the user. " + PeersServer.ReportGuidance + " " +
-            $"To continue already user-authorized work with this immediate child, use delegate_task with session_id \"{child.SessionId}\". " +
-            "For ordinary discussion, use send_message.";
-    }
-
     /// <summary>
     /// What a spawned session is told after its task: who started it, how its answer reaches that
     /// session (its final message, reported by itself, and what of it), and the ID to ask that
@@ -4497,9 +4544,8 @@ public sealed partial class Conductor : IAsyncDisposable
         $"[About this session · started by {Who(parent)} with spawn_session, {(approved ? "approved by the user" : "at the user's request")}]\n" +
         (report
             ? $"Answer in your final message: when your turn ends, Gorynych sends that message to session_id {parent.SessionId} as a " +
-              "report by itself. You do not need to send that report with a tool. The report carries only that last message, your text after " +
-              $"your last tool call, and is cut at {ReportLimit} characters, so put anything longer into a file and name the file " +
-              "in that message. "
+              "report by itself. You do not need to send that report with a tool. It includes a bounded preview of your final text " +
+              "and a report ID so the parent can use read_report for the retained result. "
             : "Your turns are not reported to that session; use send_message to keep it informed when needed. ") +
         $"To contact it, use send_message with session_id \"{parent.SessionId}\". The user can also prompt you here directly.";
 
@@ -4559,6 +4605,7 @@ public sealed partial class Conductor : IAsyncDisposable
                 archiveGate.Release();
             }
             if (changed) ServiceLog.Info($"{record.Agent} {target}: {(archived ? "archived" : "restored")}{(from is null ? "" : $" by {from}")}");
+            if (changed && !archived) QueueReportDeliveries(target);
             var result = new JsonObject();
             if (from is not null) result["text"] = ArchiveText(record, archived, changed, self: from == target);
             return result;
@@ -4942,7 +4989,7 @@ public sealed partial class Conductor : IAsyncDisposable
             // A live-note path answers at once when its agent cannot take the request, so it counts
             // as asked only after a moment.
             using var askedLater = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            var markedBefore = false;
+            var markedBefore = false; long markVersion = 0;
             if (onState is not null)
                 _ = Task.Delay(TimeSpan.FromMilliseconds(500), askedLater.Token)
                     .ContinueWith(t => { if (!t.IsCanceled) onState(AskedState(target)); }, TaskScheduler.Default);
@@ -4950,7 +4997,7 @@ public sealed partial class Conductor : IAsyncDisposable
             {
                 // An agent with its own way in (Claude's channel) answers directly.
                 // Marked before it is sent, so the agent cannot act on it first (SpawnAsync).
-                markedBefore = use.Feed.MarkOtherSessionText();
+                markedBefore = use.Feed.MarkOtherSessionText(out markVersion);
                 var answer = await rpc.SendRequestAsync(GorynychProtocol.MethodOpinion, forwarded, ct);
                 if (record.Draft)
                 {
@@ -4964,7 +5011,7 @@ public sealed partial class Conductor : IAsyncDisposable
             {
                 // No live-note path (Kimi), or the agent is not running (Claude refuses while its process
                 // is down): ask in a turn, which in the second case starts the agent just for it.
-                use.Feed.UnmarkOtherSessionText(markedBefore);
+                use.Feed.UnmarkOtherSessionText(markedBefore, markVersion);
                 askedLater.Cancel();
                 if (e.Code == JsonRpcException.InvalidRequest)
                 {
@@ -5663,6 +5710,7 @@ public sealed partial class Conductor : IAsyncDisposable
         ["hosts"] = options.Hosts is not null,
         ["build"] = HostGeneration.ThisBuild,
         ["maintenance"] = MaintenanceStatus(),
+        ["_meta"] = new JsonObject { ["gorynych/reportRecovery"] = ReportRecoveryStatus(), ["gorynych/reportDelivery"] = ReportDeliveryStatus() },
         ["agents"] = new JsonArray(agents.Values.Select(a => (JsonNode)a.Describe(s => !removed.ContainsKey(s) && Feed(s).TurnRunning, WhyNotMoved)).ToArray()),
         ["sessionDetails"] = SessionStatus(),
         ["ahp"] = AhpStatus?.Invoke(),

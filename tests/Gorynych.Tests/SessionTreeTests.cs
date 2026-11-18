@@ -414,13 +414,19 @@ public sealed class SessionTreeTests
         StringAssert.Contains(report, "For ordinary discussion, use send_message.");
         StringAssert.Contains(report, "already user-authorized work");
         Assert.IsFalse(report.Contains("ask_agent", StringComparison.Ordinal), "reports use the currently advertised messaging tools");
-        StringAssert.StartsWith(report, $"[Report · from session_id {child} (claude, \"Notes\") · your child session · its turn ended]\nok\n");
+        StringAssert.StartsWith(report, $"[Report · from session_id {child} · your child session · report_id ");
+        StringAssert.Contains(report, "native outcome: ended"); StringAssert.EndsWith(report, "\nok");
         Assert.IsFalse(report.Contains("Looking around.", StringComparison.Ordinal), report);
         var told = zed.Snapshot().Last(u => (string?)u["sessionUpdate"] == "user_message_chunk");
         Assert.AreEqual("report", (string?)told["_meta"]![GorynychProtocol.MetaOrigin]);
         Assert.IsFalse(string.IsNullOrEmpty((string?)told["messageId"]), "the service names the report it writes");
         Assert.AreEqual("child_claude", (string?)told["_meta"]![GorynychProtocol.MetaSender]);
         Assert.AreEqual(child, (string?)told["_meta"]![GorynychProtocol.MetaFromSessionId]);
+        var nativeMeta = kimi.PromptMetadata.Last(p => p.SessionId == parent).Meta!;
+        Assert.AreEqual("report", (string?)nativeMeta[GorynychProtocol.MetaOrigin]);
+        Assert.IsNull(nativeMeta[GorynychProtocol.MetaReportId], "delivery correlation is not producer capture");
+        Assert.AreEqual(conductor.ReportStorage.List(child).Items.Single().ReportId,
+            (string?)nativeMeta[GorynychProtocol.MetaReportDelivery]?["reportId"]);
 
         // The person prompts the child directly: another report.
         await using var other = await TestClient.ConnectAsync(conductor, "zed-child");
@@ -436,7 +442,7 @@ public sealed class SessionTreeTests
     }
 
     [TestMethod]
-    public async Task Report_ToAParentWithAChannel_IsANote_AndReportFalseSendsNone()
+    public async Task Report_ToAParentWithAChannel_QueuesUntilLiveReceiptAndReportFalseSendsNone()
     {
         var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
         var kimi = new LifecycleAgent("kimi", canDelete: true);
@@ -449,14 +455,11 @@ public sealed class SessionTreeTests
         var quiet = (string)(await SpawnAsync(zed, token, new JsonObject { ["agent"] = "kimi", ["prompt"] = "Bump the version", ["report"] = false }))!["sessionId"]!;
         await conductor.BackgroundTurnsIdleAsync();
 
-        var note = claude.Notes.Single();
-        Assert.AreEqual(parent, (string?)note["sessionId"]);
-        Assert.AreEqual("child_kimi", (string?)note["sender"]);
-        Assert.AreEqual(reported, (string?)note["fromSessionId"]);
-        Assert.AreEqual("child_kimi", (string?)note["_meta"]![GorynychProtocol.MetaSender], "the _meta for the message Claude will report");
-        Assert.AreEqual(reported, (string?)note["_meta"]![GorynychProtocol.MetaFromSessionId]);
-        StringAssert.StartsWith((string?)note["text"], $"[Report · from session_id {reported} (kimi, \"Fix the flaky test\") · your child session · its turn ended]\nok\n");
-        CollectionAssert.AreEqual(new[] { "Coordinate the release" }, Prompts(claude, parent), "a note is not a turn");
+        Assert.AreEqual(0, claude.Notes.Count, "legacy bare note has no reliable receipt; C3b will add the confirmed live path");
+        var report = Reports(claude, parent).Single();
+        StringAssert.StartsWith(report, $"[Report · from session_id {reported} · your child session · report_id ");
+        StringAssert.Contains(report, "read_report");
+        Assert.AreEqual(2, Prompts(claude, parent).Length, "C3a queues this report until the live receipt route is wired");
         Assert.IsFalse(conductor.Store.Get(quiet)!.ReportToParent);
     }
 
@@ -496,22 +499,96 @@ public sealed class SessionTreeTests
         var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
         // Hold the child's first turn before it opens the session, and let its agent die meanwhile.
         var childFeed = conductor.Feed("kimi-1");
-        await childFeed.LifeGate.WaitAsync();
+        await childFeed.LifeGate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        JsonNode? spawned; string child;
+        try
+        {
+            spawned = await SpawnAsync(zed, claude.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test", ["title"] = "Flaky test" }).WaitAsync(TimeSpan.FromSeconds(10));
+            child = (string)spawned!["sessionId"]!;
+            Assert.AreEqual("kimi-1", child);
+            kimi.BeforeResume = _ => throw new JsonRpcException(JsonRpcException.InternalError, "Kimi lost the session");
+            await kimi.Adapter.Current!.Rpc.DisposeAsync();
+            // The dead connection must be forgotten before this turn can reopen it.
+            await Until(() => !conductor.Agents["kimi"].IsRunning && !conductor.Agents["kimi"].IsLive(child), "the agent's exit");
+        }
+        finally { childFeed.LifeGate.Release(); }
 
-        var spawned = await SpawnAsync(zed, claude.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "Fix the flaky test", ["title"] = "Flaky test" });
-        var child = (string)spawned!["sessionId"]!;
-        Assert.AreEqual("kimi-1", child);
-        kimi.BeforeResume = _ => throw new JsonRpcException(JsonRpcException.InternalError, "Kimi lost the session");
-        await kimi.Adapter.Current!.Rpc.DisposeAsync();
-        // Its connection closes before the service forgets the sessions open in it: wait for both,
-        // or the turn finds the session still routed to the closed connection.
-        await Until(() => !conductor.Agents["kimi"].IsRunning && !conductor.Agents["kimi"].IsLive(child), "the agent's exit");
-        childFeed.LifeGate.Release();
-
-        await conductor.BackgroundTurnsIdleAsync();
+        await conductor.BackgroundTurnsIdleAsync().WaitAsync(TimeSpan.FromSeconds(10));
         var report = Reports(claude, parent).Single();
-        StringAssert.StartsWith(report, $"[Report · from session_id {child} (kimi, \"Flaky test\") · your child session · its turn failed: Kimi lost the session]\n(no final message)\n");
+        StringAssert.StartsWith(report, $"[Report · from session_id {child} · your child session · report_id ");
+        StringAssert.Contains(report, "native outcome: not_started"); StringAssert.Contains(report, "Kimi lost the session");
+        StringAssert.Contains(report, "Has text: False");
         Assert.AreEqual(0, Prompts(kimi, child).Length, "the turn never reached the agent");
+        var info = conductor.ReportStorage.List(child).Items.Single();
+        Assert.AreEqual(ReportCause.Spawn, info.Identity.Cause); Assert.AreEqual(parent, info.Identity.Parent);
+        Assert.AreEqual((string?)spawned["assignmentId"], info.Identity.AssignmentId); Assert.IsTrue(info.ProducerAck);
+        var result = conductor.ReportStorage.Read(info.ReportId, child);
+        Assert.AreEqual("not_started", result.Outcome); Assert.AreEqual("Kimi lost the session", result.Error);
+        Assert.IsFalse(result.HasText); Assert.IsNull(info.Identity.HostId);
+        Assert.AreEqual(info.ReportId, conductor.ReportStorage.Reserve(info.Identity).ReportId, "same identity never creates a second report");
+        Assert.AreEqual(0, conductor.ReportStorage.Recoverable().Items.Count, "no orphan producer reservation");
+        var directory = (string)conductor.Status()["dataDirectory"]!;
+        await zed.DisposeAsync(); await conductor.DisposeAsync();
+        await using var reopened = new Conductor(new ConductorOptions { DataDirectory = directory, ServiceId = "failed-start-reopen",
+            PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"] }, [claude.Adapter, kimi.Adapter]);
+        await reopened.ReconcileReportInventoryAsync();
+        var again = reopened.ReportStorage.List(child).Items.Single();
+        Assert.AreEqual(info.ReportId, again.ReportId); Assert.AreEqual("completed", again.Status);
+        Assert.AreEqual("not_started", reopened.ReportStorage.Read(info.ReportId, child).Outcome);
+        Assert.AreEqual(0, reopened.ReportStorage.Recoverable().Items.Count);
+        Assert.AreEqual(0, Prompts(kimi, child).Length); Assert.AreEqual(1, Reports(claude, parent).Length);
+    }
+
+    [TestMethod]
+    public async Task SpawnUnstartedPublicationFaultRecoversSameEvidenceAfterReopen()
+    {
+        var directory = TestDirs.New(); var claude = new LifecycleAgent("claude", canDelete: false);
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        Conductor New() => new(new ConductorOptions { DataDirectory = directory, ServiceId = "spawn-recovery",
+            PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"] }, [claude.Adapter, kimi.Adapter]);
+        var first = New(); var client = await TestClient.ConnectAsync(first); Conductor? next = null; var closed = false;
+        var gate = first.Feed("kimi-1").LifeGate; var held = false;
+        try
+        {
+            var parent = await NewPromptedAsync(client, "claude", "coordinate");
+            first.Store.Update(parent, "claude", r => r.Archived = true);
+            await gate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(10)); held = true;
+            var spawned = await SpawnAsync(client, claude.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "initial" }).WaitAsync(TimeSpan.FromSeconds(10));
+            var child = (string)spawned!["sessionId"]!;
+            kimi.BeforeResume = _ => throw new JsonRpcException(JsonRpcException.InternalError, "failed before native dispatch");
+            first.ReportStorage.WriteManifest = (path, json) =>
+            {
+                if (json.Contains("\"status\":\"pending\"", StringComparison.Ordinal) && json.Contains("\"outcome\":\"not_started\"", StringComparison.Ordinal))
+                    throw new IOException("injected result publication failure");
+                AtomicFile.WriteAllText(path, json);
+            };
+            await kimi.Adapter.Current!.Rpc.DisposeAsync();
+            await Until(() => !first.Agents["kimi"].IsRunning && !first.Agents["kimi"].IsLive(child), "child adapter exited");
+            gate.Release(); held = false;
+            await first.BackgroundTurnsIdleAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            var reserved = first.ReportStorage.Recoverable().Items.Single();
+            Assert.AreEqual("failed", reserved.ProducerEvidence); Assert.AreEqual("not_started", reserved.ProducerOutcome);
+            Assert.AreEqual("failed before native dispatch", reserved.ProducerError); Assert.IsNull(reserved.Identity.PromptId);
+            Assert.AreEqual(parent, reserved.Identity.Parent); Assert.AreEqual((string?)spawned["assignmentId"], reserved.Identity.AssignmentId);
+            Assert.AreEqual(0, Prompts(kimi, child).Length); Assert.AreEqual(0, Reports(claude, parent).Length);
+            await client.DisposeAsync(); await first.DisposeAsync(); closed = true;
+            next = New(); await using var nextClient = await TestClient.ConnectAsync(next);
+            await Until(() => next.ReportStorage.GetReport(reserved.ReportId).ProducerAck, "unstarted evidence imported");
+            var result = next.ReportStorage.Read(reserved.ReportId, child);
+            Assert.AreEqual("not_started", result.Outcome); Assert.AreEqual("failed before native dispatch", result.Error);
+            Assert.IsFalse(result.HasText); Assert.AreEqual(0, next.ReportStorage.Recoverable().Items.Count);
+            await nextClient.Rpc.SendRequestAsync(GorynychProtocol.MethodArchive, new JsonObject { ["sessionId"] = parent, ["archived"] = false });
+            await Until(() => next.ReportStorage.GetReport(reserved.ReportId).Status == "completed", "restored parent received one failure report");
+            await next.ReconcileReportInventoryAsync();
+            Assert.AreEqual(reserved.ReportId, next.ReportStorage.List(child).Items.Single().ReportId);
+            Assert.AreEqual(1, Reports(claude, parent).Length); Assert.AreEqual(0, Prompts(kimi, child).Length);
+        }
+        finally
+        {
+            if (held) gate.Release();
+            if (next is not null) await next.DisposeAsync();
+            if (!closed) { await client.DisposeAsync(); await first.DisposeAsync(); }
+        }
     }
 
     [TestMethod]
@@ -532,7 +609,8 @@ public sealed class SessionTreeTests
 
         await conductor.BackgroundTurnsIdleAsync();
         var report = Reports(kimi, parent).Single();
-        StringAssert.StartsWith(report, $"[Report · from session_id {child} (claude, \"Notes\") · your child session · its turn ended]\n(no final message)\n");
+        StringAssert.StartsWith(report, $"[Report · from session_id {child} · your child session · report_id ");
+        StringAssert.Contains(report, "native outcome: ended"); StringAssert.Contains(report, "Has text: False");
         Assert.IsFalse(report.Contains("Looking around.", StringComparison.Ordinal), "the text before the last tool call is not the final message");
 
         // A final message longer than a report carries is cut, never inside a surrogate pair.
@@ -541,7 +619,8 @@ public sealed class SessionTreeTests
         await PromptAsync(other, child, "Add the migration step");
         await conductor.BackgroundTurnsIdleAsync();
         var cut = Reports(kimi, parent)[1];
-        StringAssert.Contains(cut, "\n" + new string('a', 1999) + "…\n");
+        StringAssert.Contains(cut, "preview truncated: True");
+        StringAssert.Contains(cut, "\n" + new string('a', 1999));
         Assert.IsFalse(cut.Split('\n')[1].Contains('b'), "nothing past the cut in the child's final message");
     }
 
@@ -727,8 +806,8 @@ public sealed class SessionTreeTests
         var context =
             $"[About this session · started by session_id {parent} (claude, \"Coordinate the release\") with spawn_session, approved by the user]\n" +
             $"Answer in your final message: when your turn ends, Gorynych sends that message to session_id {parent} as a report by itself. " +
-            "You do not need to send that report with a tool. The report carries only that last message, your text after your last tool call, " +
-            "and is cut at 2000 characters, so put anything longer into a file and name the file in that message. " +
+            "You do not need to send that report with a tool. It includes a bounded preview of your final text " +
+            "and a report ID so the parent can use read_report for the retained result. " +
             $"To contact it, use send_message with session_id \"{parent}\". The user can also prompt you here directly." +
             $"\nAssignment ID: {conductor.Store.Get(child)!.SpawnAssignmentId}. This is an already user-authorized assignment; retain all user restrictions and existing approval requirements.";
         CollectionAssert.AreEqual(new[] { "Fix the flaky test", context }, kimi.FirstBlocks(child), "the task first, then where it came from");

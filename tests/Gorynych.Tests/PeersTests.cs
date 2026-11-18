@@ -255,9 +255,26 @@ public sealed class PeersTests
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
             StringAssert.Contains((string?)init["instructions"], "Use delegate_task to continue already user-authorized work with your immediate child");
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message" },
+            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports" },
                 tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
 
+            StringAssert.Contains((string?)init["instructions"], "read_report");
+            var wrongArgs = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_reports", ["arguments"] = new JsonArray() });
+            Assert.AreEqual(true, (bool?)wrongArgs!["isError"]);
+            var reports = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_reports", ["arguments"] = new JsonObject() });
+            Assert.AreEqual(false, (bool?)reports!["isError"]);
+            Assert.AreEqual(0, JsonNode.Parse((string)reports["content"]![0]!["text"]!)!["items"]!.AsArray().Count);
+            var reportId = conductor.ReportStorage.Reserve(new ReportIdentity("mcp-result", "answering", "asking", ReportCause.User)).ReportId;
+            using (var capture = conductor.ReportStorage.OpenCapture(reportId))
+            {
+                capture.Append("MCP exact 😀 result"); capture.Seal("ended");
+                conductor.ReportStorage.Commit(reportId, capture);
+            }
+            var actual = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "read_report", ["arguments"] = new JsonObject { ["report_id"] = reportId } });
+            Assert.AreEqual(false, (bool?)actual!["isError"]);
+            Assert.AreEqual("MCP exact 😀 result", (string?)JsonNode.Parse((string)actual["content"]![0]!["text"]!)!["text"]);
+            var missing = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "read_report", ["arguments"] = new JsonObject { ["report_id"] = Guid.NewGuid().ToString("N") } });
+            Assert.AreEqual(true, (bool?)missing!["isError"]);
             var listed = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_agents", ["arguments"] = new JsonObject() });
             var listing = (string)listed!["content"]![0]!["text"]!;
             StringAssert.StartsWith(listing, $"You are session_id asking (asker).\n{PeersServer.StatusLegend}\n[",

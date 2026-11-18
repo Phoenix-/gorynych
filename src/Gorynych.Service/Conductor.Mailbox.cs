@@ -8,6 +8,7 @@ namespace Gorynych.Service;
 public sealed partial class Conductor
 {
     MailboxStore mailbox = null!;
+    internal Action? BeforeMailboxMarkStarted { get; set; }
     readonly Lock mailboxGate = new();
     readonly Dictionary<string, Task> mailboxWorkers = new(StringComparer.Ordinal);
 
@@ -202,6 +203,7 @@ public sealed partial class Conductor
         string? promptId = null;
         long? key = null;
         var handed = false;
+        ReportAdmission? report = null;
         try
         {
             if (Draining) return; // still queued; the next service resumes it
@@ -229,20 +231,36 @@ public sealed partial class Conductor
             if (sender != "service" && !sender.StartsWith("outside:", StringComparison.Ordinal)) meta[GorynychProtocol.MetaFromSessionId] = sender;
             await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
             { Content = block, MessageId = messageId, Meta = meta.DeepClone().AsObject() })!.AsObject(), except: null, () => store.Touch(recipient));
-            mailbox.MarkStarted(id, recipient);
             if (use.Record.ParentSessionId is not null) feed.BeginTurnText(ReportLimit + 1);
             Task<JsonNode?> response;
+            var startAttempted = false;
             await feed.ForwardGate.WaitAsync(ct);
             try
             {
                 if (feed.Retired || store.Get(recipient) is not { Deleted: false }) throw NotFound(recipient);
-                response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, WithMessageId(AcpJson.ToNode(new PromptRequest
-                { SessionId = recipient, Prompt = [block], Meta = meta }), messageId), CancellationToken.None);
+                var cause = (bool?)item["delegation"] == true ? ReportCause.Delegation :
+                    item["replyTo"] is not null ? ReportCause.Reply : ReportCause.Peer;
+                report = AdmitReport(use.Record, rpc, promptId, "mailbox:" + id, cause,
+                    cause == ReportCause.Delegation ? (string?)item["assignmentId"] : null, id);
+                BeforeMailboxMarkStarted?.Invoke();
+                mailbox.MarkStarted(id, recipient);
+                var forwarded = WithReport(WithMessageId(AcpJson.ToNode(new PromptRequest
+                { SessionId = recipient, Prompt = [block], Meta = meta }), messageId), report);
+                startAttempted = true;
+                response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, forwarded, CancellationToken.None);
                 handed = true;
                 feed.Handed(key.Value);
             }
-            finally { feed.ForwardGate.Release(); }
-            var result = await response;
+            finally
+            {
+                try { if (!startAttempted) AbandonUnstarted(report); }
+                finally { feed.ForwardGate.Release(); }
+            }
+            JsonNode? result;
+            try { result = await response; }
+            catch (JsonRpcException error) { ImportLocalReport(report, feed, null, error); await HandleReportResponseErrorAsync(report, error); throw; }
+            ImportLocalReport(report, feed, result);
+            await RequireImportedAsync(report);
             // Writing bytes is not an acknowledgement. Retain the uncertain started claim
             // until the adapter has actually answered; a restart must never hide that gap.
             mailbox.MarkDelivered(id, recipient);
@@ -252,13 +270,15 @@ public sealed partial class Conductor
         }
         catch (Exception e)
         {
-            if (promptId is not null && !(handed && LivesOnInHost(e))) await MarkPromptEndAsync(feed, promptId, null, e);
-            if (promptId is not null && !LivesOnInHost(e))
+            if (e is ReportPersistenceException persistence) await ReportPersistenceNoticeAsync(feed, persistence);
+            if (e is not ReportPersistenceException && promptId is not null && !(handed && LivesOnInHost(e))) await MarkPromptEndAsync(feed, promptId, null, e);
+            if (e is not ReportPersistenceException && promptId is not null && !LivesOnInHost(e))
                 ReportTurnEnd(recipient, $"failed: {e.Message}", feed.EndTurnText());
             throw;
         }
         finally
         {
+            ForgetAdmission(report);
             if (key is not null) feed.EndPrompt(key.Value);
             feed.Activity.End();
             feed.TurnEnded();

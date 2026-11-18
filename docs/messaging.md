@@ -130,3 +130,9 @@ instructions. The installed outside shim sent it a message, long-polled, and rec
 correlated reply produced by the thread's real `reply_message` call. The conductor restart
 kept the running parent turn in its old host. A Codex draft can keep an old host alive until
 its first turn or closure, as described in the existing host-generation lifecycle.
+
+
+Managed child and intended-parent sessions can use `list_reports` to discover retained per-turn
+report metadata and `read_report` with a report ID and continuation cursor to read exact bounded
+UTF-8 pages. A report does not complete an assignment. Current automatic delivery still uses the
+legacy route; reliable delivery receipts and the new bounded preview envelope are not yet wired.

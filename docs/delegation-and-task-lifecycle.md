@@ -7,10 +7,10 @@ This records the discussion following the background-work and host-lifecycle fix
 It is a reference for implementation and review, not a new advertised tool or wire
 contract. Conceptual record and event names below are not API names.
 
-**Implementation status:** iteration 1 (explicit direct-child delegation and stable
-correlation) is built. Its current contract is in [messaging.md](messaging.md).
-The lifecycle, dependency supervision and full-result guarantees below remain
-future work, introduced through the separate iterations listed below.
+**Implementation status:** iterations 1 and 2 are built. The current contracts are
+[explicit delegation](messaging.md), [report delivery and retrieval](service-protocol.md#reports),
+and [report storage](report-storage.md). Reply waits, assignment outcomes, and
+supervision are planned as separate iterations below.
 
 Gorynych sessions are persistent conversations. The user can talk to a child
 directly, peers can exchange questions, and native background work can outlive a
@@ -406,7 +406,7 @@ The user approved six independently reviewable rollout iterations:
 | Iteration | Deliverable | Acceptance boundary |
 | --- | --- | --- |
 | 1. Explicit delegation (**built**) | Managed `delegate_task`, immediate-parent validation, trusted envelope and durable correlation, including initial spawn | New/existing session instructions, rejected relationships, retained retry/restart, queued access checks and failed spawn persistence; existing messaging and reports preserved |
-| 2. Reliable complete reports | Immutable full result identity/retrieval, cause/outcome correlation and durable delivery or visible failure | Long results, revised reviews, restart during publication/delivery, unavailable or archived parent; broad automatic report eligibility preserved |
+| 2. Reliable complete reports (**built**) | Immutable full result identity/retrieval, cause/outcome correlation and durable delivery or visible failure | Long results, revised reviews, restart during publication/delivery, unavailable or archived parent; broad automatic report eligibility preserved |
 | 3. Observable reply waits | Explicit response dependency on message M, persistence, resolution and diagnostics | Mutual waits remain visible and receive new input; restart restores edges; ordinary notifications acquire no reply obligation; no new automatic reminders yet |
 | 4. Targeted reply reminders | Fresh activity checks, bounded recipient reminders and owner escalation | Reply/deadline races, cancellation, maintenance and uncertain handoff; enable first on an opted-in test group; disabling reminders preserves messaging and wait records |
 | 5. Assignment outcomes and other waits | Explicit completed/blocked/cancelled outcomes and background/child/user-action continuations | Partial final text does not complete work; unrelated native work grants no blanket exemption; initially observe without the general completion watchdog |

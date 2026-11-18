@@ -70,6 +70,11 @@ public sealed class ClaudeAdapterOptions
     /// <summary>Headless: how long Claude may stay silent with messages waiting and no turn running before they count as dropped.</summary>
     public int StallMs { get; init; } = 30_000;
 
+    // Per-session process-local report receipt bound; tests can exercise backpressure.
+    internal int ReportNoteLedgerLimit { get; init; } = 256;
+    internal int ReportNoteGlobalLimit { get; init; } = 4096;
+    internal Func<Task>? AfterReportNoteWrite { get; init; }
+
     /// <summary>Headless, for tests: awaited before a cancel's interrupt takes the input.</summary>
     public Func<Task>? BeforeInterrupt { get; init; }
 
@@ -119,6 +124,91 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     readonly JsonRpcConnection rpc;
     readonly ClaudeStateStore state;
     readonly ConcurrentDictionary<string, IClaudeSession> sessions = new(StringComparer.Ordinal);
+    // An adapter-wide hard bound also retains unresolved facts when a session is closed.
+    readonly Lock reportNoteIndexGate = new();
+    readonly Dictionary<string, (string Session, ReportNoteAttempt Attempt)> reportNoteOwners = new(StringComparer.Ordinal);
+    // Retired receipts contain bounded facts, not note bodies. Unresolved late
+    // contradictions cannot be evicted; capacity then applies backpressure.
+    readonly Dictionary<string, (string Session, ReportNoteAttempt Attempt)> reportNoteRetired = new(StringComparer.Ordinal);
+    readonly Dictionary<string, string> retiredByUuid = new(StringComparer.Ordinal);
+    readonly Queue<string> retiredOrder = new();
+    internal ReportNoteAttempt? FindRetiredReportNote(string uuid, string session)
+    {
+        lock (reportNoteIndexGate)
+        {
+            if (!retiredByUuid.TryGetValue(uuid, out var attempt) || !reportNoteRetired.TryGetValue(attempt, out var found) || found.Session != session) return null;
+            lock (found.Attempt) found.Attempt.ObserverReferences++;
+            return found.Attempt;
+        }
+    }
+    internal (bool Ack, JsonObject? Snapshot) AcknowledgeReportNote(string attempt, string session, string report, string uuid, long revision)
+    {
+        lock (reportNoteIndexGate)
+        {
+            var retired = reportNoteRetired.TryGetValue(attempt, out var owner);
+            if (!retired && !reportNoteOwners.TryGetValue(attempt, out owner)) return (false, null);
+            if (owner.Session != session || owner.Attempt.ReportId != report || owner.Attempt.Uuid != uuid || !owner.Attempt.HostTracking)
+                throw new JsonRpcException(JsonRpcException.InvalidParams, "Report note ACK identity does not match");
+            var receipt = owner.Attempt;
+            lock (receipt)
+            {
+                var snapshot = receipt.Receipt();
+                var facts = snapshot["_meta"]![GorynychProtocol.MetaReportNote]!;
+                if ((long?)facts["revision"] != revision || !receipt.Resolved || receipt.NotificationDirty || receipt.ObserverReferences != 0)
+                    return (false, snapshot);
+                if (retired) return (true, snapshot);
+                var capacity = Math.Max(1, options.ReportNoteGlobalLimit);
+                var scans = retiredOrder.Count;
+                while (reportNoteRetired.Count >= capacity && scans-- > 0)
+                {
+                    var oldest = retiredOrder.Dequeue();
+                    if (!reportNoteRetired.TryGetValue(oldest, out var candidate)) continue;
+                    lock (candidate.Attempt)
+                    {
+                        if (!candidate.Attempt.Resolved || candidate.Attempt.NotificationActive || candidate.Attempt.NotificationDirty || candidate.Attempt.ObserverReferences != 0)
+                        { retiredOrder.Enqueue(oldest); continue; }
+                    }
+                    reportNoteRetired.Remove(oldest); retiredByUuid.Remove(candidate.Attempt.Uuid);
+                }
+                if (reportNoteRetired.Count >= capacity) return (false, snapshot);
+                reportNoteOwners.Remove(attempt); reportNoteRetired.Add(attempt, owner);
+                retiredByUuid.Add(uuid, attempt); retiredOrder.Enqueue(attempt);
+                return (true, snapshot);
+            }
+        }
+    }
+    // Ledger absence is only a release fact, never evidence of non-delivery or permission to resend.
+    internal bool ReportNoteLedgerDoesNotRetain(string attempt, string uuid)
+    {
+        lock (reportNoteIndexGate)
+            return !reportNoteOwners.ContainsKey(attempt) && !reportNoteRetired.ContainsKey(attempt) &&
+                !reportNoteOwners.Values.Any(x => x.Attempt.Uuid == uuid) && !retiredByUuid.ContainsKey(uuid);
+    }
+    internal ReportNoteAttempt? FindReportNote(string attempt, string session)
+    {
+        lock (reportNoteIndexGate)
+        {
+            if (!reportNoteOwners.TryGetValue(attempt, out var owner) && !reportNoteRetired.TryGetValue(attempt, out owner)) return null;
+            if (owner.Session != session) throw new JsonRpcException(JsonRpcException.InvalidParams, "Report note attempt ID belongs to another session");
+            return owner.Attempt;
+        }
+    }
+    internal bool ClaimReportNote(string attempt, string session, ReportNoteAttempt receipt)
+    {
+        lock (reportNoteIndexGate)
+        {
+            if (reportNoteOwners.ContainsKey(attempt) || reportNoteRetired.ContainsKey(attempt)) throw new JsonRpcException(JsonRpcException.InvalidParams, "Report note attempt ID is already retained");
+            if (reportNoteOwners.Count >= Math.Max(1, options.ReportNoteGlobalLimit)) return false;
+            reportNoteOwners.Add(attempt, (session, receipt));
+            return true;
+        }
+    }
+    internal void ReleaseReportNote(string attempt, string session)
+    {
+        lock (reportNoteIndexGate)
+            if (reportNoteOwners.TryGetValue(attempt, out var owner) && owner.Session == session) reportNoteOwners.Remove(attempt);
+    }
+
     readonly ConcurrentDictionary<string, long> cancelledAt = new(StringComparer.Ordinal);
     /// <summary>Each open session's last transcript mark (a catch-up's or a turn end's): the next turn end reads on from it.</summary>
     readonly ConcurrentDictionary<string, string> marks = new(StringComparer.Ordinal);
@@ -241,6 +331,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                     Meta = new JsonObject
                     {
                         [GorynychProtocol.MetaSteering] = new JsonObject { ["supported"] = Headless },
+                        [GorynychProtocol.CapReportNote] = Headless && Channel is not null,
+                        [GorynychProtocol.CapReportNoteAck] = Headless && Channel is not null,
                     },
                 });
             case AcpMethods.Agent.SessionNew:
@@ -357,6 +449,12 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             }
             case GorynychProtocol.MethodOpinion:
                 return await OpinionAsync(request, ct);
+            case GorynychProtocol.MethodReportNote:
+                return await ReportNoteAsync(request, ct);
+            case GorynychProtocol.MethodReportNoteStatus:
+                return ReportNoteStatus(request);
+            case GorynychProtocol.MethodReportNoteAck:
+                return ReportNoteAck(request);
             case GorynychProtocol.MethodNote:
                 return await NoteAsync(request, ct);
             default:
@@ -559,6 +657,60 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         return new JsonObject();
     }
 
+    static string ReportNoteField(JsonRpcRequest request, string name)
+    {
+        var meta = request.Params?["_meta"]?[GorynychProtocol.MetaReportNote];
+        if (meta?[name] is not JsonValue value || !value.TryGetValue<string>(out var id) || !Guid.TryParseExact(id, "N", out var parsed))
+            throw new JsonRpcException(JsonRpcException.InvalidParams, name + " must be a 32-digit ID");
+        return parsed.ToString("N");
+    }
+
+    HeadlessSession ReportNoteSession(JsonRpcRequest request)
+    {
+        if (!Headless || Channel is null)
+            throw new JsonRpcException(JsonRpcException.MethodNotFound, "Report note receipts are unsupported on this Claude transport; use a queued turn before handoff.");
+        if (request.Params?["sessionId"] is not JsonValue value || !value.TryGetValue<string>(out var id) || string.IsNullOrWhiteSpace(id))
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "sessionId is required");
+        if (Session(id, null) is not HeadlessSession headless)
+            throw new JsonRpcException(JsonRpcException.MethodNotFound, "Report note receipts require a headless Claude session.");
+        return headless;
+    }
+
+    async Task<JsonNode?> ReportNoteAsync(JsonRpcRequest request, CancellationToken ct)
+    {
+        var session = ReportNoteSession(request);
+        var reportId = ReportNoteField(request, "reportId");
+        var attemptId = ReportNoteField(request, "attemptId");
+        if (request.Params?["text"] is not JsonValue value || !value.TryGetValue<string>(out var text))
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "text is required");
+        int bytes;
+        try { bytes = new UTF8Encoding(false, true).GetByteCount(text); }
+        catch (EncoderFallbackException) { throw new JsonRpcException(JsonRpcException.InvalidParams, "Report note must contain valid Unicode"); }
+        if (bytes > 16384)
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "Report note exceeds 16384 UTF-8 bytes");
+        return await session.DeliverReportAsync(reportId, attemptId, text, ct,
+            (bool?)request.Params?["_meta"]?[GorynychProtocol.MetaHostNoteTracking] == true);
+    }
+
+    JsonNode ReportNoteStatus(JsonRpcRequest request)
+    {
+        if (request.Params is JsonObject p && p.ContainsKey("text"))
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "Report note status accepts no text");
+        var session = ReportNoteSession(request);
+        return session.ReportNoteStatus(ReportNoteField(request, "reportId"), ReportNoteField(request, "attemptId"));
+    }
+
+    JsonNode ReportNoteAck(JsonRpcRequest request)
+    {
+        if ((bool?)request.Params?["_meta"]?[GorynychProtocol.MetaHostNoteTracking] != true || request.Params is JsonObject p && p.ContainsKey("text"))
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "Report note ACK requires trusted host tracking and no text");
+        var session = ReportNoteSession(request); var note = request.Params?["_meta"]?[GorynychProtocol.MetaReportNote];
+        var uuid = (string?)note?["nativeMessageId"];
+        if (!Guid.TryParse(uuid, out _) || note?["revision"] is not JsonValue value || !value.TryGetValue<long>(out var revision) || revision <= 0)
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "Native message identity and receipt revision are required");
+        return session.AcknowledgeReportNote(ReportNoteField(request, "reportId"), ReportNoteField(request, "attemptId"), uuid!, revision);
+    }
+
     static bool IsDraft(JsonObject? meta) => meta?[GorynychProtocol.MetaDraft] is JsonValue v && v.TryGetValue<bool>(out var draft) && draft;
 
     /// <summary>Whether a session is open here, recorded, or has a transcript of Claude's: not a draft to start afresh.</summary>
@@ -579,6 +731,46 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     }
 
     public Task EmitAsync(string sessionId, SessionUpdate update) => rpc.SendUpdateAsync(sessionId, update);
+
+    internal void QueueReportReceipt(string sessionId, ReportNoteAttempt receipt)
+    {
+        if (!receipt.HostTracking) return;
+        lock (receipt)
+        {
+            receipt.NotificationDirty = true;
+            if (receipt.NotificationActive) return;
+            receipt.NotificationActive = true;
+        }
+        _ = DrainReportReceiptAsync(sessionId, receipt);
+    }
+
+    async Task DrainReportReceiptAsync(string sessionId, ReportNoteAttempt receipt)
+    {
+        while (true)
+        {
+            lock (receipt) receipt.NotificationDirty = false;
+            await EmitReportReceiptAsync(sessionId, receipt);
+            lock (receipt)
+            {
+                if (receipt.NotificationDirty) continue;
+                receipt.NotificationActive = false;
+                return;
+            }
+        }
+    }
+
+    async Task EmitReportReceiptAsync(string sessionId, ReportNoteAttempt receipt)
+    {
+        if (!receipt.HostTracking) return;
+        try
+        {
+            var snapshot = receipt.Receipt();
+            await rpc.SendNotificationAsync(GorynychProtocol.MethodHostReportNoteReceipt,
+                new JsonObject { ["sessionId"] = sessionId, ["_meta"] = snapshot["_meta"]?.DeepClone() });
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        { Log($"claude {sessionId}: report receipt observer unavailable: {e.GetType().Name}"); }
+    }
 
     // ---------------------------------------------------------------- headless: catalog and trust
 

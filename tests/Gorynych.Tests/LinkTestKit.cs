@@ -25,6 +25,7 @@ sealed class TurnAgent(string name) : IAgentAdapter
     public ScriptedAgent? Current { get; private set; }
     public bool Hold { get; set; }
     public Func<ScriptedAgent, string, CancellationToken, Task>? During { get; set; }
+    public Func<string, Task>? DuringNote { get; set; }
 
     /// <summary>No <c>started:</c> chunk: the turn sends nothing until it ends.</summary>
     public bool Quiet { get; set; }
@@ -59,6 +60,7 @@ sealed class TurnAgent(string name) : IAgentAdapter
 
     /// <summary>It advertises and takes <c>_session/steering</c>, accepting it into the running turn.</summary>
     public bool Steers { get; set; }
+    public bool ReceiptOnlyCapability { get; set; }
 
     /// <summary>How many steering requests reached the agent: a lost answer is never a reason to send one again.</summary>
     public int SteersCount;
@@ -120,7 +122,15 @@ sealed class TurnAgent(string name) : IAgentAdapter
         switch (req.Method)
         {
             case AcpMethods.Agent.Initialize:
-                return ScriptedAgent.Init(close: Closes, draftsNotDurable: DraftsNotDurable, steering: Steers);
+            {
+                var init = ScriptedAgent.Init(close: Closes, draftsNotDurable: DraftsNotDurable, steering: Steers)!;
+                if (ReceiptOnlyCapability)
+                {
+                    var meta = init["_meta"] as JsonObject ?? new JsonObject(); init["_meta"] = meta;
+                    meta[GorynychProtocol.CapReportNote] = true;
+                }
+                return init;
+            }
             case AcpMethods.Agent.SessionNew:
                 Interlocked.Increment(ref News);
                 if (SlowGate is { } slowNew) await slowNew.Task;
@@ -143,6 +153,9 @@ sealed class TurnAgent(string name) : IAgentAdapter
                     }
                 }
                 if (ResumeGate is { } slowResume) await slowResume.Task;
+                return new JsonObject();
+            case GorynychProtocol.MethodNote when DuringNote is not null:
+                await DuringNote((string)req.Params!["sessionId"]!);
                 return new JsonObject();
             case GorynychProtocol.MethodSteering:
                 Interlocked.Increment(ref SteersCount);

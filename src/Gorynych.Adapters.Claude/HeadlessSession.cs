@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
@@ -54,6 +55,10 @@ internal sealed class HeadlessSession : IClaudeSession
     readonly HashSet<string> taken = new(StringComparer.Ordinal);   // uuids the running turn replayed
     readonly List<string> pending = [];                              // written, not replayed yet
     readonly Dictionary<string, Note> notes = new(StringComparer.Ordinal);
+    // Bounded for this adapter process only; unresolved receipts are never evicted.
+    readonly Dictionary<string, ReportNoteAttempt> reportNotes = new(StringComparer.Ordinal);
+    readonly Dictionary<string, ReportNoteAttempt> reportNotesByUuid = new(StringComparer.Ordinal);
+    readonly Queue<string> reportNoteOrder = new();
     readonly Dictionary<string, Steer> steers = new(StringComparer.Ordinal); // accepted, not replayed yet
     Turn? turn;                                                      // the client's prompt
     Turn? incoming;                                                  // its prompt is accepted, still starting
@@ -351,10 +356,16 @@ internal sealed class HeadlessSession : IClaudeSession
         Turn? current;
         bool written, run;
         long serial;
+        var observed = new List<ReportNoteAttempt>();
         lock (stateGate)
         {
             current = turn;
             if (current is not null) current.CancelRequested = true;
+            // A note-owned native turn can have no client Turn. Preserve cancellation on
+            // every report UUID already echoed in this cycle, independently of that object.
+            foreach (var uuid in taken)
+                if (reportNotesByUuid.TryGetValue(uuid, out var receipt)) lock (receipt)
+                    if (receipt.CycleResult is null) { receipt.CancelRequested = true; receipt.ObserverReferences++; observed.Add(receipt); }
             written = current?.Written == true;
             // A turn of Claude's own has no client prompt: it is interrupted by its active state.
             run = active || written || ownOpen;
@@ -363,6 +374,7 @@ internal sealed class HeadlessSession : IClaudeSession
             cancelSignal = NewSignal();
             wake.TrySetResult();
         }
+        foreach (var receipt in observed) QueueObservedReceipt(receipt);
         // Not written yet: the prompt sees the cancel and writes nothing.
         if (!run || current is { Task.IsCompleted: true }) return;
         _ = InterruptAfterArrivalsAsync(current, serial, arrivalSequence);
@@ -399,6 +411,7 @@ internal sealed class HeadlessSession : IClaudeSession
             return;
         }
         await inputGate.WaitAsync();
+        var cancellingReceipts = new List<ReportNoteAttempt>();
         try
         {
             // The turn may have ended while this waited; an interrupt now would stop the next prompt.
@@ -407,17 +420,30 @@ internal sealed class HeadlessSession : IClaudeSession
                 if (current is not null)
                     if (!ReferenceEquals(turn, current) || current.Task.IsCompleted) return;
                 if (current is null && ((!active && !ownOpen) || generation != serial)) return;
+                foreach (var uuid in pending.Concat(taken).Distinct(StringComparer.Ordinal))
+                    if (reportNotesByUuid.TryGetValue(uuid, out var receipt)) lock (receipt)
+                    {
+                        receipt.CancelReceiptPending = true;
+                        if (taken.Contains(uuid) && receipt.CycleResult is null) receipt.CancelRequested = true;
+                        receipt.ObserverReferences++; cancellingReceipts.Add(receipt);
+                    }
             }
+            foreach (var receipt in cancellingReceipts) agent.QueueReportReceipt(Id, receipt);
             var response = await claude.ControlAsync(new JsonObject { ["subtype"] = "interrupt", ["cancel_queued"] = true }, TimeSpan.FromSeconds(5));
             // Probed with 2.1.302: {still_queued: [], cancelled: [uuids it dropped from the queue]}.
-            foreach (var uuid in (response["cancelled"] as JsonArray)?.Select(n => (string?)n).OfType<string>() ?? [])
-                Drop(uuid, error: null);
+            if (response["cancelled"] is not JsonArray cancelled || cancelled.Any(n => n is not JsonValue v || !v.TryGetValue<string>(out _)))
+                throw new IOException("Native interrupt did not return a valid cancelled UUID list");
+            foreach (var uuid in cancelled.Select(n => (string)n!)) Drop(uuid, error: null);
+            foreach (var receipt in cancellingReceipts) lock (receipt) receipt.CancelReceiptPending = false;
         }
         catch (Exception e) when (e is IOException or TimeoutException or ClaudeControlException or ObjectDisposedException)
         {
+            foreach (var receipt in cancellingReceipts) lock (receipt)
+                receipt.Uncertainty = "Native interrupt receipt was not confirmed; do not retry blindly";
             agent.Log($"claude {Id}: interrupt failed: {e.Message}");
         }
         finally { inputGate.Release(); }
+        foreach (var receipt in cancellingReceipts) QueueObservedReceipt(receipt);
         WithdrawAsks();
         if (current is not null)
         {
@@ -448,13 +474,28 @@ internal sealed class HeadlessSession : IClaudeSession
         Note? note;
         Steer? steer;
         Turn? current;
+        ReportNoteAttempt? observedReceipt = null; bool retiredReference = false;
         lock (stateGate)
         {
             pending.Remove(uuid);
             steers.Remove(uuid, out steer);
             notes.Remove(uuid, out note);
+            var receipt = reportNotesByUuid.GetValueOrDefault(uuid);
+            if (receipt is null) { receipt = agent.FindRetiredReportNote(uuid, Id); retiredReference = receipt is not null; }
+            if (receipt is not null) lock (receipt)
+            {
+                if (!retiredReference) receipt.ObserverReferences++;
+                observedReceipt = receipt;
+                if (error is null) { receipt.Dropped = true; receipt.DropReason = "Native interrupt reported this UUID cancelled"; }
+                else if (!receipt.Resolved) receipt.Uncertainty = "No native receipt before the adapter stall deadline";
+            }
             current = turn?.Uuid == uuid ? turn : null;
             UpdateIdle();
+        }
+        if (observedReceipt is not null)
+        {
+            try { agent.QueueReportReceipt(Id, observedReceipt); }
+            finally { lock (observedReceipt) observedReceipt.ObserverReferences--; }
         }
         note?.Dropped.TrySetResult();
         if (steer is not null)
@@ -553,6 +594,133 @@ internal sealed class HeadlessSession : IClaudeSession
         finally { inputGate.Release(); }
         ScheduleStallCheck();
         return note.Dropped.Task;
+    }
+
+    internal async Task<JsonNode> DeliverReportAsync(string reportId, string attemptId, string text, CancellationToken ct, bool hostTracking = false)
+    {
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
+        JsonNode Refused(string reason) => new JsonObject { ["_meta"] = new JsonObject {
+            [GorynychProtocol.MetaReportNote] = new JsonObject { ["reportId"] = reportId, ["attemptId"] = attemptId,
+                ["digest"] = digest, ["noInputProof"] = reason } } };
+        await inputGate.WaitAsync(ct);
+        try
+        {
+            ReportNoteAttempt receipt;
+            ClaudeProcess claude;
+            lock (stateGate)
+            {
+                if (agent.FindReportNote(attemptId, Id) is { } existing)
+                {
+                    if (existing.ReportId != reportId || existing.Digest != digest)
+                        throw new JsonRpcException(JsonRpcException.InvalidParams, "Report note attempt ID conflicts with its retained identity or content");
+                    return existing.Receipt();
+                }
+                if (process is not { Exited.IsCompleted: false } running)
+                {
+                    if (hostTracking) return Refused("native_not_running");
+                    throw new JsonRpcException(JsonRpcException.InvalidRequest, "Claude is not running; use a queued turn before handoff.");
+                }
+                claude = running;
+                while (reportNotes.Count >= Math.Max(1, options.ReportNoteLedgerLimit))
+                {
+                    // Rotate unresolved entries; only terminal facts can be evicted.
+                    var examined = reportNoteOrder.Count; var removed = false;
+                    while (examined-- > 0)
+                    {
+                        var oldest = reportNoteOrder.Dequeue();
+                        var candidate = reportNotes[oldest];
+                        // Host-tracked receipts remain pinned until a future durable ACK
+                        // boundary; this also bounds outstanding coalesced observer tasks.
+                        if (!candidate.Resolved || candidate.HostTracking) { reportNoteOrder.Enqueue(oldest); continue; }
+                        reportNotes.Remove(oldest); reportNotesByUuid.Remove(candidate.Uuid);
+                        agent.ReleaseReportNote(oldest, Id); removed = true; break;
+                    }
+                    if (!removed)
+                    {
+                        if (hostTracking) return Refused("receipt_capacity");
+                        throw new JsonRpcException(JsonRpcException.InvalidRequest, "Report note receipt capacity is full; unresolved attempts are retained. No native input was written.");
+                    }
+                }
+                receipt = new ReportNoteAttempt(reportId, attemptId, Guid.NewGuid().ToString(), digest, hostTracking);
+                if (!agent.ClaimReportNote(attemptId, Id, receipt))
+                {
+                    if (hostTracking) return Refused("receipt_capacity");
+                    throw new JsonRpcException(JsonRpcException.InvalidRequest, "Adapter report note receipt capacity is full; no native input was written");
+                }
+                reportNotes.Add(attemptId, receipt); reportNotesByUuid.Add(receipt.Uuid, receipt); reportNoteOrder.Enqueue(attemptId);
+                var meta = hostTracking
+                    ? new JsonObject { [GorynychProtocol.MetaOrigin] = "report", [GorynychProtocol.MetaReportDelivery] = new JsonObject
+                        { ["reportId"] = reportId, ["attemptId"] = attemptId } }
+                    : new JsonObject { [GorynychProtocol.MetaReportId] = reportId,
+                        [GorynychProtocol.MetaReportNote] = new JsonObject { ["attemptId"] = attemptId } };
+                var note = new Note(receipt.Uuid, text, meta);
+                notes[note.Uuid] = note; pending.Add(note.Uuid);
+                lock (receipt) { receipt.WriteStarted = true; receipt.ObserverReferences++; }
+                lastOutput = Environment.TickCount64; UpdateIdle();
+            }
+            try
+            {
+                try
+                {
+                    // Once writing starts a caller disconnect cannot safely retract or replay the input.
+                    await claude.WriteAsync(StreamJson.UserMessage(receipt.Uuid, JsonValue.Create(text)!), CancellationToken.None);
+                    if (options.AfterReportNoteWrite is { } hook) await hook();
+                    lock (stateGate) lock (receipt) receipt.WriteCompleted = true;
+                }
+                catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException)
+                {
+                    lock (stateGate)
+                    {
+                        notes.Remove(receipt.Uuid); pending.Remove(receipt.Uuid); UpdateIdle();
+                        lock (receipt) if (!receipt.Resolved) receipt.Uncertainty = "Native input write did not confirm completion; do not retry blindly";
+                    }
+                }
+                ScheduleStallCheck();
+                lock (stateGate) return receipt.Receipt();
+            }
+            finally { QueueObservedReceipt(receipt); }
+        }
+        finally { inputGate.Release(); }
+    }
+
+    void QueueObservedReceipt(ReportNoteAttempt receipt)
+    {
+        try { agent.QueueReportReceipt(Id, receipt); }
+        finally { lock (receipt) receipt.ObserverReferences--; }
+    }
+
+    internal JsonNode ReportNoteStatus(string reportId, string attemptId)
+    {
+        lock (stateGate)
+        {
+            if (agent.FindReportNote(attemptId, Id) is not { } receipt)
+            {
+                return new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaReportNote] = new JsonObject
+                    { ["reportId"] = reportId, ["attemptId"] = attemptId, ["state"] = "unknown" } } };
+            }
+            if (receipt.ReportId != reportId)
+                throw new JsonRpcException(JsonRpcException.InvalidParams, "Report note attempt ID conflicts with its retained identity");
+            return receipt.Receipt();
+        }
+    }
+
+    internal JsonNode AcknowledgeReportNote(string reportId, string attemptId, string uuid, long revision)
+    {
+        lock (stateGate)
+        {
+            var (ack, snapshot) = agent.AcknowledgeReportNote(attemptId, Id, reportId, uuid, revision);
+            if (ack && reportNotes.Remove(attemptId))
+            {
+                reportNotesByUuid.Remove(uuid);
+                var remaining = reportNoteOrder.Where(id => id != attemptId).ToArray();
+                reportNoteOrder.Clear(); foreach (var id in remaining) reportNoteOrder.Enqueue(id);
+            }
+            var facts = snapshot?["_meta"]?[GorynychProtocol.MetaReportNote] as JsonObject ?? new JsonObject
+                { ["reportId"] = reportId, ["attemptId"] = attemptId, ["nativeMessageId"] = uuid, ["revision"] = revision,
+                    ["state"] = "ledger_not_retained", ["ledgerNotRetained"] = agent.ReportNoteLedgerDoesNotRetain(attemptId, uuid) };
+            facts["acknowledged"] = ack;
+            return new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaReportNote] = facts.DeepClone() } };
+        }
     }
 
     // ---------------------------------------------------------------- options and title
@@ -886,6 +1054,7 @@ internal sealed class HeadlessSession : IClaudeSession
         bool own;
         List<Note> lost;
         List<CancellationTokenSource> withdrawn;
+        List<ReportNoteAttempt> observed;
         lock (stateGate)
         {
             if (!ReferenceEquals(process, claude)) return;
@@ -897,10 +1066,18 @@ internal sealed class HeadlessSession : IClaudeSession
             pending.Clear();
             steers.Clear();
             lost = notes.Values.ToList();
+            observed = [];
+            foreach (var receipt in reportNotes.Values) lock (receipt)
+                if (!receipt.Resolved && receipt.WriteStarted)
+                {
+                    receipt.Uncertainty = "Native process exited before a matching cycle result; do not retry blindly";
+                    receipt.ObserverReferences++; observed.Add(receipt);
+                }
             notes.Clear();
             withdrawn = asks.Values.ToList();
             UpdateIdle();
         }
+        foreach (var receipt in observed) QueueObservedReceipt(receipt);
         agent.Log(why is null ? $"claude {Id}: exited with code {code}" : $"claude {Id}: stopped: {why}");
         foreach (var note in lost) note.Dropped.TrySetResult();
         foreach (var cts in withdrawn)
@@ -1080,6 +1257,7 @@ internal sealed class HeadlessSession : IClaudeSession
         var uuid = (string?)m["uuid"] ?? "";
         Note? note;
         Steer? steer;
+        ReportNoteAttempt? observedReceipt = null; bool retiredReference = false;
         var mark = false;
         lock (stateGate)
         {
@@ -1089,6 +1267,15 @@ internal sealed class HeadlessSession : IClaudeSession
             pending.Remove(uuid);
             steers.Remove(uuid, out steer);
             notes.Remove(uuid, out note);
+            var receipt = reportNotesByUuid.GetValueOrDefault(uuid);
+            if (receipt is null) { receipt = agent.FindRetiredReportNote(uuid, Id); retiredReference = receipt is not null; }
+            if (receipt is not null) lock (receipt)
+            {
+                if (!retiredReference) receipt.ObserverReferences++;
+                receipt.Taken = true; observedReceipt = receipt;
+                // Preserve a native cancelled[] fact even if a contradictory echo arrives later.
+                receipt.Uncertainty = null;
+            }
             if (steer is not null)
             {
                 // A steered message is part of its owning ACP turn: a client prompt's, or the
@@ -1115,13 +1302,26 @@ internal sealed class HeadlessSession : IClaudeSession
             }
             UpdateIdle();
         }
+        if (observedReceipt is not null)
+        {
+            try { agent.QueueReportReceipt(Id, observedReceipt); }
+            finally { lock (observedReceipt) observedReceipt.ObserverReferences--; }
+        }
         resume = true; // the conversation now exists in Claude's own store
         if (steer is not null) return; // journaled by the conductor already: no echo
         if (note is null) return; // the client's own prompt: ACP does not echo it
         var meta = note.Meta.DeepClone().AsObject();
-        meta[GorynychProtocol.MetaOrigin] = "live";
+        if ((string?)meta[GorynychProtocol.MetaOrigin] != "report") meta[GorynychProtocol.MetaOrigin] = "live";
         if (mark) meta[GorynychProtocol.MetaAgentTurn] = "started";
         await EmitAsync(new SessionUpdateUserMessageChunk { Content = new TextContent { Text = note.Text }, MessageId = uuid, Meta = meta });
+    }
+
+    static string? BoundedReportNativeField(JsonNode? node)
+    {
+        if (node is not JsonValue value || !value.TryGetValue<string>(out var text)) return null;
+        var end = Math.Min(text.Length, 128);
+        if (end < text.Length && char.IsHighSurrogate(text[end - 1])) end--;
+        return text[..end] + (end < text.Length ? " [truncated]" : "");
     }
 
     async Task OnResultAsync(JsonObject m)
@@ -1129,12 +1329,34 @@ internal sealed class HeadlessSession : IClaudeSession
         Turn? current;
         bool own, waiting, deferred = false;
         string? authError;
+        var observedReceipts = new List<ReportNoteAttempt>();
         lock (stateGate)
         {
             // Only the turn that took the client's prompt, or one waiting for its accepted steers,
             // ends it. A later native cycle that took a pending steer stays part of that ACP turn.
             current = turn is { } t && (taken.Contains(t.Uuid) || t.Deferred is not null) ? t : null;
             own = active && activeOwn && activeMarked;
+            var nativeError = StreamJson.ResultError(m);
+            foreach (var uuid in taken)
+                if (reportNotesByUuid.TryGetValue(uuid, out var receipt)) lock (receipt)
+                {
+                    // Result is a monotone observation even when a later contradictory
+                    // cancelled[] makes the overall disposition unresolved.
+                    if (receipt.CycleResult is not null) continue;
+                    receipt.CancelRequested |= current?.CancelRequested == true;
+                    receipt.CycleResult = nativeError is null ? "ended" : receipt.CancelRequested ? "cancelled" : "failed";
+                    receipt.ObserverReferences++; observedReceipts.Add(receipt);
+                    receipt.NativeSubtype = BoundedReportNativeField(m["subtype"]);
+                    receipt.NativeStopReason = BoundedReportNativeField(m["stop_reason"]);
+                    receipt.NativeTerminalReason = BoundedReportNativeField(m["terminal_reason"]);
+                    if (nativeError is not null)
+                    {
+                        var end = Math.Min(nativeError.Length, 256);
+                        if (end < nativeError.Length && char.IsHighSurrogate(nativeError[end - 1])) end--;
+                        receipt.NativeError = nativeError[..end] + (end < nativeError.Length ? " [truncated]" : "");
+                    }
+                    receipt.Uncertainty = null;
+                }
             active = activeOwn = activeMarked = false;
             taken.Clear();
             generation++;
@@ -1159,6 +1381,7 @@ internal sealed class HeadlessSession : IClaudeSession
             waiting = pending.Count > 0;
             UpdateIdle();
         }
+        foreach (var receipt in observedReceipts) QueueObservedReceipt(receipt);
         streamed.Clear();
         toolNames.Clear();
         WithdrawAsks(); // the turn is over: no approval of it is still awaited
@@ -1356,7 +1579,20 @@ internal sealed class HeadlessSession : IClaudeSession
         try
         {
             disposed = true;
-            lock (stateGate) turn?.TryComplete(StopReason.Cancelled);
+            lock (stateGate)
+            {
+                turn?.TryComplete(StopReason.Cancelled);
+                foreach (var (id, receipt) in reportNotes)
+                {
+                    bool release;
+                    lock (receipt)
+                    {
+                        release = receipt.Resolved && !receipt.HostTracking;
+                        if (!receipt.Resolved) receipt.Uncertainty = "Session closed before a matching cycle result; do not retry blindly";
+                    }
+                    if (release) agent.ReleaseReportNote(id, Id);
+                }
+            }
             lifetime.Cancel();
             Task? finishingTitle;
             lock (stateGate) finishingTitle = titleTask;
