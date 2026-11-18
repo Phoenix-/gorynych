@@ -86,6 +86,7 @@ internal sealed partial class MailboxStore
             if (outcome == "open" && status != "blocked") throw new InvalidOperationException("Only a blocked assignment can be reopened");
             var copy = assignments.DeepClone().AsObject(); var item = copy[id]!.AsObject();
             item["status"] = outcome; item["summary"] = summary; item["revision"] = expectedRevision + 1;
+            if (outcome is "completed" or "failed" or "cancelled") item.Remove("continuation");
             if (outcomeReportId is not null) item["outcomeReportId"] = outcomeReportId;
             var entriesCopy = entries.DeepClone().AsArray();
             if (outcome == "cancelled" && (string?)item["delivery"] == "queued")
@@ -107,6 +108,29 @@ internal sealed partial class MailboxStore
             return result;
         }
     }
+    internal JsonObject UpdateContinuation(string id, string actor, string generation, long revision, string operation, string action, JsonObject? target)
+    {
+        lock (gate)
+        {
+            if (assignments[id] is not JsonObject) throw new InvalidOperationException("Assignment unavailable");
+            var copy = assignments.DeepClone().AsObject();
+            // Recheck same-store identities inside the same lock as publication. A retained
+            // operation receipt is checked first by Update and survives later target eviction.
+            if (action == "register" && target is not null)
+            {
+                if ((string?)target["kind"] == "reply_wait")
+                    target["confirmed"] = ContinuationWait((string)target["messageId"]!, actor, (long?)target["sequence"]) is not null && target["sequence"] is not null;
+                else if ((string?)target["source"] == "delegation")
+                    target["confirmed"] = assignments[(string)target["assignmentId"]!] is JsonObject dependency &&
+                        (string?)dependency["parent"] == actor && (string?)dependency["generation"] == (string?)target["generation"];
+            }
+            var (changed, result) = AssignmentContinuations.Update(copy[id]!.AsObject(), actor, generation, revision, operation, action, target);
+            result["assignmentId"] = id;
+            if (changed) Save(entries.DeepClone().AsArray(), next, assigned: copy);
+            return result;
+        }
+    }
+
     internal JsonObject[] AssignmentViews(string participant)
     {
         lock (gate) return assignments.Where(p => p.Value is JsonObject a &&

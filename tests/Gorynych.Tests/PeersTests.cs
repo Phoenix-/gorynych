@@ -255,7 +255,7 @@ public sealed class PeersTests
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
             StringAssert.Contains((string?)init["instructions"], "Use delegate_task to continue already user-authorized work with your immediate child");
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports", "request_reply", "list_reply_waits", "cancel_reply_wait", "list_assignments", "read_assignment", "update_assignment" },
+            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports", "request_reply", "list_reply_waits", "cancel_reply_wait", "list_assignments", "read_assignment", "update_assignment", "update_continuation", "list_background_tasks" },
                 tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
 
             StringAssert.Contains((string?)init["instructions"], "list_assignments");
@@ -270,6 +270,22 @@ public sealed class PeersTests
             var assignmentBody = JsonNode.Parse((string)assignmentRead!["content"]![0]!["text"]!)!;
             Assert.AreEqual("open", (string?)assignmentBody["status"]);
             var assignmentGeneration = (string)assignmentBody["generation"]!;
+            conductor.ReplyMailbox.Accept("mcp-child-task", "answering", "asking", "work", delegation: true);
+            conductor.ReplyMailbox.Accept("mcp-child-wait", "asking", "answering", "question", expectReply: true);
+            var childGeneration = (string)conductor.ReplyMailbox.FindAssignment("mcp-child-task", "asking")!["generation"]!;
+            var continuation = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "update_continuation", ["arguments"] = new JsonObject
+            { ["source"] = "delegation", ["assignment_id"] = "mcp-child-task", ["generation"] = childGeneration, ["expected_revision"] = 1,
+                ["operation_id"] = "register", ["action"] = "register", ["message_id"] = "mcp-child-wait" } });
+            Assert.AreEqual("waiting", (string?)JsonNode.Parse((string)continuation!["content"]![0]!["text"]!)!["continuation"]!["state"]);
+            var withdrawal = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "update_continuation", ["arguments"] = new JsonObject
+            { ["source"] = "delegation", ["assignment_id"] = "mcp-child-task", ["generation"] = childGeneration, ["expected_revision"] = 2,
+                ["operation_id"] = "withdraw", ["action"] = "withdraw" } });
+            Assert.IsNull(JsonNode.Parse((string)withdrawal!["content"]![0]!["text"]!)!["continuation"]);
+            var childWait = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "update_continuation", ["arguments"] = new JsonObject
+            { ["source"] = "delegation", ["assignment_id"] = "mcp-child-task", ["generation"] = childGeneration, ["expected_revision"] = 3,
+                ["operation_id"] = "child-register", ["action"] = "register", ["target_source"] = "delegation", ["target_assignment_id"] = "mcp-assignment",
+                ["target_generation"] = assignmentGeneration } });
+            Assert.AreEqual("waiting", (string?)JsonNode.Parse((string)childWait!["content"]![0]!["text"]!)!["continuation"]!["state"]);
             var assignmentCancel = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "update_assignment", ["arguments"] = new JsonObject
             { ["source"] = "delegation", ["assignment_id"] = "mcp-assignment", ["generation"] = assignmentGeneration, ["expected_revision"] = 1, ["operation_id"] = "cancel-1", ["outcome"] = "cancelled", ["summary"] = "stop" } });
             Assert.AreEqual("cancelled", (string?)JsonNode.Parse((string)assignmentCancel!["content"]![0]!["text"]!)!["status"]);
@@ -286,7 +302,7 @@ public sealed class PeersTests
             Assert.AreEqual(false, (bool?)requested!["isError"]);
             var requestId = (string)JsonNode.Parse((string)requested["content"]![0]!["text"]!)!["messageId"]!;
             var waits = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_reply_waits", ["arguments"] = new JsonObject() });
-            Assert.AreEqual(requestId, (string?)JsonNode.Parse((string)waits!["content"]![0]!["text"]!)!["items"]![0]!["messageId"]);
+            Assert.IsTrue(JsonNode.Parse((string)waits!["content"]![0]!["text"]!)!["items"]!.AsArray().Any(w => (string?)w?["messageId"] == requestId));
             var cancelled = await mcp.SendRequestAsync("tools/call", new JsonObject
             { ["name"] = "cancel_reply_wait", ["arguments"] = new JsonObject { ["message_id"] = requestId } });
             Assert.AreEqual("cancelled", (string?)JsonNode.Parse((string)cancelled!["content"]![0]!["text"]!)!["state"]);

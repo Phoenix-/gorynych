@@ -452,6 +452,8 @@ public sealed class AdapterHost
 
     async Task AgentNotifiedAsync(string method, JsonObject message, bool released = false)
     {
+        // Host-state is generated only by this host; the adapter cannot forge its retained inventory.
+        if (method == GorynychProtocol.MethodHostState) return;
         if (method == GorynychProtocol.MethodHostReportNoteReceipt)
         {
             string? failedSession = null, failedReport = null;
@@ -593,6 +595,8 @@ public sealed class AdapterHost
             Configuration(sessionId).Apply(update);
             if (update["_meta"] is JsonObject activityMeta)
             {
+                // Adapter-supplied values cannot impersonate this host-generated observation.
+                activityMeta.Remove(GorynychProtocol.MetaHostBackgroundEvidence);
                 var foreground = Text(activityMeta[GorynychProtocol.MetaForegroundState]);
                 var turn = Text(activityMeta[GorynychProtocol.MetaAgentTurn]);
                 var hasBackground = Text(update["sessionUpdate"]) == "session_info_update" && activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork);
@@ -607,6 +611,16 @@ public sealed class AdapterHost
                         activity["agentTurn"] = turn == "started";
                         activity["agentTurnKind"] = turn == "started" && Text(activityMeta[GorynychProtocol.MetaOrigin]) == "report" ? "report" : "unknown";
                         activity["agentReportDelivery"] = turn == "started" ? activityMeta[GorynychProtocol.MetaReportDelivery]?.DeepClone() : null;
+                    }
+                    if (hasBackground || hasKnown)
+                    {
+                        var historyInFlight = forwarded.Values.Any(f => f.SessionId == sessionId && IsHistoryOperation(f.Method));
+                        var evidence = options.Adapter == "claude" && live.Contains(sessionId) && !historyInFlight && hasBackground && !processExited
+                            ? BackgroundEvidence.FromSnapshot(options.HostId, seq + 1,
+                                Text(activityMeta[GorynychProtocol.MetaBackgroundCompleteStream]), activityMeta[GorynychProtocol.MetaBackgroundWork]) : null;
+                        var observation = evidence?.ToJson() ?? BackgroundEvidence.Unknown(options.HostId, seq + 1);
+                        activity["backgroundEvidence"] = observation.DeepClone();
+                        activityMeta[GorynychProtocol.MetaHostBackgroundEvidence] = observation;
                     }
                     if (hasBackground)
                     {
@@ -638,6 +652,7 @@ public sealed class AdapterHost
         var replayCarrier = Text(message["method"]) == AcpMethods.Client.SessionUpdate ? replayMessage["params"]?["update"] as JsonObject : replayMessage["params"] as JsonObject;
         if (backgroundSnapshot && replayCarrier?["_meta"] is JsonObject replayMeta)
         {
+            replayMeta.Remove(GorynychProtocol.MetaHostBackgroundEvidence);
             replayMeta.Remove(GorynychProtocol.MetaBackgroundCompleteStream);
             replayMeta.Remove(GorynychProtocol.MetaBackgroundWork);
             replayMeta.Remove(GorynychProtocol.MetaBackgroundKnown);
@@ -1263,6 +1278,9 @@ public sealed class AdapterHost
     JsonObject WithHostMeta(JsonObject result, bool reattached)
     {
         var meta = result["_meta"] as JsonObject ?? [];
+        // Capability belongs to the host implementation, not the wrapped adapter.
+        meta.Remove(GorynychProtocol.CapHostBackgroundEvidence);
+        if (options.Adapter == "claude") meta[GorynychProtocol.CapHostBackgroundEvidence] = true;
         meta[GorynychProtocol.MetaHost] = new JsonObject
         {
             ["hostId"] = options.HostId, ["link"] = GorynychProtocol.HostLinkVersion, ["reattached"] = reattached,

@@ -30,6 +30,40 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     bool backgroundUse;
     bool knownBackgroundUse;
     readonly Lock nativeActivityGate = new();
+    JsonRpcConnection? backgroundEvidenceRoute;
+    BackgroundEvidence? backgroundEvidence;
+    string? backgroundEvidenceHost;
+    long backgroundEvidenceRevision;
+    internal void ObserveBackgroundEvidence(JsonRpcConnection source, JsonNode? value)
+    {
+        var observed = BackgroundEvidence.Parse(value);
+        var stamped = BackgroundEvidence.TryStamp(value, out var host, out var revision);
+        lock (nativeActivityGate)
+        {
+            if (stamped && host == backgroundEvidenceHost && (revision < backgroundEvidenceRevision ||
+                revision == backgroundEvidenceRevision && backgroundEvidence is null && observed is not null)) return;
+            backgroundEvidenceRoute = source; backgroundEvidence = observed;
+            // An unstamped malformed observation revokes confidence but must not erase
+            // the high-water mark and permit an older complete snapshot to revive it.
+            if (stamped) { backgroundEvidenceHost = host; backgroundEvidenceRevision = revision; }
+        }
+    }
+    internal void InvalidateBackgroundEvidence(JsonRpcConnection source)
+    {
+        lock (nativeActivityGate)
+            if (ReferenceEquals(backgroundEvidenceRoute, source)) backgroundEvidence = null;
+        // Preserve host/revision: a delayed old snapshot cannot revive a removed route.
+    }
+    internal long ObservedBackgroundRevision { get { lock (nativeActivityGate) return backgroundEvidenceRevision; } }
+    // The caller must pass the current host route, not a remembered connection or client metadata.
+    internal BackgroundEvidence? BackgroundEvidenceFor(HostLink? route)
+    {
+        lock (nativeActivityGate)
+            return route is not null && !route.Rpc.IsClosed && ReferenceEquals(route.Rpc, backgroundEvidenceRoute) &&
+                route.Info.Meta?[GorynychProtocol.CapHostBackgroundEvidence] is JsonValue cap && cap.TryGetValue<bool>(out var supported) && supported &&
+                route.HostId is not null && route.HostId == backgroundEvidence?.HostId ? backgroundEvidence : null;
+    }
+
     JsonRpcConnection? completeBackgroundRoute;
     string? completeBackgroundStream;
     // A full change stream remains authoritative across ordinary turns on the same

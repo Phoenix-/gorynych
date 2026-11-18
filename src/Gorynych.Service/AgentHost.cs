@@ -73,6 +73,10 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     readonly Lock linksGate = new();
     readonly List<HostLink> links = [];                                                          // under linksGate
     readonly Dictionary<string, HostLink> route = new(StringComparer.Ordinal);                     // session -> where it is open; under linksGate
+    // At most one evidence candidate per session during authenticated reattach. It is
+    // not a route and cannot authorize a prompt. Cleared when that handshake finishes.
+    readonly Dictionary<string, HostLink> pendingBackgroundEvidence = new(StringComparer.Ordinal);
+    const int PendingBackgroundEvidenceLimit = 1024;
     readonly Dictionary<string, TaskCompletionSource<HostLink>> arriving = new(StringComparer.Ordinal); // slot -> its attach; under linksGate
     readonly HashSet<string> goneHosts = new(StringComparer.Ordinal);                             // under linksGate
     readonly HashSet<string> claimed = new(StringComparer.Ordinal);                                // slots started for an open; under linksGate
@@ -199,6 +203,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         {
             old = [.. links];
             links.Clear();
+            foreach (var (session, oldRoute) in route) conductor.InvalidateBackgroundEvidence(session, oldRoute.Rpc);
             route.Clear();
             links.Add(link);
         }
@@ -303,7 +308,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     {
         lock (linksGate)
         {
-            if (route.Remove(sessionId, out var on)) on.Sessions.Remove(sessionId);
+            if (route.Remove(sessionId, out var on)) { conductor.InvalidateBackgroundEvidence(sessionId, on.Rpc); on.Sessions.Remove(sessionId); }
             if (links.Contains(link)) pinned[sessionId] = link;
         }
         Reap();
@@ -500,6 +505,18 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             Current = expected is null || expected.Same(hello.Generation),
             ForSession = hello.Slot.Contains('.'),
         };
+        lock (linksGate)
+        {
+            if (Name == "claude" && link.Info.Meta?[GorynychProtocol.CapHostBackgroundEvidence] is JsonValue cap &&
+                cap.TryGetValue<bool>(out var supported) && supported)
+                foreach (var session in sessions)
+                {
+                    if (pendingBackgroundEvidence.Count >= PendingBackgroundEvidenceLimit) break;
+                    if (session.Length is > 0 and <= 512 && !route.ContainsKey(session)) pendingBackgroundEvidence.TryAdd(session, link);
+                }
+        }
+        try
+        {
         // Not seen by requests until it has sent what it kept: a client that resumes one of its sessions
         // meanwhile waits for it (AwaitHostOfAsync), and so finds the ends of the turns it reported.
         JsonNode? replayed;
@@ -553,6 +570,40 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         arrival?.TrySetResult(link);
         conductor.HostAttached(this, link);
         return true;
+        }
+        finally
+        {
+            lock (linksGate)
+                foreach (var session in sessions)
+                    if (pendingBackgroundEvidence.TryGetValue(session, out var pending) && ReferenceEquals(pending, link))
+                        pendingBackgroundEvidence.Remove(session);
+        }
+    }
+
+    // Keep route selection and evidence read under the same lock used for admission
+    // and replacement; a once-current open connection is not enough.
+    internal BackgroundEvidence? CurrentBackgroundEvidence(string sessionId, SessionFeed feed)
+    {
+        lock (linksGate)
+            return !closed && route.TryGetValue(sessionId, out var current) ? feed.BackgroundEvidenceFor(current) : null;
+    }
+
+    // Source admission and evidence publication share linksGate, so a late rejected or
+    // replaced connection cannot overwrite the active route between check and storage.
+    internal void ObserveBackgroundEvidence(string sessionId, JsonRpcConnection source, JsonNode? value, SessionFeed feed)
+    {
+        lock (linksGate)
+        {
+            if (closed || source.IsClosed) return;
+            HostLink? candidate;
+            if (route.TryGetValue(sessionId, out var active)) candidate = active;
+            else pendingBackgroundEvidence.TryGetValue(sessionId, out candidate);
+            if (candidate is null || !ReferenceEquals(candidate.Rpc, source) || candidate.HostId is null ||
+                candidate.Info.Meta?[GorynychProtocol.CapHostBackgroundEvidence] is not JsonValue cap ||
+                !cap.TryGetValue<bool>(out var supported) || !supported) return;
+            if (BackgroundEvidence.TryStamp(value, out var stampHost, out _) && stampHost != candidate.HostId) return;
+            feed.ObserveBackgroundEvidence(source, value);
+        }
     }
 
     static string SlotName(string slot) => slot.Length == 0 ? "the adapter" : slot.Contains('.') ? $"a session's host {slot}" : $"the adapter's host {slot}";
@@ -570,7 +621,8 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             if (!links.Remove(link)) return [];
             var lost = link.Sessions.ToList();
             foreach (var s in lost)
-                if (route.TryGetValue(s, out var on) && on == link) route.Remove(s);
+                if (route.TryGetValue(s, out var on) && on == link)
+                { conductor.InvalidateBackgroundEvidence(s, on.Rpc); route.Remove(s); }
             link.Sessions.Clear();
             return lost;
         }
@@ -618,7 +670,8 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         lock (linksGate)
         {
             if (links.FirstOrDefault(l => l.Rpc == rpc) is not { } link) return; // it went meanwhile
-            if (route.TryGetValue(sessionId, out var was) && was != link) was.Sessions.Remove(sessionId);
+            if (route.TryGetValue(sessionId, out var was) && was != link)
+            { conductor.InvalidateBackgroundEvidence(sessionId, was.Rpc); was.Sessions.Remove(sessionId); }
             route[sessionId] = link;
             link.Sessions.Add(sessionId);
             pinned.Remove(sessionId);
@@ -628,7 +681,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     public void MarkClosed(string sessionId)
     {
         lock (linksGate)
-            if (route.Remove(sessionId, out var link)) link.Sessions.Remove(sessionId);
+            if (route.Remove(sessionId, out var link)) { conductor.InvalidateBackgroundEvidence(sessionId, link.Rpc); link.Sessions.Remove(sessionId); }
         Reap();
     }
 
@@ -888,6 +941,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         {
             all = [.. links];
             links.Clear();
+            foreach (var (session, oldRoute) in route) conductor.InvalidateBackgroundEvidence(session, oldRoute.Rpc);
             route.Clear();
             pinned.Clear();
             claimed.Clear();
@@ -922,6 +976,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             closing = closed = true;
             all = [.. links];
             links.Clear();
+            foreach (var (session, oldRoute) in route) conductor.InvalidateBackgroundEvidence(session, oldRoute.Rpc);
             route.Clear();
         }
         var running = Interlocked.Exchange(ref instance, null);

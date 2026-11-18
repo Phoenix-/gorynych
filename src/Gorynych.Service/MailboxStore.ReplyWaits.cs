@@ -148,6 +148,19 @@ internal sealed partial class MailboxStore
         return result;
     }
 
+    // Sequence binds a retained ID to its particular admission, even after ID reuse.
+    internal JsonObject? ContinuationWait(string id, string waiter, long? sequence = null)
+    {
+        lock (gate)
+        {
+            if (replyWaits[id] is not JsonObject wait || (string?)wait["sender"] != waiter ||
+                (sequence is not null && (long?)wait["sequence"] != sequence)) return null;
+            return new JsonObject { ["messageId"] = id, ["sequence"] = (long)wait["sequence"]!,
+                ["state"] = (string?)wait["state"], ["requestDelivery"] = (string?)wait["requestDelivery"],
+                ["replyDelivery"] = (string?)wait["replyDelivery"] };
+        }
+    }
+
     internal int OpenReplyWaitCount
     {
         get { lock (gate) return replyWaits.Count(pair => (string?)pair.Value?["state"] == "waiting"); }
