@@ -153,11 +153,14 @@ public sealed class ConductorReportRecoveryTests
     public async Task SeparateHostProcessExitReconcilesSealedOrHonestUnknown(string mode)
     {
         var directory = TestDirs.New(); var agent = new TurnAgent("turns");
-        // Manual inventory prevents startup recovery from racing the pre-import spool comparison.
-        await using var service = new Conductor(new ConductorOptions { DataDirectory = directory, ServiceId = "process-probe" }, [agent]);
+        // Seed the durable overlay and inspect the producer spool before any conductor can
+        // start its asynchronous recovery inventory.
+        var sessions = new SessionStore(Path.Combine(directory, "sessions.json"));
+        var reports = new ReportStore(Path.Combine(directory, "reports"));
         const string child = "probe-child", parent = "probe-parent", prompt = "probe-prompt";
-        service.Store.Update(parent, "turns", r => { r.Archived = true; r.Cwd = Path.GetTempPath(); });
-        service.Store.Update(child, "turns", r => { r.ParentSessionId = parent; r.ReportToParent = true; r.Cwd = Path.GetTempPath(); });
+        sessions.Update(parent, "turns", r => { r.Archived = true; r.Cwd = Path.GetTempPath(); });
+        sessions.Update(child, "turns", r => { r.ParentSessionId = parent; r.ReportToParent = true; r.Cwd = Path.GetTempPath(); });
+        sessions.Flush();
         var hostId = "probe-" + Guid.NewGuid().ToString("N");
         using var process = ReportHostProbe.Start(Path.Combine(directory, "reports"), hostId, child, prompt,
             mode is "unsealed" or "corrupt" ? "unsealed" : mode);
@@ -167,12 +170,12 @@ public sealed class ConductorReportRecoveryTests
             Assert.AreEqual("READY", await process.StandardOutput.ReadLineAsync().WaitAsync(Wait));
             var identity = new ReportIdentity("process-turn-" + mode, child, parent, ReportCause.User, prompt, null, "message",
                 hostId, "test-generation", process.Id, AgentHost.ProcessStartedAt(process.Id));
-            var id = service.ReportStorage.Reserve(identity).ReportId;
+            var id = reports.Reserve(identity).ReportId;
             await process.StandardInput.WriteLineAsync(id); await process.StandardInput.FlushAsync();
             if (mode is "unsealed" or "corrupt")
             {
                 Assert.AreEqual("STARTED", await process.StandardOutput.ReadLineAsync().WaitAsync(Wait));
-                await LinkHarness.Until(() => File.Exists(service.ReportStorage.CapturePath(id)) && new FileInfo(service.ReportStorage.CapturePath(id)).Length > 0,
+                await LinkHarness.Until(() => File.Exists(reports.CapturePath(id)) && new FileInfo(reports.CapturePath(id)).Length > 0,
                     "host persisted partial output").WaitAsync(Wait);
                 await process.StandardInput.WriteLineAsync("STOP"); await process.StandardInput.FlushAsync();
             }
@@ -189,8 +192,11 @@ public sealed class ConductorReportRecoveryTests
                 var snapshot = candidate.Snapshot(); Assert.IsTrue(snapshot.Sealed);
                 sealedText = snapshot.Text; sealedOutcome = snapshot.Outcome; sealedError = snapshot.Error; sealedHasText = snapshot.HasText;
             }
-            if (mode == "corrupt") File.AppendAllText(service.ReportStorage.CapturePath(id), "torn");
-            await service.ReconcileReportInventoryAsync();
+            if (mode == "corrupt") File.AppendAllText(reports.CapturePath(id), "torn");
+            await using var service = new Conductor(new ConductorOptions { DataDirectory = directory, ServiceId = "process-probe" }, [agent]);
+            await LinkHarness.Until(() => service.ReportStorage.GetReport(id).ProducerAck &&
+                service.ReportStorage.GetReport(id).EndJournaled && HostTests.EndMarks(service, child) == 1,
+                "startup inventory imported, acknowledged and journaled the producer result").WaitAsync(Wait);
             var recoveredStore = new ReportStore(Path.Combine(directory, "reports"));
             var info = recoveredStore.GetReport(id); Assert.IsTrue(info.ProducerAck);
             var result = recoveredStore.Read(id, child);
@@ -215,7 +221,9 @@ public sealed class ConductorReportRecoveryTests
                 Assert.AreEqual(result.CaptureConfidenceReason, repeated.CaptureConfidenceReason);
             }
             else { Assert.AreEqual("unknown", result.Outcome); Assert.IsNotNull(result.IncompleteReason); }
+            await service.ReconcileReportInventoryAsync();
             Assert.AreEqual(1, HostTests.EndMarks(service, child));
+            Assert.AreEqual(1, service.ReportStorage.List(child).Items.Count);
         }
         finally
         {
