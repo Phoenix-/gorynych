@@ -340,12 +340,28 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public bool HasOtherSessionText => Volatile.Read(ref otherText) != 0;
 
     /// <summary>Marks <see cref="HasOtherSessionText"/>; returns whether it was marked already.</summary>
-    public bool MarkOtherSessionText() => Interlocked.Exchange(ref otherText, 1) != 0;
+    readonly Lock otherTextGate = new();
+    long otherTextVersion;
+    public bool MarkOtherSessionText() => MarkOtherSessionText(out _);
+    internal bool MarkOtherSessionText(out long version)
+    {
+        lock (otherTextGate)
+        {
+            version = ++otherTextVersion;
+            return Interlocked.Exchange(ref otherText, 1) != 0;
+        }
+    }
 
     /// <summary>Takes back a mark whose text did not reach the agent after all (it has no live-note path), unless it was marked before.</summary>
     public void UnmarkOtherSessionText(bool markedBefore)
     {
-        if (!markedBefore) Interlocked.Exchange(ref otherText, 0);
+        lock (otherTextGate)
+            if (!markedBefore) { otherTextVersion++; Interlocked.Exchange(ref otherText, 0); }
+    }
+    internal void UnmarkOtherSessionText(bool markedBefore, long version)
+    {
+        lock (otherTextGate)
+            if (!markedBefore && otherTextVersion == version) Interlocked.Exchange(ref otherText, 0);
     }
 
     /// <summary>
@@ -355,7 +371,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public void TurnEnded()
     {
         Interlocked.Exchange(ref lastTurnEnded, DateTimeOffset.UtcNow.UtcTicks);
-        if (!ClientTurn && Volatile.Read(ref agentTurn) == 0) Interlocked.Exchange(ref otherText, 0);
+        lock (otherTextGate)
+            if (!ClientTurn && Volatile.Read(ref agentTurn) == 0) { otherTextVersion++; Interlocked.Exchange(ref otherText, 0); }
     }
 
     long lastTurnEnded;
@@ -678,6 +695,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     System.Text.StringBuilder? turnText;
     int turnTextLimit;
     bool turnTextStale; // a tool call came after the text kept so far
+    bool turnTextHasText;
 
     /// <summary>
     /// Starts keeping the agent's final message of a turn whose end is reported to a parent: at
@@ -685,7 +703,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// </summary>
     public void BeginTurnText(int limit)
     {
-        lock (clientsGate) { turnText = new(); turnTextLimit = limit; turnTextStale = false; }
+        lock (clientsGate) { turnText = new(); turnTextLimit = limit; turnTextStale = false; turnTextHasText = false; }
     }
 
     /// <summary>
@@ -698,9 +716,14 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         {
             var text = turnTextStale ? "" : turnText?.ToString() ?? "";
             turnText = null;
-            turnTextStale = false;
+            turnTextStale = false; turnTextHasText = false;
             return text;
         }
+    }
+
+    internal string? SnapshotTurnText()
+    {
+        lock (clientsGate) return turnText is null || turnTextStale || !turnTextHasText ? null : turnText.ToString();
     }
 
     /// <summary>
@@ -719,7 +742,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
                 if (turnText is null) return;
                 if (kind == "tool_call") turnTextStale = true; // what the agent says next is a new message
                 if (text is null) return;
-                if (turnTextStale) { turnText.Clear(); turnTextStale = false; }
+                if (turnTextStale) { turnText.Clear(); turnTextStale = false; turnTextHasText = false; }
+                turnTextHasText = true;
                 var room = turnTextLimit - turnText.Length;
                 if (room > 0) turnText.Append(text, 0, Math.Min(room, text.Length));
                 return;
@@ -1104,7 +1128,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// </summary>
     /// <param name="HostTurn">The host's number for it, which its <c>_gorynych/turn_ended</c> carries.</param>
     /// <param name="HostId">The host it runs in.</param>
-    public sealed record AdoptedTurn(long Key, string? PromptId, string Agent, long? HostTurn, string? HostId = null);
+    public sealed record AdoptedTurn(long Key, string? PromptId, string Agent, long? HostTurn, string? HostId = null,
+        string TurnKind = "unknown", string? ReportId = null);
 
     AdoptedTurn? adopted; // under clientsGate
 
@@ -1136,6 +1161,18 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         }
     }
 
+    internal SemaphoreSlim EndMarkGate { get; } = new(1, 1);
+
+    internal AdoptedTurn? EndAdoptedIf(AdoptedTurn expected)
+    {
+        lock (clientsGate)
+        {
+            if (!ReferenceEquals(adopted, expected)) return null;
+            adopted = null;
+            return expected;
+        }
+    }
+
     HashSet<string>? endMarks; // under clientsGate once read: the prompts whose end the journal has
 
     HashSet<string> EndMarks()
@@ -1157,6 +1194,19 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     {
         var marks = EndMarks();
         lock (clientsGate) return marks.Add(promptId);
+    }
+
+    // A failed durable journal append must remain retryable by inventory or replay.
+    public void ReleaseEndMark(string promptId)
+    {
+        // The write may have reached disk despite throwing. Preserve its claim if the
+        // reloaded journal proves it; otherwise allow inventory/replay to retry.
+        bool durable;
+        try { durable = Journal.EndMarkedPromptIds().Contains(promptId); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { durable = false; }
+        if (durable) return;
+        var marks = EndMarks();
+        lock (clientsGate) marks.Remove(promptId);
     }
 
     readonly Dictionary<string, long> hostSeen = new(StringComparer.Ordinal); // under clientsGate: per host, the last of its updates taken

@@ -98,6 +98,7 @@ static partial class FakeHeadless
                             await Task.Delay(Timeout.Infinite);
                         break;
                     case "user":
+                        File.AppendAllText(Path.Combine(root, sessionId + ".inputs.jsonl"), m.ToJsonString() + "\n");
                         await Inbox.Writer.WriteAsync(m);
                         break;
                 }
@@ -198,11 +199,42 @@ static partial class FakeHeadless
             {
                 // cancel_queued drops what waits in the queue and lists it.
                 var cancelled = new JsonArray();
+                var late = new List<JsonObject>();
                 if ((bool?)request["cancel_queued"] == true)
                     while (Inbox.Reader.TryRead(out var queued))
+                    {
                         cancelled.Add((JsonNode?)(string?)queued["uuid"]);
+                        if (File.Exists(Path.Combine(cwd, "receipt-late-cancelled"))) late.Add(queued);
+                    }
+                if (contradictoryReplay is { } replayUuid) { cancelled.Add((JsonNode?)replayUuid); contradictoryReplay = null; }
                 interrupted.TrySetResult();
-                await RespondAsync(id, new JsonObject { ["still_queued"] = new JsonArray(), ["cancelled"] = cancelled });
+                File.AppendAllText(Path.Combine(cwd, "receipt-interrupt-output.jsonl"), cancelled.ToJsonString() + "\n");
+                if (File.Exists(Path.Combine(cwd, "receipt-malformed-interrupt")))
+                    await RespondAsync(id, new JsonObject());
+                else if (File.Exists(Path.Combine(cwd, "hold-contradiction-response")))
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        while (!File.Exists(Path.Combine(cwd, "release-contradiction-response"))) await Task.Delay(20);
+                        await RespondAsync(id, new JsonObject { ["still_queued"] = new JsonArray(), ["cancelled"] = cancelled });
+                    });
+                }
+                else await RespondAsync(id, new JsonObject { ["still_queued"] = new JsonArray(), ["cancelled"] = cancelled });
+                if (late.Count > 0)
+                    _ = Task.Run(async () =>
+                    {
+                        while (!File.Exists(Path.Combine(cwd, "release-late-cancelled"))) await Task.Delay(20);
+                        foreach (var message in late) await ReplayAsync(message, sessionId);
+                        await ResultAsync(sessionId, "contradictory late result");
+                        if (File.Exists(Path.Combine(cwd, "receipt-duplicate-events")))
+                        {
+                            while (!File.Exists(Path.Combine(cwd, "release-duplicate-events"))) await Task.Delay(20);
+                            foreach (var message in late) await ReplayAsync(message, sessionId);
+                            await WriteAsync(new JsonObject { ["type"] = "result", ["subtype"] = "error_during_execution",
+                                ["is_error"] = true, ["session_id"] = sessionId, ["errors"] = new JsonArray("duplicate later error") });
+                            File.WriteAllText(Path.Combine(cwd, "duplicate-events-sent"), "");
+                        }
+                    });
                 break;
             }
             default:
@@ -220,11 +252,28 @@ static partial class FakeHeadless
         interrupted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         var prompt = Text(first);
         if (prompt.Contains("swallow", StringComparison.OrdinalIgnoreCase)) return;
+        if (prompt.Contains("receipt-result-without-echo", StringComparison.Ordinal))
+        {
+            await ResultAsync(sessionId, "result without receipt echo");
+            return;
+        }
+        if (prompt.Contains("receipt-exit-before-echo", StringComparison.Ordinal)) Environment.Exit(42);
+        if (prompt.Contains("receipt-hold-before-echo", StringComparison.Ordinal))
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-report-echo"))) await Task.Delay(20);
         // Its MCP servers take long to start: no system/init while the folder has `init-held`.
         while (File.Exists(Path.Combine(Environment.CurrentDirectory, "init-held"))) await Task.Delay(20);
         var apiKey = File.Exists(Path.Combine(Environment.CurrentDirectory, "api-key-init")) ? "ANTHROPIC_API_KEY" : "none";
         await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "init", ["session_id"] = sessionId, ["model"] = model, ["permissionMode"] = mode, ["apiKeySource"] = apiKey });
         await ReplayAsync(first, sessionId);
+        if (prompt.Contains("receipt-exit-after-echo", StringComparison.Ordinal)) Environment.Exit(42);
+        if (prompt.Contains("receipt-hold-after-echo", StringComparison.Ordinal))
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-report-result"))) await Task.Delay(20);
+        if (prompt.Contains("receipt-fail-after-echo", StringComparison.Ordinal))
+        {
+            await WriteAsync(new JsonObject { ["type"] = "result", ["subtype"] = "error_during_execution", ["is_error"] = true,
+                ["session_id"] = sessionId, ["errors"] = new JsonArray("fake receipt failure") });
+            return;
+        }
         var backgroundProbe = prompt.Contains("background snapshot probe", StringComparison.OrdinalIgnoreCase);
         if (backgroundProbe)
             await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "background_tasks_changed", ["session_id"] = sessionId,
@@ -385,6 +434,11 @@ static partial class FakeHeadless
         }
         else answer = "echo: " + prompt;
 
+        if (aborted && prompt.Contains("receipt-success-after-interrupt", StringComparison.Ordinal))
+        {
+            await ResultAsync(sessionId, "success after interrupt");
+            return;
+        }
         if (aborted)
         {
             await WriteAsync(new JsonObject
@@ -446,8 +500,10 @@ static partial class FakeHeadless
         });
     }
 
+    static string? contradictoryReplay;
     static Task ReplayAsync(JsonObject user, string sessionId)
     {
+        if (Text(user).Contains("joined contradictory report", StringComparison.Ordinal)) contradictoryReplay = (string?)user["uuid"];
         var replay = (JsonObject)user.DeepClone();
         replay["isReplay"] = true;
         replay["session_id"] = sessionId;

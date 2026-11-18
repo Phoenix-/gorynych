@@ -504,6 +504,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         try
         {
             if (report is not null) await conductor.AdoptAsync(this, link, report, ct);
+            await conductor.ReconcileReportInventoryAsync(hello.HostId);
             var after = conductor.HostCursors(hello.HostId, sessions.Concat(Strings(report?["buffered"])).Distinct(StringComparer.Ordinal));
             replayed = await rpc.SendRequestAsync(GorynychProtocol.MethodHostReplay, new JsonObject { ["after"] = after }, ct);
         }

@@ -26,8 +26,11 @@ public sealed partial class ClaudeHeadlessTests
 
     static ClaudeAdapterOptions Options(string dir, List<string>? log = null, bool liveNotes = false, Func<Task>? beforeInterrupt = null,
         bool fetchCatalog = true, string permissionMode = "default", int stallMs = 1500,
-        Func<Task>? beforeStartup = null, bool autoTitle = false) => new()
+        Func<Task>? beforeStartup = null, bool autoTitle = false, int reportNoteLimit = 256, Func<Task>? afterReportNoteWrite = null, int reportNoteGlobalLimit = 4096) => new()
     {
+        ReportNoteLedgerLimit = reportNoteLimit,
+        ReportNoteGlobalLimit = reportNoteGlobalLimit,
+        AfterReportNoteWrite = afterReportNoteWrite,
         BeforeInterrupt = beforeInterrupt,
         BeforeStartup = beforeStartup,
         FetchCatalog = fetchCatalog,
@@ -893,6 +896,11 @@ public sealed partial class ClaudeHeadlessTests
                     new InitializeRequest { ProtocolVersion = 1 });
                 Assert.AreEqual(false, (bool?)init.Meta?[GorynychProtocol.MetaSteering]?["supported"],
                     "the TUI transport never advertises ACP steering");
+                Assert.AreEqual(false, (bool?)init.Meta?[GorynychProtocol.CapReportNote], "the TUI does not advertise native receipt support");
+                var denied = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => rpc.SendRequestAsync(GorynychProtocol.MethodReportNote,
+                    new JsonObject { ["sessionId"] = "missing", ["text"] = "x", ["_meta"] = new JsonObject
+                    { [GorynychProtocol.MetaReportNote] = new JsonObject { ["reportId"] = Guid.NewGuid().ToString("N"), ["attemptId"] = Guid.NewGuid().ToString("N") } } }));
+                Assert.AreEqual(JsonRpcException.MethodNotFound, denied.Code);
             }
             finally { await rpc.DisposeAsync(); }
         }

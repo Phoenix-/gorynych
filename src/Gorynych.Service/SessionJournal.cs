@@ -34,6 +34,7 @@ public sealed class SessionJournal
     readonly string path;
     readonly int maxEntries;
     readonly Lock gate = new();
+    internal Action<IReadOnlyList<JsonNode>>? BeforeWrite { get; set; }
     List<string>? lines;
     bool turns;
     long last; // the newest entry's position; valid once loaded
@@ -117,14 +118,25 @@ public sealed class SessionJournal
             var added = updates.Select(u => u.ToJsonString(LineOptions)).ToList();
             all.AddRange(added);
             turns |= updates.Any(IsTurn);
-            if (all.Count > maxEntries)
+            try
             {
-                Compact(all);
-                Rewrite(all);
+                BeforeWrite?.Invoke(updates);
+                if (all.Count > maxEntries)
+                {
+                    Compact(all);
+                    Rewrite(all);
+                }
+                else
+                {
+                    File.AppendAllText(path, string.Concat(added.Select(l => l + "\n")), Encoding.UTF8);
+                }
             }
-            else
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
-                File.AppendAllText(path, string.Concat(added.Select(l => l + "\n")), Encoding.UTF8);
+                // The write may have failed before or after touching disk. Do not advertise the
+                // speculative in-memory rows; the next read reconciles the actual journal.
+                lines = null; last = 0; turns = false;
+                throw;
             }
         }
     }

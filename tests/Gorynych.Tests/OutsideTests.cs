@@ -582,6 +582,9 @@ public sealed class OutsideTests
         Assert.AreEqual(OutsideTools.ModernVersion, (string?)unsupported["data"]!["supported"]![0]);
         Assert.AreEqual(-32601, (int?)(await McpAsync(zed, "resources/list", null))!["error"]!["code"]);
         Assert.AreEqual(-32602, (int?)(await McpAsync(zed, "tools/call", Call("spawn_session", [])))!["error"]!["code"], "an unknown tool");
+        Assert.AreEqual(-32602, (int?)(await McpAsync(zed, "tools/call", Call("read_report", [])))!["error"]!["code"]);
+        Assert.AreEqual(-32602, (int?)(await McpAsync(zed, "tools/call", Call("list_reports", [])))!["error"]!["code"]);
+
 
         var other = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => zed.Rpc.SendRequestAsync(GorynychProtocol.MethodMcpMessage,
             new JsonObject { ["serverId"] = "someone-else", ["requestId"] = "1", ["method"] = "tools/list" }));

@@ -6,6 +6,20 @@ namespace Gorynych.Tests;
 public class MailboxStoreTests
 {
     [TestMethod]
+    public void DelegationRetrySurvivesRestartAndCannotCollideWithOrdinaryMessages()
+    {
+        var path = Path.Combine(TestDirs.New(), "mailbox.json");
+        var store = new MailboxStore(path);
+        store.Accept("ordinary", "parent", "child", "task");
+        Assert.ThrowsExactly<InvalidOperationException>(() => store.Accept("ordinary", "parent", "child", "task", delegation: true));
+        var item = store.Accept("assignment", "parent", "child", "task", delegation: true);
+        Assert.AreEqual("assignment", (string?)item["assignmentId"]);
+        store = new MailboxStore(path);
+        Assert.AreEqual("assignment", (string?)store.Accept("assignment", "parent", "child", "task", delegation: true)["assignmentId"]);
+        Assert.ThrowsExactly<InvalidOperationException>(() => store.Accept("assignment", "parent", "child", "task"));
+        Assert.AreEqual(2, store.Read("child", 0, 10).Count);
+    }
+    [TestMethod]
     public void FailureAndItsNotice_ArePersistedTogetherEvenAtCapacity()
     {
         var path = Path.Combine(TestDirs.New(), "mailbox.json");

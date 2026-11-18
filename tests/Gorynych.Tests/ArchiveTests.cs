@@ -353,6 +353,7 @@ public sealed class ArchiveTests
         {
             "mcp__gorynych__reply", "mcp__gorynych__list_agents", "mcp__gorynych__ask_agent",
             "mcp__gorynych__send_message", "mcp__gorynych__reply_message",
+            "mcp__gorynych__read_report", "mcp__gorynych__list_reports",
             "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", "mcp__gorynych__spawn_session",
         }, ChannelHost.PreAllowedTools.ToArray());
         CollectionAssert.AreEquivalent(ChannelHost.PreAllowedTools.Where(t => t != "mcp__gorynych__spawn_session").ToArray(), ChannelHost.AllowedTools);
@@ -361,36 +362,72 @@ public sealed class ArchiveTests
     // ---------------------------------------------------------------- reports
 
     [TestMethod]
-    public async Task Report_ToAnArchivedParent_IsDropped_NeitherATurnNorAChannelNote()
+    public async Task Report_ToArchivedOriginalParent_RemainsPendingAndIsDeliveredOnceAfterRestore()
     {
         var kimi = new LifecycleAgent("kimi", canDelete: true);
         var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
         await using var conductor = Conductor(null, kimi.Adapter, claude.Adapter);
+        Assert.IsNull(conductor.Hosts, "this fixture exercises direct adapters without host receipt support");
         await using var zed = await TestClient.ConnectAsync(conductor, "zed");
         var kimiParent = await NewPromptedAsync(zed, "kimi", "Coordinate the release");
         var claudeParent = await NewPromptedAsync(zed, "claude", "Plan the docs");
         await ArchiveAsync(zed, kimiParent, true);
         await ArchiveAsync(zed, claudeParent, true);
 
-        // An archived session can still spawn; its children's turns are not reported to it.
-        var toKimi = (string)(await SpawnAsync(zed, kimi.Tokens[kimiParent], "claude", "Write the notes"))!["sessionId"]!;
-        var toClaude = (string)(await SpawnAsync(zed, claude.Tokens[claudeParent], "kimi", "Fix the flaky test"))!["sessionId"]!;
-        await conductor.BackgroundTurnsIdleAsync();
+        // Each first child turn publishes a durable result while its original parent is archived.
+        var kimiSpawn = await SpawnAsync(zed, kimi.Tokens[kimiParent], "claude", "Write the notes");
+        var claudeSpawn = await SpawnAsync(zed, claude.Tokens[claudeParent], "kimi", "Fix the flaky test");
+        var toKimi = (string)kimiSpawn!["sessionId"]!; var toClaude = (string)claudeSpawn!["sessionId"]!;
+        await Until(() => conductor.ReportStorage.List(toKimi).Items.Any(x => x.Identity.Cause == ReportCause.Spawn && x.ProducerAck && x.Status == "pending" && x.DispositionReason?.Contains("archived") == true) &&
+            conductor.ReportStorage.List(toClaude).Items.Any(x => x.Identity.Cause == ReportCause.Spawn && x.ProducerAck && x.Status == "pending" && x.DispositionReason?.Contains("archived") == true),
+            "both archived parents retain blocked reports", TimeSpan.FromSeconds(20));
+        var kimiReport = conductor.ReportStorage.List(toKimi).Items.Single(x => x.Identity.Cause == ReportCause.Spawn);
+        var claudeReport = conductor.ReportStorage.List(toClaude).Items.Single(x => x.Identity.Cause == ReportCause.Spawn);
+        Assert.AreEqual(kimiParent, kimiReport.Identity.Parent); Assert.AreEqual(claudeParent, claudeReport.Identity.Parent);
+        Assert.AreEqual((string?)kimiSpawn["assignmentId"], kimiReport.Identity.AssignmentId);
+        Assert.AreEqual((string?)claudeSpawn["assignmentId"], claudeReport.Identity.AssignmentId);
+        CollectionAssert.AreEqual(new[] { "Coordinate the release" }, Prompts(kimi, kimiParent), "archived Kimi receives no report turn");
+        CollectionAssert.AreEqual(new[] { "Plan the docs" }, Prompts(claude, claudeParent), "archived Claude receives no report turn");
+        Assert.AreEqual(0, claude.Notes.Count, "archived Claude receives no channel note");
 
-        CollectionAssert.AreEqual(new[] { "Coordinate the release" }, Prompts(kimi, kimiParent), "no report turn");
-        Assert.AreEqual(0, claude.Notes.Count, "no channel note");
-        CollectionAssert.AreEqual(new[] { "Plan the docs" }, Prompts(claude, claudeParent));
-        Assert.IsTrue(conductor.Store.Get(kimiParent)!.Archived && conductor.Store.Get(claudeParent)!.Archived);
+        // The immutable original parent remains authorized to inspect the saved result while archived.
+        async Task<JsonNode?> Read(string id, string token) => await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodReadReport,
+            new JsonObject { ["reportId"] = id, ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token } });
+        var kimiSaved = await Read(kimiReport.ReportId, kimi.Tokens[kimiParent]);
+        var claudeSaved = await Read(claudeReport.ReportId, claude.Tokens[claudeParent]);
+        Assert.AreEqual(kimiParent, (string?)kimiSaved!["identity"]?["parent"]); Assert.AreEqual("pending", (string?)kimiSaved["deliveryStatus"]);
+        Assert.AreEqual(claudeParent, (string?)claudeSaved!["identity"]?["parent"]); Assert.AreEqual("pending", (string?)claudeSaved["deliveryStatus"]);
+        Assert.AreEqual("ok", (string?)kimiSaved["text"]); Assert.AreEqual("ok", (string?)claudeSaved["text"]);
+        StringAssert.Contains((string?)kimiSaved["incompleteReason"], "In-process");
+        StringAssert.Contains((string?)claudeSaved["incompleteReason"], "In-process");
 
-        // Restored, the next turns are reported again.
+        // A later relationship change must not redirect either already-published report.
+        conductor.Store.Update(toKimi, "claude", r => r.ParentSessionId = claudeParent);
+        conductor.Store.Update(toClaude, "kimi", r => r.ParentSessionId = kimiParent);
         await ArchiveAsync(zed, kimiParent, false);
-        await ArchiveAsync(zed, claudeParent, false);
-        await using var other = await TestClient.ConnectAsync(conductor, "zed-children");
-        await PromptAsync(other, toKimi, "Add the migration step");
-        await PromptAsync(other, toClaude, "Add a test");
-        await conductor.BackgroundTurnsIdleAsync();
+        await Until(() => conductor.ReportStorage.GetReport(kimiReport.ReportId).Status == "completed", "first original parent receives its saved report", TimeSpan.FromSeconds(20));
+        Assert.AreEqual("pending", conductor.ReportStorage.GetReport(claudeReport.ReportId).Status, "the other original parent is still archived");
+        CollectionAssert.AreEqual(new[] { "Plan the docs" }, Prompts(claude, claudeParent));
+        var kimiDelivery = conductor.ReportStorage.GetReport(kimiReport.ReportId).Delivery!;
+        Assert.AreEqual("queued", kimiDelivery.Route); Assert.AreEqual(kimiParent, kimiDelivery.Parent);
+        var kimiReports = Prompts(kimi, kimiParent).Where(x => x.Contains($"report_id {kimiReport.ReportId}", StringComparison.Ordinal)).ToArray();
+        Assert.AreEqual(1, kimiReports.Length); StringAssert.Contains(kimiReports[0], toKimi);
 
-        StringAssert.StartsWith(Prompts(kimi, kimiParent).Last(), $"[Report · from session_id {toKimi} ");
-        StringAssert.StartsWith((string?)claude.Notes.Single()["text"], $"[Report · from session_id {toClaude} ");
+        await ArchiveAsync(zed, claudeParent, false);
+        await Until(() => conductor.ReportStorage.GetReport(claudeReport.ReportId).Status == "completed", "second original parent receives its saved report", TimeSpan.FromSeconds(20));
+        var claudeDelivery = conductor.ReportStorage.GetReport(claudeReport.ReportId).Delivery!;
+        Assert.AreEqual("queued", claudeDelivery.Route, "direct legacy HasChannel does not provide durable note receipts");
+        Assert.AreEqual(claudeParent, claudeDelivery.Parent);
+        var claudeReports = Prompts(claude, claudeParent).Where(x => x.Contains($"report_id {claudeReport.ReportId}", StringComparison.Ordinal)).ToArray();
+        Assert.AreEqual(1, claudeReports.Length); StringAssert.Contains(claudeReports[0], toClaude);
+        Assert.AreEqual(0, claude.Notes.Count, "legacy channel notes do not establish reliable report delivery");
+
+        conductor.QueueReportDeliveries();
+        await Until(() => !conductor.ReportDeliveryRunning(kimiReport.ReportId) && !conductor.ReportDeliveryRunning(claudeReport.ReportId),
+            "repeat recovery pass finishes", TimeSpan.FromSeconds(20));
+        Assert.AreEqual(2, Prompts(kimi, kimiParent).Length, "one original prompt and one report");
+        Assert.AreEqual(2, Prompts(claude, claudeParent).Length, "one original prompt and one report");
+        Assert.AreEqual(1, conductor.ReportStorage.List(toKimi).Items.Count(x => x.Identity.Cause == ReportCause.Spawn));
+        Assert.AreEqual(1, conductor.ReportStorage.List(toClaude).Items.Count(x => x.Identity.Cause == ReportCause.Spawn));
     }
 }

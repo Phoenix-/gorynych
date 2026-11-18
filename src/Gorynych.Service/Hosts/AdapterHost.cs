@@ -51,6 +51,9 @@ public sealed class AdapterHostOptions
     /// <summary>How long a conductor's <c>initialize</c> waits for the agent's answer to an earlier one.</summary>
     public TimeSpan InitializeWait { get; init; } = TimeSpan.FromSeconds(60);
 
+    internal ReportStore? ReportStore { get; init; }
+    internal Action<ReportCapture>? CaptureOpened { get; init; }
+    internal Action? BeforeProducerEvidence { get; init; }
     public Action<string>? Log { get; init; }
 }
 
@@ -81,6 +84,7 @@ public sealed class AdapterHost
     readonly Func<CancellationToken, Task<(Stream Input, Stream Output)>> connect;
     readonly AdapterHostOptions options;
     readonly Lock state = new();
+    string? noteReceiptFailure;
     readonly SemaphoreSlim sendGate = new(1, 1); // what goes to the conductor in the agent's order, and the switch to the next one
     readonly SemaphoreSlim agentGate = new(1, 1); // writes to the agent
     readonly CancellationTokenSource stopping = new();
@@ -132,6 +136,21 @@ public sealed class AdapterHost
         current = null;
         sendGate.Release();
         if (last is not null) Drop(last);
+        // Stop new dispatches, then release all unsealed producers under the same state lock
+        // used by admission, live capture and terminal sealing. Their spools stay recoverable.
+        await agentGate.WaitAsync();
+        try
+        {
+            lock (state)
+                foreach (var request in forwarded.Values)
+                    if (request.Capture is { } capture)
+                    {
+                        try { capture.Dispose(); }
+                        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Log($"capture cleanup failed: {e.Message}"); }
+                        request.Capture = null;
+                    }
+        }
+        finally { agentGate.Release(); }
         try { await agent.DisposeAsync(); }
         catch (Exception e) { Log($"the agent did not stop cleanly: {e.Message}"); }
         _ = reading;
@@ -223,6 +242,7 @@ public sealed class AdapterHost
             string? ended = null;
             lock (state)
             {
+                if (stopping.IsCancellationRequested) return;
                 if (!released && forwarded.TryGetValue(key, out var pending)
                     && pending.Method == AcpMethods.Agent.SessionPrompt && pending.SessionId is { } pendingSession
                     && DeferTerminal(message, key, pendingSession)) return;
@@ -232,6 +252,17 @@ public sealed class AdapterHost
                 {
                     var report = new JsonObject { ["sessionId"] = sessionId, ["turn"] = key };
                     if (request.PromptId is { } promptId) report["promptId"] = promptId;
+                    if (request.ReportId is { } reportId)
+                    {
+                        SealReport(request, message);
+                        report["_meta"] = new JsonObject { [GorynychProtocol.MetaReportId] = reportId,
+                            [GorynychProtocol.MetaReportCapture] = new JsonObject { ["failure"] = request.CaptureFailure } };
+                    }
+                    if (request.Delivery is { } delivery)
+                    {
+                        if (report["_meta"] is not JsonObject deliveryMeta) report["_meta"] = deliveryMeta = new JsonObject();
+                        deliveryMeta[GorynychProtocol.MetaReportDelivery] = delivery.DeepClone();
+                    }
                     if (request.AskId is { } askId) report["askId"] = askId;
                     if (request.Opinion is { } opinion) report["opinion"] = opinion;
                     if (request.AskId is not null && request.From is { } from) report["from"] = from;
@@ -277,6 +308,78 @@ public sealed class AdapterHost
             if (message["result"] is JsonObject result) message["result"] = WithHostMeta(result, reattached: false);
             initialized.TrySetResult();
         }
+        if (request.ReportId is { } completedId && request.Method == AcpMethods.Agent.SessionPrompt)
+        {
+            var target = message["result"] as JsonObject ?? message["error"] as JsonObject;
+            if (target is not null)
+            {
+                var meta = target["_meta"] as JsonObject ?? new JsonObject();
+                meta[GorynychProtocol.MetaReportId] = completedId;
+                meta[GorynychProtocol.MetaReportCapture] = new JsonObject { ["failure"] = request.CaptureFailure };
+                target["_meta"] = meta;
+            }
+        }
+        if (request.NoteStatusReport is { } statusReport && request.SessionId is { } statusSession &&
+            message["result"]?["_meta"]?[GorynychProtocol.MetaReportNote] is JsonObject statusFacts &&
+            Text(statusFacts["state"]) != "unknown")
+        {
+            try
+            {
+                if (Text(statusFacts["noInputProof"]) is { } proof)
+                {
+                    if (request.Method != GorynychProtocol.MethodReportNote || request.NoteAttempt is not { } attempt ||
+                        request.NoteDigest is not { } digest || Text(statusFacts["reportId"]) != statusReport ||
+                        Text(statusFacts["attemptId"]) != attempt || Text(statusFacts["digest"]) != digest)
+                        throw new InvalidOperationException("No-input proof does not match the forwarded attempt");
+                    var store = options.ReportStore ?? throw new InvalidOperationException("Report storage is unavailable");
+                    var generation = options.Generation?.Key ?? throw new InvalidOperationException("Host generation is unavailable");
+                    store.RecordNoteNoInput(statusReport, statusSession, options.HostId, generation, attempt, digest, proof);
+                }
+                else if (statusFacts.ContainsKey("ledgerNotRetained"))
+                {
+                    if ((bool?)statusFacts["ledgerNotRetained"] != true)
+                        throw new InvalidOperationException("Ledger absence was not confirmed");
+                    if (request.Method != GorynychProtocol.MethodReportNoteAck || request.NoteAckRevision is not { } absentRevision ||
+                        Text(statusFacts["reportId"]) != statusReport || Text(statusFacts["attemptId"]) != request.NoteAttempt ||
+                        Text(statusFacts["nativeMessageId"]) != request.NoteAckUuid || (long?)statusFacts["revision"] != absentRevision)
+                        throw new InvalidOperationException("Ledger absence does not match the forwarded ACK request");
+                    var store = options.ReportStore ?? throw new InvalidOperationException("Report storage is unavailable");
+                    var generation = options.Generation?.Key ?? throw new InvalidOperationException("Host generation is unavailable");
+                    if (!store.RecordNoteLedgerNotRetained(statusReport, statusSession, options.HostId, generation, request.NoteAttempt!, request.NoteAckUuid!, absentRevision))
+                        throw new InvalidOperationException("Receipt changed before ledger absence publication");
+                }
+                else
+                {
+                    StoreNoteFacts(statusReport, statusSession, statusFacts);
+                    if (request.NoteAckRevision is { } revision && (bool?)statusFacts["acknowledged"] == true)
+                    {
+                        if (Text(statusFacts["attemptId"]) != request.NoteAttempt || Text(statusFacts["nativeMessageId"]) != request.NoteAckUuid ||
+                            (long?)statusFacts["revision"] != revision)
+                            throw new InvalidOperationException("Adapter ACK does not match the requested receipt");
+                        var store = options.ReportStore ?? throw new InvalidOperationException("Report storage is unavailable");
+                        var generation = options.Generation?.Key ?? throw new InvalidOperationException("Host generation is unavailable");
+                        if (!store.RecordNoteAcknowledged(statusReport, statusSession, options.HostId, generation, request.NoteAttempt!, revision))
+                            throw new InvalidOperationException("Receipt changed before ACK publication");
+                    }
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or KeyNotFoundException)
+            {
+                lock (state) noteReceiptFailure = "Report note evidence could not be persisted: " + e.GetType().Name;
+                message.Remove("result");
+                message["error"] = new JsonObject { ["code"] = JsonRpcException.InternalError, ["message"] = noteReceiptFailure };
+            }
+            if (message["error"] is null && (request.Method == GorynychProtocol.MethodReportNote ||
+                request.NoteAckRevision is not null && ((bool?)statusFacts["acknowledged"] == true || (bool?)statusFacts["ledgerNotRetained"] == true)))
+            {
+                try { await EmitAsync(Notification(GorynychProtocol.MethodHostState, new JsonObject { ["_meta"] = new JsonObject
+                    { [GorynychProtocol.CapHostReportNote] = new JsonObject { ["reportId"] = statusReport, ["sessionId"] = statusSession } } })); }
+                catch (Exception notifyError) when (notifyError is IOException or ObjectDisposedException or OperationCanceledException) { }
+            }
+        }
+        // Native errors cannot impersonate a host admission receipt.
+        if (message["error"]?["data"] is JsonObject nativeErrorData)
+            nativeErrorData.Remove(GorynychProtocol.MetaReportRefused);
         message["id"] = request.ConductorId.DeepClone();
         if (!request.Connection.IsLost) await TryWriteAsync(request.Connection, message);
         if (request.Method == GorynychProtocol.MethodSteering) await FlushTerminalsAsync();
@@ -335,8 +438,44 @@ public sealed class AdapterHost
     JsonObject SessionConfigurations() => new(live.Where(configurations.ContainsKey)
         .Select(id => new KeyValuePair<string, JsonNode?>(id, configurations[id].Snapshot())));
 
+    void StoreNoteFacts(string id, string session, JsonObject facts)
+    {
+        var store = options.ReportStore ?? throw new InvalidOperationException("Report storage is unavailable");
+        var generation = options.Generation?.Key ?? throw new InvalidOperationException("Host generation is unavailable");
+        var bounded = (JsonObject)facts.DeepClone();
+        foreach (var field in new[] { "nativeError", "nativeSubtype", "nativeStopReason", "nativeTerminalReason", "dropReason", "uncertainty" })
+            if (bounded[field] is JsonValue value && value.TryGetValue<string>(out var text)) bounded[field] = BoundReceiptField(text);
+        store.RecordNoteReceipt(id, session, options.HostId, generation, bounded);
+    }
+
     async Task AgentNotifiedAsync(string method, JsonObject message, bool released = false)
     {
+        if (method == GorynychProtocol.MethodHostReportNoteReceipt)
+        {
+            string? failedSession = null, failedReport = null;
+            try
+            {
+                var session = failedSession = Text(message["params"]?["sessionId"]) ?? throw new ArgumentException("Missing receipt session");
+                var facts = message["params"]?["_meta"]?[GorynychProtocol.MetaReportNote] as JsonObject ?? throw new ArgumentException("Missing receipt facts");
+                var id = failedReport = Text(facts["reportId"]) ?? throw new ArgumentException("Missing receipt report");
+                StoreNoteFacts(id, session, facts);
+                // A hint is emitted only after durable publication; recovery also scans
+                // the manifest, so this notification need not survive host replay eviction.
+                try { await EmitAsync(Notification(GorynychProtocol.MethodHostState, new JsonObject { ["_meta"] = new JsonObject
+                    { [GorynychProtocol.CapHostReportNote] = new JsonObject { ["reportId"] = id, ["sessionId"] = session } } })); }
+                catch (Exception notifyError) when (notifyError is IOException or ObjectDisposedException or OperationCanceledException) { }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or KeyNotFoundException)
+            {
+                lock (state) noteReceiptFailure = "Report note evidence could not be persisted: " + e.GetType().Name;
+                Log(noteReceiptFailure);
+                try { await EmitAsync(Notification(GorynychProtocol.MethodHostState, new JsonObject { ["_meta"] = new JsonObject
+                    { [GorynychProtocol.CapHostReportNote] = new JsonObject { ["failure"] = noteReceiptFailure,
+                        ["reportId"] = failedReport, ["sessionId"] = failedSession } } })); }
+                catch (Exception notifyError) when (notifyError is IOException or ObjectDisposedException or OperationCanceledException) { }
+            }
+            return; // private adapter-to-host evidence is not ordinary replay or a public update
+        }
         if (!released && method == AcpMethods.Client.SessionUpdate
             && Text(message["params"]?["sessionId"]) is { } sessionId
             && Text(message["params"]?["update"]?["_meta"]?[GorynychProtocol.MetaAgentTurn]) == "ended"
@@ -418,7 +557,11 @@ public sealed class AdapterHost
         try
         {
             string line;
-            lock (state) line = Number(message);
+            lock (state)
+            {
+                CaptureUpdate(message);
+                line = Number(message);
+            }
             if (current is { IsLost: false } connection) await TryWriteLineAsync(connection, line);
         }
         finally
@@ -452,7 +595,12 @@ public sealed class AdapterHost
                 {
                     if (!activities.TryGetValue(sessionId, out var activity)) activities[sessionId] = activity = [];
                     if (foreground is "running" or "idle" or "requires_action") activity["foreground"] = foreground;
-                    if (turn is "started" or "ended") activity["agentTurn"] = turn == "started";
+                    if (turn is "started" or "ended")
+                    {
+                        activity["agentTurn"] = turn == "started";
+                        activity["agentTurnKind"] = turn == "started" && Text(activityMeta[GorynychProtocol.MetaOrigin]) == "report" ? "report" : "unknown";
+                        activity["agentReportDelivery"] = turn == "started" ? activityMeta[GorynychProtocol.MetaReportDelivery]?.DeepClone() : null;
+                    }
                     if (hasBackground)
                     {
                         var raw = activityMeta[GorynychProtocol.MetaBackgroundWork];
@@ -691,6 +839,105 @@ public sealed class AdapterHost
 
     async Task ConductorAsksAsync(Connection connection, JsonNode id, string method, JsonObject message)
     {
+        string? noteStatusReport = null;
+        string? noteAttempt = null, noteDigest = null, noteAckUuid = null;
+        long? noteAckRevision = null;
+        if (method == GorynychProtocol.MethodHostReportNoteAck)
+        {
+            try
+            {
+                var p = message["params"] as JsonObject ?? throw new ArgumentException("Missing request");
+                if (p.ContainsKey("text")) throw new ArgumentException("ACK accepts no text");
+                var session = Text(p["sessionId"]) ?? throw new ArgumentException("Missing session");
+                var note = p["_meta"]?[GorynychProtocol.MetaReportNote];
+                var report = Text(note?["reportId"]) ?? throw new ArgumentException("Missing report ID");
+                var attempt = Text(note?["attemptId"]) ?? throw new ArgumentException("Missing attempt ID");
+                var uuid = Text(note?["nativeMessageId"]) ?? throw new ArgumentException("Missing native UUID");
+                if (note?["revision"] is not JsonValue rv || !rv.TryGetValue<long>(out var revision) || revision <= 0)
+                    throw new ArgumentException("Invalid receipt revision");
+                var store = options.ReportStore ?? throw new InvalidOperationException("Report storage is unavailable");
+                var generation = options.Generation?.Key ?? throw new InvalidOperationException("Host generation is unavailable");
+                if (!store.CanAcknowledgeNote(report, session, options.HostId, generation, attempt, uuid, revision))
+                    throw new InvalidOperationException("Receipt is not durably settled at this revision");
+                var meta = p["_meta"] as JsonObject ?? new JsonObject(); p["_meta"] = meta;
+                meta[GorynychProtocol.MetaHostNoteTracking] = true;
+                noteStatusReport = report; noteAttempt = attempt; noteAckUuid = uuid; noteAckRevision = revision;
+                method = GorynychProtocol.MethodReportNoteAck; message["method"] = method;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or KeyNotFoundException)
+            {
+                await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                    ["error"] = new JsonObject { ["code"] = JsonRpcException.InvalidRequest, ["message"] = "Report note ACK unresolved: " + e.Message } });
+                return;
+            }
+        }
+        if (method == GorynychProtocol.MethodHostReportNoteStatus)
+        {
+            try
+            {
+                var p = message["params"] as JsonObject ?? throw new ArgumentException("Missing request");
+                if (p.ContainsKey("text")) throw new ArgumentException("Status accepts no text");
+                var session = Text(p["sessionId"]) ?? throw new ArgumentException("Missing session");
+                var note = p["_meta"]?[GorynychProtocol.MetaReportNote];
+                var report = Text(note?["reportId"]) ?? throw new ArgumentException("Missing report ID");
+                var attempt = Text(note?["attemptId"]) ?? throw new ArgumentException("Missing attempt ID");
+                var store = options.ReportStore ?? throw new InvalidOperationException("Report storage is unavailable");
+                var generation = options.Generation?.Key ?? throw new InvalidOperationException("Host generation is unavailable");
+                _ = store.ReadNoteReceipt(report, session, options.HostId, generation, attempt);
+                noteStatusReport = report;
+                method = GorynychProtocol.MethodReportNoteStatus; message["method"] = method;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or KeyNotFoundException)
+            {
+                await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                    ["error"] = new JsonObject { ["code"] = JsonRpcException.InvalidRequest, ["message"] = "Report note status refused: " + e.Message } });
+                return;
+            }
+        }
+        if (method == GorynychProtocol.MethodHostReportNote)
+        {
+            try
+            {
+                var p = message["params"] as JsonObject ?? throw new ArgumentException("Missing request");
+                var session = Text(p["sessionId"]) ?? throw new ArgumentException("Missing session");
+                var text = Text(p["text"]) ?? throw new ArgumentException("Missing text");
+                var note = p["_meta"]?[GorynychProtocol.MetaReportNote];
+                var report = Text(note?["reportId"]) ?? throw new ArgumentException("Missing report ID");
+                var attempt = Text(note?["attemptId"]) ?? throw new ArgumentException("Missing attempt ID");
+                var store = options.ReportStore ?? throw new InvalidOperationException("Host receipt storage is unavailable");
+                var generation = options.Generation?.Key ?? throw new InvalidOperationException("Host generation is unavailable");
+                if ((bool?)initialize?["_meta"]?[GorynychProtocol.CapReportNote] != true)
+                    throw new InvalidOperationException("Adapter cannot confirm report notes");
+                if (!store.BeginHostNote(report, session, options.HostId, generation, attempt, text))
+                {
+                    var retained = store.ReadNoteReceipt(report, session, options.HostId, generation, attempt) ?? new JsonObject();
+                    var proof = store.ReadNoteNoInput(report, session, options.HostId, generation, attempt);
+                    if (proof is not null)
+                    {
+                        retained["noInputProof"] = proof;
+                        retained["digest"] = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
+                    }
+                    retained["reportId"] = report; retained["attemptId"] = attempt;
+                    retained["state"] = (bool?)retained["contradiction"] == true || (bool?)retained["cancelReceiptPending"] == true ? "uncertain" :
+                        retained["cycleResult"] is not null ? "cycle_result" : (bool?)retained["nativeCancelled"] == true ? "dropped" : "uncertain";
+                    await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaReportNote] = retained } }));
+                    return;
+                }
+                noteAttempt = attempt;
+                noteDigest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
+                var meta = p["_meta"] as JsonObject ?? new JsonObject(); p["_meta"] = meta;
+                meta[GorynychProtocol.MetaHostNoteTracking] = true;
+                noteStatusReport = report; // persist the initial response before acknowledging the caller
+                method = GorynychProtocol.MethodReportNote; message["method"] = method;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or KeyNotFoundException)
+            {
+                await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                    ["error"] = new JsonObject { ["code"] = e is IOException or UnauthorizedAccessException ? JsonRpcException.InternalError : JsonRpcException.InvalidRequest,
+                        ["message"] = "Report note verification is unresolved; a prior native handoff may have occurred. Do not retry or fall back without evidence. " + e.Message } });
+                return;
+            }
+        }
         switch (method)
         {
             case AcpMethods.Agent.Initialize:
@@ -744,15 +991,49 @@ public sealed class AdapterHost
                 ended.TrySetResult(0);
                 return;
         }
-        long key;
+        long key = 0;
         var @params = message["params"] as JsonObject;
-        lock (state)
+        var sessionId = Text(@params?["sessionId"]);
+        var reportId = method == AcpMethods.Agent.SessionPrompt ? Text(@params?["_meta"]?[GorynychProtocol.MetaReportId]) : null;
+        ReportCapture? capture = null;
+        var provenUnstarted = reportId is not null;
+        Exception? refusal = null;
+        try
         {
-            key = ++nextToAgent;
-            forwarded[key] = new Forwarded
+            lock (state)
             {
+              try
+              {
+                if (stopping.IsCancellationRequested) throw new InvalidOperationException("The host is stopping");
+                var history = IsHistoryOperation(method);
+                if (sessionId is not null && (history || method == AcpMethods.Agent.SessionPrompt) &&
+                    forwarded.Values.Any(f => f.SessionId == sessionId && f.Capture is not null))
+                    throw new InvalidOperationException("A report capture is active for this session; retry after its turn ends");
+                if (reportId is not null)
+                {
+                    if (options.ReportStore is null) throw new InvalidOperationException("This host does not support report capture");
+                    var session = sessionId ?? throw new InvalidOperationException("Missing report session");
+                    var prompt = Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]) ?? throw new InvalidOperationException("Missing report prompt ID");
+                    if (forwarded.Values.Any(f => f.SessionId == session && (f.Method == AcpMethods.Agent.SessionPrompt || IsHistoryOperation(f.Method))))
+                        throw new InvalidOperationException("A prompt or history operation is already running in this session");
+                    // A failed open may mean another producer or an existing spool; it is
+                    // not proof that this reservation was never handed off.
+                    provenUnstarted = false;
+                    capture = options.ReportStore.OpenReservedCapture(reportId, session, prompt);
+                    provenUnstarted = true;
+                    options.CaptureOpened?.Invoke(capture);
+                    (@params?["_meta"] as JsonObject)?.Remove(GorynychProtocol.MetaReportId);
+                }
+                key = ++nextToAgent;
+                forwarded[key] = new Forwarded
+                {
                 Connection = connection, ConductorId = id.DeepClone(), Method = method, SessionId = Text(@params?["sessionId"]),
-                PromptId = Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]),
+                PromptId = Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]), ReportId = reportId, Capture = capture,
+                NoteStatusReport = noteStatusReport, NoteAttempt = noteAttempt, NoteDigest = noteDigest,
+                NoteAckUuid = noteAckUuid, NoteAckRevision = noteAckRevision,
+                Delivery = method == AcpMethods.Agent.SessionPrompt && Text(@params?["_meta"]?[GorynychProtocol.MetaOrigin]) == "report"
+                    ? @params?["_meta"]?[GorynychProtocol.MetaReportDelivery]?.DeepClone() as JsonObject : null,
+                TurnKind = reportId is not null ? "work" : Text(@params?["_meta"]?[GorynychProtocol.MetaOrigin]) == "report" ? "report" : "unknown",
                 ModeId = method == AcpMethods.Agent.SessionSetMode ? Text(@params?["modeId"]) : null,
                 ModelId = method == "session/set_model" ? Text(@params?["modelId"]) : null,
                 AskId = Text(@params?["_meta"]?[GorynychProtocol.MetaAskId]) ?? Text(@params?["askId"]), // a prompt's _meta; _gorynych/opinion's params
@@ -761,10 +1042,112 @@ public sealed class AdapterHost
                 MessageId = method == GorynychProtocol.MethodSteering ? Text(@params?["_meta"]?[GorynychProtocol.MetaMessageId]) : null,
                 SteerOrigin = method == GorynychProtocol.MethodSteering ? Text(@params?["_meta"]?[GorynychProtocol.MetaSteerOrigin]) : null,
                 Prompt = method == GorynychProtocol.MethodSteering ? @params?["prompt"]?.DeepClone() as JsonArray : null,
-            };
+                };
+              }
+              catch
+              {
+                  // Keep an unregistered lease inside the same shutdown exclusion.
+                  capture?.Dispose(); capture = null;
+                  throw;
+              }
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or KeyNotFoundException)
+        {
+            capture?.Dispose(); refusal = e;
+        }
+        if (refusal is not null)
+        {
+            await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                ["error"] = new JsonObject { ["code"] = JsonRpcException.InvalidRequest, ["message"] = "Host request refused: " + refusal.Message,
+                    ["data"] = !provenUnstarted ? null : new JsonObject { [GorynychProtocol.MetaReportRefused] = new JsonObject
+                    { ["reportId"] = reportId, ["sessionId"] = sessionId, ["promptId"] = Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]) } } } });
+            return;
         }
         message["id"] = key;
         await WriteToAgentAsync(message);
+    }
+
+    static bool IsHistoryOperation(string method) => method is AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionResume or GorynychProtocol.MethodCatchUp;
+
+    // Called once for live agent notifications, under the ordered send gate and state lock.
+    void CaptureUpdate(JsonObject message)
+    {
+        if (Text(message["method"]) != AcpMethods.Client.SessionUpdate) return;
+        var session = Text(message["params"]?["sessionId"]);
+        var update = message["params"]?["update"];
+        var type = Text(update?["sessionUpdate"]);
+        if (session is null || type is not ("agent_message_chunk" or "tool_call")) return;
+        var request = forwarded.Values.FirstOrDefault(f => f.Method == AcpMethods.Agent.SessionPrompt && f.SessionId == session && f.Capture is not null);
+        if (request?.Capture is null) return;
+        if (request.CaptureFailure is not null && type != "tool_call") return;
+        try
+        {
+            if (type == "tool_call") { request.Capture.ToolCall(); request.CaptureFailure = null; }
+            else if (Text(update?["content"]?["type"]) == "text" && Text(update?["content"]?["text"]) is { } text) request.Capture.Append(text);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or InvalidDataException)
+        {
+            request.CaptureFailure = BoundError(e.Message);
+        }
+    }
+
+    static string BoundReceiptField(string text)
+    {
+        const string suffix = " [truncated]"; const int limit = 64;
+        if (Encoding.UTF8.GetByteCount(text) <= limit) return text;
+        var output = new StringBuilder(); var bytes = 0;
+        foreach (var rune in text.EnumerateRunes())
+        {
+            if (bytes + rune.Utf8SequenceLength > limit - suffix.Length) break;
+            output.Append(rune.ToString()); bytes += rune.Utf8SequenceLength;
+        }
+        return output.Append(suffix).ToString();
+    }
+
+    static string BoundError(string text)
+    {
+        const string suffix = " [truncated]";
+        if (Encoding.UTF8.GetByteCount(text) <= ReportCapture.ErrorBytes) return text;
+        var result = new StringBuilder();
+        var bytes = 0;
+        foreach (var rune in text.EnumerateRunes())
+        {
+            if (bytes + rune.Utf8SequenceLength > ReportCapture.ErrorBytes - suffix.Length) break;
+            result.Append(rune.ToString()); bytes += rune.Utf8SequenceLength;
+        }
+        return result.Append(suffix).ToString();
+    }
+
+    void SealReport(Forwarded request, JsonObject response)
+    {
+        if (request.Capture is not { } capture) return;
+        var error = response["error"] is { } nativeError ? BoundError(nativeError.ToJsonString()) : null;
+        var outcome = ReportTerminalOutcome.From(response["result"], error is not null);
+        try
+        {
+            if (request.CaptureFailure is { } failure) capture.SealIncomplete(failure, outcome, error);
+            else capture.Seal(outcome, error);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
+        {
+            request.CaptureFailure = BoundError(e.Message);
+        }
+        finally
+        {
+            try { capture.Dispose(); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { request.CaptureFailure = BoundError(e.Message); }
+        }
+        if (request.ReportId is { } id && options.ReportStore is { } reports)
+        {
+            try
+            {
+                options.BeforeProducerEvidence?.Invoke();
+                reports.RecordProducerEvidence(id, options.HostId, outcome, error, request.CaptureFailure);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
+            { request.CaptureFailure = BoundError("Producer evidence could not be saved: " + e.Message); }
+        }
     }
 
     // Live snapshots survive eviction from the bounded notification replay buffer.
@@ -784,13 +1167,17 @@ public sealed class AdapterHost
                 ["sessionStates"] = SessionConfigurations(),
                 ["sessionActivities"] = SessionActivities(),
                 ["turns"] = new JsonArray(forwarded.Where(f => f.Value.Method == AcpMethods.Agent.SessionPrompt && f.Value.SessionId is not null)
-                    .Select(f => (JsonNode)new JsonObject { ["sessionId"] = f.Value.SessionId, ["turn"] = f.Key, ["promptId"] = f.Value.PromptId }).ToArray()),
+                    .Select(f => (JsonNode)new JsonObject { ["sessionId"] = f.Value.SessionId, ["turn"] = f.Key, ["promptId"] = f.Value.PromptId,
+                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaReportId] = f.Value.ReportId,
+                            [GorynychProtocol.MetaHostTurnKind] = f.Value.TurnKind,
+                            [GorynychProtocol.MetaReportDelivery] = f.Value.Delivery?.DeepClone() } }).ToArray()),
                 // The questions the agent is answering, by turn or by its own way in: the next conductor waits for their answers.
                 ["asks"] = new JsonArray(forwarded.Values.Where(f => f.AskId is not null && f.SessionId is not null
                         && f.Method is AcpMethods.Agent.SessionPrompt or GorynychProtocol.MethodOpinion)
                     .Select(f => (JsonNode)new JsonObject { ["sessionId"] = f.SessionId, ["askId"] = f.AskId, ["opinion"] = f.Opinion, ["from"] = f.From }).ToArray()),
                 ["buffered"] = new JsonArray(buffer.Select(b => b.SessionId).Distinct(StringComparer.Ordinal).Select(s => (JsonNode)s).ToArray()),
                 ["requests"] = asked.Count,
+                ["_meta"] = new JsonObject { [GorynychProtocol.CapHostReportNote] = new JsonObject { ["failure"] = noteReceiptFailure } },
                 ["seq"] = seq,
             };
     }
@@ -820,7 +1207,8 @@ public sealed class AdapterHost
             // A current snapshot after history: a replayed old option update must not replace a
             // newer value returned by set_config_option while no conductor was connected.
             JsonObject snapshot;
-            lock (state) snapshot = new JsonObject { ["sessionStates"] = SessionConfigurations(), ["sessionActivities"] = SessionActivities() };
+            lock (state) snapshot = new JsonObject { ["sessionStates"] = SessionConfigurations(), ["sessionActivities"] = SessionActivities(),
+                ["_meta"] = new JsonObject { [GorynychProtocol.CapHostReportNote] = new JsonObject { ["failure"] = noteReceiptFailure } } };
             if (!await TryWriteAsync(connection, Notification(GorynychProtocol.MethodHostState, snapshot)))
                 throw new IOException("the connection went");
             current = connection;
@@ -870,6 +1258,11 @@ public sealed class AdapterHost
         {
             ["hostId"] = options.HostId, ["link"] = GorynychProtocol.HostLinkVersion, ["reattached"] = reattached,
         };
+        if (options.ReportStore is not null) meta[GorynychProtocol.MetaReportCapture] = new JsonObject { ["supported"] = true };
+        if (options.ReportStore is not null && options.Generation is not null &&
+            (bool?)result["_meta"]?[GorynychProtocol.CapReportNote] == true)
+            meta[GorynychProtocol.CapHostReportNote] = new JsonObject { ["supported"] = true,
+                ["durableRouting"] = (bool?)result["_meta"]?[GorynychProtocol.CapReportNoteAck] == true };
         result["_meta"] = meta;
         return result;
     }
@@ -880,6 +1273,7 @@ public sealed class AdapterHost
         await agentGate.WaitAsync();
         try
         {
+            if (stopping.IsCancellationRequested) return;
             await agent.Output.WriteAsync(bytes);
             await agent.Output.FlushAsync();
         }
@@ -956,6 +1350,16 @@ public sealed class AdapterHost
         public required string Method { get; init; }
         public string? SessionId { get; init; }
         public string? PromptId { get; init; }
+        public string? ReportId { get; init; }
+        public string? NoteStatusReport { get; init; }
+        public string? NoteAttempt { get; init; }
+        public string? NoteDigest { get; init; }
+        public string? NoteAckUuid { get; init; }
+        public long? NoteAckRevision { get; init; }
+        public JsonObject? Delivery { get; init; }
+        public string TurnKind { get; init; } = "unknown";
+        public ReportCapture? Capture { get; set; }
+        public string? CaptureFailure { get; set; }
         public string? ModeId { get; init; }
         public string? ModelId { get; init; }
 

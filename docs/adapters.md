@@ -1309,3 +1309,10 @@ for a change.
   contiguous `seq` and could give a catch-up after a mark. Reading it needs a zstd decoder,
   which .NET 10 does not have.
 - Images in prompts (DSH offers them only for an image-capable route).
+
+Headless Claude exposes a separate capability-negotiated report-note receipt and status contract;
+see `service-protocol.md`. Its UUID replay and matching native cycle result are native observations,
+while input write/flush is only adapter-side admission. This process-local bounded ledger survives
+conductor reconnect to the same adapter, but it is not a durable outbox or an assignment lifecycle.
+TUI and unsupported transports refuse before report-note handoff so a future conductor can choose
+its queued fallback. Current report delivery is unchanged pending C3.

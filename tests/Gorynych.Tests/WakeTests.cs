@@ -224,10 +224,10 @@ public sealed class WakeTests
         // closed: a child's turn may begin before its spawn returns its ID.
         kimi.BeforePrompt = id => id != kimiParent ? holdChildren.Task : Task.CompletedTask;
         claude.BeforePrompt = id => id != claudeParent ? holdChildren.Task : Task.CompletedTask;
-        await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, new JsonObject
+        var kimiChild = (string)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, new JsonObject
         {
             ["agent"] = "claude", ["prompt"] = "Write the notes", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = kimi.Tokens[kimiParent] },
-        });
+        }))!["sessionId"]!;
         var claudeChild = (string)(await zed.Rpc.SendRequestAsync(GorynychProtocol.MethodSpawn, new JsonObject
         {
             ["agent"] = "kimi", ["prompt"] = "Fix the flaky test", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = claude.Tokens[claudeParent] },
@@ -241,9 +241,18 @@ public sealed class WakeTests
         static bool ClosedAgain(LifecycleAgent agent, string id) => agent.CallsFor(id) is var calls && calls.Contains(Resume) && calls.Last() == Close;
         await Until(() => ClosedAgain(kimi, kimiParent) && ClosedAgain(claude, claudeParent), "both parents woken and closed again");
 
-        CollectionAssert.AreEqual(new[] { Resume, Note, Prompt, Close }, CallsFrom(kimi, kimiParent, Resume));
-        CollectionAssert.AreEqual(new[] { Resume, Note, Prompt, Close }, CallsFrom(claude, claudeParent, Resume));
-        StringAssert.StartsWith(claude.Prompts.Last(p => p.SessionId == claudeParent).Text, $"[Report · from session_id {claudeChild} ");
+        CollectionAssert.AreEqual(new[] { Resume, Prompt, Close }, CallsFrom(kimi, kimiParent, Resume));
+        CollectionAssert.AreEqual(new[] { Resume, Prompt, Close }, CallsFrom(claude, claudeParent, Resume));
+        foreach (var (parent, child, adapter) in new[] { (kimiParent, kimiChild, kimi), (claudeParent, claudeChild, claude) })
+        {
+            var report = conductor.ReportStorage.List(child).Items.Single(x => x.Identity.Child == child && x.Identity.Parent == parent);
+            Assert.AreEqual("completed", report.Status); Assert.AreEqual("queued", report.Delivery?.Route);
+            string[] parentPrompts; lock (adapter.Prompts) parentPrompts = adapter.Prompts.Where(p => p.SessionId == parent).Select(p => p.Text).ToArray();
+            var delivery = parentPrompts.Single(p => p.Contains($"report_id {report.ReportId}", StringComparison.Ordinal));
+            StringAssert.Contains(delivery, child); StringAssert.Contains(delivery, "read_report");
+            Assert.AreEqual(2, parentPrompts.Length, "one user prompt and one durable report delivery");
+        }
+        Assert.AreEqual(0, claude.Notes.Count, "legacy HasChannel does not provide durable note receipts");
     }
 
     // ---------------------------------------------------------------- a real failure to start

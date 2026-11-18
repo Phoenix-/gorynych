@@ -744,7 +744,12 @@ sealed class LifecycleAgent
                         .OfType<string>().ToArray();
                     // The blocks joined as the Claude adapter joins them; the title from the first, like Kimi's.
                     var text = string.Join("\n\n", blocks);
-                    lock (Prompts) { Prompts.Add((sessionId!, text)); firstBlocks.TryAdd(sessionId!, blocks); }
+                    lock (Prompts)
+                    {
+                        Prompts.Add((sessionId!, text));
+                        PromptMetadata.Add((sessionId!, req.Params?["_meta"]?.DeepClone()));
+                        firstBlocks.TryAdd(sessionId!, blocks);
+                    }
                     if (BeforePrompt is { } beforePrompt) await beforePrompt(sessionId!);
                     if (DuringPrompt is { } during) await during(agent, sessionId!);
                     lock (sessions) this.titles.TryAdd(sessionId!, blocks[0]);
@@ -825,6 +830,7 @@ sealed class LifecycleAgent
 
     /// <summary>Every prompt as it arrives (before <see cref="BeforePrompt"/>), with its text blocks joined.</summary>
     public List<(string SessionId, string Text)> Prompts { get; } = [];
+    public List<(string SessionId, JsonNode? Meta)> PromptMetadata { get; } = [];
 
     readonly Dictionary<string, string[]> firstBlocks = [];
 

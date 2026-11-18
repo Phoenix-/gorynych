@@ -2,6 +2,7 @@ using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
+using Gorynych.Adapters.Claude;
 using Gorynych.Service;
 
 namespace Gorynych.Tests;
@@ -163,39 +164,90 @@ public sealed class SpawnInitiationTests
     }
 
     [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task AChildsReportInTheUsersTurn_HoldsBackAUserAskedSpawn_AndTheNextTurnIsClearAgain()
     {
-        var claude = new LifecycleAgent("claude", canDelete: false) { HasChannel = true };
-        var kimi = new LifecycleAgent("kimi", canDelete: true);
-        await using var conductor = Conductor(claude.Adapter, kimi.Adapter);
-        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
-        zed.Approve = Start;
-        var parent = await NewPromptedAsync(zed, "claude", "Coordinate the release");
-        var child = (string)(await SpawnAsync(zed, claude.Tokens[parent], "proposal"))!["sessionId"]!;
-        await conductor.BackgroundTurnsIdleAsync();
-        await Until(() => { lock (claude.Notes) return claude.Notes.Count == 1; }, "the first turn's report, as a note");
-        await PromptAsync(zed, parent, "Thanks"); // a turn of the user's ends: nothing of the report is left
-        Assert.IsFalse(conductor.Feed(parent).HasOtherSessionText);
-        JsonNode? spawned = null;
-        var armed = true;
-        claude.BeforePrompt = async id =>
+        var dir = TestDirs.New();
+        var config = AppContext.BaseDirectory.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}") ? "Release" : "Debug";
+        var tests = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
+        var fake = Path.Combine(tests, "Gorynych.FakeClaude", "bin", config, "net10.0", TestDirs.Exe("Gorynych.FakeClaude"));
+        Assert.IsTrue(File.Exists(fake), "the isolated FakeClaude fixture must be built");
+        var claude = new ClaudeAdapter(new ClaudeAdapterOptions
         {
-            if (id != parent || !armed) return;
-            armed = false;
-            await PromptAsync(zed, child, "One more thing"); // its end is reported into this turn
-            await Until(() => { lock (claude.Notes) return claude.Notes.Count == 2; }, "the report in the turn");
-            spawned = await SpawnAsync(zed, claude.Tokens[parent], "user_asked");
-            // The session it starts reports its first turn too: into this turn, not after it, where
-            // the report would rightly mark the idle parent again.
-            await Until(() => { lock (claude.Notes) return claude.Notes.Count == 3; }, "the started session's report in the turn");
+            DataDirectory = Path.Combine(dir, "claude"), Executable = fake,
+            ProjectsDirectory = Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", "projects"),
+            ClaudeStatePath = Path.Combine(dir, "no-claude-state.json"), ChannelServerCommand = ["gorynych-peers-not-started"],
+            FetchCatalog = false, StartupTimeoutSeconds = 20, InterruptGraceMs = 3000, CloseTimeoutMs = 3000,
+        });
+        var kimi = new LifecycleAgent("kimi", canDelete: true);
+        var hosts = new InProcessHosts(name => name == "claude" ? claude : kimi.Adapter);
+        await using var conductor = hosts.Conductor(dir, claude, kimi.Adapter); hosts.Service = conductor;
+        await using var zed = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = (await zed.Rpc.RequestAsync<NewSessionRequest, NewSessionResponse>(AcpMethods.Agent.SessionNew,
+            new NewSessionRequest { Cwd = dir, McpServers = [], Meta = new JsonObject { [GorynychProtocol.MetaAgent] = "claude" } })).SessionId;
+        await PromptAsync(zed, parent, "warmup");
+        var token = conductor.Store.Get(parent)!.PeerToken!;
+        var route = conductor.Agents["claude"].RouteOf(parent)!;
+        Assert.AreEqual(true, (bool?)route.Info.Meta?[GorynychProtocol.CapHostReportNote]?["durableRouting"], "actual parent host supports durable live notes");
+        var child = await NewPromptedAsync(zed, "kimi", "child warmup");
+        conductor.Store.Update(child, "kimi", record => { record.ParentSessionId = parent; record.ReportToParent = true; });
+
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        zed.Approve = async request =>
+        {
+            if (request.ToolCall.Title?.StartsWith("Start a", StringComparison.Ordinal) == true) return await Start(request);
+            entered.TrySetResult(); await release.Task;
+            return new SelectedPermissionOutcome { OptionId = request.Options[0].OptionId };
         };
         var before = SpawnCards(zed).Length;
+        var turn = PromptAsync(zed, parent, "please write a file");
+        JsonNode? spawned;
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            await PromptAsync(zed, child, "child work during the user's turn");
+            await LinkHarness.Until(() => conductor.ReportStorage.List(child).Items.Any(x => x.Identity.Cause == ReportCause.User && x.Delivery is { Route: "note", DispatchStarted: true }),
+                "the child's actual report enters the live note route").WaitAsync(TimeSpan.FromSeconds(15));
+            var report = conductor.ReportStorage.List(child).Items.Single(x => x.Identity.Cause == ReportCause.User);
+            var claim = report.Delivery!;
+            await LinkHarness.Until(() =>
+            {
+                try { return (bool?)conductor.ReportStorage.ReadNoteReceipt(report.ReportId, parent, claim.HostId!, claim.HostGeneration!, claim.AttemptId)?["writeCompleted"] == true; }
+                catch (InvalidOperationException) { return false; }
+            }, "the host durably records native note input").WaitAsync(TimeSpan.FromSeconds(15));
+            var uuid = (string)conductor.ReportStorage.ReadNoteReceipt(report.ReportId, parent, claim.HostId!, claim.HostGeneration!, claim.AttemptId)!["nativeMessageId"]!;
+            var inputs = Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", parent + ".inputs.jsonl");
+            await LinkHarness.Until(() =>
+            {
+                try { return File.Exists(inputs) && File.ReadAllLines(inputs).Count(line => (string?)JsonNode.Parse(line)?["uuid"] == uuid) == 1; }
+                catch (IOException) { return false; }
+            }, "FakeClaude observes the report UUID once").WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.IsFalse(turn.IsCompleted, "the user's native turn is still held at its real approval");
+            Assert.IsTrue(conductor.Feed(parent).HasOtherSessionText, "live delivery marked the authority boundary");
+            spawned = await SpawnAsync(zed, token, "user_asked");
+            Assert.AreEqual(before + 1, SpawnCards(zed).Length, "the live report forces a spawn approval");
+            Assert.AreEqual($"The user was asked although you passed initiation user_asked, as {OtherText}.", (string?)spawned!["note"]);
+        }
+        finally { release.TrySetResult(); await turn.WaitAsync(TimeSpan.FromSeconds(15)); }
 
-        await PromptAsync(zed, parent, "Start a Kimi session that writes the docs");
+        var spawnedChild = (string)spawned!["sessionId"]!;
+        await LinkHarness.Until(() => conductor.ReportStorage.List(spawnedChild).Items.Any(x => x.Identity.Cause == ReportCause.Spawn && x.ProducerAck) &&
+            conductor.ReportStorage.List(parent).Items.Where(x => x.Identity.Parent == parent).All(x => x.Status == "completed") &&
+            !conductor.Feed(parent).TurnRunning && !conductor.Feed(parent).HasOtherSessionText, "all live report turns end and the marker clears").WaitAsync(TimeSpan.FromSeconds(20));
+        Assert.IsFalse(conductor.Feed(parent).HasOtherSessionText, "the prior report does not taint the next user turn");
 
-        Assert.AreEqual(before + 1, SpawnCards(zed).Length, "a report holds another agent's text");
-        Assert.AreEqual($"The user was asked although you passed initiation user_asked, as {OtherText}.", (string?)spawned!["note"]);
-        Assert.IsFalse(conductor.Feed(parent).HasOtherSessionText, "cleared when the turn ended");
+        entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var next = PromptAsync(zed, parent, "please write another file");
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            var cards = SpawnCards(zed).Length;
+            await SpawnAsync(zed, token, "user_asked");
+            Assert.AreEqual(cards, SpawnCards(zed).Length, "a clean subsequent user turn does not need a spawn card");
+        }
+        finally { release.TrySetResult(); await next.WaitAsync(TimeSpan.FromSeconds(15)); }
     }
 
     [TestMethod]
@@ -367,16 +419,19 @@ public sealed class SpawnInitiationTests
             Assert.AreEqual(mode, kimi.Modes[id], "the first prompt sees the requested mode");
             return Task.CompletedTask;
         };
-        JsonNode? spawned = null;
+        JsonNode? spawned = null; var armed = 1; var spawnCalls = 0;
         claude.BeforePrompt = async id =>
         {
-            if (id == parent) spawned = await SpawnAsync(zed, claude.Tokens[parent], initiation, mode);
+            if (id != parent || Interlocked.Exchange(ref armed, 0) == 0) return;
+            Interlocked.Increment(ref spawnCalls);
+            spawned = await SpawnAsync(zed, claude.Tokens[parent], initiation, mode);
         };
 
         await PromptAsync(zed, parent, "Start a Kimi coder");
         await conductor.BackgroundTurnsIdleAsync();
 
         var child = (string)spawned!["sessionId"]!;
+        Assert.AreEqual(1, Volatile.Read(ref spawnCalls), "the user's turn initiated exactly one spawn even if a report turn followed");
         Assert.AreEqual(approvals, SpawnCards(zed).Length);
         CollectionAssert.AreEqual(new[] { AcpMethods.Agent.SessionSetConfigOption, AcpMethods.Agent.SessionPrompt },
             kimi.CallsFor(child).Where(m => m != AcpMethods.Agent.SessionNew).ToArray());

@@ -160,6 +160,7 @@ public sealed class PeersTests
     [TestMethod]
     public void ReportInstructions_ContinueTheUsersTask_WithoutGrantingNewAuthority()
     {
+        StringAssert.Contains(PeersServer.SystemPrompt, "Use delegate_task to continue already user-authorized work with your immediate child");
         foreach (var prompt in new[] { PeersServer.SystemPrompt, Gorynych.Adapters.Claude.ChannelHost.LiveSystemPrompt })
         {
             StringAssert.Contains(prompt, "No reply to the child is required.");
@@ -177,6 +178,7 @@ public sealed class PeersTests
         string Description(string tool) => (string)tools[tool]["description"]!;
 
         StringAssert.Contains(Description("send_message"), "durable acceptance");
+        StringAssert.Contains(Description("send_message"), "Use delegate_task to continue already user-authorized work with your immediate child");
         StringAssert.Contains(Description("send_message"), "Use reply_message to reply to a received message_id.");
         StringAssert.Contains(Description("send_message"),
             "If the recipient has full access and you do not, the user approves first.");
@@ -186,6 +188,8 @@ public sealed class PeersTests
         StringAssert.Contains(Description("spawn_session"), "sends this session a short report with the child's final message by itself");
         StringAssert.Contains(Description("spawn_session"), "The user approves each spawn first, unless they asked for it themselves in this turn (initiation user_asked)");
         StringAssert.Contains(Description("spawn_session"), "config_options holds the native model-related values the child actually runs with");
+        StringAssert.Contains(Description("spawn_session"), "assignment_id");
+        StringAssert.Contains(Description("spawn_session"), "Use delegate_task for further already user-authorized work with this child");
         var configOptions = tools["spawn_session"]["inputSchema"]!["properties"]!["config_options"]!;
         Assert.AreEqual("object", (string?)configOptions["type"]);
         Assert.AreEqual("string", (string?)configOptions["additionalProperties"]!["type"]);
@@ -249,10 +253,28 @@ public sealed class PeersTests
             mcp.Start();
             var init = await mcp.SendRequestAsync("initialize", new JsonObject { ["protocolVersion"] = "2025-06-18", ["capabilities"] = new JsonObject() });
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
+            StringAssert.Contains((string?)init["instructions"], "Use delegate_task to continue already user-authorized work with your immediate child");
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "spawn_session", "archive_session", "restore_session", "reply_message" },
+            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports" },
                 tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
 
+            StringAssert.Contains((string?)init["instructions"], "read_report");
+            var wrongArgs = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_reports", ["arguments"] = new JsonArray() });
+            Assert.AreEqual(true, (bool?)wrongArgs!["isError"]);
+            var reports = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_reports", ["arguments"] = new JsonObject() });
+            Assert.AreEqual(false, (bool?)reports!["isError"]);
+            Assert.AreEqual(0, JsonNode.Parse((string)reports["content"]![0]!["text"]!)!["items"]!.AsArray().Count);
+            var reportId = conductor.ReportStorage.Reserve(new ReportIdentity("mcp-result", "answering", "asking", ReportCause.User)).ReportId;
+            using (var capture = conductor.ReportStorage.OpenCapture(reportId))
+            {
+                capture.Append("MCP exact 😀 result"); capture.Seal("ended");
+                conductor.ReportStorage.Commit(reportId, capture);
+            }
+            var actual = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "read_report", ["arguments"] = new JsonObject { ["report_id"] = reportId } });
+            Assert.AreEqual(false, (bool?)actual!["isError"]);
+            Assert.AreEqual("MCP exact 😀 result", (string?)JsonNode.Parse((string)actual["content"]![0]!["text"]!)!["text"]);
+            var missing = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "read_report", ["arguments"] = new JsonObject { ["report_id"] = Guid.NewGuid().ToString("N") } });
+            Assert.AreEqual(true, (bool?)missing!["isError"]);
             var listed = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_agents", ["arguments"] = new JsonObject() });
             var listing = (string)listed!["content"]![0]!["text"]!;
             StringAssert.StartsWith(listing, $"You are session_id asking (asker).\n{PeersServer.StatusLegend}\n[",

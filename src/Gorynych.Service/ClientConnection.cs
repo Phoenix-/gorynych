@@ -129,6 +129,8 @@ internal sealed class ClientConnection
             case AcpMethods.Agent.SessionDelete:
                 return await conductor.DeleteAsync(RequireSession(request), ct);
             case GorynychProtocol.MethodStatus:
+                // An explicit status check is a bounded recovery opportunity after storage heals.
+                conductor.QueueReportDeliveries();
                 return conductor.Status();
             case GorynychProtocol.MethodAttributesGet:
             case GorynychProtocol.MethodAttributesPatch:
@@ -142,8 +144,24 @@ internal sealed class ClientConnection
             case GorynychProtocol.MethodStart:
                 ServiceLog.Info($"{Rpc.Name}: asked to start adapters");
                 return conductor.Start(request);
+            // Native report-note receipts are a private conductor-to-host protocol. Never send an
+            // external ACP client's request through the generic session forwarding path.
+            case GorynychProtocol.MethodReportNote:
+            case GorynychProtocol.MethodReportNoteStatus:
+            case GorynychProtocol.MethodReportNoteAck:
+            case GorynychProtocol.MethodHostReportNoteAck:
+            case GorynychProtocol.MethodHostReportNote:
+            case GorynychProtocol.MethodHostReportNoteStatus:
+            case GorynychProtocol.MethodHostReportNoteReceipt:
+                throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {request.Method}");
             case GorynychProtocol.MethodOpinion:
                 return await conductor.OpinionAsync(request, ct, linkGone: () => Rpc.IsClosed);
+            case GorynychProtocol.MethodReadReport:
+                return conductor.ReadReport(request);
+            case GorynychProtocol.MethodListReports:
+                return conductor.ListReports(request);
+            case GorynychProtocol.MethodDelegateTask:
+                return await conductor.DelegateTaskAsync(request, ct);
             case GorynychProtocol.MethodSendMessage:
                 return await conductor.SendMessageAsync(request, reply: false, ct);
             case GorynychProtocol.MethodReplyMessage:
@@ -177,6 +195,8 @@ internal sealed class ClientConnection
 
     async Task OnNotificationAsync(string method, JsonNode? @params)
     {
+        if (method is GorynychProtocol.MethodReportNote or GorynychProtocol.MethodReportNoteStatus or GorynychProtocol.MethodReportNoteAck or
+            GorynychProtocol.MethodHostReportNote or GorynychProtocol.MethodHostReportNoteStatus or GorynychProtocol.MethodHostReportNoteAck or GorynychProtocol.MethodHostReportNoteReceipt) return;
         if ((string?)@params?["sessionId"] is not { } sid) return;
         if (method == AcpMethods.Agent.SessionCancel) cancelledAt[sid] = Rpc.NotificationSequence;
         try { await conductor.ForwardNotificationAsync(method, @params, sid); }
@@ -216,6 +236,8 @@ internal sealed class ClientConnection
         var flags = DeprecatedFlags();
         flags[GorynychProtocol.CapSessionAttributes] = true;
         flags[GorynychProtocol.CapGroups] = true;
+        flags[GorynychProtocol.CapDelegateTask] = true;
+        flags[GorynychProtocol.CapReportRetrieval] = true;
         flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
         flags[GorynychProtocol.MetaSessionState] = 1;
         return flags;

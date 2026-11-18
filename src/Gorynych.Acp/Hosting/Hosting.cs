@@ -37,6 +37,18 @@ public static class GorynychProtocol
     /// <summary>Which adapter owns a session; in <c>session/new</c> params it selects one.</summary>
     public const string MetaAgent = "gorynych/agent";
 
+    /// <summary>Internal host prompt and terminal correlation for a pre-admitted report.</summary>
+    public const string MetaReportId = "gorynych/reportId";
+    /// <summary>Trusted queued parent-delivery correlation, separate from producer capture.</summary>
+    public const string MetaReportDelivery = "gorynych/reportDelivery";
+    /// <summary>Internal host capture capability and diagnostic extension.</summary>
+    public const string MetaReportCapture = "gorynych/reportCapture";
+    /// <summary>Trusted host-only error data proving a report prompt was refused before dispatch.</summary>
+    public const string MetaReportRefused = "gorynych/reportRefused";
+    /// <summary>Host-generated kind of an in-flight turn for adoption.</summary>
+    public const string MetaHostTurnKind = "gorynych/hostTurnKind";
+
+
     /// <summary>
     /// The shared ACP v1 steering extension: a request <c>{sessionId, prompt, _meta?}</c> into a
     /// running turn (docs/steering.md). It is not an ACP-defined method.
@@ -97,6 +109,29 @@ public static class GorynychProtocol
     /// <summary>Asks a session's agent for an opinion: <c>{sessionId, text, sender?}</c> → <c>{text}</c>.</summary>
     public const string MethodOpinion = "_gorynych/opinion";
 
+    /// <summary>Durably delegate already authorized work to an immediate child.</summary>
+    public const string MethodDelegateTask = "_gorynych/delegate_task";
+    /// <summary>Advertises support for <see cref="MethodDelegateTask"/>.</summary>
+    public const string CapDelegateTask = "gorynych/delegateTask";
+    /// <summary>Read an immutable report, or list report metadata as an authenticated peer.</summary>
+    public const string MethodReadReport = "_gorynych/read_report";
+    public const string MethodListReports = "_gorynych/list_reports";
+    public const string CapReportRetrieval = "gorynych/reportRetrieval";
+    /// <summary>Headless native report-note submission and receipt query (extension fields live in _meta).</summary>
+    public const string MethodReportNote = "_gorynych/report_note";
+    public const string MethodReportNoteStatus = "_gorynych/report_note_status";
+    public const string MethodReportNoteAck = "_gorynych/report_note_ack";
+    public const string MetaReportNote = "gorynych/reportNote";
+    public const string CapReportNote = "gorynych/reportNoteReceipt";
+    public const string CapReportNoteAck = "gorynych/reportNoteAck";
+    public const string MethodHostReportNote = "_gorynych/host_report_note";
+    public const string MethodHostReportNoteStatus = "_gorynych/host_report_note_status";
+    public const string MethodHostReportNoteAck = "_gorynych/host_report_note_ack";
+    public const string MethodHostReportNoteReceipt = "_gorynych/host_report_note_receipt";
+    public const string MetaHostNoteTracking = "gorynych/hostNoteTracking";
+    public const string CapHostReportNote = "gorynych/hostReportNoteReceipt";
+    /// <summary>Correlation ID for a delegated or spawned assignment.</summary>
+    public const string MetaAssignmentId = "gorynych/assignmentId";
     /// <summary>Durably enqueue an inter-session message without waiting for a reply.</summary>
     public const string MethodSendMessage = "_gorynych/send_message";
     public const string MethodReplyMessage = "_gorynych/reply_message";
@@ -408,6 +443,7 @@ public static class GorynychProtocol
     [
         "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent",
         "mcp__gorynych__send_message", "mcp__gorynych__reply_message",
+        "mcp__gorynych__read_report", "mcp__gorynych__list_reports",
         "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", SpawnTool,
     ];
 

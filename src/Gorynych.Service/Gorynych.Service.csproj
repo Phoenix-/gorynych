@@ -26,5 +26,6 @@
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Gorynych.Tests" />
+    <InternalsVisibleTo Include="Gorynych.ReportHostProbe" />
   </ItemGroup>
 </Project>

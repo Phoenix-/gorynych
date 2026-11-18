@@ -14,6 +14,7 @@ public sealed class PeersMailboxTests
     {
         var tools = PeersServer.Tools(true).ToDictionary(t => (string)t["name"]!);
         Assert.IsTrue(tools.ContainsKey("send_message"));
+        Assert.IsTrue(tools.ContainsKey("delegate_task"));
         Assert.IsTrue(tools.ContainsKey("reply_message"));
         Assert.IsFalse(tools.ContainsKey("ask_agent"));
         Assert.IsFalse(tools.ContainsKey("reply"));
@@ -42,6 +43,7 @@ public sealed class PeersMailboxTests
 
     [TestMethod]
     [DataRow("send_message", "session_id", GorynychProtocol.MethodSendMessage, "sessionId")]
+    [DataRow("delegate_task", "session_id", GorynychProtocol.MethodDelegateTask, "sessionId")]
     [DataRow("reply_message", "message_id", GorynychProtocol.MethodReplyMessage, "messageId")]
     public async Task RetriesLostResponseWithSameIdAndReturnsReceipt(string tool, string input, string method, string field)
     {
@@ -52,7 +54,9 @@ public sealed class PeersMailboxTests
             lock (requests) requests.Add(request.Params!.DeepClone().AsObject());
             if (n == 1) { await server.DisposeAsync(); return null; }
             if (n == 2) throw new JsonRpcException(JsonRpcException.InternalError, "restarting", new JsonObject { [GorynychProtocol.MetaRestarting] = true });
-            return new JsonObject { ["messageId"] = "accepted-id", ["status"] = "accepted" };
+            var receipt = new JsonObject { ["messageId"] = "accepted-id", ["status"] = "accepted" };
+            if (tool == "delegate_task") receipt["assignmentId"] = "accepted-id";
+            return receipt;
         });
         using var http = new HttpClient(new FailHttp());
         var result = await PeersServer.CallAsync(http, route, "token", "http://unused", tool,

@@ -4,7 +4,10 @@ Why Gorynych is built the way it is: the decisions, the architecture, how it map
 what the probes proved, and what is still a plan. The specifications that the code follows
 live next to this file: [service protocol](service-protocol.md),
 [adapter contract](adapter-contract.md), [adapters](adapters.md), [ACP types](acp-types.md),
-[external clients](external-clients.md), [the AHP face](ahp-face.md), [steering](steering.md). Where this document and a specification disagree,
+[external clients](external-clients.md), [the AHP face](ahp-face.md), [steering](steering.md).
+The planned [delegation and task lifecycle](delegation-and-task-lifecycle.md) records
+assignment obligations, dependency waits, automatic reports and guarded wake-ups.
+Where this document and a specification disagree,
 the specification wins.
 
 Status words used below: **done** (in the code and tested), **in progress** (on a branch),
@@ -226,7 +229,7 @@ How messages travel, per harness:
   stdin for Claude (a paste into the PTY after `Stop` in the TUI fallback).
 - **A question from another agent:** into a running Claude, on stdin (the TUI's channel in the
   fallback), answered with `reply`; to the others as an ordinary turn marked with the asking
-  session ([below](#asking-another-session)).
+  session ([below](#sessions-that-talk-to-each-other)).
 - **An approval:** Claude's `can_use_tool` (the TUI's `PermissionRequest`), Kimi's `session/request_permission`, Codex's
   server request and DSH's `session/request_permission` all become one
   `session/request_permission` card. DSH asks only for sandbox escalations; its sessions' shell
@@ -366,7 +369,7 @@ Titles and archive live in the harness when it has them; otherwise in the servic
 Every session gets a `gorynych` MCP server through ACP's `mcpServers`:
 `Gorynych.Service peers --pipe <pipe> --token <token>`, with a random token per session that
 tells the service who is calling. Its tools: `list_agents`, `send_message`, `reply_message`,
-`spawn_session`, `archive_session` and `restore_session`. The asynchronous mailbox,
+`delegate_task`, `spawn_session`, `archive_session` and `restore_session`. The asynchronous mailbox,
 automatic wake, external pull reception and recovery are specified in [messaging.md](messaging.md).
 All **done**; the exact texts agents see are
 in [service-protocol.md](service-protocol.md#what-agents-are-told).
@@ -452,6 +455,16 @@ before the first prompt. Full access from a caller without it requires confirmat
 [service-protocol.md](service-protocol.md#child-sessions).
 
 When the scheme settles, the parent link is a candidate for its own ACP RFD (**planned**).
+
+**Iteration 1 built, 17 November 2026:** `delegate_task` continues authorized work
+with an immediate child, checked by the service, with a stable assignment correlation
+ID. The initial spawned assignment has the same form of correlation. Full results,
+service-tracked obligations and guarded reminders remain **planned**.
+Automatic child reports remain broad: peer- or user-initiated continuation is not
+by itself a reason to discard a result. Turn completion is separate from explicit
+assignment completion. The states, dependency edges, transitions, recovery rules
+and acceptance scenarios are in
+[Delegation, task obligations, and session wake-ups](delegation-and-task-lifecycle.md).
 
 ## Waking and idle unload
 

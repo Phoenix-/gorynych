@@ -308,7 +308,8 @@ static async Task<int> HostCommand(CommandLine line)
         var stream = await ServicePipe.ConnectAsync(Gorynych.Service.Hosts.HostNames.Pipe(pipe), TimeSpan.FromSeconds(1), ct)
             ?? throw new IOException("no conductor on the host pipe");
         return (stream, stream);
-    }, new Gorynych.Service.Hosts.AdapterHostOptions { Adapter = adapterName, Token = token, Slot = slot, Generation = generation, Log = ServiceLog.Info });
+    }, new Gorynych.Service.Hosts.AdapterHostOptions { Adapter = adapterName, Token = token, Slot = slot, Generation = generation, Log = ServiceLog.Info,
+        ReportStore = new ReportStore(Path.Combine(data, "reports")) });
     ServiceLog.Info($"host {adapterName} {host.HostId} starting, pid {Environment.ProcessId}, pipe {pipe}, data {data}, slot {(slot.Length == 0 ? "(none)" : slot)}, " +
         $"build {build} (read in {buildTook.TotalMilliseconds:0} ms)");
     var code = await host.RunAsync();

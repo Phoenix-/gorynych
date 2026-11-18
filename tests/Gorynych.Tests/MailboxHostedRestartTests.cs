@@ -12,10 +12,11 @@ public sealed class MailboxHostedRestartTests
     static readonly TimeSpan Wait = TimeSpan.FromSeconds(20);
 
     [TestMethod]
-    [DataRow(false, DisplayName = "accepted message queued behind a surviving native turn")]
-    [DataRow(true, DisplayName = "mailbox turn already handed to a surviving host")]
+    [DataRow(false, false, DisplayName = "accepted message queued behind a surviving native turn")]
+    [DataRow(true, false, DisplayName = "mailbox turn already handed to a surviving host")]
+    [DataRow(false, true, DisplayName = "delegation retry across restart behind a surviving native turn")]
     [Timeout(60000, CooperativeCancellation = true)]
-    public async Task HostedRestart_PreservesTheQueue_AndNeverSilentlyReplaysAnUncertainHandoff(bool inFlight)
+    public async Task HostedRestart_PreservesTheQueue_AndNeverSilentlyReplaysAnUncertainHandoff(bool inFlight, bool delegation)
     {
         var directory = TestDirs.New();
         var recipient = new LifecycleAgent("claude", canDelete: false);
@@ -63,13 +64,16 @@ public sealed class MailboxHostedRestartTests
                 await entered.Task.WaitAsync(Wait);
             }
             var messageId = Guid.NewGuid().ToString("N");
-            var receipt = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodSendMessage, new JsonObject
+            var method = delegation ? GorynychProtocol.MethodDelegateTask : GorynychProtocol.MethodSendMessage;
+            JsonObject Message() => new()
             {
                 ["sessionId"] = to, ["text"] = marker, ["_meta"] = new JsonObject
                 { [GorynychProtocol.MetaPeerToken] = service.Store.Get(from)!.PeerToken,
                     [GorynychProtocol.MetaMessageRequestId] = messageId },
-            }).WaitAsync(Wait);
+            };
+            var receipt = await client.Rpc.SendRequestAsync(method, Message()).WaitAsync(Wait);
             Assert.AreEqual("accepted", (string?)receipt!["status"]);
+            if (delegation) Assert.AreEqual(messageId, (string?)receipt["assignmentId"]);
             if (inFlight) await entered.Task.WaitAsync(Wait);
             if (inFlight)
             {
@@ -90,6 +94,13 @@ public sealed class MailboxHostedRestartTests
             client = await TestClient.ConnectAsync(service);
             await LinkHarness.Until(() => service.Feed(to).Adopted is not null,
                 "the new conductor adopts the turn still running in its surviving host");
+
+            if (delegation)
+            {
+                var retry = await client.Rpc.SendRequestAsync(method, Message()).WaitAsync(Wait);
+                Assert.AreEqual(messageId, (string?)retry!["assignmentId"]);
+                Assert.AreEqual(messageId, (string?)retry["messageId"]);
+            }
 
             if (inFlight)
                 await LinkHarness.Until(() =>
@@ -118,6 +129,8 @@ public sealed class MailboxHostedRestartTests
             {
                 Assert.AreEqual(1, recipient.Prompts.Count(p => p.SessionId == to && p.Text.Contains(marker, StringComparison.Ordinal)),
                     "accepted payload reaches the surviving native agent once, never a blind replay");
+                if (delegation) StringAssert.Contains(recipient.Prompts.Single(p => p.SessionId == to && p.Text.Contains(marker, StringComparison.Ordinal)).Text,
+                    $"assignment_id {messageId}");
                 if (inFlight) Assert.AreEqual(1, recipient.Prompts.Count(p => p.SessionId == to && p.Text.Contains(secondMarker, StringComparison.Ordinal)));
             }
             Assert.AreEqual(4, HostTests.EndMarks(service, to), "each native turn ends exactly once across adoption");
