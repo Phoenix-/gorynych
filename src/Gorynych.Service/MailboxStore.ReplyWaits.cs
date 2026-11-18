@@ -29,7 +29,7 @@ internal sealed partial class MailboxStore
         lock (gate) return AddressOf(id);
     }
 
-    JsonObject? AdmitOrResolveWait(string id, string sender, string recipient, string text, string? replyTo, bool expectReply)
+    JsonObject? AdmitOrResolveWait(string id, string sender, string recipient, string text, string? replyTo, bool expectReply, ReplyReminderSchedule? schedule)
     {
         if (expectReply)
         {
@@ -46,6 +46,15 @@ internal sealed partial class MailboxStore
                 ["sequence"] = next + 1, ["sender"] = sender, ["recipient"] = recipient,
                 ["fingerprint"] = WaitFingerprint(text), ["state"] = "waiting", ["requestDelivery"] = "queued",
             };
+            if (schedule is not null)
+                copy[id]!["reminders"] = new JsonObject
+                {
+                    ["projectKey"] = schedule.ProjectKey, ["groupId"] = schedule.GroupId,
+                    ["admittedAt"] = schedule.AdmittedAt.ToString("O"),
+                    ["overdueAt"] = schedule.OverdueAt.ToString("O"),
+                    ["delayTicks"] = schedule.Delay.Ticks,
+                    ["reminder"] = "pending", ["escalation"] = "pending",
+                };
             return copy;
         }
         if (replyTo is null || replyWaits[replyTo] is not JsonObject current || current["replyId"] is not null ||
@@ -62,10 +71,19 @@ internal sealed partial class MailboxStore
     JsonObject? WithWaitDelivery(JsonObject item, string delivery)
     {
         var id = (string)item["id"]!;
+        if ((string?)item["reminderFor"] is { } original && (string?)item["reminderKind"] is { } kind &&
+            replyWaits[original]?["reminders"] is JsonObject reminders && (string?)reminders[kind + "MessageId"] == id)
+        {
+            var copy = replyWaits.DeepClone().AsObject();
+            copy[original]!["reminders"]![kind] = delivery;
+            return copy;
+        }
         if ((bool?)item["expectReply"] == true && replyWaits[id] is not null)
         {
             var copy = replyWaits.DeepClone().AsObject();
             copy[id]!["requestDelivery"] = delivery;
+            if (delivery == "delivered" && copy[id]!["reminders"] is JsonObject reminder && reminder["reviewAt"] is null)
+                reminder["reviewAt"] = clock.GetUtcNow().AddTicks((long)reminder["delayTicks"]!).ToString("O");
             return copy;
         }
         if ((string?)item["replyTo"] is not { } replyTo || (string?)replyWaits[replyTo]?["replyId"] != id) return null;
@@ -108,12 +126,27 @@ internal sealed partial class MailboxStore
         }
     }
 
-    static JsonObject WaitMetadata(string id, JsonNode wait) => new()
+    JsonObject WaitMetadata(string id, JsonNode wait)
     {
+        var result = new JsonObject
+        {
         ["messageId"] = id, ["waiter"] = (string?)wait["sender"], ["recipient"] = (string?)wait["recipient"],
         ["state"] = (string?)wait["state"], ["requestDelivery"] = (string?)wait["requestDelivery"],
         ["replyId"] = (string?)wait["replyId"], ["replyDelivery"] = (string?)wait["replyDelivery"],
-    };
+            ["reminders"] = wait["reminders"]?.DeepClone(),
+        };
+        if (result["reminders"] is JsonObject reminder && DateTimeOffset.TryParse((string?)reminder["overdueAt"], out var at))
+        {
+            reminder["overdue"] = (string?)wait["state"] == "waiting" && clock.GetUtcNow() >= at;
+            if ((string?)wait["state"] == "waiting")
+                reminder["reciprocalMessageId"] = replyWaits.FirstOrDefault(p => p.Key != id && p.Value is JsonObject other &&
+                    (string?)other["state"] == "waiting" && (string?)other["sender"] == (string?)wait["recipient"] &&
+                    (string?)other["recipient"] == (string?)wait["sender"] &&
+                    (string?)other["reminders"]?["projectKey"] == (string?)reminder["projectKey"] &&
+                    (string?)other["reminders"]?["groupId"] == (string?)reminder["groupId"]).Key;
+        }
+        return result;
+    }
 
     internal int OpenReplyWaitCount
     {

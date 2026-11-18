@@ -156,7 +156,7 @@ static partial class FakeHeadless
                         """),
                     ["account"] = account,
                     ["current_permission_mode"] = mode,
-                    ["claude_code_version"] = "fake",
+                    ["claude_code_version"] = File.Exists(Path.Combine(cwd, "background-supported")) ? "2.1.203" : "fake",
                 });
                 break;
             case "set_model":

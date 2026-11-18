@@ -22,10 +22,27 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public bool IsHistoryImport(JsonRpcConnection? source) { lock (clientsGate) return source is not null && ReferenceEquals(importingHistory, source); }
 
     public SessionActivity Activity { get; init; } = new("standalone");
+    // A completed native prompt is positive idle evidence only for that exact live route.
+    JsonRpcConnection? confirmedIdleRoute;
+    public void ConfirmIdle(JsonRpcConnection rpc) => Volatile.Write(ref confirmedIdleRoute, rpc);
+    public bool HasConfirmedIdle(JsonRpcConnection rpc) => ReferenceEquals(Volatile.Read(ref confirmedIdleRoute), rpc);
     int nativeActivity;
     bool backgroundUse;
     bool knownBackgroundUse;
     readonly Lock nativeActivityGate = new();
+    JsonRpcConnection? completeBackgroundRoute;
+    string? completeBackgroundStream;
+    // A full change stream remains authoritative across ordinary turns on the same
+    // live host; null/invalid/exit or a different route revokes that evidence.
+    public void BeginReminderActivityEpoch() => Volatile.Write(ref confirmedIdleRoute, null);
+    public bool HasFreshReminderBackground(JsonRpcConnection rpc)
+    {
+        lock (nativeActivityGate) return ReferenceEquals(completeBackgroundRoute, rpc) && completeBackgroundStream is not null;
+    }
+    public string? ReminderBackgroundStream(JsonRpcConnection rpc)
+    {
+        lock (nativeActivityGate) return ReferenceEquals(completeBackgroundRoute, rpc) ? completeBackgroundStream : null;
+    }
     public bool HasBackgroundWork
     {
         get { lock (nativeActivityGate) return backgroundUse || knownBackgroundUse; }
@@ -51,13 +68,15 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             return false;
         }
     }
-    public bool ReportBackground(BackgroundWorkSnapshot? tasks)
+    public bool ReportBackground(BackgroundWorkSnapshot? tasks, JsonRpcConnection? observedFrom = null, string? stream = null)
     {
         lock (nativeActivityGate)
         {
             var needed = tasks is null ? backgroundUse : tasks.Count > 0;
             if (needed && !backgroundUse) { EnterUse(); backgroundUse = true; }
             Activity.ReportBackground(tasks);
+            completeBackgroundRoute = tasks is { Count: 0 } && stream is not null ? observedFrom : null;
+            completeBackgroundStream = completeBackgroundRoute is null ? null : stream;
             if (!needed && backgroundUse) { backgroundUse = false; ExitUse(); return true; }
             return false;
         }
@@ -68,6 +87,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         {
             Activity.ReportBackground(null);
             Activity.ReportKnownBackground(null);
+            completeBackgroundRoute = null; completeBackgroundStream = null;
             var released = backgroundUse || knownBackgroundUse;
             if (backgroundUse) { backgroundUse = false; ExitUse(); }
             if (knownBackgroundUse) { knownBackgroundUse = false; ExitUse(); }
@@ -77,7 +97,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public void BeginNativeActivity()
     {
         lock (nativeActivityGate)
-            if (Interlocked.Exchange(ref nativeActivity, 1) == 0) EnterUse();
+            if (Interlocked.Exchange(ref nativeActivity, 1) == 0) { Volatile.Write(ref confirmedIdleRoute, null); EnterUse(); }
     }
     public bool EndNativeActivity()
     {
@@ -257,6 +277,10 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <summary>Orders a prompt and a later <c>session/cancel</c> on their way to the agent.</summary>
     public SemaphoreSlim ForwardGate { get; } = new(1, 1);
 
+    // A reminder's mode must remain stable until the native turn answers; ACP write
+    // completion alone does not prove the adapter has started processing the prompt.
+    public SemaphoreSlim ReminderModeGate { get; } = new(1, 1);
+
     /// <summary>One resume or load of the session in its agent at a time.</summary>
     public SemaphoreSlim OpenGate { get; } = new(1, 1);
 
@@ -405,6 +429,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         lock (agentActivityGate)
         {
             if (Interlocked.Exchange(ref agentTurn, 1) != 0) return false;
+            BeginReminderActivityEpoch();
             Activity.Begin();
             return true;
         }
@@ -496,7 +521,11 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <summary>When the agent last sent an update for the session, on the conductor's clock.</summary>
     public DateTimeOffset LastActivity => new(Interlocked.Read(ref lastActivity), TimeSpan.Zero);
 
-    public void Active(DateTimeOffset now) => Interlocked.Exchange(ref lastActivity, now.UtcTicks);
+    public void Active(DateTimeOffset now)
+    {
+        Volatile.Write(ref confirmedIdleRoute, null);
+        Interlocked.Exchange(ref lastActivity, now.UtcTicks);
+    }
 
     readonly Lock idleGate = new();
     CancellationTokenSource? idleStop;
@@ -574,6 +603,12 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     }
 
     readonly SessionConfiguration configuration = new();
+    int reminderModeUncertain;
+    internal bool ReminderModeUncertain => Volatile.Read(ref reminderModeUncertain) != 0;
+    internal void InvalidateReminderMode() => Volatile.Write(ref reminderModeUncertain, 1);
+    void ConfirmReminderMode() => Volatile.Write(ref reminderModeUncertain, 0);
+    static bool HasModeOption(JsonNode? options) => options is JsonArray array &&
+        array.OfType<JsonObject>().Any(option => (string?)option["category"] == "mode" && option["currentValue"] is not null);
 
     /// <summary>
     /// Takes the session state from an agent's response (<c>session/new</c>, <c>session/load</c>,
@@ -582,6 +617,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public void CaptureState(JsonNode? response)
     {
         configuration.Capture(response);
+        if (response?["modes"]?["currentModeId"] is not null || HasModeOption(response?["configOptions"])) ConfirmReminderMode();
     }
 
     /// <summary>
@@ -591,6 +627,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public void ApplyStateUpdate(JsonObject update)
     {
         configuration.Apply(update);
+        if (((string?)update["sessionUpdate"] == "current_mode_update" && update["currentModeId"] is not null) ||
+            ((string?)update["sessionUpdate"] == "config_option_update" && HasModeOption(update["configOptions"]))) ConfirmReminderMode();
     }
 
     JsonObject? commands; // under gate
@@ -669,6 +707,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public void SetCurrent(string key, string field, JsonNode? value)
     {
         configuration.SetCurrent(key, field, value);
+        if (key == "modes" && field == "currentModeId" && value is not null) ConfirmReminderMode();
     }
 
     /// <summary>A copy of the session state as the agent last reported it; empty if it reported none.</summary>

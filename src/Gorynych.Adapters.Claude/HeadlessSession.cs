@@ -68,6 +68,7 @@ internal sealed class HeadlessSession : IClaudeSession
     long lastOutput;
     bool processUp;         // the current process said system/init: it is up, its MCP servers too
     bool backgroundReported;
+    bool? reminderBackgroundEmpty;
     string? authenticationError; // a native auth or billing error of the running turn
     string? lastResultError;
 
@@ -145,7 +146,10 @@ internal sealed class HeadlessSession : IClaudeSession
     // ---------------------------------------------------------------- prompts
 
     public Task<StopReason> PromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct, long arrivalSequence = 0) =>
-        PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null);
+        PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null, requiredStream: null);
+
+    internal Task<StopReason> ReminderPromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct,
+        long arrivalSequence, string requiredStream) => PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null, requiredStream);
 
     /// <summary>
     /// The shared extension's legacy idle start for a direct ACP caller that did not opt in: runs
@@ -155,7 +159,7 @@ internal sealed class HeadlessSession : IClaudeSession
     public async Task<JsonObject> StartIdleAsync(AcpSteering.Request request, CancellationToken ct)
     {
         var started = NewSignal();
-        var run = PromptCoreAsync(request.Prompt, () => false, CancellationToken.None, 0, started);
+        var run = PromptCoreAsync(request.Prompt, () => false, CancellationToken.None, 0, started, requiredStream: null);
         _ = run.ContinueWith(t =>
         {
             if (t.IsFaulted) started.TrySetException(t.Exception!.GetBaseException());
@@ -166,16 +170,26 @@ internal sealed class HeadlessSession : IClaudeSession
     }
 
     async Task<StopReason> PromptCoreAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct,
-        long arrivalSequence, TaskCompletionSource? started)
+        long arrivalSequence, TaskCompletionSource? started, string? requiredStream)
     {
-        await promptGate.WaitAsync(ct);
+        if (requiredStream is null) await promptGate.WaitAsync(ct);
+        else if (!await promptGate.WaitAsync(0, ct))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, "Claude is busy; the reminder was not sent.");
         var current = new Turn(Guid.NewGuid().ToString());
         lock (stateGate) incoming = current;
         AdmitArrival(arrivalSequence); // a steer behind it waits for its input write, not for this admission
         try
         {
             if (cancelled()) return StopReason.Cancelled;
-            var claude = await EnsureRunningAsync(ct);
+            ClaudeProcess claude;
+            if (requiredStream is null) claude = await EnsureRunningAsync(ct);
+            else
+            {
+                lock (stateGate)
+                    claude = process is { Exited.IsCompleted: false } currentProcess && currentProcess.BackgroundStreamId == requiredStream
+                        ? currentProcess : throw new JsonRpcException(JsonRpcException.InvalidRequest,
+                            "The confirmed Claude process changed or exited; the reminder was not sent.");
+            }
             // One turn at a time: wait until Claude is idle, and take the input in the same step.
             while (true)
             {
@@ -189,6 +203,8 @@ internal sealed class HeadlessSession : IClaudeSession
                         UpdateIdle();
                         break;
                     }
+                    if (requiredStream is not null)
+                        throw new JsonRpcException(JsonRpcException.InvalidRequest, "Claude is busy; the reminder was not sent.");
                     wake = Task.WhenAny(idle.Task, cancelSignal.Task);
                 }
                 await wake.WaitAsync(ct);
@@ -196,11 +212,16 @@ internal sealed class HeadlessSession : IClaudeSession
             }
             var written = false;
             await inputGate.WaitAsync(ct);
+            var backgroundHeld = false;
             try
             {
+                if (requiredStream is not null) { await backgroundGate.WaitAsync(ct); backgroundHeld = true; }
                 lock (stateGate)
                 {
                     if (current.CancelRequested || cancelled()) return StopReason.Cancelled;
+                    if (requiredStream is not null && (!ReferenceEquals(process, claude) || claude.Exited.IsCompleted ||
+                        claude.BackgroundStreamId != requiredStream || reminderBackgroundEmpty != true))
+                        throw new JsonRpcException(JsonRpcException.InvalidRequest, "Claude process or background evidence changed; the reminder was not sent.");
                     current.Written = true;
                 }
                 lock (stateGate) lastOutput = Environment.TickCount64;
@@ -221,6 +242,7 @@ internal sealed class HeadlessSession : IClaudeSession
             }
             finally
             {
+                if (backgroundHeld) backgroundGate.Release();
                 inputGate.Release();
                 if (!written) Withdraw(current);
             }
@@ -1119,12 +1141,14 @@ internal sealed class HeadlessSession : IClaudeSession
             {
                 if ((owner is not null && !ReferenceEquals(process, owner)) || (exited && process is not null)) return;
                 if (initial && backgroundReported) return;
+                reminderBackgroundEmpty = owner is not null && tasks is not null ? tasks.Count == 0 : null;
                 if (owner is not null && !initial) backgroundReported = true;
             }
             await EmitAsync(new SessionInfoUpdate { Meta = new JsonObject
             {
                 [GorynychProtocol.MetaBackgroundWork] = tasks,
                 [GorynychProtocol.MetaBackgroundProcessExited] = exited,
+                [GorynychProtocol.MetaBackgroundCompleteStream] = owner is not null && tasks is not null ? owner.BackgroundStreamId : null,
             } });
         }
         finally { backgroundGate.Release(); }

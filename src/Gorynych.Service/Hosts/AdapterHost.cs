@@ -638,6 +638,7 @@ public sealed class AdapterHost
         var replayCarrier = Text(message["method"]) == AcpMethods.Client.SessionUpdate ? replayMessage["params"]?["update"] as JsonObject : replayMessage["params"] as JsonObject;
         if (backgroundSnapshot && replayCarrier?["_meta"] is JsonObject replayMeta)
         {
+            replayMeta.Remove(GorynychProtocol.MetaBackgroundCompleteStream);
             replayMeta.Remove(GorynychProtocol.MetaBackgroundWork);
             replayMeta.Remove(GorynychProtocol.MetaBackgroundKnown);
             replayMeta.Remove(GorynychProtocol.MetaBackgroundProcessExited);

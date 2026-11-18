@@ -217,6 +217,9 @@ public sealed class ManagementTests
         var state = ManagementState.Read(rig.Data);
         Assert.IsTrue(state.StoppedAll, "stop --all is remembered");
         Assert.IsTrue(state.IsStopped("turns"));
+        // The stop result is written before AfterResult requests shutdown. The client can
+        // observe that result first, so wait for the service-side action rather than racing it.
+        await Until(() => rig.Service.ShutdownRequested.IsCancellationRequested, "shutdown after the stop result");
         Assert.IsTrue(rig.Service.ShutdownRequested.IsCancellationRequested, "stop --all asks the service to exit");
         Assert.IsTrue(rig.Service.StopHostsOnExit, "its hosts stop with it");
 
