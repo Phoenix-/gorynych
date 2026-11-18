@@ -197,11 +197,30 @@ claude -p --input-format stream-json --output-format stream-json --verbose
 | replay of Claude's record of a command it ran (`<command-…>`, `<local-command-…>`) under a `uuid` the adapter did not write | nothing, and no turn starts: no `result` follows it ([below](#mode-model-and-effort-selectors)) |
 | `system` `init` | the current model and mode (`config_option_update` when they change) |
 | `result` | ends the turn; a turn of Claude's own ends with `_meta["gorynych/agentTurn"]: "ended"` |
-| a subagent's messages (`parent_tool_use_id`) | not shown yet; the `Task` tool call shows until its result |
+| a confirmed `Agent`/`Task` and `task_started` (`task_type: local_agent`) | capability-gated ACP `subagent_update`, outgoing `session_message`, and the native child transcript on a restricted session |
 
 Output that arrives while no turn was counted is a turn Claude began itself (a background
 task ended): it is marked `gorynych/agentTurn: "started"` on its first update and `"ended"`
 with its `result`, so the service holds the session meanwhile.
+
+Headless Claude's native subagents use the ACP Subagent Sessions Preview. A child is exposed
+only after the stream links an observed `Agent` or `Task` tool call to `task_started` with a
+`local_agent` task ID. Its session ID is scoped to the parent and native task ID. The observed
+prompt is sent as an outgoing `session_message`; a child user message is sent as its incoming
+view without guessing the sender. A `task_notification` ends only the matching observed `run_id`;
+an ambiguous or older event cannot finish a newer run. When Claude reports `stopped` without
+proving cancellation, the state is `unknown`. A completed notification's observed summary is a
+fallback when no child assistant message was delivered; the same answer is not repeated.
+Child approvals are attributed when the native `agent_id` or an observed child tool call proves
+the association. Unattributed approvals stay on the parent. Clients without `subagents` keep the
+ordinary parent tool call. Claude's separate task checklist is not changed by subagent tasks.
+
+History replay scans the active parent conversation for observed tool-result agent IDs and
+replays bounded, matching child transcript files. It includes direct children even if they
+finished after the parent's history mark, but does not reconstruct nested history or infer live
+state from those files. A missing, malformed, oversized, or unverified child file is omitted.
+Claude Code 2.1.302 can omit a foreground child's assistant message from its live stream;
+the native notification summary and transcript are independent best-effort sources.
 
 #### Task plans
 
@@ -510,7 +529,8 @@ written):
   - `tool_use` as a tool call;
   - `tool_result` as its update.
 
-  Left out: subagents' entries, slash commands and their output (`<command-…>`,
+  The parent transcript pass leaves out sidechain entries; verified direct-child transcripts are
+  replayed separately as described above. Also left out: slash commands and their output (`<command-…>`,
   `<local-command-…>`), meta notes (`isMeta`), `[Request interrupted by user]`, a compaction's
   summary, a torn last line, and the `<system-reminder>` blocks Claude Code writes into user
   messages (a block that is only a reminder; reminders a text starts with). A reminder inside
@@ -702,7 +722,7 @@ nothing of it.
 
 ### Not done yet
 
-- Headless: subagent messages and `/compact` are not mapped; MCP servers'
+- Headless: `/compact` is not mapped; MCP servers'
   elicitations are declined; not tried on Linux and macOS.
 - Task plans: a `TaskCreate` without a structured task ID or a `TaskUpdate` without a structured
   successful result is not shown; history priming fails open for a transcript

@@ -254,7 +254,7 @@ an ACP client. The types are generated from the published JSON schema
 | Loaded or not | `session/status` (`open`, `saved`) | draft RFD | the same words in `list_agents`; adopt when stable |
 | Title and archive | `session/set_title`, `session/archive` | draft RFDs | own `_gorynych/archive` and overlay names meanwhile; adopt when stable |
 | List changes | `session/list/subscribe` | open PR | own `_gorynych/sessions_changed` meanwhile |
-| Native Codex subagents | [Subagent Sessions Preview](https://agentclientprotocol.com/rfds/subagents) | ACP v1 preview | capability-gated associations and child traffic through the native parent's connection |
+| Native Codex and headless Claude subagents | [Subagent Sessions Preview](https://agentclientprotocol.com/rfds/subagents) | ACP v1 preview | capability-gated associations and child traffic through the native parent's connection |
 | Gorynych child sessions | ordinary ACP sessions | stable v1 | the service's own parent link preserves direct prompting ([below](#child-sessions)) |
 | Questions between agents | none | — | own `_gorynych/opinion`, through the `gorynych` MCP server |
 | The service as an intermediary | [proxy-chains RFD](https://agentclientprotocol.com/rfds/proxy-chains.md): a conductor, `proxy/initialize`, `proxy/successor` | unstable RFD | the service is a conductor in that sense; no `proxy/*` methods until the RFD settles |
@@ -1053,7 +1053,7 @@ the same folder.
 
 Open:
 
-- Claude subagents in the feed: `SubagentStart`, `SubagentStop`, `agent_transcript_path`.
+- Claude native subagent nested-history recovery and process-exit observability beyond the headless stream.
 - Text between tool calls in a long turn: whether all of it comes through `MessageDisplay`.
 - The opinion authorization in the system prompt was checked with Haiku only, not with Opus or
   Sonnet.

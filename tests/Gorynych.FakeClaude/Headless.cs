@@ -297,7 +297,23 @@ static partial class FakeHeadless
         string answer;
         var aborted = false;
         var joined = new List<string>();
-        if (prompt.Contains("write", StringComparison.OrdinalIgnoreCase))
+        if (prompt.Contains("native child withdrawal probe", StringComparison.Ordinal))
+        {
+            var parent = await ToolUseAsync(sessionId, "Agent", new JsonObject { ["prompt"] = "probe" });
+            await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "task_started", ["task_type"] = "local_agent",
+                ["task_id"] = "fake-child", ["tool_use_id"] = parent, ["run_id"] = "001" });
+            await WriteAsync(new JsonObject { ["type"] = "assistant", ["agent_id"] = "fake-child", ["parent_tool_use_id"] = parent,
+                ["message"] = new JsonObject { ["id"] = "fake-child-message", ["content"] = new JsonArray(new JsonObject {
+                    ["type"] = "tool_use", ["id"] = "fake-child-tool", ["name"] = "Bash", ["input"] = new JsonObject { ["command"] = "true" } }) } });
+            await WriteAsync(new JsonObject { ["type"] = "control_request", ["request_id"] = "fake-withdraw",
+                ["request"] = new JsonObject { ["subtype"] = "can_use_tool", ["agent_id"] = "fake-child", ["tool_use_id"] = "fake-child-tool",
+                    ["tool_name"] = "Bash", ["input"] = new JsonObject { ["command"] = "true" } } });
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "withdraw-now"))) await Task.Delay(20);
+            await WriteAsync(new JsonObject { ["type"] = "control_cancel_request", ["request_id"] = "fake-withdraw" });
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "withdraw-done"))) await Task.Delay(20);
+            answer = "withdrawn";
+        }
+        else if (prompt.Contains("write", StringComparison.OrdinalIgnoreCase))
         {
             var input = new JsonObject { ["file_path"] = Path.Combine(Environment.CurrentDirectory, "fake.txt"), ["content"] = "hi" };
             var toolUse = await ToolUseAsync(sessionId, "Write", input);

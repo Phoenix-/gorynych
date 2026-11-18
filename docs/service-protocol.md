@@ -651,7 +651,7 @@ open and prompt any of them directly. ACP's subagents RFD hides a subagent from
 session that names its parent in `_meta["gorynych/parentSessionId"]`; a stock client shows
 it as one more session, a Gorynych GUI can draw the tree.
 
-Codex's own subagents use the ACP [Subagent Sessions Preview](https://agentclientprotocol.com/rfds/subagents).
+Codex's and headless Claude's own subagents use the ACP [Subagent Sessions Preview](https://agentclientprotocol.com/rfds/subagents).
 The client opts in with `clientCapabilities.subagents: {}` at initialization. The
 service sends associations and subagent updates through the ordinary parent's
 connection, preserving the child session IDs. Clients without the capability

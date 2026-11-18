@@ -125,7 +125,7 @@ internal static class TranscriptHistory
     /// then keeps its journal as it is.
     /// </summary>
     public static async Task<Replay?> ReadAsync(string path, string? mark, Func<SessionUpdate, Task> send, Action<string>? log = null,
-        long maxBytes = MaxBytes, ClaudeTaskPlan? taskState = null)
+        long maxBytes = MaxBytes, ClaudeTaskPlan? taskState = null, Func<JsonObject, Task>? observe = null)
     {
         try
         {
@@ -137,7 +137,7 @@ internal static class TranscriptHistory
             {
                 if (next.After.Count == 0) return new Replay(true, mark, read, 0);
                 var (tasks, primed) = TaskPlanFor(file, null, next.After, at.Uuid, at.Offset, maxBytes, log);
-                var sent = await SendAsync(file, next.After, send, log, tasks);
+                var sent = await SendAsync(file, next.After, send, log, tasks, observe);
                 if (primed) taskState?.CopyFrom(tasks!);
                 return new Replay(true, MarkOf(next.Last), read, sent, primed);
             }
@@ -153,14 +153,14 @@ internal static class TranscriptHistory
                 if (ChainBack(last, all, until: markUuid) is { } chain)
                 {
                     var (tasks, primed) = TaskPlanFor(file, all, chain, markUuid, parsed?.Offset ?? 0, maxBytes, log);
-                    var sent = await SendAsync(file, chain, send, log, tasks);
+                    var sent = await SendAsync(file, chain, send, log, tasks, observe);
                     if (primed) taskState?.CopyFrom(tasks!);
                     return new Replay(true, MarkOf(last), read, sent, primed);
                 }
                 log?.Invoke("the conversation does not reach the mark: replaying all of it");
             }
             var full = new ClaudeTaskPlan();
-            var replayed = await SendAsync(file, ChainBack(last, all, until: null)!, send, log, full);
+            var replayed = await SendAsync(file, ChainBack(last, all, until: null)!, send, log, full, observe);
             taskState?.CopyFrom(full);
             return new Replay(false, MarkOf(last), read, replayed, TasksPrimed: true);
         }
@@ -695,7 +695,7 @@ internal static class TranscriptHistory
 
     /// <summary>Parses each entry of the chain in turn and sends its updates; an entry of an unexpected shape is left out.</summary>
     static async Task<int> SendAsync(FileStream file, List<Entry> chain, Func<SessionUpdate, Task> send, Action<string>? log,
-        ClaudeTaskPlan? tasks = null)
+        ClaudeTaskPlan? tasks = null, Func<JsonObject, Task>? observe = null)
     {
         var tools = new Dictionary<string, string>(StringComparer.Ordinal);
         var sent = 0;
@@ -708,7 +708,9 @@ internal static class TranscriptHistory
                 var bytes = new byte[entry.Length];
                 file.Position = entry.Start;
                 file.ReadExactly(bytes);
-                updates = JsonNode.Parse(bytes) is JsonObject json ? UpdatesOf(json, entry.Uuid!, tools, tasks) : [];
+                if (JsonNode.Parse(bytes) is not JsonObject json) continue;
+                if (observe is not null) await observe(json);
+                updates = UpdatesOf(json, entry.Uuid!, tools, tasks);
             }
             catch (Exception e) when (e is JsonException or InvalidOperationException or FormatException or KeyNotFoundException or IOException)
             {

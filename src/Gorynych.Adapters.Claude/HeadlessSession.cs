@@ -76,6 +76,9 @@ internal sealed class HeadlessSession : IClaudeSession
     string? messageId;
     readonly HashSet<string> streamed = new(StringComparer.Ordinal);
     readonly Dictionary<string, string> toolNames = new(StringComparer.Ordinal);
+    readonly ClaudeNativeSubagents nativeSubagents;
+    readonly SemaphoreSlim nativeSubagentGate = new(1, 1);
+    Task nativeSubagentReset = Task.CompletedTask; // under stateGate
 
     readonly ConcurrentDictionary<string, CancellationTokenSource> asks = new(StringComparer.Ordinal);
     int permissionCount;
@@ -112,12 +115,28 @@ internal sealed class HeadlessSession : IClaudeSession
         Id = id;
         Cwd = cwd;
         this.resume = resume;
+        nativeSubagents = new ClaudeNativeSubagents(id, agent.ClientMarksSubagentLive);
         Token = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
     }
 
     public string Id { get; }
     public string Cwd { get; }
     public string Token { get; }
+    internal async Task RefreshNativeSubagentsAsync()
+    {
+        await nativeSubagentGate.WaitAsync();
+        try { await nativeSubagents.RefreshAsync(agent.EmitAsync); }
+        finally { nativeSubagentGate.Release(); }
+    }
+
+    async Task LoseNativeSubagentsAsync()
+    {
+        await nativeSubagentGate.WaitAsync();
+        try { await nativeSubagents.LostAsync(agent.EmitAsync); }
+        catch (Exception e) when (e is IOException or JsonRpcException or ObjectDisposedException or InvalidOperationException or OperationCanceledException)
+        { agent.Log($"claude {Id}: child state could not be withdrawn: {e.Message}"); }
+        finally { nativeSubagentGate.Release(); }
+    }
     public List<McpServer> McpServers { get; set; } = [];
     public string? SystemPrompt { get; set; }
 
@@ -957,6 +976,9 @@ internal sealed class HeadlessSession : IClaudeSession
                 if (!previous.Exited.IsCompleted) return previous;
                 OnExited(previous, previous.Exited.Result); // whichever runs first resets the state
             }
+            Task reset;
+            lock (stateGate) reset = nativeSubagentReset;
+            await reset.WaitAsync(ct);
             await agent.EnsureTrustedAsync(Id, Cwd, ct);
             await ReportBackgroundAsync(null);
             var claude = Launch();
@@ -1081,6 +1103,7 @@ internal sealed class HeadlessSession : IClaudeSession
         {
             if (!ReferenceEquals(process, claude)) return;
             process = null;
+            if (agent.ClientHasSubagents) nativeSubagentReset = Task.Run(LoseNativeSubagentsAsync);
             own = ownOpen || (active && activeOwn && activeMarked);
             active = activeOwn = activeMarked = false;
             ownOpen = false;
@@ -1164,6 +1187,20 @@ internal sealed class HeadlessSession : IClaudeSession
     async Task OnMessageAsync(ClaudeProcess claude, JsonObject m)
     {
         lock (stateGate) lastOutput = Environment.TickCount64;
+        if (agent.ClientHasSubagents)
+        {
+            await nativeSubagentGate.WaitAsync();
+            try
+            {
+                if (IsCurrent(claude))
+                {
+                    if (StreamJson.Type(m) == "assistant" && !StreamJson.IsSubagent(m))
+                        foreach (var (call, tool, input) in StreamJson.ToolUses(m)) nativeSubagents.ObserveCall(Id, call.ToolCallId, tool, input);
+                    await nativeSubagents.ObserveAsync(m, agent.EmitAsync);
+                }
+            }
+            finally { nativeSubagentGate.Release(); }
+        }
         switch (StreamJson.Type(m))
         {
             case "stream_event":
@@ -1538,16 +1575,25 @@ internal sealed class HeadlessSession : IClaudeSession
         var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         asks[requestId] = cts;
         var toolCallId = (string?)request["tool_use_id"] ?? $"permission-{Interlocked.Increment(ref permissionCount)}";
+        (string Session, long RunVersion, string RequestId)? childPermission = null;
+        var requestSession = Id;
         JsonObject answer;
         try
         {
+            if (agent.ClientHasSubagents)
+            {
+                await nativeSubagentGate.WaitAsync(cts.Token);
+                try { childPermission = await nativeSubagents.BeginPermissionAsync(requestId, request, agent.EmitAsync); }
+                finally { nativeSubagentGate.Release(); }
+                requestSession = childPermission?.Session ?? Id;
+            }
             if (tool == "AskUserQuestion")
             {
                 if (!agent.ClientHasForms)
                     answer = StreamJson.Deny("The user's client cannot show questions; ask in plain text instead.");
                 else
                 {
-                    var response = await agent.ElicitAsync(ClaudeHooks.QuestionForm(Id, toolCallId, input), cts.Token);
+                    var response = await agent.ElicitAsync(ClaudeHooks.QuestionForm(requestSession, toolCallId, input), cts.Token);
                     answer = ClaudeHooks.AnsweredInput(input, response) is { } answered
                         ? StreamJson.Allow(answered)
                         : StreamJson.Deny("The user chose not to answer.");
@@ -1556,14 +1602,15 @@ internal sealed class HeadlessSession : IClaudeSession
             else
             {
                 var hookLike = new JsonObject { ["tool_name"] = tool, ["tool_input"] = input.DeepClone() };
-                var decision = await agent.RequestPermissionAsync(ClaudeHooks.Permission(Id, toolCallId, hookLike), cts.Token);
+                var decision = await agent.RequestPermissionAsync(ClaudeHooks.Permission(requestSession, toolCallId, hookLike), cts.Token);
                 if (ClaudeHooks.IsAllowed(decision.Outcome)) answer = StreamJson.Allow(input);
                 else
                 {
-                    await EmitAsync(ClaudeHooks.ToolCallStatusUpdate(toolCallId, ToolCallStatus.Failed, "Denied in Gorynych."));
+                    await agent.EmitAsync(requestSession, ClaudeHooks.ToolCallStatusUpdate(toolCallId, ToolCallStatus.Failed, "Denied in Gorynych."));
                     answer = StreamJson.Deny("The user denied this tool call in Gorynych.");
                 }
             }
+            await claude.RespondAsync(requestId, answer);
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -1574,14 +1621,19 @@ internal sealed class HeadlessSession : IClaudeSession
         {
             // Claude must always get an answer, or its turn waits for ever.
             agent.Log($"claude {Id}: approval failed: {e.Message}");
-            answer = StreamJson.Deny("Gorynych could not reach the user for approval.");
+            await claude.RespondAsync(requestId, StreamJson.Deny("Gorynych could not reach the user for approval."));
         }
         finally
         {
             asks.TryRemove(requestId, out _);
             cts.Dispose();
+            if (childPermission is { } completed)
+            {
+                await nativeSubagentGate.WaitAsync();
+                try { await nativeSubagents.EndPermissionAsync(completed, agent.EmitAsync); }
+                finally { nativeSubagentGate.Release(); }
+            }
         }
-        await claude.RespondAsync(requestId, answer);
     }
 
     static string StderrNote(ClaudeProcess claude) =>

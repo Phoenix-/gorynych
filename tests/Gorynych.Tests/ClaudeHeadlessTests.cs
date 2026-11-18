@@ -16,6 +16,7 @@ public sealed partial class ClaudeHeadlessTests
 {
     static string FakeClaude()
     {
+        if (Environment.GetEnvironmentVariable("GORYNYCH_TEST_FAKE_CLAUDE") is { Length: > 0 } isolated && File.Exists(isolated)) return isolated;
         var config = AppContext.BaseDirectory.Contains($"{Path.DirectorySeparatorChar}Release{Path.DirectorySeparatorChar}") ? "Release" : "Debug";
         var tests = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
         var exe = Path.Combine(tests, "Gorynych.FakeClaude", "bin", config, "net10.0", TestDirs.Exe("Gorynych.FakeClaude"));
@@ -102,6 +103,35 @@ public sealed partial class ClaudeHeadlessTests
 
     /// <summary>The mark of a turn of Claude's own; the service's mark of a prompt's end, which carries the prompt's ID, is not one.</summary>
     static string? Mark(JsonObject u) => u["_meta"]?[GorynychProtocol.MetaPromptId] is null ? (string?)u["_meta"]?[GorynychProtocol.MetaAgentTurn] : null;
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task NativeChildWithdrawnPermissionRestoresRunning()
+    {
+        var dir = TestDirs.New();
+        await using var conductor = TestDirs.Conductor(dir, new ClaudeAdapter(Options(dir)));
+        await using var client = await TestClient.ConnectAsync(conductor, "subagent", subagents: true);
+        var id = await NewAsync(client, dir);
+        var held = new TaskCompletionSource<RequestPermissionOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Approve = r => r.SessionId == id
+            ? Task.FromResult<RequestPermissionOutcome>(new SelectedPermissionOutcome { OptionId = r.Options[0].OptionId }) : held.Task;
+        var prompt = PromptAsync(client, id, "native child withdrawal probe");
+        try
+        {
+            await Until(() => client.SessionUpdates.Any(x => (string?)x.Update["state"]?["state"] == "requires_action"));
+            Assert.IsTrue(client.SessionUpdates.Any(x => (string?)x.Update["state"]?["state"] == "requires_action"));
+            File.WriteAllText(Path.Combine(dir, "withdraw-now"), "");
+            await Until(() => client.SessionUpdates.Count(x => (string?)x.Update["state"]?["state"] == "running") >= 2);
+            Assert.AreEqual(2, client.SessionUpdates.Count(x => (string?)x.Update["state"]?["state"] == "running"));
+        }
+        finally
+        {
+            File.WriteAllText(Path.Combine(dir, "withdraw-now"), "");
+            File.WriteAllText(Path.Combine(dir, "withdraw-done"), "");
+            held.TrySetResult(new SelectedPermissionOutcome { OptionId = ClaudeHooks.AllowOptionId });
+        }
+        await prompt.WaitAsync(TimeSpan.FromSeconds(20));
+    }
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]

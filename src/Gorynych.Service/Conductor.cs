@@ -798,7 +798,7 @@ public sealed partial class Conductor : IAsyncDisposable
                 try
                 {
                     var feed = Feed(sessionId);
-                    if (store.Get(sessionId)?.Agent == "codex")
+                    if (store.Get(sessionId) is { Deleted: false, Agent: "codex" or "claude" })
                         foreach (var update in feed.Journal.ReadAll())
                             if (SubagentRouting.Announcement(update) is { } child)
                                 subagents.Announce(SubagentRouting.SessionOf(update) ?? sessionId, child, sessionId);
@@ -1637,14 +1637,14 @@ public sealed partial class Conductor : IAsyncDisposable
         }
         var sessionId = (string?)@params?["sessionId"];
         if (sessionId is null || removed.ContainsKey(sessionId)) return;
-        var root = host.Name == "codex" ? RootOfSubagent(sessionId) : null;
+        var root = host.Name is "codex" or "claude" ? RootOfSubagent(sessionId) : null;
         var feed = Feed(root ?? sessionId);
         if (method == AcpMethods.Client.SessionUpdate)
         {
             if (@params!["update"] is not JsonObject update) return;
             if (root is not null || SubagentRouting.IsPreview(update))
             {
-                if (host.Name != "codex" || store.Get(feed.SessionId) is not { Agent: "codex", Deleted: false }) return;
+                if (host.Name is not ("codex" or "claude") || store.Get(feed.SessionId) is not { Deleted: false } owner || owner.Agent != host.Name) return;
                 var currentSnapshot = SubagentRouting.IsCurrentSnapshot(update);
                 var liveState = SubagentRouting.IsLiveState(update);
                 var historical = !currentSnapshot && !liveState && feed.IsHistoryImport(source);
@@ -1828,7 +1828,7 @@ public sealed partial class Conductor : IAsyncDisposable
             if (store.Get(feed.SessionId)?.Agent != host.Name) continue;
             // The adapter in this process runs all its sessions; a host, those open in it.
             var its = link.HostId is null || open.Contains(feed.SessionId);
-            if (its && host.Name == "codex") Track(Task.Run(() => feed.SubagentHostLostAsync(link.Rpc)));
+            if (its && host.Name is "codex" or "claude") Track(Task.Run(() => feed.SubagentHostLostAsync(link.Rpc)));
             if (its)
             {
                 feed.Activity.Report("idle");
@@ -1906,7 +1906,7 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         if (request.Params is not JsonObject p || p["sessionId"] is not JsonValue v || !v.TryGetValue<string>(out var sessionId)
             || removed.ContainsKey(sessionId)) return;
-        var feed = Feed(host.Name == "codex" ? RootOfSubagent(sessionId) ?? sessionId : sessionId);
+        var feed = Feed(host.Name is "codex" or "claude" ? RootOfSubagent(sessionId) ?? sessionId : sessionId);
         feed.BeginAsking();
         askedIn.AddOrUpdate(request, feed);
     }
@@ -1928,11 +1928,14 @@ public sealed partial class Conductor : IAsyncDisposable
     /// its session. With no client attached it waits for one; if the client goes away before
     /// answering, the request goes to the next one.
     /// </summary>
-    internal async Task<JsonNode?> OnAgentRequestAsync(AgentHost host, JsonRpcRequest request, CancellationToken ct)
+    internal async Task<JsonNode?> OnAgentRequestAsync(AgentHost host, JsonRpcRequest request, CancellationToken ct, JsonRpcConnection? source = null)
     {
         var sessionId = (string?)request.Params?["sessionId"]
             ?? throw new JsonRpcException(JsonRpcException.MethodNotFound, $"{request.Method} is not supported by Gorynych");
-        var root = host.Name == "codex" ? RootOfSubagent(sessionId) : null;
+        var root = host.Name is "codex" or "claude" ? RootOfSubagent(sessionId) : null;
+        if (root is not null && (store.Get(root) is not { Deleted: false } owner || owner.Agent != host.Name ||
+            source is not null && (source.IsClosed || host.RouteOf(root) is { } route && route.Rpc != source)))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, "The native child does not belong to this adapter connection.");
         var feed = Feed(root ?? sessionId);
         if (request.Method == AcpMethods.Client.SessionRequestPermission && PreAllowed(request.Params, feed) is { } optionId)
         {
@@ -2612,7 +2615,7 @@ public sealed partial class Conductor : IAsyncDisposable
                 await CatchUpByReadingAsync(host, on.Rpc, feed, cleanupStop.Token);
                 // Older hosts do not mark live states during catch-up. Ask their adapter for
                 // its latest observations afterwards; newer hosts also safely refresh here.
-                if (host.Name == "codex") await RefreshSubagentStatesAsync(host, on.Rpc, feed.SessionId);
+                if (host.Name is "codex" or "claude") await RefreshSubagentStatesAsync(host, on.Rpc, feed.SessionId);
             }
         }
         catch (Exception e) when (e is not OperationCanceledException)
@@ -2712,7 +2715,7 @@ public sealed partial class Conductor : IAsyncDisposable
             // Opening it catches the journal up with the agent's own history first (OpenAsync); a
             // session the journal has never seen is imported so.
             var (rpc, opened) = await EnsureLiveAsync(record, ct);
-            if (client.TakesSubagents && host.Name == "codex")
+            if (client.TakesSubagents && host.Name is "codex" or "claude")
                 afterAnswer(() => RefreshSubagentStatesAsync(host, rpc, client, record.SessionId));
             response = opened ?? feed.State();
         }
@@ -2746,7 +2749,7 @@ public sealed partial class Conductor : IAsyncDisposable
         if (IsStopping(host.Name)) throw Unavailable(host.Name);
         var (rpc, opened) = await EnsureLiveAsync(use.Record, ct);
         var position = await use.Feed.ResumeAndAttachAsync(client, after);
-        if (client.TakesSubagents && host.Name == "codex")
+        if (client.TakesSubagents && host.Name is "codex" or "claude")
             afterAnswer(() => RefreshSubagentStatesAsync(host, rpc, client, request.SessionId));
         await NoticeOnOpenAsync(use.Feed, client);
         // The bridge consumes resume responses when reconnecting its service pipe while

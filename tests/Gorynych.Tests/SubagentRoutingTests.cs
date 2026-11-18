@@ -183,6 +183,38 @@ public sealed class SubagentRoutingTests
     }
 
     [TestMethod]
+    [DataRow("codex")]
+    [DataRow("claude")]
+    public async Task HostCursorsRestoresNestedJournalRoutes(string adapterName)
+    {
+        var dir = TestDirs.New();
+        var options = new ConductorOptions { DataDirectory = dir, ServiceId = "test" };
+        var firstAdapter = new ScriptedAdapter(adapterName, AgentRequestAsync);
+        await using (var first = new Conductor(options, [firstAdapter]))
+        {
+            await using var client = await TestClient.ConnectAsync(first, "first", subagents: true);
+            await client.Rpc.SendRequestAsync("session/new", Session());
+            await client.Rpc.SendRequestAsync("session/prompt", new JsonObject { ["sessionId"] = Root,
+                ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "delegate" }) }).WaitAsync(Wait);
+        }
+        var restoredAdapter = new ScriptedAdapter(adapterName, AgentRequestAsync);
+        var wrongAdapter = new ScriptedAdapter(adapterName == "codex" ? "claude" : "codex", AgentRequestAsync);
+        await using var restored = new Conductor(options, [restoredAdapter, wrongAdapter]);
+        Assert.IsNull(restored.RootOfSubagent(Grandchild));
+        restored.HostCursors("host", [Root]);
+        Assert.AreEqual(Root, restored.RootOfSubagent(Child));
+        Assert.AreEqual(Root, restored.RootOfSubagent(Grandchild));
+        await using var reader = await TestClient.ConnectAsync(restored, "reader", subagents: true);
+        await reader.Rpc.SendRequestAsync("session/resume", Session());
+        var notification = new JsonObject { ["sessionId"] = Grandchild, ["update"] = new JsonObject {
+            ["sessionUpdate"] = "agent_message_chunk", ["content"] = new JsonObject { ["type"] = "text", ["text"] = "after restart" } } };
+        await restored.OnAgentNotificationAsync(restored.Agents[wrongAdapter.Name], "session/update", (JsonObject)notification.DeepClone());
+        Assert.IsFalse(reader.SessionUpdates.Any(x => (string?)x.Update["content"]?["text"] == "after restart"));
+        await restored.OnAgentNotificationAsync(restored.Agents[adapterName], "session/update", notification);
+        await WaitForAsync(() => reader.SessionUpdates.Any(x => x.SessionId == Grandchild && (string?)x.Update["content"]?["text"] == "after restart"));
+    }
+
+    [TestMethod]
     public void ChildReplayDeduplicatesItsStreamWithoutUsingRootMessageIds()
     {
         var rootMessage = AcpJson.ToNode<SessionUpdate>(new SessionUpdateAgentMessageChunk
@@ -202,9 +234,11 @@ public sealed class SubagentRoutingTests
     }
 
     [TestMethod]
-    public async Task LiveAndReplayUseChildIdsOnlyForCapableClients()
+    [DataRow("codex")]
+    [DataRow("claude")]
+    public async Task LiveAndReplayUseChildIdsOnlyForCapableClients(string adapterName)
     {
-        var adapter = new ScriptedAdapter("codex", AgentRequestAsync);
+        var adapter = new ScriptedAdapter(adapterName, AgentRequestAsync);
         await using var service = new Conductor(new ConductorOptions { DataDirectory = TestDirs.New(), ServiceId = "test" }, [adapter]);
         await using var modern = await TestClient.ConnectAsync(service, "modern", subagents: true);
         await modern.Rpc.SendRequestAsync("session/new", new JsonObject { ["cwd"] = Path.GetTempPath(), ["mcpServers"] = new JsonArray() });

@@ -142,10 +142,10 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             Terminal = false,
             // The service relays forms to a client that declared them.
             Elicitation = new ElicitationCapabilities { Form = new ElicitationFormCapabilities() },
-            Subagents = Name == "codex" ? new SubagentCapabilities() : null,
+            Subagents = Name is "codex" or "claude" ? new SubagentCapabilities() : null,
         },
         ClientInfo = new Implementation { Name = "gorynych", Title = "Gorynych", Version = Version },
-        Meta = Name == "codex" ? new JsonObject { [GorynychProtocol.MetaSubagentLiveState] = true } : null,
+        Meta = Name is "codex" or "claude" ? new JsonObject { [GorynychProtocol.MetaSubagentLiveState] = true } : null,
     };
 
     /// <summary>The adapter-wide connection, for a list or what no session has open: started, or waited for.</summary>
@@ -175,9 +175,9 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         {
             RequestArrived = request => conductor.OnAgentRequestArrived(this, request),
             RequestDone = conductor.OnAgentRequestDone,
-            RequestHandler = (req, token) => conductor.OnAgentRequestAsync(this, req, token),
             Log = m => ServiceLog.Warn(m),
         };
+        rpc.RequestHandler = (req, token) => conductor.OnAgentRequestAsync(this, req, token, rpc);
         rpc.NotificationHandler = (method, p) => conductor.OnAgentNotificationAsync(this, method, p, rpc);
         rpc.Start();
         InitializeResponse init;
@@ -485,7 +485,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         // before the answer to its replay, so before its sessions can move (Conductor.OnAgentRequestArrived).
         rpc.RequestArrived = request => conductor.OnAgentRequestArrived(this, request);
         rpc.RequestDone = conductor.OnAgentRequestDone;
-        rpc.RequestHandler = (req, token) => conductor.OnAgentRequestAsync(this, req, token);
+        rpc.RequestHandler = (req, token) => conductor.OnAgentRequestAsync(this, req, token, rpc);
         rpc.NotificationHandler = (method, p) => conductor.OnAgentNotificationAsync(this, method, p, rpc);
         var init = await rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, InitializeParams(), ct);
         var reattached = init.Meta?[GorynychProtocol.MetaHost]?["reattached"] is JsonValue r && r.TryGetValue<bool>(out var back) && back;

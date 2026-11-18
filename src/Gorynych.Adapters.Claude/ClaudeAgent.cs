@@ -290,10 +290,14 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     async Task<JsonNode?> HandleAsync(JsonRpcRequest request, CancellationToken ct)
     {
+        if ((string?)request.Params?["sessionId"] is { } nativeTarget && nativeTarget.StartsWith("claude-subagent:", StringComparison.Ordinal))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, "Native subagent sessions cannot be opened or controlled directly.");
         switch (request.Method)
         {
             case AcpMethods.Agent.Initialize:
                 ClientHasForms = request.ParamsAs<InitializeRequest>().ClientCapabilities?.Elicitation?.Form is not null;
+                ClientHasSubagents = Headless && request.ParamsAs<InitializeRequest>().ClientCapabilities?.Subagents is not null;
+                ClientMarksSubagentLive = request.Params?["_meta"]?[GorynychProtocol.MetaSubagentLiveState] is JsonValue flag && flag.TryGetValue<bool>(out var enabled) && enabled;
                 return AcpJson.ToNode(new InitializeResponse
                 {
                     ProtocolVersion = AcpMethods.ProtocolVersion,
@@ -401,6 +405,13 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                     : await session.PromptAsync(p.Prompt, cancelled, ct, request.Sequence);
                 state.Update(session.Id, session.Cwd, r => r.UpdatedAt = DateTimeOffset.UtcNow);
                 return AcpJson.ToNode(new PromptResponse { StopReason = stop, Meta = await MarkMetaAsync(session) });
+            }
+            case GorynychProtocol.MethodRefreshSubagentStates:
+            {
+                var sessionId = (string?)request.Params?["sessionId"] ?? "";
+                if (Headless && sessions.TryGetValue(sessionId, out var active) && active is HeadlessSession headlessSession)
+                    await headlessSession.RefreshNativeSubagentsAsync();
+                return new JsonObject();
             }
             case GorynychProtocol.MethodSteering:
             {
@@ -539,6 +550,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
     {
         var mark = (string?)from["type"] == GorynychProtocol.ReplayAfterMark ? (string?)from["mark"] : null;
         var path = TranscriptOf(session);
+        var nativeHistory = ClientHasSubagents && Headless ? new ClaudeSubagentHistory(session.Id, path, EmitAsync, Log) : null;
         var replay = await TranscriptHistory.ReadAsync(path, mark, update => rpc.SendUpdateAsync(session.Id, update),
             m => Log($"claude {session.Id}: {m}"), taskState: session.TaskPlan);
         if (replay is null)
@@ -546,6 +558,11 @@ internal sealed class ClaudeAgent : IAsyncDisposable
             Log($"claude {session.Id}: no readable transcript at {path}; the service's journal is not caught up");
             return null;
         }
+        // A background child can finish after the parent's last mark without adding a parent
+        // turn. Reconstruct the active parent chain separately, even for an empty after-mark slice.
+        if (nativeHistory is not null)
+            await TranscriptHistory.ReadAsync(path, null, _ => Task.CompletedTask,
+                m => Log($"claude {session.Id}: subagent history: {m}"), observe: nativeHistory.ObserveAsync);
         if (replay.TasksPrimed) session.TasksPrimed = true;
         Log($"claude {session.Id}: {replay.Sent} updates replayed {(replay.FromMark ? "after the mark" : "from the start")} ({replay.BytesRead} bytes read)");
         Remember(session.Id, replay.Mark);
@@ -1009,6 +1026,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     /// <summary>True when the ACP client declared form elicitation in <c>initialize</c>.</summary>
     public bool ClientHasForms { get; private set; }
+    public bool ClientHasSubagents { get; private set; }
+    public bool ClientMarksSubagentLive { get; private set; }
 
     public Task<CreateElicitationResponse> ElicitAsync(CreateElicitationRequest request, CancellationToken ct) =>
         rpc.RequestAsync<CreateElicitationRequest, CreateElicitationResponse>(AcpMethods.Client.ElicitationCreate, request, ct);
