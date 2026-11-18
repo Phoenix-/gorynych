@@ -7,14 +7,109 @@ namespace Gorynych.Service;
 
 public sealed partial class Conductor
 {
-    static JsonObject PublicAssignment(JsonObject state) => new()
+    JsonObject PublicAssignment(JsonObject state) => new()
     {
         ["source"] = state["source"]?.DeepClone(), ["assignmentId"] = state["assignmentId"]?.DeepClone(),
         ["parent"] = state["parent"]?.DeepClone(), ["child"] = state["child"]?.DeepClone(),
         ["generation"] = state["generation"]?.DeepClone(), ["status"] = state["status"]?.DeepClone(), ["revision"] = state["revision"]?.DeepClone(),
         ["delivery"] = state["delivery"]?.DeepClone(), ["summary"] = state["summary"]?.DeepClone(),
         ["outcomeReportId"] = state["outcomeReportId"]?.DeepClone(),
+        ["continuation"] = ContinuationView(state),
     };
+
+    JsonObject? ContinuationView(JsonObject owner)
+    {
+        if (owner["continuation"] is not JsonObject reference) return null;
+        var actor = (string)owner["child"]!;
+        if ((string?)reference["kind"] == "reply_wait")
+        {
+            var message = (string)reference["messageId"]!;
+            var wait = mailbox.ContinuationWait(message, actor, (long)reference["sequence"]!);
+            var state = (string?)wait?["state"]; var requestDelivery = (string?)wait?["requestDelivery"];
+            var disposition = wait is null ? "unavailable" : state == "replied" ? "ready" : state == "cancelled" ? "cancelled" :
+                requestDelivery == "failed" ? "undeliverable" : requestDelivery == "uncertain" ? "unknown" : "waiting";
+            return new JsonObject { ["kind"] = "reply_wait", ["messageId"] = message, ["state"] = disposition,
+                ["requestDelivery"] = requestDelivery, ["replyDelivery"] = wait?["replyDelivery"]?.DeepClone(),
+                ["reason"] = wait is null ? "Retained reply wait unavailable" : disposition is "undeliverable" or "unknown" ? requestDelivery : null };
+        }
+        if ((string?)reference["kind"] != "child_assignment") return null;
+        var source = (string)reference["source"]!; var id = (string)reference["assignmentId"]!;
+        var generation = (string)reference["generation"]!;
+        var child = AssignmentFor(source, id, actor);
+        if ((string?)child?["parent"] != actor || (string?)child?["generation"] != generation) child = null;
+        var status = (string?)child?["status"]; var delivery = (string?)child?["delivery"];
+        var childState = child is null ? "unavailable" : status is "completed" or "failed" or "cancelled" ? "ready" :
+            status == "blocked" ? "blocked" : delivery is "failed" or "not_started" or "suppressed" ? "undeliverable" :
+            delivery == "uncertain" ? "unknown" : "waiting";
+        var reason = childState switch
+        {
+            "unavailable" => "Retained child assignment unavailable",
+            "blocked" => "Child assignment is blocked",
+            "ready" => status,
+            "undeliverable" => "Child assignment delivery: " + delivery,
+            "unknown" => "Child assignment delivery is uncertain",
+            _ => null,
+        };
+        return new JsonObject { ["kind"] = "child_assignment", ["source"] = source, ["assignmentId"] = id,
+            ["generation"] = generation, ["state"] = childState, ["delivery"] = delivery, ["reason"] = reason };
+    }
+
+    internal Action? ContinuationAfterLookupForTests { get; set; }
+
+    internal JsonObject UpdateContinuation(JsonRpcRequest request)
+    {
+        if (Draining) throw Restarting();
+        var actor = MailboxPeer(request);
+        var args = AssignmentParams(request, "source", "assignmentId", "generation", "expectedRevision", "operationId", "action", "messageId", "targetSource", "targetAssignmentId", "targetGeneration");
+        var (source, id) = AssignmentIdentity(args);
+        var generation = RequiredMailboxText(args, "generation"); var operation = RequiredMailboxText(args, "operationId");
+        var action = RequiredMailboxText(args, "action");
+        if (!Guid.TryParseExact(generation, "N", out _) || operation.Length > 256 || action is not ("register" or "withdraw") ||
+            args["expectedRevision"] is not JsonValue value || !(value.TryGetValue<long>(out var revision) ||
+                value.TryGetValue<int>(out var small) && (revision = small) >= 0) || revision < 1)
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "Invalid continuation operation");
+        var hasMessage = args.ContainsKey("messageId");
+        var hasChild = args.ContainsKey("targetSource") || args.ContainsKey("targetAssignmentId") || args.ContainsKey("targetGeneration");
+        if (action == "withdraw" && (hasMessage || hasChild) || action == "register" && hasMessage == hasChild)
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "Register requires one target; withdraw accepts none");
+        string? message = null, childSource = null, childId = null, childGeneration = null;
+        if (action == "register" && hasMessage)
+        {
+            message = RequiredMailboxText(args, "messageId");
+            if (message.Length > 256) throw new JsonRpcException(JsonRpcException.InvalidParams, "Invalid message ID");
+        }
+        else if (action == "register")
+        {
+            childSource = RequiredMailboxText(args, "targetSource"); childId = RequiredMailboxText(args, "targetAssignmentId");
+            childGeneration = RequiredMailboxText(args, "targetGeneration");
+            if (childSource is not ("spawn" or "delegation") || childId.Length > 256 || !Guid.TryParseExact(childGeneration, "N", out _))
+                throw new JsonRpcException(JsonRpcException.InvalidParams, "Invalid child assignment identity");
+        }
+        try
+        {
+            var owner = AssignmentFor(source, id, actor);
+            if (owner is null || (string?)owner["child"] != actor) throw new InvalidOperationException("Assignment unavailable");
+            JsonObject? target = null;
+            if (message is not null)
+            {
+                target = mailbox.ContinuationWait(message, actor) ?? new JsonObject { ["messageId"] = message };
+                target["kind"] = "reply_wait"; target["confirmed"] = target["sequence"] is not null;
+                target.Remove("state"); target.Remove("requestDelivery"); target.Remove("replyDelivery");
+            }
+            else if (childId is not null)
+            {
+                var dependency = AssignmentFor(childSource!, childId, actor);
+                target = new JsonObject { ["kind"] = "child_assignment", ["source"] = childSource, ["assignmentId"] = childId,
+                    ["generation"] = childGeneration, ["confirmed"] = (string?)dependency?["parent"] == actor && (string?)dependency?["generation"] == childGeneration };
+            }
+            ContinuationAfterLookupForTests?.Invoke();
+            var result = source == "spawn" ? store.UpdateSpawnContinuation((string)owner["child"]!, id, actor, generation, revision, operation, action, target)
+                : mailbox.UpdateContinuation(id, actor, generation, revision, operation, action, target);
+            return PublicAssignment(result);
+        }
+        catch (Exception e) when (e is InvalidOperationException or ArgumentException or IOException or UnauthorizedAccessException)
+        { throw new JsonRpcException(JsonRpcException.InvalidParams, "Continuation unavailable: " + e.Message); }
+    }
 
     static JsonObject AssignmentParams(JsonRpcRequest request, params string[] allowed)
     {

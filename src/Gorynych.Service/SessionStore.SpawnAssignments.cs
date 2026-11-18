@@ -133,6 +133,7 @@ public sealed partial class SessionStore
             if (status is "completed" or "cancelled" or "failed") throw new InvalidOperationException("Assignment is already terminal");
             if (outcome == "open" && status != "blocked") throw new InvalidOperationException("Only a blocked assignment can be reopened");
             state["status"] = outcome; state["summary"] = summary; state["revision"] = expectedRevision + 1;
+            if (outcome is "completed" or "failed" or "cancelled") state.Remove("continuation");
             if (outcomeReportId is not null) state["outcomeReportId"] = outcomeReportId;
             if (outcome == "cancelled" && (string?)state["delivery"] == "queued") state["delivery"] = "suppressed";
             var result = SpawnView(state);
@@ -143,6 +144,17 @@ public sealed partial class SessionStore
             return (true, result);
         });
     }
+
+    internal JsonObject UpdateSpawnContinuation(string child, string id, string actor, string generation, long revision, string operation, string action, JsonObject? target) =>
+        ChangeSpawn(child, (_, state) =>
+        {
+            if ((string?)state["assignmentId"] != id) throw new InvalidOperationException("Assignment unavailable");
+            if (action == "register" && (string?)target?["kind"] == "child_assignment" && (string?)target?["source"] == "spawn")
+                target!["confirmed"] = records.Values.Any(r => r.SpawnAssignment is JsonObject dependency &&
+                    (string?)dependency["assignmentId"] == (string?)target["assignmentId"] &&
+                    (string?)dependency["parent"] == actor && (string?)dependency["generation"] == (string?)target["generation"]);
+            return AssignmentContinuations.Update(state, actor, generation, revision, operation, action, target);
+        });
 
     // No spawn prompt is blindly replayed after conductor loss. A claim is not a native receipt.
     internal void ReconcileSpawnAssignments()

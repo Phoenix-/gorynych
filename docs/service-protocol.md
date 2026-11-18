@@ -2646,3 +2646,11 @@ longer be read, while the explicit outcome and summary remain until assignment e
 The service does not synthesize an outcome from native turn results and does not schedule a
 model turn on an outcome update. MCP Tasks informs the lifecycle design; these methods do
 not implement the `tasks/*` protocol.
+
+### Passive assignment continuations
+
+Managed peers call `_gorynych/update_continuation` (`update_continuation` in MCP). The authenticated assignee supplies `source`, `assignmentId`, `generation`, `expectedRevision`, `operationId`, and `action` (`register` or `withdraw`). Registration supplies exactly one target: `messageId` for the assignee's retained reply wait, or `targetSource`, `targetAssignmentId` and `targetGeneration` for an assignment whose retained parent is the assignee. ACP advertises `gorynych/assignmentContinuations` in capability `_meta`.
+
+Assignment reads by its parent or assignee reconcile a retained target identity. A reply-wait view separately reports request and reply delivery, and `ready` means reply acceptance only. A child target exposes its state and a generic blocked reason, without disclosing its summary. A same-store target is checked under the owner's commit lock; a cross-store target is a snapshot and an evicted or replaced identity is reported unavailable on read. Retried operations remain idempotent after target eviction. No call here wakes a session, changes a dependency or completes the owner.
+
+A child continuation also exposes the exact independent assignment `delivery`. For an open child, `failed`, `not_started` or `suppressed` yields `undeliverable`, while `uncertain` yields `unknown`; terminal outcomes remain `ready` and blocked outcomes remain `blocked`. These dispositions neither change the owner outcome nor start or repeat a turn.

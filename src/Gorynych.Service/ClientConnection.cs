@@ -177,6 +177,8 @@ internal sealed class ClientConnection
                 return conductor.ReadAssignment(request);
             case GorynychProtocol.MethodUpdateAssignment:
                 return conductor.UpdateAssignment(request);
+            case GorynychProtocol.MethodUpdateContinuation:
+                return conductor.UpdateContinuation(request);
             case GorynychProtocol.MethodListReplyWaits:
                 return conductor.ListReplyWaits(request);
             case GorynychProtocol.MethodCancelReplyWait:
@@ -258,6 +260,7 @@ internal sealed class ClientConnection
         flags[GorynychProtocol.CapReportRetrieval] = true;
         flags[GorynychProtocol.CapReplyWaits] = true;
         flags[GorynychProtocol.CapAssignments] = true;
+        flags[GorynychProtocol.CapAssignmentContinuations] = true;
         flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
         flags[GorynychProtocol.MetaSessionState] = 1;
         return flags;

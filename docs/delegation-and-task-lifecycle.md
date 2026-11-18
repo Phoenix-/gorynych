@@ -457,3 +457,13 @@ properties and remain separately reviewable.
 The earlier deferred note in local commit `f37c50a` proposed initiator-based report
 exclusions. The decisions above supersede those exclusions; the note was not
 integrated into `main`. No runtime capability is introduced by this documentation.
+
+### Passive reply and child continuations (5b first slice)
+
+A managed assignee may use `update_continuation` with an assignment source, ID, exact generation, expected revision, operation ID and `register`, plus either their retained reply-wait message ID or the source, ID and exact generation of an immediate child assignment for which they are the parent. `withdraw` removes the continuation. Parent and assignee can read it; it does not change the owner's outcome or start a turn. Terminal owner outcomes retire the continuation without changing the dependency.
+
+Reply references bind the wait's message ID, waiter and immutable admission sequence. Read reconciliation reports `waiting`, `ready`, `cancelled`, `undeliverable`, `unknown` or `unavailable`, with separate `requestDelivery` and `replyDelivery`. `ready` means that the reply was accepted, not delivered to a native agent or read by one. Child continuations report `waiting`, `blocked`, `ready` after a terminal child outcome, or `unavailable`; they expose a generic blocker rather than the child's private summary. A terminal child does not complete its owner.
+
+Same-store admission validates the reference under the owner's publication lock. Cross-store admission binds a trusted target snapshot without nesting store locks; a dependency may disappear between observation and publication. On each read the original identity is checked again, and a missing or replaced dependency is `unavailable`, never the state of a replacement. Retained operation retries do not require the target to remain present. No timers, wakeups, native background, user-action targets or changes to report delivery are part of this slice.
+
+A child continuation also exposes the exact independent assignment `delivery`. For an open child, `failed`, `not_started` or `suppressed` yields `undeliverable`, while `uncertain` yields `unknown`; terminal outcomes remain `ready` and blocked outcomes remain `blocked`. These dispositions neither change the owner outcome nor start or repeat a turn.
