@@ -109,6 +109,150 @@ public sealed class MailboxDeliveryTests
     }
 
     [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task CancelBeforeDelegationClaimSuppressesJournalAndKeepsNextMessageDeliverable()
+    {
+        var parent = new Peer("alpha"); var child = new Peer("beta");
+        await using var service = Create(TestDirs.New(), parent, child);
+        await using var client = await TestClient.ConnectAsync(service);
+        await New(client, parent, child);
+        service.Store.Update(child.Id, "beta", r => { r.ParentSessionId = parent.Id; r.ReportToParent = false; });
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        service.BeforeMailboxMarkStarted = () => { entered.Set(); if (!release.Wait(Wait)) throw new IOException("claim barrier timed out"); };
+        try
+        {
+            var receipt = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject
+            { ["sessionId"] = child.Id, ["text"] = "cancelled task", ["_meta"] = new JsonObject
+                { [GorynychProtocol.MetaPeerToken] = parent.Token, [GorynychProtocol.MetaMessageRequestId] = "cancel-task" } }).WaitAsync(Wait);
+            Assert.AreEqual("cancel-task", (string?)receipt!["assignmentId"]);
+            Assert.IsTrue(await Task.Run(() => entered.Wait(Wait)), "worker reached the pre-claim barrier");
+            var cancelled = service.ReplyMailbox.TransitionAssignment("cancel-task", parent.Id, 1, "cancel-op", "cancelled", "stop", generation: (string)service.ReplyMailbox.FindAssignment("cancel-task", parent.Id)!["generation"]!);
+            Assert.AreEqual("suppressed", (string?)cancelled["delivery"]);
+            await Send(client, parent, child.Id, "next ordinary", "next").WaitAsync(Wait);
+            service.BeforeMailboxMarkStarted = null;
+        }
+        finally { release.Set(); }
+        await LinkHarness.Until(() => child.Prompts.Any(p => p.Contains("next ordinary", StringComparison.Ordinal)), "next message delivered").WaitAsync(Wait);
+        Assert.IsFalse(child.Prompts.Any(p => p.Contains("cancelled task", StringComparison.Ordinal)));
+        var entries = service.Feed(child.Id).Journal.ReadAll();
+        Assert.IsFalse(entries.Any(u => (string?)u["_meta"]?[GorynychProtocol.MetaMailboxMessage] == "cancel-task"), "suppressed delegation is not journaled as a turn");
+        Assert.AreEqual("cancelled", (string?)service.ReplyMailbox.FindAssignment("cancel-task", child.Id)!["status"]);
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task CancelAfterDelegationClaimDoesNotCancelNativeTurnOrLoseDelivery()
+    {
+        var parent = new Peer("alpha"); var child = new Peer("beta");
+        await using var service = Create(TestDirs.New(), parent, child);
+        await using var client = await TestClient.ConnectAsync(service);
+        await New(client, parent, child);
+        service.Store.Update(child.Id, "beta", r => { r.ParentSessionId = parent.Id; r.ReportToParent = false; });
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellations = 0;
+        child.Prompt = async (agent, _, text) =>
+        {
+            agent.Rpc.NotificationHandler = (method, _) => { if (method == AcpMethods.Agent.SessionCancel) Interlocked.Increment(ref cancellations); return Task.CompletedTask; };
+            if (text.Contains("claimed-task", StringComparison.Ordinal)) { entered.TrySetResult(); await release.Task; }
+        };
+        try
+        {
+            await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject
+            { ["sessionId"] = child.Id, ["text"] = "work after claim", ["_meta"] = new JsonObject
+                { [GorynychProtocol.MetaPeerToken] = parent.Token, [GorynychProtocol.MetaMessageRequestId] = "claimed-task" } }).WaitAsync(Wait);
+            await entered.Task.WaitAsync(Wait);
+            Assert.AreEqual("started", (string?)service.ReplyMailbox.FindAssignment("claimed-task", parent.Id)!["delivery"]);
+            service.ReplyMailbox.TransitionAssignment("claimed-task", parent.Id, 1, "cancel-op", "cancelled", "stop", generation: (string)service.ReplyMailbox.FindAssignment("claimed-task", parent.Id)!["generation"]!);
+            Assert.AreEqual("started", (string?)service.ReplyMailbox.FindAssignment("claimed-task", parent.Id)!["delivery"]);
+        }
+        finally { release.TrySetResult(); }
+        await LinkHarness.Until(() => (string?)service.ReplyMailbox.FindAssignment("claimed-task", child.Id)?["delivery"] == "delivered", "native turn completes normally").WaitAsync(Wait);
+        Assert.AreEqual("cancelled", (string?)service.ReplyMailbox.FindAssignment("claimed-task", child.Id)!["status"]);
+        Assert.AreEqual(1, child.Prompts.Count(p => p.Contains("claimed-task", StringComparison.Ordinal)));
+        Assert.AreEqual(0, Volatile.Read(ref cancellations), "assignment cancellation does not send session/cancel");
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task ReusedDelegationIdDispatchesDistinctPromptAndReport()
+    {
+        var parent = new Peer("alpha"); var child = new Peer("beta");
+        await using var service = Create(TestDirs.New(), parent, child);
+        await using var client = await TestClient.ConnectAsync(service);
+        await New(client, parent, child);
+        service.Store.Update(child.Id, "beta", r => { r.ParentSessionId = parent.Id; r.ReportToParent = true; });
+        service.ReplyMailbox.CapacityForTests = 1; service.ReplyMailbox.AssignmentCapacityForTests = 1;
+        Task<JsonNode?> Delegate(string text) => client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject
+        { ["sessionId"] = child.Id, ["text"] = text, ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = parent.Token,
+            [GorynychProtocol.MetaMessageRequestId] = "same" } });
+        await Delegate("first incarnation").WaitAsync(Wait);
+        await LinkHarness.Until(() => (string?)service.ReplyMailbox.FindAssignment("same", parent.Id)?["delivery"] == "delivered" &&
+            service.ReportStorage.List(child.Id).Items.Any(r => r.Identity.MessageId == "same" && r.ProducerAck), "first delegation and report").WaitAsync(Wait);
+        var old = service.ReplyMailbox.FindAssignment("same", parent.Id)!; var oldGeneration = (string)old["generation"]!;
+        var oldReport = service.ReportStorage.List(child.Id).Items.Single(r => r.Identity.MessageId == "same");
+        Assert.AreEqual(oldGeneration, oldReport.Identity.AssignmentGeneration);
+        service.ReplyMailbox.TransitionAssignment("same", parent.Id, 1, "cancel-old", "cancelled", "done", generation: oldGeneration);
+        service.ReplyMailbox.Accept("filler", parent.Id, child.Id, "filler", delegation: true);
+        service.ReplyMailbox.TransitionAssignment("filler", parent.Id, 1, "cancel-filler", "cancelled", "stop", generation: (string)service.ReplyMailbox.FindAssignment("filler", parent.Id)!["generation"]!);
+        await Delegate("second incarnation").WaitAsync(Wait);
+        var generation = (string)service.ReplyMailbox.FindAssignment("same", child.Id)!["generation"]!;
+        Assert.AreNotEqual(oldGeneration, generation);
+        await Delegate("second incarnation").WaitAsync(Wait);
+        await LinkHarness.Until(() => service.ReportStorage.List(child.Id).Items.Count(r => r.Identity.MessageId == "same" && r.ProducerAck) == 2,
+            "both distinct reports published").WaitAsync(Wait);
+        var reports = service.ReportStorage.List(child.Id).Items.Where(r => r.Identity.MessageId == "same").ToArray();
+        Assert.AreEqual(2, reports.Select(r => r.Identity.PromptId).Distinct().Count());
+        Assert.AreEqual(2, reports.Select(r => r.Identity.TurnKey).Distinct().Count());
+        Assert.IsTrue(reports.Any(r => r.Identity.AssignmentGeneration == generation));
+        Assert.AreEqual(1, child.Prompts.Count(p => p.Contains("first incarnation", StringComparison.Ordinal)));
+        Assert.AreEqual(1, child.Prompts.Count(p => p.Contains("second incarnation", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task OrdinaryCompositeIdsCannotCollideWithDelegationPromptOrReportKeys()
+    {
+        var parent = new Peer("alpha"); var child = new Peer("beta");
+        await using var service = Create(TestDirs.New(), parent, child);
+        await using var client = await TestClient.ConnectAsync(service);
+        await New(client, parent, child);
+        service.Store.Update(child.Id, "beta", r => { r.ParentSessionId = parent.Id; r.ReportToParent = true; });
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        child.Prompt = async (_, _, text) => { if (text == "busy") { entered.TrySetResult(); await release.Task; } };
+        var busy = client.Rpc.RequestAsync<PromptRequest, PromptResponse>(AcpMethods.Agent.SessionPrompt,
+            new PromptRequest { SessionId = child.Id, Prompt = [new TextContent { Text = "busy" }] });
+        try
+        {
+            await entered.Task.WaitAsync(Wait);
+            var receipt = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject
+            { ["sessionId"] = child.Id, ["text"] = "delegated body", ["_meta"] = new JsonObject
+                { [GorynychProtocol.MetaPeerToken] = parent.Token, [GorynychProtocol.MetaMessageRequestId] = "same" } }).WaitAsync(Wait);
+            Assert.AreEqual("same", (string?)receipt!["assignmentId"]);
+            var generation = (string)service.ReplyMailbox.FindAssignment("same", parent.Id)!["generation"]!;
+            var oldPromptCollision = "same-" + generation;
+            var oldTurnCollision = "same:" + generation;
+            await Send(client, parent, child.Id, "ordinary prompt collision", oldPromptCollision).WaitAsync(Wait);
+            await Send(client, parent, child.Id, "ordinary report collision", oldTurnCollision).WaitAsync(Wait);
+            release.TrySetResult(); await busy.WaitAsync(Wait);
+            await LinkHarness.Until(() => service.ReportStorage.List(child.Id).Items.Count(r => r.ProducerAck &&
+                r.Identity.MessageId is { } id && (id == "same" || id == oldPromptCollision || id == oldTurnCollision)) == 3,
+                "all three independent reports published").WaitAsync(Wait);
+            var reports = service.ReportStorage.List(child.Id).Items.Where(r => r.Identity.MessageId is { } id &&
+                (id == "same" || id == oldPromptCollision || id == oldTurnCollision)).ToArray();
+            Assert.AreEqual(3, reports.Select(r => r.Identity.PromptId).Distinct().Count());
+            Assert.AreEqual(3, reports.Select(r => r.Identity.TurnKey).Distinct().Count());
+            Assert.AreEqual(ReportCause.Delegation, reports.Single(r => r.Identity.MessageId == "same").Identity.Cause);
+            Assert.AreEqual(generation, reports.Single(r => r.Identity.MessageId == "same").Identity.AssignmentGeneration);
+            Assert.AreEqual(1, child.Prompts.Count(p => p.Contains("delegated body", StringComparison.Ordinal)));
+            Assert.AreEqual(1, child.Prompts.Count(p => p.Contains("ordinary prompt collision", StringComparison.Ordinal)));
+            Assert.AreEqual(1, child.Prompts.Count(p => p.Contains("ordinary report collision", StringComparison.Ordinal)));
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    [TestMethod]
     public async Task BusyRecipient_DoesNotBlockSend_AndReplyWakesOriginalSender()
     {
         var a = new Peer("alpha"); var b = new Peer("beta");

@@ -224,7 +224,7 @@ public sealed partial class Conductor
         var recipient = (string)item["recipient"]!;
         var sender = (string)item["sender"]!;
         var notify = sender != "service" && (sender.StartsWith("outside:", StringComparison.Ordinal) || store.Get(sender) is { Deleted: false }) ? sender : null;
-        mailbox.MarkFailed(id, recipient, reason, notify, uncertain);
+        if (!mailbox.MarkFailed(id, recipient, reason, notify, uncertain, (long)item["sequence"]!)) return;
         if (notify is not null) QueueMailbox(notify);
         ServiceLog.Warn($"mailbox {id}: {reason}");
     }
@@ -263,9 +263,13 @@ public sealed partial class Conductor
             if (!suppliedGates) rpc = await RpcForTurnAsync(use.Record, rpc, ct, forAgent: true);
             else if (HostOf(use.Record).RouteOf(recipient)?.Rpc != rpc) throw new IOException("Reminder route changed after handoff claim");
             var block = new TextContent { Text = MailboxPrompt(item) };
-            var messageId = "mailbox-" + id;
+            var assignmentGeneration = (bool?)item["delegation"] == true ? (string?)item["assignmentGeneration"] : null;
+            // Request IDs are arbitrary bounded strings: a separate prefix prevents an
+            // ordinary/legacy mailbox ID from spelling a generated delegation key.
+            var messageId = assignmentGeneration is null ? "mailbox-" + id : "delegation-" + assignmentGeneration + "-" + id;
             promptId = ServicePromptId(messageId);
-            key = feed.BeginPrompt(promptId);
+            var isDelegation = (bool?)item["delegation"] == true;
+            if (!isDelegation) key = feed.BeginPrompt(promptId);
             var shownSender = sender.StartsWith("outside:", StringComparison.Ordinal) ? "outside_agent" : sender;
             var meta = new JsonObject { [GorynychProtocol.MetaOrigin] = "peer", [GorynychProtocol.MetaSender] = shownSender,
                 [GorynychProtocol.MetaMailboxMessage] = id, [GorynychProtocol.MetaPromptId] = promptId };
@@ -274,8 +278,9 @@ public sealed partial class Conductor
             if ((string?)item["reminderFor"] is { } reminderFor)
                 meta[GorynychProtocol.MetaReplyReminder] = new JsonObject { ["messageId"] = reminderFor, ["kind"] = (string?)item["reminderKind"], ["backgroundStream"] = (string?)item["reminderStream"] };
             if (sender != "service" && !sender.StartsWith("outside:", StringComparison.Ordinal)) meta[GorynychProtocol.MetaFromSessionId] = sender;
-            await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
+            async Task PublishMessageAsync() => await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
             { Content = block, MessageId = messageId, Meta = meta.DeepClone().AsObject() })!.AsObject(), except: null, () => store.Touch(recipient));
+            if (!isDelegation) await PublishMessageAsync();
             if (use.Record.ParentSessionId is not null) feed.BeginTurnText(ReportLimit + 1);
             Task<JsonNode?> response;
             var startAttempted = false;
@@ -285,8 +290,9 @@ public sealed partial class Conductor
                 if (feed.Retired || store.Get(recipient) is not { Deleted: false }) throw NotFound(recipient);
                 var cause = (bool?)item["delegation"] == true ? ReportCause.Delegation :
                     item["replyTo"] is not null ? ReportCause.Reply : ReportCause.Peer;
-                report = AdmitReport(use.Record, rpc, promptId, "mailbox:" + id, cause,
-                    cause == ReportCause.Delegation ? (string?)item["assignmentId"] : null, id);
+                var turnKey = assignmentGeneration is null ? "mailbox:" + id : "delegation:" + assignmentGeneration + ":" + id;
+                report = AdmitReport(use.Record, rpc, promptId, turnKey, cause,
+                    cause == ReportCause.Delegation ? (string?)item["assignmentId"] : null, id, assignmentGeneration);
                 BeforeMailboxMarkStarted?.Invoke();
                 if (suppliedGates && ((string?)item["reminderSource"] is not { } authoritySource ||
                     Draining || IsStopping(use.Record.Agent) || feed.ReadOnly is not null || feed.OpenedReadOnly ||
@@ -295,14 +301,19 @@ public sealed partial class Conductor
                     HostOf(use.Record).RouteOf(recipient)?.Rpc != rpc || (InFullAccess(recipient) && !authorityModeHeld) ||
                     !ReminderAuthorityAllows(recipient, authoritySource)))
                     throw new IOException("Reminder authority or live activity changed before dispatch; handoff remains unconfirmed.");
-                mailbox.MarkStarted(id, recipient);
+                if (!mailbox.TryMarkStarted(id, recipient, (long)item["sequence"]!)) return;
+                if (isDelegation)
+                {
+                    key = feed.BeginPrompt(promptId);
+                    await PublishMessageAsync();
+                }
                 var forwarded = WithReport(WithMessageId(AcpJson.ToNode(new PromptRequest
                 { SessionId = recipient, Prompt = [block], Meta = meta }), messageId), report);
                 feed.BeginReminderActivityEpoch();
                 startAttempted = true;
                 response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, forwarded, CancellationToken.None);
                 handed = true;
-                feed.Handed(key.Value);
+                feed.Handed(key ?? throw new InvalidOperationException("Mailbox prompt was not started"));
             }
             finally
             {

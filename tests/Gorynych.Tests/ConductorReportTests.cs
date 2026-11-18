@@ -117,6 +117,7 @@ public sealed class ConductorReportTests
         await LinkHarness.Until(() => service.ReportStorage.List(child).Items.Any(x => x.Identity.Cause == ReportCause.Spawn && x.ProducerAck), "spawn report").WaitAsync(Wait);
         var spawn = service.ReportStorage.List(child).Items.Single(x => x.Identity.Cause == ReportCause.Spawn);
         Assert.AreEqual(assignment, spawn.Identity.AssignmentId);
+        Assert.AreEqual((string?)service.Store.FindSpawnAssignment(assignment, parent)!["generation"], spawn.Identity.AssignmentGeneration);
         Task<JsonNode?> Message(string method, string token, string targetName, string target, string requestId) => client.Rpc.SendRequestAsync(method,
             new JsonObject { [targetName] = target, ["text"] = "work " + requestId, ["_meta"] = new JsonObject {
                 [GorynychProtocol.MetaPeerToken] = token, [GorynychProtocol.MetaMessageRequestId] = requestId } });
@@ -124,6 +125,7 @@ public sealed class ConductorReportTests
         await LinkHarness.Until(() => service.ReportStorage.List(child).Items.Any(x => x.Identity.MessageId == "delegation-id" && x.ProducerAck), "delegation report").WaitAsync(Wait);
         var delegation = service.ReportStorage.List(child).Items.Single(x => x.Identity.MessageId == "delegation-id");
         Assert.AreEqual(ReportCause.Delegation, delegation.Identity.Cause); Assert.AreEqual("delegation-id", delegation.Identity.AssignmentId);
+        Assert.AreEqual((string?)service.ReplyMailbox.FindAssignment("delegation-id", parent)!["generation"], delegation.Identity.AssignmentGeneration);
         await Message(GorynychProtocol.MethodSendMessage, agent.Tokens[parent], "sessionId", child, "peer-id").WaitAsync(Wait);
         await LinkHarness.Until(() => service.ReportStorage.List(child).Items.Any(x => x.Identity.MessageId == "peer-id" && x.ProducerAck), "peer report").WaitAsync(Wait);
         var peer = service.ReportStorage.List(child).Items.Single(x => x.Identity.MessageId == "peer-id");

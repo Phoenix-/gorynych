@@ -11,7 +11,8 @@ are not necessarily API names; the linked service documentation defines current 
 implemented and awaiting independent review. The current contracts are
 [explicit delegation](messaging.md), [report delivery and retrieval](service-protocol.md#reports),
 [report storage](report-storage.md), and reply waits and reminders in [messaging](messaging.md#explicit-reply-expectations).
-Assignment outcomes and supervision remain planned as separate iterations below.
+Iteration 5a now has participant-managed explicit assignment outcomes; trusted user-control
+cancellation and later continuations/supervision remain separate work.
 
 Gorynych sessions are persistent conversations. The user can talk to a child
 directly, peers can exchange questions, and native background work can outlive a
@@ -410,7 +411,7 @@ The user approved six independently reviewable rollout iterations:
 | 2. Reliable complete reports (**built**) | Immutable full result identity/retrieval, cause/outcome correlation and durable delivery or visible failure | Long results, revised reviews, restart during publication/delivery, unavailable or archived parent; broad automatic report eligibility preserved |
 | 3. Observable reply waits (**built**) | Explicit response dependency on message M, persistence, resolution and diagnostics | Mutual waits remain visible and receive new input; restart restores edges; ordinary notifications acquire no reply obligation; no new automatic reminders yet |
 | 4. Targeted reply reminders (**under review**) | Fresh activity checks, bounded recipient reminders and owner escalation | Reply/deadline races, cancellation, maintenance and uncertain handoff; enable first on an opted-in test group; disabling reminders preserves messaging and wait records |
-| 5. Assignment outcomes and other waits | Explicit completed/blocked/cancelled outcomes and background/child/user-action continuations | Partial final text does not complete work; unrelated native work grants no blanket exemption; initially observe without the general completion watchdog |
+| 5. Assignment outcomes and other waits (**5a participant API; user control pending**) | Explicit completed/blocked/cancelled outcomes and background/child/user-action continuations | Partial final text does not complete work; unrelated native work grants no blanket exemption; initially observe without the general completion watchdog |
 | 6. General completion supervision | Detect an open admitted assignment left without execution, valid waiting or an exposed obstacle | Seven-agent team scenario, native background work, mutual waiting, user intervention and restart; only now enable completion reminders |
 
 Each iteration must be usable and reviewable without deploying the next one. The

@@ -10,7 +10,7 @@ internal enum ReportCause { Unknown, Spawn, User, Delegation, Peer, Reply, Nativ
 internal sealed record ReportIdentity(string TurnKey, string Child, string Parent, ReportCause Cause,
     string? PromptId = null, string? AssignmentId = null, string? MessageId = null,
     string? HostId = null, string? HostGeneration = null, int? HostProcessId = null, string? HostProcessStart = null,
-    bool LegacyCapture = false);
+    bool LegacyCapture = false, string? AssignmentGeneration = null);
 internal sealed record ReportDeliveryClaim(string AttemptId, string Parent, string MessageId, string PromptId,
     string Route, string? HostId, string? HostGeneration, bool DispatchStarted = false,
     bool? ReceiptAckPending = null, bool? ReceiptConflict = null, int? HostProcessId = null, string? HostProcessStart = null,
@@ -89,7 +89,7 @@ internal sealed partial class ReportStore
         ArgumentException.ThrowIfNullOrWhiteSpace(i.Child);
         ArgumentException.ThrowIfNullOrWhiteSpace(i.Parent);
         if (!Enum.IsDefined(i.Cause)) throw new ArgumentException("Invalid report cause");
-        if (new[] { i.TurnKey, i.Child, i.Parent, i.PromptId, i.AssignmentId, i.MessageId, i.HostId, i.HostGeneration, i.HostProcessStart }.Any(s => s?.Length > 512))
+        if (new[] { i.TurnKey, i.Child, i.Parent, i.PromptId, i.AssignmentId, i.MessageId, i.HostId, i.HostGeneration, i.HostProcessStart, i.AssignmentGeneration }.Any(s => s?.Length > 512))
             throw new ArgumentException("Report identity field exceeds 512 characters");
     }
     static JsonObject Identity(ReportIdentity i)
@@ -103,6 +103,7 @@ internal sealed partial class ReportStore
         if (i.HostProcessId is not null) value["hostProcessId"] = i.HostProcessId;
         if (i.HostProcessStart is not null) value["hostProcessStart"] = i.HostProcessStart;
         if (i.LegacyCapture) value["legacyCapture"] = true;
+        if (i.AssignmentGeneration is not null) value["assignmentGeneration"] = i.AssignmentGeneration;
         return value;
     }
     static ReportIdentity IdentityFrom(JsonNode? n)
@@ -111,7 +112,7 @@ internal sealed partial class ReportStore
             throw new InvalidDataException("Invalid persisted report cause");
         return new((string)n!["turnKey"]!, (string)n["child"]!, (string)n["parent"]!, cause,
             (string?)n["promptId"], (string?)n["assignmentId"], (string?)n["messageId"],
-            (string?)n["hostId"], (string?)n["hostGeneration"], (int?)n["hostProcessId"], (string?)n["hostProcessStart"], (bool?)n["legacyCapture"] == true);
+            (string?)n["hostId"], (string?)n["hostGeneration"], (int?)n["hostProcessId"], (string?)n["hostProcessStart"], (bool?)n["legacyCapture"] == true, (string?)n["assignmentGeneration"]);
     }
     static ReportInfo Info(JsonObject item) => new((string)item["id"]!, IdentityFrom(item["identity"]),
         (string)item["status"]!, (string?)item["reason"], (bool?)item["producerAck"] == true,

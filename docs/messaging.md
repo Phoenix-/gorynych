@@ -11,15 +11,40 @@ opening or delivering to the recipient. Other relationships use `send_message`. 
 a service-generated delegation envelope and remains bound by user restrictions and existing
 approval and mode checks. Each accepted call returns `messageId`, `assignmentId`, and `status`;
 the first two currently have the same opaque value. Spawn returns `assignment_id` as well;
-its first prompt and journal identify the same assignment. These IDs are correlation only,
-not task completion, a wait, or permission to exceed the user's assignment.
-Each new explicit delegation has its own correlation ID. This iteration does not
-group several calls into a shared lifecycle or accept an existing assignment ID.
+its first prompt and journal identify the same assignment. An assignment ID is not itself
+completion, a wait, or permission to exceed the user's assignment. Each new explicit
+delegation has its own ID; calls cannot attach to an existing assignment.
 
-Delegation uses the existing bounded mailbox retention: retry identity is retained only while
-the entry remains in its 5000-entry history. Pending messages are never evicted. Cross-kind
-reuse of a retained request ID is rejected. Spawn correlation remains in the session overlay;
-no retrospective IDs are assigned to older sessions.
+New delegation and spawn admissions retain bounded assignment records independently of
+ordinary message history. Pending and uncertain deliveries and open assignments are pinned;
+terminal resolved records can be evicted. Retry identity lasts while the message or assignment
+record is retained, and cross-kind reuse is rejected. No historical assignments are inferred.
+
+## Explicit assignment outcomes
+
+`list_assignments {cursor?,limit?}` lists records where the calling session is parent or child;
+`read_assignment {source,assignment_id}` reads one. Source is required and is `spawn` or
+`delegation`: the same ID may occur in both stores, and a call never falls back to the other.
+The listing uses an opaque participant-scoped keyset cursor, a default limit of 50 and maximum
+100. Inserts before the cursor are not included in later pages; eviction does not invalidate it.
+
+`update_assignment {source,assignment_id,generation,expected_revision,operation_id,outcome,summary?,report_id?}`
+records an explicit outcome. The child may use `completed`, `blocked`, `failed`, or `open`
+(to clear a blocker); the parent may use `cancelled`. A bounded summary is required except
+for `open`. Reuse the same operation ID and arguments for a retry. Each record retains the
+latest 64 receipts; an evicted retry with an old revision is rejected. A completion can reference
+a published retained report for exactly this source, assignment and participants. The summary
+is sufficient without a report, and later report eviction does not undo the outcome.
+Pass the exact service-generated `generation` returned by list or read: if an expired ID is
+later reused, an old generation cannot mutate the new assignment or attach its old report.
+Reports without matching generation, including historical reports, cannot be attached. A turn
+ending or a report arriving does not complete an assignment. Cancellation before the durable
+handoff claim suppresses that start; cancellation after claim never sends `session/cancel` and
+does not erase delivery uncertainty.
+
+Only authenticated session participants can use these methods. Parent cancellation is available;
+there is currently no separate trusted user-control cancellation path. Absence of a peer token,
+client-supplied role fields, or client identity strings do not grant that authority.
 
 Send and reply return `{"messageId":"...","status":"accepted"}` after durable service
 acceptance, without waiting for recipient work. Opening an unloaded recipient and required
