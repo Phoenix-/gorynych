@@ -29,7 +29,7 @@ public sealed partial class Conductor
     }
 
     ReportAdmission? AdmitReport(SessionRecord record, JsonRpcConnection rpc, string promptId, string turnKey,
-        ReportCause cause, string? assignment, string? message)
+        ReportCause cause, string? assignment, string? message, string? assignmentGeneration = null)
     {
         if (!record.ReportToParent || record.ParentSessionId is not { } parent) return null;
         var link = HostOf(record).RouteOf(record.SessionId);
@@ -39,7 +39,7 @@ public sealed partial class Conductor
         {
             var identity = new ReportIdentity(turnKey, record.SessionId, parent, cause, promptId, assignment, message,
                 link.HostId, link.Generation?.Key, link.HostId is null ? Environment.ProcessId : link.ProcessId > 0 ? link.ProcessId : null,
-                link.HostId is null ? AgentHost.ProcessStartedAt(Environment.ProcessId) : link.ProcessStart, legacy);
+                link.HostId is null ? AgentHost.ProcessStartedAt(Environment.ProcessId) : link.ProcessStart, legacy, assignmentGeneration);
             var receipt = reports.Reserve(identity);
             var id = receipt.ReportId;
             var admission = new ReportAdmission(id, identity, receipt.Created);
@@ -181,8 +181,9 @@ public sealed partial class Conductor
         if (!child.ReportToParent) return;
         try
         {
-            var identity = new ReportIdentity("spawn-unstarted:" + (child.SpawnAssignmentId ?? child.SessionId), child.SessionId,
-                parent.SessionId, ReportCause.Spawn, promptId, child.SpawnAssignmentId);
+            var generation = (string?)child.SpawnAssignment?["generation"];
+            var identity = new ReportIdentity("spawn-unstarted:" + (child.SpawnAssignmentId ?? child.SessionId) + (generation is null ? "" : ":" + generation), child.SessionId,
+                parent.SessionId, ReportCause.Spawn, promptId, child.SpawnAssignmentId, AssignmentGeneration: generation);
             var id = reports.Reserve(identity, BoundLocalNativeError(failure.Message)).ReportId;
             ImportReport(id);
         }

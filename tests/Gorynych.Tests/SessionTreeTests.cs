@@ -123,6 +123,258 @@ public sealed class SessionTreeTests
     }
 
     [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task SpawnCancellationBeforeClaimSuppressesInputAndLeavesSessionUsable()
+    {
+        var parentAgent = new LifecycleAgent("claude", canDelete: false);
+        var childAgent = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, parentAgent.Adapter, childAgent.Adapter);
+        await using var client = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(client, "claude", "Coordinate work");
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        conductor.BeforeSpawnAssignmentClaim = () => { entered.Set(); if (!release.Wait(TimeSpan.FromSeconds(15))) throw new IOException("claim barrier timeout"); };
+        string child; string assignment;
+        try
+        {
+            var spawned = await SpawnAsync(client, parentAgent.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "suppressed spawn work", ["report"] = false });
+            child = (string)spawned!["sessionId"]!; assignment = (string)spawned["assignmentId"]!;
+            Assert.IsTrue(await Task.Run(() => entered.Wait(TimeSpan.FromSeconds(15))));
+            Assert.AreEqual("queued", (string?)conductor.Store.FindSpawnAssignment(assignment, parent)!["delivery"]);
+            conductor.Store.TransitionSpawnAssignment(child, assignment, parent, 1, "cancel", "cancelled", "withdrawn", generation: (string)conductor.Store.Get(child)!.SpawnAssignment!["generation"]!);
+        }
+        finally { release.Set(); }
+        await Until(() => conductor.Feed(child).TurnGate.CurrentCount == 1, "cancelled first-turn gate released");
+        Assert.AreEqual(0, Prompts(childAgent, child).Length);
+        Assert.IsFalse(conductor.Feed(child).Journal.ReadAll().Any(u => (string?)u["_meta"]?[GorynychProtocol.MetaAssignmentId] == assignment));
+        conductor.BeforeSpawnAssignmentClaim = null;
+        await PromptAsync(client, child, "ordinary work after suppression");
+        Assert.AreEqual(1, Prompts(childAgent, child).Length);
+        Assert.AreEqual("suppressed", (string?)conductor.Store.FindSpawnAssignment(assignment, parent)!["delivery"]);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task DeletedSpawnBeforeClaimRetainsHiddenAssignmentWithoutInput(bool nativeDelete)
+    {
+        var parentAgent = new LifecycleAgent("claude", canDelete: false); var childAgent = new LifecycleAgent("kimi", canDelete: nativeDelete);
+        await using var conductor = Conductor(null, parentAgent.Adapter, childAgent.Adapter);
+        await using var client = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(client, "claude", "coordinate");
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        conductor.BeforeSpawnAssignmentClaim = () => { entered.Set(); if (!release.Wait(TimeSpan.FromSeconds(15))) throw new IOException("claim barrier timeout"); };
+        string child; string assignment; SessionFeed? oldFeed = null;
+        try
+        {
+            var spawned = await SpawnAsync(client, parentAgent.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "deleted work", ["report"] = false });
+            child = (string)spawned!["sessionId"]!; assignment = (string)spawned["assignmentId"]!;
+            Assert.IsTrue(await Task.Run(() => entered.Wait(TimeSpan.FromSeconds(15))));
+            oldFeed = conductor.Feed(child);
+            await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionDelete, new JsonObject { ["sessionId"] = child }).WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.IsTrue(conductor.Store.Get(child)!.Deleted);
+            Assert.AreEqual("not_started", (string?)conductor.Store.FindSpawnAssignment(assignment, parent)!["delivery"]);
+        }
+        finally { release.Set(); }
+        await Until(() => oldFeed!.TurnGate.CurrentCount == 1, "deleted runner exited");
+        Assert.AreEqual(0, Prompts(childAgent, child).Length);
+        Assert.AreEqual("open", (string?)conductor.Store.FindSpawnAssignment(assignment, parent)!["status"]);
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task SpawnRunnerFailureBeforeClaimRecordsNotStarted()
+    {
+        var parentAgent = new LifecycleAgent("claude", canDelete: false); var childAgent = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, parentAgent.Adapter, childAgent.Adapter);
+        await using var client = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(client, "claude", "coordinate");
+        conductor.BeforeSpawnAssignmentClaim = () => throw new IOException("preclaim failure");
+        var spawned = await SpawnAsync(client, parentAgent.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "not started", ["report"] = false });
+        var child = (string)spawned!["sessionId"]!; var assignment = (string)spawned["assignmentId"]!;
+        await Until(() => (string?)conductor.Store.FindSpawnAssignment(assignment, parent)?["delivery"] == "not_started", "preclaim failure persisted");
+        Assert.AreEqual("open", (string?)conductor.Store.FindSpawnAssignment(assignment, child)!["status"]);
+        Assert.AreEqual(0, Prompts(childAgent, child).Length);
+        Assert.IsFalse(conductor.Feed(child).Journal.ReadAll().Any(u => (string?)u["_meta"]?[GorynychProtocol.MetaAssignmentId] == assignment));
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task SpawnCancellationAfterClaimKeepsNativeTurnAndOutcomeIndependent()
+    {
+        var parentAgent = new LifecycleAgent("claude", canDelete: false);
+        var childAgent = new LifecycleAgent("kimi", canDelete: true);
+        await using var conductor = Conductor(null, parentAgent.Adapter, childAgent.Adapter);
+        await using var client = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(client, "claude", "Coordinate work");
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        childAgent.BeforePrompt = async _ => { entered.TrySetResult(); await release.Task; };
+        var cancellations = 0;
+        string child; string assignment;
+        try
+        {
+            var spawned = await SpawnAsync(client, parentAgent.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "claimed spawn work", ["report"] = false });
+            child = (string)spawned!["sessionId"]!; assignment = (string)spawned["assignmentId"]!;
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            var native = childAgent.Adapter.Current!.Rpc; var previous = native.NotificationHandler;
+            native.NotificationHandler = (method, payload) =>
+            {
+                if (method == AcpMethods.Agent.SessionCancel) Interlocked.Increment(ref cancellations);
+                return previous?.Invoke(method, payload) ?? Task.CompletedTask;
+            };
+            Assert.AreEqual("started", (string?)conductor.Store.FindSpawnAssignment(assignment, parent)!["delivery"]);
+            conductor.Store.TransitionSpawnAssignment(child, assignment, parent, 1, "cancel", "cancelled", "withdrawn", generation: (string)conductor.Store.Get(child)!.SpawnAssignment!["generation"]!);
+        }
+        finally { release.TrySetResult(); }
+        await Until(() => (string?)conductor.Store.FindSpawnAssignment(assignment, parent)?["delivery"] == "delivered", "native result recorded");
+        Assert.AreEqual("cancelled", (string?)conductor.Store.FindSpawnAssignment(assignment, child)!["status"]);
+        Assert.AreEqual(1, Prompts(childAgent, child).Length);
+        Assert.AreEqual(0, Volatile.Read(ref cancellations), "assignment cancellation does not send session/cancel");
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task SpawnQueuedBeforeConductorExitIsNotReplayed()
+    {
+        var directory = TestDirs.New();
+        var parentAgent = new LifecycleAgent("claude", canDelete: false);
+        var childAgent = new LifecycleAgent("kimi", canDelete: true);
+        var hosts = new InProcessHosts(name => name == "claude" ? parentAgent.Adapter : childAgent.Adapter);
+        Conductor Next()
+        {
+            var service = new Conductor(new ConductorOptions { DataDirectory = directory, ServiceId = "spawn-preclaim-restart", Hosts = hosts,
+                HostToken = InProcessHosts.Token, PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"] }, [parentAgent.Adapter, childAgent.Adapter]);
+            hosts.Service = service; return service;
+        }
+        var conductor = Next(); var client = await TestClient.ConnectAsync(conductor, "zed");
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        try
+        {
+            var parent = await NewPromptedAsync(client, "claude", "coordinate");
+            conductor.BeforeSpawnAssignmentClaim = () => { entered.Set(); if (!release.Wait(TimeSpan.FromSeconds(25))) throw new IOException("claim barrier timeout"); };
+            var spawned = await SpawnAsync(client, parentAgent.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "preclaim work", ["report"] = false });
+            var child = (string)spawned!["sessionId"]!; var assignment = (string)spawned["assignmentId"]!;
+            Assert.IsTrue(await Task.Run(() => entered.Wait(TimeSpan.FromSeconds(15))));
+            var oldFeed = conductor.Feed(child);
+            await HostTests.GoneAsync(conductor, null, hosts); await client.DisposeAsync();
+            conductor = Next(); client = await TestClient.ConnectAsync(conductor, "zed");
+            Assert.AreEqual("not_started", (string?)conductor.Store.FindSpawnAssignment(assignment, parent)!["delivery"]);
+            release.Set();
+            await LinkHarness.Until(() => oldFeed.TurnGate.CurrentCount == 1, "old preclaim runner left").WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.AreEqual(0, Prompts(childAgent, child).Count(p => p.Contains("preclaim work", StringComparison.Ordinal)));
+            await PromptAsync(client, child, "ordinary work").WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.AreEqual(0, Prompts(childAgent, child).Count(p => p.Contains("preclaim work", StringComparison.Ordinal)));
+            Assert.AreEqual("not_started", (string?)conductor.Store.FindSpawnAssignment(assignment, parent)!["delivery"]);
+        }
+        finally { release.Set(); await client.DisposeAsync(); await conductor.DisposeAsync(); }
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task SpawnClaimSurvivesHostedRestartAndLateTerminal()
+    {
+        var directory = TestDirs.New();
+        var parentAgent = new LifecycleAgent("claude", canDelete: false);
+        var childAgent = new LifecycleAgent("kimi", canDelete: true);
+        var hosts = new InProcessHosts(name => name == "claude" ? parentAgent.Adapter : childAgent.Adapter);
+        Conductor Next()
+        {
+            var service = new Conductor(new ConductorOptions { DataDirectory = directory, ServiceId = "spawn-restart", Hosts = hosts,
+                HostToken = InProcessHosts.Token, PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"] }, [parentAgent.Adapter, childAgent.Adapter]);
+            hosts.Service = service; return service;
+        }
+        var conductor = Next(); var client = await TestClient.ConnectAsync(conductor, "zed");
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var parent = await NewPromptedAsync(client, "claude", "coordinate");
+            childAgent.BeforePrompt = async _ => { entered.TrySetResult(); await release.Task; };
+            var spawned = await SpawnAsync(client, parentAgent.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "restart work", ["report"] = false });
+            var child = (string)spawned!["sessionId"]!; var assignment = (string)spawned["assignmentId"]!;
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            conductor.Store.TransitionSpawnAssignment(child, assignment, parent, 1, "cancel", "cancelled", "withdrawn", generation: (string)conductor.Store.Get(child)!.SpawnAssignment!["generation"]!);
+            await HostTests.RestartAsync(conductor); await HostTests.GoneAsync(conductor, null, hosts); await client.DisposeAsync();
+            conductor = Next(); client = await TestClient.ConnectAsync(conductor, "zed");
+            await LinkHarness.Until(() => conductor.Feed(child).Adopted is not null, "spawn turn adopted").WaitAsync(TimeSpan.FromSeconds(20));
+            var recovered = conductor.Store.FindSpawnAssignment(assignment, parent)!;
+            Assert.AreEqual("cancelled", (string?)recovered["status"]); Assert.AreEqual("uncertain", (string?)recovered["delivery"]);
+            release.TrySetResult();
+            await LinkHarness.Until(() => (string?)conductor.Store.FindSpawnAssignment(assignment, parent)?["delivery"] == "delivered", "late spawn terminal recorded").WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.AreEqual("cancelled", (string?)conductor.Store.FindSpawnAssignment(assignment, child)!["status"]);
+            Assert.AreEqual(1, Prompts(childAgent, child).Count(p => p.Contains("restart work", StringComparison.Ordinal)));
+            childAgent.BeforePrompt = null;
+            await PromptAsync(client, child, "next work").WaitAsync(TimeSpan.FromSeconds(20));
+        }
+        finally { release.TrySetResult(); await client.DisposeAsync(); await conductor.DisposeAsync(); }
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task HostedSpawnRefusalBeforeDispatchPersistsNotStarted(bool failReportCleanup)
+    {
+        var directory = TestDirs.New(); var parentAgent = new LifecycleAgent("claude", canDelete: false);
+        var childAgent = new LifecycleAgent("kimi", canDelete: true);
+        var hosts = new InProcessHosts(name => name == "claude" ? parentAgent.Adapter : childAgent.Adapter);
+        await using var conductor = new Conductor(new ConductorOptions { DataDirectory = directory, ServiceId = "spawn-refusal", Hosts = hosts,
+            HostToken = InProcessHosts.Token, PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"] }, [parentAgent.Adapter, childAgent.Adapter]);
+        hosts.Service = conductor;
+        await using var client = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(client, "claude", "coordinate");
+        using var claimEntered = new ManualResetEventSlim(); using var claimRelease = new ManualResetEventSlim();
+        var historyEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var historyRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        conductor.BeforeSpawnAssignmentClaim = () => { claimEntered.Set(); if (!claimRelease.Wait(TimeSpan.FromSeconds(20))) throw new IOException("claim barrier timeout"); };
+        childAgent.BeforeResume = async _ => { historyEntered.TrySetResult(); await historyRelease.Task; };
+        Task<JsonNode?>? history = null;
+        var originalWriter = conductor.ReportStorage.WriteManifest;
+        var cleanupAttempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            var spawned = await SpawnAsync(client, parentAgent.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "must not dispatch" });
+            var child = (string)spawned!["sessionId"]!; var assignment = (string)spawned["assignmentId"]!;
+            Assert.IsTrue(await Task.Run(() => claimEntered.Wait(TimeSpan.FromSeconds(15))));
+            var rpc = conductor.Agents["kimi"].RouteOf(child)!.Rpc;
+            history = rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, new JsonObject { ["sessionId"] = child, ["cwd"] = directory, ["mcpServers"] = new JsonArray() });
+            await historyEntered.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            if (failReportCleanup) conductor.ReportStorage.WriteManifest = (_, _) => { cleanupAttempted.TrySetResult(); throw new IOException("report cleanup fault"); };
+            claimRelease.Set();
+            await LinkHarness.Until(() => (string?)conductor.Store.FindSpawnAssignment(assignment, parent)?["delivery"] == "not_started", "host refusal recorded").WaitAsync(TimeSpan.FromSeconds(20));
+            if (failReportCleanup) await cleanupAttempted.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            var saved = new SessionStore(Path.Combine(directory, "sessions.json")).FindSpawnAssignment(assignment, child)!;
+            Assert.AreEqual("open", (string?)saved["status"]);
+            Assert.AreEqual((string?)saved["reportId"], (string?)saved["hostRefusalReportId"]);
+            Assert.IsNotNull(saved["hostRefusalReportId"]);
+            Assert.AreEqual(0, Prompts(childAgent, child).Length, "host refused before native prompt input");
+        }
+        finally { conductor.ReportStorage.WriteManifest = originalWriter; claimRelease.Set(); historyRelease.TrySetResult(); }
+        if (history is not null) await history.WaitAsync(TimeSpan.FromSeconds(20));
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task HostedNativeSpawnErrorIsFailedNotHostRefusal()
+    {
+        var directory = TestDirs.New(); var parentAgent = new LifecycleAgent("claude", canDelete: false);
+        var childAgent = new LifecycleAgent("kimi", canDelete: true);
+        var hosts = new InProcessHosts(name => name == "claude" ? parentAgent.Adapter : childAgent.Adapter);
+        await using var conductor = new Conductor(new ConductorOptions { DataDirectory = directory, ServiceId = "spawn-native-error", Hosts = hosts,
+            HostToken = InProcessHosts.Token, PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"] }, [parentAgent.Adapter, childAgent.Adapter]);
+        hosts.Service = conductor; await using var client = await TestClient.ConnectAsync(conductor, "zed");
+        var parent = await NewPromptedAsync(client, "claude", "coordinate");
+        childAgent.BeforePrompt = _ => Task.FromException(new JsonRpcException(JsonRpcException.InvalidRequest, "native rejected input"));
+        var spawned = await SpawnAsync(client, parentAgent.Tokens[parent], new JsonObject { ["agent"] = "kimi", ["prompt"] = "native error" });
+        var child = (string)spawned!["sessionId"]!; var assignment = (string)spawned["assignmentId"]!;
+        await LinkHarness.Until(() => (string?)conductor.Store.FindSpawnAssignment(assignment, parent)?["delivery"] == "failed", "native failure persisted").WaitAsync(TimeSpan.FromSeconds(20));
+        var saved = new SessionStore(Path.Combine(directory, "sessions.json")).FindSpawnAssignment(assignment, child)!;
+        Assert.IsNull(saved["hostRefusalReportId"]);
+        Assert.AreEqual(1, Prompts(childAgent, child).Length, "native adapter received exactly one prompt");
+    }
+
+    [TestMethod]
     public async Task DelegateOnlyToImmediateChildAndPreserveCorrelation()
     {
         var agent = new LifecycleAgent("claude", canDelete: false);

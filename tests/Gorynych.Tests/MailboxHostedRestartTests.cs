@@ -15,6 +15,7 @@ public sealed class MailboxHostedRestartTests
     [DataRow(false, false, false, DisplayName = "accepted message queued behind a surviving native turn")]
     [DataRow(true, false, false, DisplayName = "mailbox turn already handed to a surviving host")]
     [DataRow(false, true, false, DisplayName = "delegation retry across restart behind a surviving native turn")]
+    [DataRow(true, true, false, DisplayName = "cancelled delegation after claim across hosted restart")]
     [DataRow(false, false, true, DisplayName = "reply wait queued across a surviving native turn")]
     [DataRow(true, false, true, DisplayName = "reply wait retains uncertain handoff across restart")]
     [Timeout(60000, CooperativeCancellation = true)]
@@ -77,6 +78,11 @@ public sealed class MailboxHostedRestartTests
             Assert.AreEqual("accepted", (string?)receipt!["status"]);
             if (delegation) Assert.AreEqual(messageId, (string?)receipt["assignmentId"]);
             if (inFlight) await entered.Task.WaitAsync(Wait);
+            if (inFlight && delegation)
+            {
+                var cancelled = service.ReplyMailbox.TransitionAssignment(messageId, from, 1, "cancel-op", "cancelled", "withdrawn", generation: (string)service.ReplyMailbox.FindAssignment(messageId, from)!["generation"]!);
+                Assert.AreEqual("started", (string?)cancelled["delivery"]);
+            }
             if (inFlight)
             {
                 var queued = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodSendMessage, new JsonObject
@@ -120,6 +126,14 @@ public sealed class MailboxHostedRestartTests
                     lock (sender.Prompts) return sender.Prompts.Any(p => p.SessionId == from &&
                         p.Text.Contains("processing is uncertain", StringComparison.Ordinal));
                 }, "explicit uncertainty notice after hosted mailbox handoff");
+            if (inFlight && delegation)
+            {
+                var recovered = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodReadAssignment, new JsonObject
+                { ["source"] = "delegation", ["assignmentId"] = messageId,
+                    ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = service.Store.Get(from)!.PeerToken } }).WaitAsync(Wait);
+                Assert.AreEqual("cancelled", (string?)recovered!["status"]);
+                Assert.AreEqual("uncertain", (string?)recovered["delivery"]);
+            }
             if (inFlight && expectReply)
             {
                 var page = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodListReplyWaits,
@@ -140,6 +154,13 @@ public sealed class MailboxHostedRestartTests
                     lock (recipient.Prompts) return recipient.Prompts.Any(p => p.Text.Contains(secondMarker, StringComparison.Ordinal));
                 }, "second queued message follows the surviving mailbox turn");
             await Prompt(client, to, "post-restart barrier").WaitAsync(Wait);
+            if (inFlight && delegation)
+            {
+                var late = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodReadAssignment, new JsonObject
+                { ["source"] = "delegation", ["assignmentId"] = messageId,
+                    ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = service.Store.Get(from)!.PeerToken } }).WaitAsync(Wait);
+                Assert.AreEqual("cancelled", (string?)late!["status"], "late turn/report cannot reopen the assignment");
+            }
             // BackgroundTurnsIdleAsync also tracks the host's perpetual stale-generation sweep.
             // Await the reports' actual turn completions instead of waiting for that loop to exit.
             await LinkHarness.Until(() => HostTests.EndMarks(service, from) == (inFlight ? 5 : 4),

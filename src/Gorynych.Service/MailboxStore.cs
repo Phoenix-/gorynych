@@ -11,7 +11,8 @@ internal sealed partial class MailboxStore
 {
     internal const int MaxTextLength = 32000;
     readonly string path;
-    readonly int capacity;
+    int capacity;
+    internal int CapacityForTests { set { if (value <= 0) throw new ArgumentOutOfRangeException(nameof(value)); lock (gate) capacity = value; } }
     readonly TimeProvider clock;
     readonly Lock gate = new();
     JsonArray entries;
@@ -19,12 +20,13 @@ internal sealed partial class MailboxStore
     long trimmedThrough;
     internal Action<string, string> WriteFile { get; set; } = static (path, json) => AtomicFile.WriteAllText(path, json);
 
-    internal MailboxStore(string path, int capacity = 5000, int waitCapacity = 1000, TimeProvider? clock = null)
+    internal MailboxStore(string path, int capacity = 5000, int waitCapacity = 1000, TimeProvider? clock = null, int assignmentCapacity = 1000)
     {
         this.path = path;
         this.clock = clock ?? TimeProvider.System;
         this.capacity = capacity > 0 ? capacity : throw new ArgumentOutOfRangeException(nameof(capacity));
         this.waitCapacity = waitCapacity > 0 ? waitCapacity : throw new ArgumentOutOfRangeException(nameof(waitCapacity));
+        this.assignmentCapacity = assignmentCapacity > 0 ? assignmentCapacity : throw new ArgumentOutOfRangeException(nameof(assignmentCapacity));
         if (File.Exists(path))
         {
             var root = JsonNode.Parse(File.ReadAllText(path))?.AsObject() ?? throw new InvalidDataException("Invalid mailbox state");
@@ -32,6 +34,7 @@ internal sealed partial class MailboxStore
             next = (long?)root["next"] ?? throw new InvalidDataException("Missing mailbox sequence");
             trimmedThrough = (long?)root["trimmedThrough"] ?? 0;
             if (root["replyWaits"] is { } retained) replyWaits = retained.AsObject();
+            if (root["assignments"] is { } existingAssignments) assignments = existingAssignments.AsObject();
         }
         else entries = [];
     }
@@ -75,11 +78,12 @@ internal sealed partial class MailboxStore
             var item = new JsonObject { ["id"] = requestId, ["sequence"] = next + 1, ["sender"] = sender,
                 ["recipient"] = recipient, ["text"] = text, ["replyTo"] = replyTo, ["delivered"] = false,
                 ["approvedFullAccess"] = approvedFullAccess };
-            if (delegation) { item["delegation"] = true; item["assignmentId"] = requestId; }
+            if (delegation) { item["delegation"] = true; item["assignmentId"] = requestId; item["assignmentGeneration"] = Guid.NewGuid().ToString("N"); }
             if (expectReply) item["expectReply"] = true;
             replacement.Add((JsonNode)item);
             var waits = AdmitOrResolveWait(requestId, sender, recipient, text, replyTo, expectReply, schedule);
-            Save(replacement, next + 1, trimmed, waits);
+            var admitted = delegation ? AdmitAssignment(requestId, sender, recipient, text, (string)item["assignmentGeneration"]!) : null;
+            Save(replacement, next + 1, trimmed, waits, admitted);
             return item.DeepClone().AsObject();
         }
     }
@@ -91,6 +95,12 @@ internal sealed partial class MailboxStore
     {
         lock (gate)
         {
+            if (!reply && delegation && assignments[requestId] is not null)
+            {
+                if (FindRetry(requestId, sender, targetOrMessage, text, null, delegation, expectReply) is null)
+                    throw new InvalidOperationException("The retained assignment identity is no longer available for retry");
+                return targetOrMessage;
+            }
             if (AddressOf(requestId) is not { } existing) return null;
             var target = reply ? existing.Recipient : targetOrMessage;
             if (FindRetry(requestId, sender, target, text, reply ? targetOrMessage : null, delegation, expectReply) is null)
@@ -113,6 +123,13 @@ internal sealed partial class MailboxStore
             if (expectReply && replyWaits[requestId] is null)
                 throw new InvalidOperationException("The reply wait has expired; its expectation cannot be recreated by retrying the old request.");
             return existing.DeepClone().AsObject();
+        }
+        if (assignments[requestId] is JsonObject assignment)
+        {
+            if (!delegation || expectReply || replyTo is not null || (string?)assignment["parent"] != sender ||
+                (string?)assignment["child"] != recipient || (string?)assignment["fingerprint"] != WaitFingerprint(text))
+                throw new InvalidOperationException("Message ID is already used for another message");
+            return new JsonObject { ["id"] = requestId, ["assignmentId"] = requestId, ["sender"] = sender, ["recipient"] = recipient };
         }
         if (replyWaits[requestId] is JsonObject retained)
         {
@@ -170,18 +187,43 @@ internal sealed partial class MailboxStore
 
     // A persisted claim precedes handing a prompt to a host. Recovery must treat a claim as
     // uncertain, since a crash can occur on either side of the host accepting that prompt.
-    internal void MarkStarted(string id, string recipient) => SetFlag(id, recipient, "started");
+    internal void MarkStarted(string id, string recipient)
+    {
+        if (!TryMarkStarted(id, recipient)) throw new InvalidOperationException("Assignment was cancelled before dispatch");
+    }
+
+    internal bool TryMarkStarted(string id, string recipient, long? expectedSequence = null)
+    {
+        lock (gate)
+        {
+            if (assignments[id] is JsonObject assignment && (string?)assignment["status"] == "cancelled" &&
+                (string?)assignment["delivery"] == "suppressed") return false;
+            var copy = entries.DeepClone().AsArray();
+            var item = copy.OfType<JsonObject>().FirstOrDefault(e => (string?)e["id"] == id && (string?)e["recipient"] == recipient);
+            if (expectedSequence is not null && (long?)item?["sequence"] != expectedSequence) return false;
+            if (item is null) throw new InvalidOperationException("Unknown message for recipient");
+            if ((bool?)item["started"] == true) return true;
+            item["started"] = true;
+            var updated = WithAssignmentDelivery(id, "started");
+            Save(copy, next, waits: WithWaitDelivery(item, "handoff_started"), assigned: updated);
+            return true;
+        }
+    }
 
     internal void MarkDelivered(string id, string recipient)
         => SetFlag(id, recipient, "delivered");
 
-    internal void MarkFailed(string id, string recipient, string reason, string? notify = null, bool uncertain = false)
+    internal bool MarkFailed(string id, string recipient, string reason, string? notify = null, bool uncertain = false, long? expectedSequence = null)
     {
         if (reason.Length > MaxTextLength - 1500) reason = reason[..(MaxTextLength - 1500)] + "...";
         lock (gate)
         {
             var copy = entries.DeepClone().AsArray();
-            var item = copy.OfType<JsonObject>().First(e => (string?)e["id"] == id && (string?)e["recipient"] == recipient);
+            var item = copy.OfType<JsonObject>().FirstOrDefault(e => (string?)e["id"] == id && (string?)e["recipient"] == recipient);
+            if (expectedSequence is not null && (long?)item?["sequence"] != expectedSequence) return false;
+            if (item is null) throw new InvalidOperationException("Unknown message for recipient");
+            // A cancellation that suppressed this queued input won the admission race.
+            if ((string?)assignments[id]?["delivery"] == "suppressed") return false;
             item["error"] = reason;
             item["delivered"] = true;
             var sequence = next;
@@ -203,7 +245,9 @@ internal sealed partial class MailboxStore
                         ["text"] = $"Delivery notice for message_id {id} to {recipient}: {reason}\nThis is a service notice; no reply is required.", ["delivered"] = false });
                 }
             }
-            Save(copy, sequence, trimmed, WithWaitDelivery(item, uncertain && (bool?)item["started"] == true ? "uncertain" : "failed"));
+            var disposition = uncertain && (bool?)item["started"] == true ? "uncertain" : "failed";
+            Save(copy, sequence, trimmed, WithWaitDelivery(item, disposition), WithAssignmentDelivery(id, disposition));
+            return true;
         }
     }
 
@@ -216,17 +260,20 @@ internal sealed partial class MailboxStore
                 ?? throw new InvalidOperationException("Unknown message for recipient");
             if ((bool?)item[flag] == true) return;
             item[flag] = true;
-            Save(copy, next, waits: WithWaitDelivery(item, flag == "started" ? "handoff_started" : "delivered"));
+            Save(copy, next, waits: WithWaitDelivery(item, flag == "started" ? "handoff_started" : "delivered"),
+                assigned: WithAssignmentDelivery(id, flag == "started" ? "started" : "delivered"));
         }
     }
 
-    void Save(JsonArray replacement, long sequence, long? trimmed = null, JsonObject? waits = null)
+    void Save(JsonArray replacement, long sequence, long? trimmed = null, JsonObject? waits = null, JsonObject? assigned = null)
     {
         var root = new JsonObject { ["next"] = sequence, ["entries"] = replacement, ["trimmedThrough"] = trimmed ?? trimmedThrough };
         if (waits is not null || replyWaits.Count > 0) root["replyWaits"] = waits ?? replyWaits.DeepClone();
+        if (assigned is not null || assignments.Count > 0) root["assignments"] = assigned ?? assignments.DeepClone();
         WriteFile(path, root.ToJsonString());
         entries = root["entries"]!.AsArray();
         if (waits is not null) replyWaits = waits;
+        if (assigned is not null) assignments = assigned;
         next = sequence;
         trimmedThrough = trimmed ?? trimmedThrough;
     }

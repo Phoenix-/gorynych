@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Nodes;
 using Gorynych.Acp.Hosting;
 
 namespace Gorynych.Service;
@@ -46,6 +47,10 @@ public sealed class SessionRecord
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? SpawnAssignmentId { get; set; }
+
+    // Service-owned initial-spawn obligation, committed with the session overlay.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonObject? SpawnAssignment { get; set; }
 
     /// <summary>The AHP URI of a session created through the AHP face (<c>gorynych/ahpUri</c>); null for any other.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -119,7 +124,7 @@ internal sealed partial class ServiceJsonContext : JsonSerializerContext;
 /// The service's overlay of sessions: which adapter owns each one, plus the fields the
 /// harness cannot store (for Kimi, a title). Persisted as one small JSON file.
 /// </summary>
-public sealed class SessionStore
+public sealed partial class SessionStore
 {
     /// <summary>How often a bare activity stamp (<see cref="Touch"/>) may try to write the file.</summary>
     static readonly TimeSpan TouchSaveInterval = TimeSpan.FromSeconds(1);
@@ -222,14 +227,33 @@ public sealed class SessionStore
         {
             if (!records.TryGetValue(sessionId, out var current) || current.Deleted)
                 throw new InvalidOperationException("Spawn session no longer exists");
+            if (current.SpawnAssignmentId is not null)
+            {
+                if (current.SpawnAssignment is not null && current.SpawnAssignmentId == assignmentId) return Clone(current);
+                throw new InvalidOperationException("The session already has a spawn assignment identity");
+            }
+            if (records.Values.Any(r => r.SessionId != sessionId && (string?)r.SpawnAssignment?["assignmentId"] == assignmentId))
+                throw new InvalidOperationException("The spawn assignment ID is already in use");
+            SessionRecord? evicted = null;
+            if (SpawnAssignmentCapacity <= 0) throw new InvalidOperationException("Invalid spawn assignment capacity");
+            if (records.Values.Count(r => r.SpawnAssignment is not null) >= SpawnAssignmentCapacity)
+            {
+                var victim = records.Values.Where(r => (string?)r.SpawnAssignment?["status"] is "completed" or "cancelled" or "failed" &&
+                        (string?)r.SpawnAssignment?["delivery"] is "delivered" or "failed" or "suppressed" or "not_started")
+                    .OrderBy(r => r.CreatedAt).ThenBy(r => r.SessionId, StringComparer.Ordinal).FirstOrDefault();
+                if (victim is null) throw new InvalidOperationException("Spawn assignment storage is full of active or unresolved assignments");
+                evicted = Clone(victim); evicted.SpawnAssignment = null;
+            }
             var candidate = Clone(current);
             candidate.SpawnAssignmentId = assignmentId;
+            candidate.SpawnAssignment = NewSpawnAssignment(current, assignmentId);
             candidate.Draft = false;
-            var snapshot = records.Values.Select(r => r.SessionId == sessionId ? candidate : r)
+            var snapshot = records.Values.Select(r => r.SessionId == sessionId ? candidate : evicted is not null && r.SessionId == evicted.SessionId ? evicted : r)
                 .OrderBy(r => r.CreatedAt).ToList();
             var json = JsonSerializer.Serialize(snapshot, ServiceJsonContext.Default.ListSessionRecord);
             WriteFile(path, json, true);
             var before = Clone(current);
+            if (evicted is not null) records[evicted.SessionId] = evicted;
             records[sessionId] = candidate;
             written = ++changes;
             Changed?.Invoke(before, Clone(candidate));
@@ -267,9 +291,17 @@ public sealed class SessionStore
         lock (gate)
         {
             removed.Add(sessionId);
-            if (!records.Remove(sessionId, out var gone)) return;
+            if (!records.TryGetValue(sessionId, out var gone)) return;
+            var before = Clone(gone);
+            // Keep a hidden tombstone for the separately retained spawn obligation.
+            if (gone.SpawnAssignment is not null)
+            {
+                gone.Deleted = true; gone.Draft = false;
+                if ((string?)gone.SpawnAssignment["delivery"] == "queued") gone.SpawnAssignment["delivery"] = "not_started";
+            }
+            else records.Remove(sessionId);
             snapshot = Snapshot();
-            Removed?.Invoke(Clone(gone));
+            Removed?.Invoke(before);
         }
         Write(snapshot, durable: false);
     }
@@ -336,7 +368,7 @@ public sealed class SessionStore
         SessionId = r.SessionId, Agent = r.Agent, Cwd = r.Cwd, Title = r.Title, TitleSource = r.TitleSource,
         AutoTitleAttempted = r.AutoTitleAttempted,
         CreatedAt = r.CreatedAt, UpdatedAt = r.UpdatedAt, Draft = r.Draft, Deleted = r.Deleted,
-        ParentSessionId = r.ParentSessionId, SpawnAssignmentId = r.SpawnAssignmentId, ReportToParent = r.ReportToParent, Archived = r.Archived, PeerToken = r.PeerToken,
+        ParentSessionId = r.ParentSessionId, SpawnAssignmentId = r.SpawnAssignmentId, SpawnAssignment = r.SpawnAssignment?.DeepClone().AsObject(), ReportToParent = r.ReportToParent, Archived = r.Archived, PeerToken = r.PeerToken,
         HostSeen = r.HostSeen, HostPrompts = r.HostPrompts is null ? null : [.. r.HostPrompts],
         HostOf = r.HostOf, HostSlot = r.HostSlot, AhpUri = r.AhpUri,
     };

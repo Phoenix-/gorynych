@@ -255,8 +255,27 @@ public sealed class PeersTests
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
             StringAssert.Contains((string?)init["instructions"], "Use delegate_task to continue already user-authorized work with your immediate child");
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports", "request_reply", "list_reply_waits", "cancel_reply_wait" },
+            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports", "request_reply", "list_reply_waits", "cancel_reply_wait", "list_assignments", "read_assignment", "update_assignment" },
                 tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
+
+            StringAssert.Contains((string?)init["instructions"], "list_assignments");
+            conductor.ReplyMailbox.Accept("mcp-assignment", "asking", "answering", "work", delegation: true);
+            var malformedAssignment = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_assignments", ["arguments"] = new JsonArray() });
+            Assert.AreEqual(true, (bool?)malformedAssignment!["isError"]);
+            var assignmentList = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_assignments", ["arguments"] = new JsonObject() });
+            var assignmentPage = JsonNode.Parse((string)assignmentList!["content"]![0]!["text"]!)!;
+            Assert.AreEqual("mcp-assignment", (string?)assignmentPage["items"]![0]!["assignmentId"]);
+            var assignmentRead = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "read_assignment", ["arguments"] = new JsonObject
+            { ["source"] = "delegation", ["assignment_id"] = "mcp-assignment" } });
+            var assignmentBody = JsonNode.Parse((string)assignmentRead!["content"]![0]!["text"]!)!;
+            Assert.AreEqual("open", (string?)assignmentBody["status"]);
+            var assignmentGeneration = (string)assignmentBody["generation"]!;
+            var assignmentCancel = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "update_assignment", ["arguments"] = new JsonObject
+            { ["source"] = "delegation", ["assignment_id"] = "mcp-assignment", ["generation"] = assignmentGeneration, ["expected_revision"] = 1, ["operation_id"] = "cancel-1", ["outcome"] = "cancelled", ["summary"] = "stop" } });
+            Assert.AreEqual("cancelled", (string?)JsonNode.Parse((string)assignmentCancel!["content"]![0]!["text"]!)!["status"]);
+            var spoof = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "read_assignment", ["arguments"] = new JsonObject
+            { ["source"] = "delegation", ["assignment_id"] = "mcp-assignment", ["actor"] = "answering" } });
+            Assert.AreEqual(true, (bool?)spoof!["isError"]);
 
             var malformedWait = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_reply_waits", ["arguments"] = new JsonArray() });
             Assert.AreEqual(true, (bool?)malformedWait!["isError"]);

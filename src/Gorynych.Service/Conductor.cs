@@ -205,6 +205,7 @@ public sealed partial class Conductor : IAsyncDisposable
         journalDirectory = Path.Combine(options.DataDirectory, "journal");
         Directory.CreateDirectory(journalDirectory);
         store = new SessionStore(Path.Combine(options.DataDirectory, "sessions.json"));
+        store.ReconcileSpawnAssignments();
         uiMetadata = new UiMetadataStore(Path.Combine(options.DataDirectory, "ui-metadata.json"));
         reminderPolicy = ReplyReminderPolicy.Load(Path.Combine(options.DataDirectory, "reply-reminders.json"), out reminderPolicyStatus);
         startupDrafts = store.All().Where(r => r.Draft).Select(r => r.SessionId).ToList();
@@ -829,6 +830,17 @@ public sealed partial class Conductor : IAsyncDisposable
         var feed = Feed(sessionId);
         var hostSeq = (string?)report["_meta"]?[GorynychProtocol.MetaHostSeq];
         if (!ImportTerminal(report, sessionId)) return; // no cursor or end mark before durable import and ACK
+        try
+        {
+            lock (restartGate)
+                if (!cleanupStop.IsCancellationRequested && store.Get(sessionId) is { } owner && owner.Agent == host.Name)
+                    store.RecordSpawnDelivery(sessionId, (string?)report["promptId"], report["error"] is null ? "delivered" : "failed");
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            Volatile.Write(ref reportRecoveryFailure, "Spawn assignment delivery could not be saved: " + e.Message);
+            return; // retain terminal for recovery, rather than advance its cursor
+        }
         if (!hostSeqTaken && hostSeq is not null && SessionJournal.TryParseHostSeq(hostSeq, out var streamHost, out var sequence) &&
             sequence <= feed.HostCursor(streamHost))
         {
@@ -3846,7 +3858,11 @@ public sealed partial class Conductor : IAsyncDisposable
         }
         try
         {
-            store.Update(id, record.Agent, r => { r.Deleted = true; r.Draft = false; }, durable);
+            store.Update(id, record.Agent, r =>
+            {
+                r.Deleted = true; r.Draft = false;
+                if ((string?)r.SpawnAssignment?["delivery"] == "queued") r.SpawnAssignment!["delivery"] = "not_started";
+            }, durable);
         }
         catch (IOException e)
         {
@@ -4428,6 +4444,8 @@ public sealed partial class Conductor : IAsyncDisposable
     }
 
     /// <summary>The first turn of a spawned session. Holds the session's turn gate, taken before the spawn returned.</summary>
+    internal Action? BeforeSpawnAssignmentClaim { get; set; }
+
     async Task SpawnedTurnAsync(SessionFeed feed, SessionRecord record, SessionRecord parent, string prompt, bool approved)
     {
         string? promptId = null; // once its user message is out
@@ -4458,15 +4476,21 @@ public sealed partial class Conductor : IAsyncDisposable
             {
                 Content = shown, MessageId = messageId, Meta = meta,
             })!.AsObject();
-            await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
-            promptId = id;
-            await ProvisionalTitleAsync(feed, use.Record, rpc, [task]);
             feed.BeginTurnText(ReportLimit + 1);
             Task<JsonNode?> response;
             await feed.ForwardGate.WaitAsync(CancellationToken.None);
             try
             {
-                report = AdmitReport(record, rpc, id, "spawn:" + messageId, ReportCause.Spawn, record.SpawnAssignmentId, messageId);
+                report = AdmitReport(record, rpc, id, "spawn:" + messageId, ReportCause.Spawn, record.SpawnAssignmentId, messageId, (string?)record.SpawnAssignment?["generation"]);
+                BeforeSpawnAssignmentClaim?.Invoke();
+                lock (restartGate)
+                {
+                    if (draining || cleanupStop.IsCancellationRequested) return;
+                    if (!store.ClaimSpawnAssignment(record.SessionId, record.SpawnAssignmentId!, id, report?.Id)) return;
+                }
+                promptId = id;
+                await feed.PublishAsync(asked, except: null, () => store.Touch(record.SessionId));
+                await ProvisionalTitleAsync(feed, use.Record, rpc, [task]);
                 var forwarded = WithReport(WithMessageId(AcpJson.ToNode(new PromptRequest
                     {
                         SessionId = record.SessionId, Prompt = [task, context],
@@ -4483,7 +4507,21 @@ public sealed partial class Conductor : IAsyncDisposable
             }
             JsonNode? result;
             try { result = await response; }
-            catch (JsonRpcException error) { ImportLocalReport(report, feed, null, error); await HandleReportResponseErrorAsync(report, error); throw; }
+            catch (JsonRpcException error)
+            {
+                if (HostRefusedBeforeDispatch(report, error))
+                {
+                    try { lock (restartGate) if (!cleanupStop.IsCancellationRequested) store.RecordProvenUnstartedSpawn(record.SessionId, id, report!.Id); }
+                    catch (Exception failure) when (failure is IOException or UnauthorizedAccessException)
+                    { ServiceLog.Warn($"Spawn assignment refusal remains unconfirmed: {failure.Message}"); }
+                }
+                ImportLocalReport(report, feed, null, error);
+                await HandleReportResponseErrorAsync(report, error);
+                throw;
+            }
+            try { lock (restartGate) if (!cleanupStop.IsCancellationRequested) store.RecordSpawnDelivery(record.SessionId, id, "delivered"); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            { ServiceLog.Warn($"Spawn assignment delivery remains unconfirmed: {e.Message}"); }
             ImportLocalReport(report, feed, result);
             await RequireImportedAsync(report);
             KeepMark(feed, result);
@@ -4492,6 +4530,19 @@ public sealed partial class Conductor : IAsyncDisposable
         }
         catch (Exception e)
         {
+            try
+            {
+                lock (restartGate)
+                    if (!cleanupStop.IsCancellationRequested)
+                    {
+                        if (promptId is null) store.AbandonUnstartedSpawn(record.SessionId, record.SpawnAssignmentId!);
+                        else if (e is JsonRpcException refused && HostRefusedBeforeDispatch(report, refused))
+                            store.RecordProvenUnstartedSpawn(record.SessionId, promptId, report!.Id);
+                        else store.RecordSpawnDelivery(record.SessionId, promptId, !startAttempted ? "not_started" : e is JsonRpcException ? "failed" : "uncertain");
+                    }
+            }
+            catch (Exception failure) when (failure is IOException or UnauthorizedAccessException)
+            { ServiceLog.Warn($"Spawn assignment delivery remains unconfirmed: {failure.Message}"); }
             ServiceLog.Warn($"{record.Agent} {record.SessionId}: the spawned session's first turn failed: {e.Message}");
             if (e is ReportPersistenceException persistence) await ReportPersistenceNoticeAsync(feed, persistence);
             if (e is not ReportPersistenceException && promptId is not null && !(handed && LivesOnInHost(e))) await MarkPromptEndAsync(feed, promptId, null, e);
@@ -5966,7 +6017,7 @@ public sealed partial class Conductor : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-        cleanupStop.Cancel();
+        lock (restartGate) cleanupStop.Cancel();
         Volatile.Read(ref reclaimSweep)?.Dispose();
         reminderTimer?.Dispose();
         try { await Task.WhenAll(autoTitleTasks.Keys).WaitAsync(TimeSpan.FromSeconds(2)); }

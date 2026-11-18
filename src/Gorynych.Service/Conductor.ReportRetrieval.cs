@@ -10,7 +10,7 @@ public sealed partial class Conductor
     {
         ["turnKey"] = i.TurnKey, ["child"] = i.Child, ["parent"] = i.Parent,
         ["cause"] = i.Cause.ToString().ToLowerInvariant(), ["promptId"] = i.PromptId,
-        ["assignmentId"] = i.AssignmentId, ["messageId"] = i.MessageId,
+        ["assignmentId"] = i.AssignmentId, ["assignmentGeneration"] = i.AssignmentGeneration, ["messageId"] = i.MessageId,
         ["hostId"] = i.HostId, ["hostGeneration"] = i.HostGeneration, ["legacyCapture"] = i.LegacyCapture,
     };
 

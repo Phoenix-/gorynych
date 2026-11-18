@@ -404,7 +404,8 @@ retention, failure and compatibility. Managed prompts carry `gorynych/mailboxMes
 `_meta`; peer messages grant no new authority. The service advertises
 `gorynych/delegateTask` in `agentCapabilities._meta`. A delegated prompt and spawned
 first prompt carry `gorynych/assignmentId`; the managed spawn result exposes it as
-`assignment_id`. These identifiers provide correlation, not a task lifecycle.
+`assignment_id`. New assignments also have explicit outcome records; see
+[assignment outcomes](messaging.md#explicit-assignment-outcomes). A turn result alone does not complete one.
 
 ## Opinions between agents
 
@@ -2620,3 +2621,28 @@ longer identifies its live native process and never launches a new process for o
 a substitute. Service-generated reminder prompts carry `gorynych/replyReminder` under `_meta`, naming
 the original message and kind. The policy and retention guarantees are described in
 [messaging.md](messaging.md#targeted-reply-reminders).
+
+
+### Assignment outcomes (managed sessions)
+
+ACP `agentCapabilities._meta["gorynych/assignments"]` advertises
+`_gorynych/list_assignments`, `_gorynych/read_assignment` and `_gorynych/update_assignment`.
+Each request requires the existing peer token in `_meta`; an ACP client connection by itself
+is not a trusted user identity. List accepts `cursor?`, `limit?` (1..100). Exact read requires
+`source` (`spawn` or `delegation`) and `assignmentId`; update also requires
+`generation`, `expectedRevision`, `operationId`, `outcome`, and, except for `open`, `summary`; optional
+`reportId` is allowed only for `completed`. Records expose source, assignmentId, parent,
+child, immutable generation, status, revision, independent delivery, summary and outcomeReportId. No proof,
+operation history or peer token is returned. Participant-scoped keyset cursors remain usable
+after an earlier record is evicted.
+
+A report reference is accepted only while the immutable report is published and readable,
+and its stored cause, assignment ID, generation, parent and child match. Historical
+reports without an assignment generation cannot be attached; a summary remains sufficient. Validation and the assignment
+commit hold the report retention lock together. A retained operation receipt is checked before
+report availability, so an exact retry still succeeds after later report eviction. Assignment
+records and operation histories have bounded retention; expired report references can no
+longer be read, while the explicit outcome and summary remain until assignment eviction.
+The service does not synthesize an outcome from native turn results and does not schedule a
+model turn on an outcome update. MCP Tasks informs the lifecycle design; these methods do
+not implement the `tasks/*` protocol.
