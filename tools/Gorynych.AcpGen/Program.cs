@@ -11,6 +11,20 @@ var root = args.Length > 0 ? Path.GetFullPath(args[0]) : FindRepoRoot();
 var version = args.Length > 1 ? args[1] : "main-7441d10";
 var schemaDir = Path.Combine(root, "schema", "acp", version);
 var schema = JsonNode.Parse(File.ReadAllText(Path.Combine(schemaDir, "schema.json")))!.AsObject();
+// Only the subagent preview is overlaid; the rest remains the pinned stable schema.
+var previewPath = Path.Combine(schemaDir, "schema.preview.json");
+if (File.Exists(previewPath))
+{
+    var preview = JsonNode.Parse(File.ReadAllText(previewPath))!.AsObject();
+    var defs = schema["$defs"]!.AsObject();
+    foreach (var (name, definition) in preview["$defs"]!.AsObject())
+        if (!defs.ContainsKey(name)) defs.Add(name, definition!.DeepClone());
+    defs["ClientCapabilities"]!["properties"]!["subagents"] = preview["clientSubagents"]!.DeepClone();
+    var updates = defs["SessionUpdate"]!["oneOf"]!.AsArray();
+    foreach (var update in preview["sessionUpdates"]!.AsArray()) updates.Add(update!.DeepClone());
+    var toolContent = defs["ToolCallContent"]!["oneOf"]!.AsArray();
+    foreach (var content in preview["toolCallContent"]!.AsArray()) toolContent.Add(content!.DeepClone());
+}
 var meta = JsonNode.Parse(File.ReadAllText(Path.Combine(schemaDir, "meta.json")))!.AsObject();
 var output = Path.Combine(root, "src", "Gorynych.Acp", "Generated", "Acp.g.cs");
 var code = new Generator(schema, meta, version).Run();

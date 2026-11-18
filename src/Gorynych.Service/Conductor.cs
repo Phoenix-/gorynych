@@ -149,6 +149,7 @@ public sealed partial class Conductor : IAsyncDisposable
     const string AttributesKey = GorynychProtocol.MetaAttributes;
     readonly string journalDirectory;
     readonly ConcurrentDictionary<string, SessionFeed> feeds = new(StringComparer.Ordinal);
+    readonly SubagentRouting subagents = new();
     readonly ConcurrentDictionary<ClientConnection, byte> clients = new();
     readonly string activityEpoch = Guid.NewGuid().ToString("N");
 
@@ -792,7 +793,15 @@ public sealed partial class Conductor : IAsyncDisposable
             {
                 // A later ordinary event may have advanced the journal cursor past an
                 // unresolved report-delivery terminal retained by this host.
-                try { after[sessionId] = NeedsDeliveryReplay(sessionId, hostId) ? 0 : Feed(sessionId).HostCursor(hostId); }
+                try
+                {
+                    var feed = Feed(sessionId);
+                    if (store.Get(sessionId)?.Agent == "codex")
+                        foreach (var update in feed.Journal.ReadAll())
+                            if (SubagentRouting.Announcement(update) is { } child)
+                                subagents.Announce(SubagentRouting.SessionOf(update) ?? sessionId, child, sessionId);
+                    after[sessionId] = NeedsDeliveryReplay(sessionId, hostId) ? 0 : feed.HostCursor(hostId);
+                }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or System.Text.Json.JsonException)
                 { Volatile.Write(ref reportRecoveryFailure, "Report replay inventory failed: " + e.Message); after[sessionId] = 0; }
             }
@@ -1573,7 +1582,7 @@ public sealed partial class Conductor : IAsyncDisposable
 
     // ---------------------------------------------------------------- from agents
 
-    internal async Task OnAgentNotificationAsync(AgentHost host, string method, JsonNode? @params)
+    internal async Task OnAgentNotificationAsync(AgentHost host, string method, JsonNode? @params, JsonRpcConnection? source = null)
     {
         if (method == GorynychProtocol.MethodHostState)
         {
@@ -1626,10 +1635,34 @@ public sealed partial class Conductor : IAsyncDisposable
         }
         var sessionId = (string?)@params?["sessionId"];
         if (sessionId is null || removed.ContainsKey(sessionId)) return;
-        var feed = Feed(sessionId);
+        var root = host.Name == "codex" ? RootOfSubagent(sessionId) : null;
+        var feed = Feed(root ?? sessionId);
         if (method == AcpMethods.Client.SessionUpdate)
         {
             if (@params!["update"] is not JsonObject update) return;
+            if (root is not null || SubagentRouting.IsPreview(update))
+            {
+                if (host.Name != "codex" || store.Get(feed.SessionId) is not { Agent: "codex", Deleted: false }) return;
+                var currentSnapshot = SubagentRouting.IsCurrentSnapshot(update);
+                var liveState = SubagentRouting.IsLiveState(update);
+                var historical = !currentSnapshot && !liveState && feed.IsHistoryImport(source);
+                if (currentSnapshot && (source is null || host.RouteOf(feed.SessionId)?.Rpc != source)) return;
+                if (!historical && source is not null && (source.IsClosed || host.RouteOf(feed.SessionId) is { } active && active.Rpc != source)) return;
+                if (SubagentRouting.Announcement(update) is { } child
+                    && (child.Length == 0 || store.Get(child) is not null || !subagents.Announce(sessionId, child, feed.SessionId))) return;
+                if (root is not null) SubagentRouting.SetSession(update, sessionId);
+                if (update["_meta"]?[GorynychProtocol.MetaHostSeq] is JsonValue seq && seq.TryGetValue<string>(out var stamp) && !feed.TakeFromHost(stamp)) return;
+                if (update["_meta"] is JsonObject meta)
+                {
+                    var removedPrivate = meta.Remove(GorynychProtocol.MetaSubagentSnapshot);
+                    removedPrivate |= meta.Remove(GorynychProtocol.MetaSubagentLiveState);
+                    if (removedPrivate && meta.Count == 0) update.Remove("_meta");
+                }
+                if (currentSnapshot || liveState || !feed.CollectReplay(update))
+                    await feed.PublishAsync(update, except: null, () => { }, journal: !currentSnapshot,
+                        stateSource: source, historical: historical);
+                return;
+            }
             if (options.Hosts is null && feed.HasSteeringInFlight
                 && (string?)update["_meta"]?[GorynychProtocol.MetaAgentTurn] == "ended")
             {
@@ -1789,6 +1822,7 @@ public sealed partial class Conductor : IAsyncDisposable
             if (store.Get(feed.SessionId)?.Agent != host.Name) continue;
             // The adapter in this process runs all its sessions; a host, those open in it.
             var its = link.HostId is null || open.Contains(feed.SessionId);
+            if (its && host.Name == "codex") Track(Task.Run(() => feed.SubagentHostLostAsync(link.Rpc)));
             if (its)
             {
                 feed.Activity.Report("idle");
@@ -1862,11 +1896,11 @@ public sealed partial class Conductor : IAsyncDisposable
     /// back asks its questions again before it answers its replay, so they count before its sessions
     /// can move at all; one that goes before it asked them counts none.
     /// </summary>
-    internal void OnAgentRequestArrived(JsonRpcRequest request)
+    internal void OnAgentRequestArrived(AgentHost host, JsonRpcRequest request)
     {
         if (request.Params is not JsonObject p || p["sessionId"] is not JsonValue v || !v.TryGetValue<string>(out var sessionId)
             || removed.ContainsKey(sessionId)) return;
-        var feed = Feed(sessionId);
+        var feed = Feed(host.Name == "codex" ? RootOfSubagent(sessionId) ?? sessionId : sessionId);
         feed.BeginAsking();
         askedIn.AddOrUpdate(request, feed);
     }
@@ -1892,12 +1926,13 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         var sessionId = (string?)request.Params?["sessionId"]
             ?? throw new JsonRpcException(JsonRpcException.MethodNotFound, $"{request.Method} is not supported by Gorynych");
-        if (request.Method == AcpMethods.Client.SessionRequestPermission && PreAllowed(request.Params, Feed(sessionId)) is { } optionId)
+        var root = host.Name == "codex" ? RootOfSubagent(sessionId) : null;
+        var feed = Feed(root ?? sessionId);
+        if (request.Method == AcpMethods.Client.SessionRequestPermission && PreAllowed(request.Params, feed) is { } optionId)
         {
             ServiceLog.Info($"{host.Name} {sessionId}: allowed {(string?)request.Params?["toolCall"]?["title"] ?? (string?)request.Params?["toolCall"]?["toolCallId"]} without asking");
             return AcpJson.ToNode(new RequestPermissionResponse { Outcome = new SelectedPermissionOutcome { OptionId = optionId } });
         }
-        var feed = Feed(sessionId);
         // From a host, a question outlives this service when it exits for a restart: its host asks
         // the next one, which a client's link joins to the one it shows. So the client keeps it, as
         // its connection goes with this service, rather than see it withdrawn.
@@ -1920,12 +1955,19 @@ public sealed partial class Conductor : IAsyncDisposable
         {
             while (true)
             {
-                var client = await feed.WaitForClientAsync(c => c.Accepts(request.Method), ct);
+                var client = await feed.WaitForClientAsync(c => c.Accepts(request.Method) && (root is null || c.Subagents.RootOf(sessionId) == root), ct);
                 try
                 {
-                    if (request.Method == AcpMethods.Client.ElicitationCreate && !client.Accepts(request.Method))
-                        return await FormFallback.AskAsync(client, request, ct);
-                    return await client.Rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
+                    var outgoing = request;
+                    if (root is not null && client.Subagents.RootOf(sessionId) != root && request.Params is JsonObject original)
+                    {
+                        var fallback = (JsonObject)original.DeepClone();
+                        fallback["sessionId"] = root;
+                        outgoing = request with { Params = fallback };
+                    }
+                    if (outgoing.Method == AcpMethods.Client.ElicitationCreate && !client.Accepts(outgoing.Method))
+                        return await FormFallback.AskAsync(client, outgoing, ct);
+                    return await client.Rpc.SendRequestAsync(outgoing.Method, outgoing.Params?.DeepClone(), ct);
                 }
                 catch (Exception e) when (e is IOException or TimeoutException || (e is OperationCanceledException && !ct.IsCancellationRequested))
                 {
@@ -1937,9 +1979,11 @@ public sealed partial class Conductor : IAsyncDisposable
         {
             feed.ExitUse();
             // A question counted as it arrived goes idle once its answer is written (OnAgentRequestDone).
-            if (!askedIn.TryGetValue(request, out var counted)) IdleFromNow(sessionId);
+            if (!askedIn.TryGetValue(request, out var counted)) IdleFromNow(feed.SessionId);
         }
     }
+
+    internal string? RootOfSubagent(string sessionId) => subagents.RootOf(sessionId);
 
     // ---------------------------------------------------------------- for clients
 
@@ -2471,6 +2515,7 @@ public sealed partial class Conductor : IAsyncDisposable
                 SessionId = record.SessionId, Cwd = record.Cwd, McpServers = PeersFor(record.SessionId), SystemPrompt = SystemPromptFor(host),
                 Meta = meta.Count > 0 ? meta : null,
             };
+            if (host.ReplaysFrom) feed.BeginHistoryImport(rpc);
             if (host.ReplaysFrom && collect) feed.BeginReplay(feed.Journal.MaxEntries);
             try
             {
@@ -2479,6 +2524,7 @@ public sealed partial class Conductor : IAsyncDisposable
             finally
             {
                 if (host.ReplaysFrom && collect) history = feed.EndReplay();
+                if (host.ReplaysFrom) feed.EndHistoryImport(rpc);
             }
             if (host.ReplaysFrom)
             {
@@ -2496,6 +2542,7 @@ public sealed partial class Conductor : IAsyncDisposable
         }
         else if (host.CanLoad)
         {
+            feed.BeginHistoryImport(rpc);
             if (collect) feed.BeginReplay(feed.Journal.MaxEntries);
             try
             {
@@ -2508,6 +2555,7 @@ public sealed partial class Conductor : IAsyncDisposable
             finally
             {
                 if (collect) history = feed.EndReplay();
+                feed.EndHistoryImport(rpc);
             }
             replayed = HistoryCatchUp.Replayed.All;
         }
@@ -2554,7 +2602,12 @@ public sealed partial class Conductor : IAsyncDisposable
         try
         {
             if (feed.ReportedReadOnly is null && feed.OpenedReadOnly && host.RouteOf(feed.SessionId) is { } on)
+            {
                 await CatchUpByReadingAsync(host, on.Rpc, feed, cleanupStop.Token);
+                // Older hosts do not mark live states during catch-up. Ask their adapter for
+                // its latest observations afterwards; newer hosts also safely refresh here.
+                if (host.Name == "codex") await RefreshSubagentStatesAsync(host, on.Rpc, feed.SessionId);
+            }
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
@@ -2575,6 +2628,7 @@ public sealed partial class Conductor : IAsyncDisposable
         var from = mark is null
             ? new JsonObject { ["type"] = GorynychProtocol.ReplayFromStart }
             : new JsonObject { ["type"] = GorynychProtocol.ReplayAfterMark, ["mark"] = mark };
+        feed.BeginHistoryImport(rpc);
         if (collect) feed.BeginReplay(feed.Journal.MaxEntries);
         (List<JsonObject> Updates, bool Dropped) history = ([], false);
         JsonNode? reply;
@@ -2586,6 +2640,7 @@ public sealed partial class Conductor : IAsyncDisposable
         finally
         {
             if (collect) history = feed.EndReplay();
+            feed.EndHistoryImport(rpc);
         }
         if (reply?["_meta"]?[GorynychProtocol.MetaReplay] is not JsonObject replay)
         {
@@ -2604,10 +2659,14 @@ public sealed partial class Conductor : IAsyncDisposable
         try
         {
             if (options.CatchingUp is { } hold) await hold(feed.SessionId);
-            var plan = HistoryCatchUp.Make(feed.Journal.ReadAll(), history, replayed, host.DisplayName, dropped);
+            var journal = feed.Journal.ReadAll();
+            var plan = HistoryCatchUp.Make(journal, history, replayed, host.DisplayName, dropped);
+            var subagentHistory = SubagentRouting.NewHistory(feed.SessionId,
+                plan.Kind == HistoryCatchUp.Kind.Replace ? [] : journal, history);
             switch (plan.Kind)
             {
                 case HistoryCatchUp.Kind.Append:
+                    plan.Updates.AddRange(subagentHistory);
                     await feed.AppendHistoryAsync(plan.Updates, plan.Trimmed);
                     SetMark(feed, mark);
                     ServiceLog.Info($"{host.Name} {feed.SessionId}: {plan.Updates.Count} updates of its own history added to the journal ({plan.Why})");
@@ -2615,10 +2674,12 @@ public sealed partial class Conductor : IAsyncDisposable
                         ServiceLog.Warn($"{host.Name} {feed.SessionId}: its own history gained more than the journal keeps; only the last {plan.Updates.Count} updates were added, the journal is marked trimmed");
                     break;
                 case HistoryCatchUp.Kind.Replace:
+                    plan.Updates.AddRange(subagentHistory);
                     await feed.ReplaceHistoryAsync(plan.Updates, options.Time.GetUtcNow(), mark, plan.Trimmed);
                     ServiceLog.Warn($"{host.Name} {feed.SessionId}: its own history was rewritten ({plan.Why}); the journal was imported again ({plan.Updates.Count - 1} updates), the earlier one kept");
                     break;
                 default:
+                    if (subagentHistory.Count > 0) await feed.AppendHistoryAsync(subagentHistory, dropped);
                     SetMark(feed, mark);
                     if (replayed == HistoryCatchUp.Replayed.All) ServiceLog.Info($"{host.Name} {feed.SessionId}: nothing to add to the journal ({plan.Why})");
                     break;
@@ -2630,7 +2691,8 @@ public sealed partial class Conductor : IAsyncDisposable
         }
     }
 
-    internal async Task<JsonNode?> LoadAsync(ClientConnection client, LoadSessionRequest request, CancellationToken ct)
+    internal async Task<JsonNode?> LoadAsync(ClientConnection client, LoadSessionRequest request,
+        Action<Func<Task>> afterAnswer, CancellationToken ct)
     {
         RefuseSystemPrompt(request.SystemPrompt);
         using var use = await UseAsync(request.SessionId, ct);
@@ -2643,7 +2705,9 @@ public sealed partial class Conductor : IAsyncDisposable
         {
             // Opening it catches the journal up with the agent's own history first (OpenAsync); a
             // session the journal has never seen is imported so.
-            var (_, opened) = await EnsureLiveAsync(record, ct);
+            var (rpc, opened) = await EnsureLiveAsync(record, ct);
+            if (client.TakesSubagents && host.Name == "codex")
+                afterAnswer(() => RefreshSubagentStatesAsync(host, rpc, client, record.SessionId));
             response = opened ?? feed.State();
         }
         catch (Exception e) when (e is JsonRpcException or IOException)
@@ -2664,16 +2728,20 @@ public sealed partial class Conductor : IAsyncDisposable
     /// coming back), the client first gets what the journal has after its position, or all of it
     /// from <c>{"type": "start"}</c>; a plain resume replays nothing.
     /// </summary>
-    internal async Task<JsonNode?> ResumeAsync(ClientConnection client, ResumeSessionRequest request, CancellationToken ct)
+    internal async Task<JsonNode?> ResumeAsync(ClientConnection client, ResumeSessionRequest request,
+        Action<Func<Task>> afterAnswer, CancellationToken ct)
     {
         RefuseSystemPrompt(request.SystemPrompt);
         var after = ReplayFrom(request.Meta?[GorynychProtocol.MetaReplayFrom]);
         // A resumable link coming back says what its client shows of the session's interactivity.
         if (request.Meta?[GorynychProtocol.MetaInteractivity] is not null) client.Knows(request.SessionId, ReadOnlyOf(request.Meta));
         using var use = await UseAsync(request.SessionId, ct);
-        if (IsStopping(HostOf(use.Record).Name)) throw Unavailable(HostOf(use.Record).Name);
-        var (_, opened) = await EnsureLiveAsync(use.Record, ct);
+        var host = HostOf(use.Record);
+        if (IsStopping(host.Name)) throw Unavailable(host.Name);
+        var (rpc, opened) = await EnsureLiveAsync(use.Record, ct);
         var position = await use.Feed.ResumeAndAttachAsync(client, after);
+        if (client.TakesSubagents && host.Name == "codex")
+            afterAnswer(() => RefreshSubagentStatesAsync(host, rpc, client, request.SessionId));
         await NoticeOnOpenAsync(use.Feed, client);
         // The bridge consumes resume responses when reconnecting its service pipe while
         // keeping Zed's stdio alive. Send a live snapshot even without a transition so
@@ -2682,7 +2750,30 @@ public sealed partial class Conductor : IAsyncDisposable
         activity["sessionId"] = request.SessionId;
         client.Notify(GorynychProtocol.MethodSessionState, activity);
         // An already open session gets the state the agent last reported, so every client sees its switches.
-        return WithLinkState(opened ?? use.Feed.State(), use.Feed, position, HostOf(use.Record).Steers);
+        return WithLinkState(opened ?? use.Feed.State(), use.Feed, position, host.Steers);
+    }
+
+    // ACP v1 treats state sent before the load/resume answer as historical. Ask the
+    // same runtime for its observations after that boundary, without replaying history.
+    async Task RefreshSubagentStatesAsync(AgentHost host, JsonRpcConnection rpc, ClientConnection client, string sessionId)
+    {
+        if (client.Rpc.IsClosed) return;
+        await RefreshSubagentStatesAsync(host, rpc, sessionId);
+    }
+
+    async Task RefreshSubagentStatesAsync(AgentHost host, JsonRpcConnection rpc, string sessionId)
+    {
+        if (host.RouteOf(sessionId)?.Rpc != rpc) return;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cleanupStop.Token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        try
+        {
+            await rpc.SendRequestAsync(GorynychProtocol.MethodRefreshSubagentStates,
+                new JsonObject { ["sessionId"] = sessionId }, timeout.Token);
+        }
+        catch (JsonRpcException e) when (e.Code == JsonRpcException.MethodNotFound) { } // Host from an older build.
+        catch (Exception e) when (e is JsonRpcException or IOException or OperationCanceledException)
+        { ServiceLog.Warn($"codex {sessionId}: current subagent state unavailable: {e.Message}"); }
     }
 
     /// <summary>The position a client's <c>replayFrom</c> asks to resume after; null without one.</summary>
@@ -3679,6 +3770,7 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         var id = record.SessionId;
         removed[id] = 0;
+        subagents.Forget(id);
         // Metadata cleanup is best effort: a failed write leaves the previous snapshot intact.
         uiMetadataGate.Wait();
         try { uiMetadata.Remove(id); }
@@ -4735,7 +4827,7 @@ public sealed partial class Conductor : IAsyncDisposable
             try { await LoadHistoryAsync(use, ct); }
             catch (Exception e) when (e is JsonRpcException or IOException) { throw new UnreadableException(use.Record, e); }
         }
-        var page = SessionReader.Read(feed.Journal.ReadAll(), cursor, limit, thoughts, budget);
+        var page = SessionReader.Read(feed.Journal.ReadAll().Where(u => !SubagentRouting.IsPreview(u)).ToList(), cursor, limit, thoughts, budget);
         return new SessionRead(store.Get(sessionId) ?? use.Record, host.IsLive(sessionId), page, feed.TurnGate.CurrentCount == 0, feed.Journal.Trimmed);
     }
 

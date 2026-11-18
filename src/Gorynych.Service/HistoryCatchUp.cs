@@ -47,9 +47,10 @@ internal static class HistoryCatchUp
     /// <param name="agent">The agent's display name, for the notice of a rewrite.</param>
     public static Plan Make(IReadOnlyList<JsonNode> journal, IReadOnlyList<JsonObject> replay, Replayed replayed, string agent, bool dropped = false)
     {
+        if (journal.Any(SubagentRouting.IsPreview)) journal = journal.Where(u => !SubagentRouting.IsPreview(u)).ToArray();
         // Only a turn's parts are history; text the agent put into a user message itself (a
         // leading system reminder, as Kimi adds one to each) was not typed and is cut off.
-        var history = replay.Where(u => SessionJournal.IsTurnKind((string?)u["sessionUpdate"])).Select(WithoutReminder).OfType<JsonObject>().ToList();
+        var history = replay.Where(u => !SubagentRouting.IsPreview(u) && SessionJournal.IsTurnKind((string?)u["sessionUpdate"])).Select(WithoutReminder).OfType<JsonObject>().ToList();
         var known = KnownKeys(journal);
         var parts = journal.OfType<JsonObject>().Where(e => SessionJournal.IsTurnKind((string?)e["sessionUpdate"]) && !IsNotice(e)).ToList();
         // What the replay dropped came right after the mark, so the journal misses it.

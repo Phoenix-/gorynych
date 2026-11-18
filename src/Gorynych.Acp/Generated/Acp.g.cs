@@ -428,6 +428,38 @@ public sealed partial class Terminal : ToolCallContent
     public JsonObject? Meta { get; set; }
 }
 
+/// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// A display-only reference to another session that this tool call operates on,
+/// such as a subagent it created, delegated to, or is waiting on.
+///
+/// The referenced session must already be known to the Client through ordinary
+/// session setup or a `subagent_update` announcement. The reference does not
+/// establish ownership, grant any Client-initiated controls, or report that the
+/// referenced session received or finished any work.
+/// </summary>
+public sealed partial class SessionReference : ToolCallContent
+{
+    public SessionReference() : base("session") { }
+    /// <summary>
+    /// The referenced session.
+    /// </summary>
+    [JsonPropertyName("sessionId")]
+    public string SessionId { get; set; } = "";
+    /// <summary>
+    /// The _meta property is reserved by ACP to allow clients and agents to attach additional
+    /// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+    /// these keys.
+    ///
+    /// See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
 internal sealed class ToolCallContentJsonConverter : JsonConverter<ToolCallContent>
 {
     public override ToolCallContent? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
@@ -440,6 +472,7 @@ internal sealed class ToolCallContentJsonConverter : JsonConverter<ToolCallConte
             "content" => obj.Deserialize(AcpJsonContext.Default.Content),
             "diff" => obj.Deserialize(AcpJsonContext.Default.Diff),
             "terminal" => obj.Deserialize(AcpJsonContext.Default.Terminal),
+            "session" => obj.Deserialize(AcpJsonContext.Default.SessionReference),
             _ => new ToolCallContent.Unknown(tag, obj),
         };
     }
@@ -452,6 +485,7 @@ internal sealed class ToolCallContentJsonConverter : JsonConverter<ToolCallConte
             Content x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.Content),
             Diff x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.Diff),
             Terminal x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.Terminal),
+            SessionReference x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.SessionReference),
             _ => throw new JsonException($"Unsupported ToolCallContent variant {value.GetType()}."),
         };
         AcpJson.WriteTagged(writer, "type", value is ToolCallContent.Unknown ? null : value.Tag, body);
@@ -3650,6 +3684,205 @@ public sealed partial class CompactionSummaryChunk : SessionUpdate
     public JsonObject? Meta { get; set; }
 }
 
+/// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// Notification that the enclosing parent session created and owns a child session.
+///
+/// Later updates modify the existing association's metadata, not its ownership.
+///
+/// Sent on the immediate parent session. The first update for an unknown
+/// `sessionId` announces the child and MUST be sent
+/// before any live child traffic or live message naming the child as sender
+/// or recipient. Parents may message and reuse an announced child across
+/// multiple operations.
+/// Child events are delivered automatically on the same connection. No child
+/// load, resume, or subscription is needed.
+///
+/// Only the subagent session ID is required. Omitted patch fields keep their
+/// previous values. `null` clears them. Clearing capabilities disables child
+/// mutations. Clearing state leaves current activity unset/unconfirmed: it does
+/// not imply idle, stop work, or create an `unknown` state snapshot. A concrete
+/// state replaces the entire previous state object, not the session.
+/// The title and description provide the parent's display metadata for the
+/// child. They do not replace the content of individual messages or operations.
+/// `cwd` and `additionalDirectories` report where the Agent placed the child.
+/// While unset, each inherits the immediate parent's effective value.
+/// </summary>
+public sealed partial class SubagentUpdate : SessionUpdate
+{
+    public SubagentUpdate() : base("subagent_update") { }
+    /// <summary>
+    /// The opaque session ID identifying the child in all ACP messages.
+    /// </summary>
+    [JsonPropertyName("sessionId")]
+    public string SessionId { get; set; } = "";
+    /// <summary>
+    /// The parent's human-readable display title for this child. It need not be unique.
+    ///
+    /// Omitted means unchanged. `null` clears it. If unset, the Client chooses
+    /// a fallback presentation.
+    /// </summary>
+    [JsonPropertyName("title")]
+    public string? Title { get; set; }
+    /// <summary>
+    /// The parent's human-readable description of the child's role or purpose.
+    ///
+    /// Omitted means unchanged. `null` clears it. If unset, the Client chooses
+    /// a fallback presentation. This is current display metadata, not the
+    /// history of instructions sent to the child.
+    /// </summary>
+    [JsonPropertyName("description")]
+    public string? Description { get; set; }
+    /// <summary>
+    /// Client-initiated session mutations permitted for this subagent session.
+    ///
+    /// Omitted means unchanged. `null` clears the capability set and disables
+    /// child mutations. If never supplied, no session mutations are permitted.
+    /// Read-only operations retain their normal protocol semantics and capability
+    /// requirements. A concrete object replaces the whole capability set.
+    /// </summary>
+    [JsonPropertyName("capabilities")]
+    public SubagentSessionCapabilities? Capabilities { get; set; }
+    /// <summary>
+    /// Current state snapshot for the child session.
+    ///
+    /// Omitted means unchanged. `null` clears the current activity without
+    /// asserting idle or sending an `unknown` snapshot. A concrete state
+    /// replaces the previous state object wholesale. If never supplied, the
+    /// current activity is unset/unconfirmed.
+    /// </summary>
+    [JsonPropertyName("state")]
+    public StateUpdate? State { get; set; }
+    /// <summary>
+    /// The child's working directory. Must be an absolute path.
+    ///
+    /// Optional and nullable. Omitted means unchanged. `null` clears the
+    /// reported value. While unset, the child inherits its immediate parent's
+    /// effective working directory. Clients use this value for the child's
+    /// root set and as the default terminal working directory.
+    /// </summary>
+    [JsonPropertyName("cwd")]
+    public string? Cwd { get; set; }
+    /// <summary>
+    /// Additional workspace roots for the child. Each path must be absolute.
+    ///
+    /// Optional and nullable. Omitted means unchanged. `null` clears the
+    /// reported value. While unset, the child inherits its immediate parent's
+    /// effective additional directories, independently of `cwd`. A concrete
+    /// array replaces the whole list. `[]` reports no additional directories.
+    /// Clients use these values for the child's root set.
+    /// </summary>
+    [JsonPropertyName("additionalDirectories")]
+    public List<string>? AdditionalDirectories { get; set; }
+    /// <summary>
+    /// The _meta property is reserved by ACP to allow clients and agents to attach additional
+    /// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+    /// these keys.
+    ///
+    /// See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)
+    /// Omitted means unchanged. `null` removes the metadata.
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
+/// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// An upsert for an inter-session message.
+/// </summary>
+public sealed partial class SessionMessage : SessionUpdate
+{
+    public SessionMessage() : base("session_message") { }
+    /// <summary>
+    /// Identifier of this message within the enclosing session's transcript.
+    /// </summary>
+    [JsonPropertyName("messageId")]
+    public string MessageId { get; set; } = "";
+    /// <summary>
+    /// The sending session.
+    ///
+    /// Omitted leaves the stored value unchanged. `null` clears it. A value replaces it.
+    /// </summary>
+    [JsonPropertyName("senderSessionId")]
+    public string? SenderSessionId { get; set; }
+    /// <summary>
+    /// The receiving session.
+    ///
+    /// Omitted leaves the stored value unchanged. `null` clears it. A value replaces it.
+    /// </summary>
+    [JsonPropertyName("recipientSessionId")]
+    public string? RecipientSessionId { get; set; }
+    /// <summary>
+    /// On an incoming view, the `messageId` of the same message's outgoing view in the
+    /// sender's transcript.
+    ///
+    /// Omitted leaves the stored value unchanged. `null` clears it. A value replaces it. It can arrive
+    /// after the message starts streaming.
+    /// </summary>
+    [JsonPropertyName("senderMessageId")]
+    public string? SenderMessageId { get; set; }
+    /// <summary>
+    /// On an outgoing view, the `messageId` of the same message's incoming view in the
+    /// recipient's transcript.
+    ///
+    /// Omitted leaves the stored value unchanged. `null` clears it. A value replaces it. It can arrive
+    /// after the message starts streaming.
+    /// </summary>
+    [JsonPropertyName("recipientMessageId")]
+    public string? RecipientMessageId { get; set; }
+    /// <summary>
+    /// Omitted leaves content unchanged. `null` or `[]` clears it.
+    /// A non-empty array replaces all content.
+    /// </summary>
+    [JsonPropertyName("content")]
+    public List<ContentBlock>? Content { get; set; }
+    /// <summary>
+    /// Omitted leaves metadata unchanged. `null` removes it.
+    ///
+    /// Implementations MUST NOT make assumptions about values in `_meta`.
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
+/// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// A streamed content block of an inter-session message.
+///
+/// A chunk carries only content. The message's participants and references come from
+/// `session_message` upserts, which can arrive before, between, or after its chunks.
+/// </summary>
+public sealed partial class SessionMessageChunk : SessionUpdate
+{
+    public SessionMessageChunk() : base("session_message_chunk") { }
+    /// <summary>
+    /// Identifier of this message within the enclosing session's transcript.
+    /// </summary>
+    [JsonPropertyName("messageId")]
+    public string MessageId { get; set; } = "";
+    /// <summary>
+    /// A single content block appended to the message.
+    /// </summary>
+    [JsonPropertyName("content")]
+    public ContentBlock Content { get; set; } = null!;
+    /// <summary>
+    /// Optional and nullable chunk-scoped metadata. Omitted or `null` means none.
+    ///
+    /// Implementations MUST NOT make assumptions about values in `_meta`.
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
 internal sealed class SessionUpdateJsonConverter : JsonConverter<SessionUpdate>
 {
     public override SessionUpdate? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
@@ -3673,6 +3906,9 @@ internal sealed class SessionUpdateJsonConverter : JsonConverter<SessionUpdate>
             "notice" => obj.Deserialize(AcpJsonContext.Default.Notice),
             "compaction_update" => obj.Deserialize(AcpJsonContext.Default.CompactionUpdate),
             "compaction_summary_chunk" => obj.Deserialize(AcpJsonContext.Default.CompactionSummaryChunk),
+            "subagent_update" => obj.Deserialize(AcpJsonContext.Default.SubagentUpdate),
+            "session_message" => obj.Deserialize(AcpJsonContext.Default.SessionMessage),
+            "session_message_chunk" => obj.Deserialize(AcpJsonContext.Default.SessionMessageChunk),
             _ => new SessionUpdate.Unknown(tag, obj),
         };
     }
@@ -3696,6 +3932,9 @@ internal sealed class SessionUpdateJsonConverter : JsonConverter<SessionUpdate>
             Notice x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.Notice),
             CompactionUpdate x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.CompactionUpdate),
             CompactionSummaryChunk x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.CompactionSummaryChunk),
+            SubagentUpdate x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.SubagentUpdate),
+            SessionMessage x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.SessionMessage),
+            SessionMessageChunk x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.SessionMessageChunk),
             _ => throw new JsonException($"Unsupported SessionUpdate variant {value.GetType()}."),
         };
         AcpJson.WriteTagged(writer, "sessionUpdate", value is SessionUpdate.Unknown ? null : value.Tag, body);
@@ -4082,6 +4321,20 @@ public sealed partial class ClientCapabilities
     /// </summary>
     [JsonPropertyName("_meta")]
     public JsonObject? Meta { get; set; }
+    /// <summary>
+    /// **UNSTABLE**
+    ///
+    /// This capability is not part of the spec yet, and may be removed or changed at any point.
+    ///
+    /// Whether the client understands exposed subagent sessions.
+    ///
+    /// Optional and nullable. Omitted or `null` both mean the client does not
+    /// advertise support.
+    /// Supplying `{}` means the client understands child associations, work-state
+    /// snapshots, session-directed messages, and restricted-session semantics.
+    /// </summary>
+    [JsonPropertyName("subagents")]
+    public SubagentCapabilities? Subagents { get; set; }
 }
 
 /// <summary>
@@ -5419,6 +5672,399 @@ public sealed partial class CancelRequestNotification
 }
 
 /// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// Capability marker for exposing reusable child sessions as restricted ACP sessions.
+///
+/// Supplying `{}` advertises support for child association and state updates,
+/// session-directed messages, and restricted-session semantics. The client
+/// must advertise this capability before the agent sends subagent updates or
+/// session-directed messages.
+/// </summary>
+public sealed partial class SubagentCapabilities
+{
+    /// <summary>
+    /// The _meta property is reserved by ACP to allow clients and agents to attach additional
+    /// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+    /// these keys.
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
+/// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// Client-initiated session mutations permitted for a specific subagent session.
+///
+/// A mutation requires an explicit per-child capability. Support for the method
+/// on ordinary sessions does not grant support on a child.
+/// </summary>
+public sealed partial class SubagentSessionCapabilities
+{
+    /// <summary>
+    /// Permits the client to cancel this child's current work without ending
+    /// the session. Omitted or `null` means unsupported. An object (including
+    /// `{}`) means supported.
+    /// </summary>
+    [JsonPropertyName("cancel")]
+    public SessionCancelCapabilities? Cancel { get; set; }
+    /// <summary>
+    /// The _meta property is reserved by ACP to allow clients and agents to attach additional
+    /// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+    /// these keys.
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
+/// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// Capability to cancel work in a subagent session without ending that session.
+///
+/// Supplying `{}` advertises support. An omitted or `null` `cancel` does not.
+/// </summary>
+public sealed partial class SessionCancelCapabilities
+{
+    /// <summary>
+    /// The _meta property is reserved by ACP to allow clients and agents to attach additional
+    /// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+    /// these keys.
+    ///
+    /// See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
+/// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// Current foreground-work state of a reusable child session.
+///
+/// Each update is a whole-object snapshot. Idle does not terminate the child.
+/// The parent can message it again, transitioning it back to running.
+/// Background activity may still emit other session updates while idle.
+/// </summary>
+/// <remarks>Discriminated by <c>state</c>; unknown variants deserialize to <see cref="Unknown"/>.</remarks>
+[JsonConverter(typeof(StateUpdateJsonConverter))]
+public abstract partial class StateUpdate
+{
+    private protected StateUpdate(string? tag) { Tag = tag; }
+
+    /// <summary>The <c>state</c> value of this variant; null for the variant that has none.</summary>
+    [JsonIgnore] public string? Tag { get; }
+
+    /// <summary>A variant this schema version does not know; keeps the raw JSON so it can be forwarded unchanged.</summary>
+    public sealed class Unknown(string? tag, JsonObject raw) : StateUpdate(tag)
+    {
+        [JsonIgnore] public JsonObject Raw { get; } = raw;
+    }
+}
+
+/// <summary>
+/// Foreground work is in progress.
+/// </summary>
+public sealed partial class RunningStateUpdate : StateUpdate
+{
+    public RunningStateUpdate() : base("running") { }
+    /// <summary>
+    /// The _meta property is reserved by ACP for additional metadata.
+    /// Implementations MUST NOT make assumptions about values at these keys.
+    /// Optional. Omitted and `null` mean no metadata for this state snapshot.
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
+public sealed partial class StateUpdateIdle : StateUpdate
+{
+    public StateUpdateIdle() : base("idle") { }
+    /// <summary>
+    /// **UNSTABLE** Token usage for completed foreground work.
+    ///
+    /// Optional. Omitted or `null` means not reported.
+    /// </summary>
+    [JsonPropertyName("usage")]
+    public Usage? Usage { get; set; }
+    /// <summary>
+    /// The _meta property is reserved by ACP for additional metadata.
+    /// Implementations MUST NOT make assumptions about values at these keys.
+    /// Optional. Omitted and `null` mean no metadata for this state snapshot.
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+    /// <summary>
+    /// Why foreground work stopped. The value selects one of this type's variants, which may add fields of their own.
+    ///
+    /// Optional. Omitted or `null` both mean the agent is not reporting a stop reason; a malformed value is treated the same way.
+    ///
+    /// See protocol docs: [Work state](https://agentclientprotocol.com/protocol/v1/draft/subagents#work-state)
+    /// </summary>
+    [JsonPropertyName("stopReason")]
+    public string? StopReason { get; set; }
+}
+
+/// <summary>
+/// Foreground work is blocked on user action.
+/// </summary>
+public sealed partial class RequiresActionStateUpdate : StateUpdate
+{
+    public RequiresActionStateUpdate() : base("requires_action") { }
+    /// <summary>
+    /// The _meta property is reserved by ACP for additional metadata.
+    /// Implementations MUST NOT make assumptions about values at these keys.
+    /// Optional. Omitted and `null` mean no metadata for this state snapshot.
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
+/// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// The Agent cannot currently determine foreground activity.
+///
+/// Report this when activity becomes unobservable, not merely because the child
+/// has been quiet. The Client MUST stop presenting the previous state as confirmed
+/// current activity, but may retain it as last known. A later state replaces this
+/// snapshot normally.
+///
+/// This is not a task outcome or session closure. It does not cancel work, resolve
+/// pending requests, or revoke capabilities. If a control is no longer available,
+/// the Agent updates the capabilities explicitly. Unfinished tool calls and
+/// terminals stay as last reported. The Agent does not invent a final status
+/// for them, and Clients do not present them as confirmed live activity.
+/// </summary>
+public sealed partial class UnknownStateUpdate : StateUpdate
+{
+    public UnknownStateUpdate() : base("unknown") { }
+    /// <summary>
+    /// The _meta property is reserved by ACP for additional metadata.
+    /// Implementations MUST NOT make assumptions about values at these keys.
+    /// Optional. Omitted and `null` mean no metadata for this state snapshot.
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
+internal sealed class StateUpdateJsonConverter : JsonConverter<StateUpdate>
+{
+    public override StateUpdate? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.Null) return null;
+        var obj = JsonNode.Parse(ref reader) as JsonObject ?? throw new JsonException("StateUpdate must be a JSON object.");
+        var tag = AcpJson.GetTag(obj, "state");
+        return tag switch
+        {
+            "running" => obj.Deserialize(AcpJsonContext.Default.RunningStateUpdate),
+            "idle" => obj.Deserialize(AcpJsonContext.Default.StateUpdateIdle),
+            "requires_action" => obj.Deserialize(AcpJsonContext.Default.RequiresActionStateUpdate),
+            "unknown" => obj.Deserialize(AcpJsonContext.Default.UnknownStateUpdate),
+            _ => new StateUpdate.Unknown(tag, obj),
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, StateUpdate value, JsonSerializerOptions options)
+    {
+        JsonNode? body = value switch
+        {
+            StateUpdate.Unknown u => u.Raw,
+            RunningStateUpdate x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.RunningStateUpdate),
+            StateUpdateIdle x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.StateUpdateIdle),
+            RequiresActionStateUpdate x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.RequiresActionStateUpdate),
+            UnknownStateUpdate x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.UnknownStateUpdate),
+            _ => throw new JsonException($"Unsupported StateUpdate variant {value.GetType()}."),
+        };
+        AcpJson.WriteTagged(writer, "state", value is StateUpdate.Unknown ? null : value.Tag, body);
+    }
+}
+
+/// <summary>
+/// The child is ready to process another prompt.
+///
+/// An omitted, `null`, or malformed `stopReason` means not reported.
+/// </summary>
+/// <remarks>Discriminated by <c>stopReason</c>; unknown variants deserialize to <see cref="Unknown"/>.</remarks>
+[JsonConverter(typeof(IdleStateUpdateJsonConverter))]
+public abstract partial class IdleStateUpdate
+{
+    private protected IdleStateUpdate(string? tag) { Tag = tag; }
+
+    /// <summary>The <c>stopReason</c> value of this variant; null for the variant that has none.</summary>
+    [JsonIgnore] public string? Tag { get; }
+    /// <summary>
+    /// **UNSTABLE** Token usage for completed foreground work.
+    ///
+    /// Optional. Omitted or `null` means not reported.
+    /// </summary>
+    [JsonPropertyName("usage")]
+    public Usage? Usage { get; set; }
+    /// <summary>
+    /// The _meta property is reserved by ACP for additional metadata.
+    /// Implementations MUST NOT make assumptions about values at these keys.
+    /// Optional. Omitted and `null` mean no metadata for this state snapshot.
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+
+    /// <summary>A variant this schema version does not know; keeps the raw JSON so it can be forwarded unchanged.</summary>
+    public sealed class Unknown(string? tag, JsonObject raw) : IdleStateUpdate(tag)
+    {
+        [JsonIgnore] public JsonObject Raw { get; } = raw;
+    }
+}
+
+public sealed partial class IdleStateUpdateEndTurn : IdleStateUpdate
+{
+    public IdleStateUpdateEndTurn() : base("end_turn") { }
+}
+
+public sealed partial class IdleStateUpdateMaxTokens : IdleStateUpdate
+{
+    public IdleStateUpdateMaxTokens() : base("max_tokens") { }
+}
+
+public sealed partial class IdleStateUpdateMaxTurnRequests : IdleStateUpdate
+{
+    public IdleStateUpdateMaxTurnRequests() : base("max_turn_requests") { }
+}
+
+public sealed partial class IdleStateUpdateRefusal : IdleStateUpdate
+{
+    public IdleStateUpdateRefusal() : base("refusal") { }
+}
+
+public sealed partial class IdleStateUpdateCancelled : IdleStateUpdate
+{
+    public IdleStateUpdateCancelled() : base("cancelled") { }
+}
+
+/// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// Details of a failure that ended a child's foreground work.
+/// </summary>
+public sealed partial class ErrorStopReason : IdleStateUpdate
+{
+    public ErrorStopReason() : base("error") { }
+    /// <summary>
+    /// The failure, as a JSON-RPC error object.
+    ///
+    /// Optional. Omitted or `null` both mean the agent is not reporting failure details.
+    /// Agents SHOULD include it.
+    /// </summary>
+    [JsonPropertyName("error")]
+    public Error? Error { get; set; }
+}
+
+public sealed partial class IdleStateUpdateNone : IdleStateUpdate
+{
+    public IdleStateUpdateNone() : base(null) { }
+}
+
+internal sealed class IdleStateUpdateJsonConverter : JsonConverter<IdleStateUpdate>
+{
+    public override IdleStateUpdate? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.Null) return null;
+        var obj = JsonNode.Parse(ref reader) as JsonObject ?? throw new JsonException("IdleStateUpdate must be a JSON object.");
+        var tag = AcpJson.GetTag(obj, "stopReason");
+        return tag switch
+        {
+            "end_turn" => obj.Deserialize(AcpJsonContext.Default.IdleStateUpdateEndTurn),
+            "max_tokens" => obj.Deserialize(AcpJsonContext.Default.IdleStateUpdateMaxTokens),
+            "max_turn_requests" => obj.Deserialize(AcpJsonContext.Default.IdleStateUpdateMaxTurnRequests),
+            "refusal" => obj.Deserialize(AcpJsonContext.Default.IdleStateUpdateRefusal),
+            "cancelled" => obj.Deserialize(AcpJsonContext.Default.IdleStateUpdateCancelled),
+            "error" => obj.Deserialize(AcpJsonContext.Default.ErrorStopReason),
+            null => obj.Deserialize(AcpJsonContext.Default.IdleStateUpdateNone),
+            _ => new IdleStateUpdate.Unknown(tag, obj),
+        };
+    }
+
+    public override void Write(Utf8JsonWriter writer, IdleStateUpdate value, JsonSerializerOptions options)
+    {
+        JsonNode? body = value switch
+        {
+            IdleStateUpdate.Unknown u => u.Raw,
+            IdleStateUpdateEndTurn x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.IdleStateUpdateEndTurn),
+            IdleStateUpdateMaxTokens x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.IdleStateUpdateMaxTokens),
+            IdleStateUpdateMaxTurnRequests x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.IdleStateUpdateMaxTurnRequests),
+            IdleStateUpdateRefusal x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.IdleStateUpdateRefusal),
+            IdleStateUpdateCancelled x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.IdleStateUpdateCancelled),
+            ErrorStopReason x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.ErrorStopReason),
+            IdleStateUpdateNone x => JsonSerializer.SerializeToNode(x, AcpJsonContext.Default.IdleStateUpdateNone),
+            _ => throw new JsonException($"Unsupported IdleStateUpdate variant {value.GetType()}."),
+        };
+        AcpJson.WriteTagged(writer, "stopReason", value is IdleStateUpdate.Unknown ? null : value.Tag, body);
+    }
+}
+
+/// <summary>
+/// **UNSTABLE**
+///
+/// This capability is not part of the spec yet, and may be removed or changed at any point.
+///
+/// Token usage information for a prompt turn.
+/// </summary>
+public sealed partial class Usage
+{
+    /// <summary>
+    /// Sum of all token types across session.
+    /// </summary>
+    [JsonPropertyName("totalTokens")]
+    public ulong TotalTokens { get; set; }
+    /// <summary>
+    /// Total input tokens across all turns.
+    /// </summary>
+    [JsonPropertyName("inputTokens")]
+    public ulong InputTokens { get; set; }
+    /// <summary>
+    /// Total output tokens across all turns.
+    /// </summary>
+    [JsonPropertyName("outputTokens")]
+    public ulong OutputTokens { get; set; }
+    /// <summary>
+    /// Total thought/reasoning tokens
+    /// </summary>
+    [JsonPropertyName("thoughtTokens")]
+    public ulong? ThoughtTokens { get; set; }
+    /// <summary>
+    /// Total cache read tokens.
+    /// </summary>
+    [JsonPropertyName("cachedReadTokens")]
+    public ulong? CachedReadTokens { get; set; }
+    /// <summary>
+    /// Total cache write tokens.
+    /// </summary>
+    [JsonPropertyName("cachedWriteTokens")]
+    public ulong? CachedWriteTokens { get; set; }
+    /// <summary>
+    /// The _meta property is reserved by ACP to allow clients and agents to attach additional
+    /// metadata to their interactions. Implementations MUST NOT make assumptions about values at
+    /// these keys.
+    ///
+    /// See protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/v1/draft/extensibility)
+    /// </summary>
+    [JsonPropertyName("_meta")]
+    public JsonObject? Meta { get; set; }
+}
+
+/// <summary>
 /// Source-generated System.Text.Json metadata for every ACP type, so serialization works under Native AOT.
 /// </summary>
 [JsonSourceGenerationOptions(DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
@@ -5429,6 +6075,7 @@ public sealed partial class CancelRequestNotification
 [JsonSerializable(typeof(Content))]
 [JsonSerializable(typeof(Diff))]
 [JsonSerializable(typeof(Terminal))]
+[JsonSerializable(typeof(SessionReference))]
 [JsonSerializable(typeof(TextContent))]
 [JsonSerializable(typeof(ImageContent))]
 [JsonSerializable(typeof(AudioContent))]
@@ -5511,6 +6158,9 @@ public sealed partial class CancelRequestNotification
 [JsonSerializable(typeof(Notice))]
 [JsonSerializable(typeof(CompactionUpdate))]
 [JsonSerializable(typeof(CompactionSummaryChunk))]
+[JsonSerializable(typeof(SubagentUpdate))]
+[JsonSerializable(typeof(SessionMessage))]
+[JsonSerializable(typeof(SessionMessageChunk))]
 [JsonSerializable(typeof(ContentChunk))]
 [JsonSerializable(typeof(PlanEntry))]
 [JsonSerializable(typeof(AvailableCommand))]
@@ -5563,6 +6213,21 @@ public sealed partial class CancelRequestNotification
 [JsonSerializable(typeof(CreateElicitationResponseCancel))]
 [JsonSerializable(typeof(CancelNotification))]
 [JsonSerializable(typeof(CancelRequestNotification))]
+[JsonSerializable(typeof(SubagentCapabilities))]
+[JsonSerializable(typeof(SubagentSessionCapabilities))]
+[JsonSerializable(typeof(SessionCancelCapabilities))]
+[JsonSerializable(typeof(RunningStateUpdate))]
+[JsonSerializable(typeof(StateUpdateIdle))]
+[JsonSerializable(typeof(RequiresActionStateUpdate))]
+[JsonSerializable(typeof(UnknownStateUpdate))]
+[JsonSerializable(typeof(IdleStateUpdateEndTurn))]
+[JsonSerializable(typeof(IdleStateUpdateMaxTokens))]
+[JsonSerializable(typeof(IdleStateUpdateMaxTurnRequests))]
+[JsonSerializable(typeof(IdleStateUpdateRefusal))]
+[JsonSerializable(typeof(IdleStateUpdateCancelled))]
+[JsonSerializable(typeof(ErrorStopReason))]
+[JsonSerializable(typeof(IdleStateUpdateNone))]
+[JsonSerializable(typeof(Usage))]
 [JsonSerializable(typeof(ToolCallContent))]
 [JsonSerializable(typeof(ContentBlock))]
 [JsonSerializable(typeof(CreateElicitationRequest))]
@@ -5575,6 +6240,8 @@ public sealed partial class CancelRequestNotification
 [JsonSerializable(typeof(SetSessionConfigOptionRequest))]
 [JsonSerializable(typeof(RequestPermissionOutcome))]
 [JsonSerializable(typeof(CreateElicitationResponse))]
+[JsonSerializable(typeof(IdleStateUpdate))]
+[JsonSerializable(typeof(StateUpdate))]
 [JsonSerializable(typeof(JsonNode))]
 [JsonSerializable(typeof(JsonObject))]
 [JsonSerializable(typeof(JsonElement))]

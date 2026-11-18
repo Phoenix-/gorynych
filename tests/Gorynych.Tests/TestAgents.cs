@@ -154,7 +154,7 @@ sealed class TestClient : IAsyncDisposable
 
     /// <param name="agent">Scopes the connection to one agent, as the stdio bridge does.</param>
     /// <param name="notices">It shows ACP's <c>notice</c> session updates (<c>clientCapabilities.session.notices</c>).</param>
-    public static async Task<TestClient> ConnectAsync(Conductor conductor, string name = "test-client", bool forms = true, string? agent = null, bool notices = false)
+    public static async Task<TestClient> ConnectAsync(Conductor conductor, string name = "test-client", bool forms = true, string? agent = null, bool notices = false, bool subagents = false)
     {
         var link = new DuplexLink();
         var (si, so) = link.AgentEnd;
@@ -192,11 +192,12 @@ sealed class TestClient : IAsyncDisposable
         client.Initialized = await client.Rpc.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest
         {
             ProtocolVersion = 1,
-            ClientCapabilities = forms || notices
+            ClientCapabilities = forms || notices || subagents
                 ? new ClientCapabilities
                 {
                     Elicitation = forms ? new ElicitationCapabilities { Form = new ElicitationFormCapabilities() } : null,
                     Session = notices ? new ClientSessionCapabilities { Notices = new NoticeCapabilities() } : null,
+                    Subagents = subagents ? new SubagentCapabilities() : null,
                 }
                 : null,
             Meta = agent is null ? null : new JsonObject { [GorynychProtocol.MetaAgent] = agent },

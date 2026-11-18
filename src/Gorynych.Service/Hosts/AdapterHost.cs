@@ -84,6 +84,7 @@ public sealed class AdapterHost
     readonly Func<CancellationToken, Task<(Stream Input, Stream Output)>> connect;
     readonly AdapterHostOptions options;
     readonly Lock state = new();
+    readonly SubagentRouting subagents = new();
     string? noteReceiptFailure;
     readonly SemaphoreSlim sendGate = new(1, 1); // what goes to the conductor in the agent's order, and the switch to the next one
     readonly SemaphoreSlim agentGate = new(1, 1); // writes to the agent
@@ -421,6 +422,7 @@ public sealed class AdapterHost
                 break;
             case AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete when request.SessionId is { } closed:
                 live.Remove(closed);
+                subagents.Forget(closed);
                 configurations.Remove(closed);
                 activities.Remove(closed);
                 break;
@@ -578,8 +580,13 @@ public sealed class AdapterHost
     string Number(JsonObject message)
     {
         var @params = message["params"] as JsonObject;
-        var sessionId = Text(@params?["sessionId"]);
-        if (Text(message["method"]) == AcpMethods.Client.SessionUpdate && sessionId is not null
+        var target = Text(@params?["sessionId"]);
+        var root = target is null ? null : subagents.RootOf(target);
+        var sessionId = root ?? target;
+        if (Text(message["method"]) == AcpMethods.Client.SessionUpdate && target is not null
+            && SubagentRouting.Announcement(@params?["update"]) is { } child)
+            subagents.Announce(target, child, sessionId!);
+        if (Text(message["method"]) == AcpMethods.Client.SessionUpdate && root is null && sessionId is not null
             && (live.Contains(sessionId) || forwarded.Values.Any(request => request.SessionId == sessionId && request.Method is AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionResume))
             && @params?["update"] is JsonObject update)
         {
@@ -622,6 +629,7 @@ public sealed class AdapterHost
         }
         var number = ++seq;
         var carrier = Text(message["method"]) == AcpMethods.Client.SessionUpdate ? @params?["update"] as JsonObject : @params;
+        if (SubagentRouting.IsCurrentSnapshot(carrier)) return message.ToJsonString(Wire);
         // Retain the snapshot separately; preserve any unrelated update in replay.
         var backgroundSnapshot = Text(message["method"]) == AcpMethods.Client.SessionUpdate
             && Text(carrier?["sessionUpdate"]) == "session_info_update"

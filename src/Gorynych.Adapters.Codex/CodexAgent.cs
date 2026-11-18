@@ -418,7 +418,7 @@ sealed class CodexThread
 /// The ACP agent face of the Codex adapter. It runs in the service process and speaks ACP over
 /// an in-memory link to the service, and the app-server's JSON-RPC to one <c>codex app-server</c>.
 /// </summary>
-sealed class CodexAgent : IAsyncDisposable
+sealed partial class CodexAgent : IAsyncDisposable
 {
     /// <summary>Notifications the adapter has no use for, which app-server then does not send.</summary>
     static readonly List<string> Unused =
@@ -525,6 +525,8 @@ sealed class CodexAgent : IAsyncDisposable
     string version = "";
     int disposed;
     int backgroundUnsupported;
+    bool clientSubagents;
+    bool markSubagentLiveState;
 
     public CodexAgent(CodexAdapterOptions options, JsonRpcConnection rpc, AgentInstance appServer,
         Func<IEnumerable<string>, IReadOnlyDictionary<string, string>> holders, string locksDirectory)
@@ -537,7 +539,7 @@ sealed class CodexAgent : IAsyncDisposable
         app = new JsonRpcConnection(appServer.Input, appServer.Output, "codex-app-server")
         {
             RequestHandler = OnServerRequestAsync,
-            NotificationHandler = OnServerNotificationAsync,
+            NotificationHandler = QueueServerNotification,
             Log = Log,
         };
         rpc.RequestHandler = HandleAsync;
@@ -641,9 +643,13 @@ sealed class CodexAgent : IAsyncDisposable
 
     async Task<JsonNode?> HandleAsync(JsonRpcRequest request, CancellationToken ct)
     {
+        if ((string?)request.Params?["sessionId"] is { } target && nativeChildren.ContainsKey(target))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, "Native subagent sessions cannot be opened or controlled directly.");
         switch (request.Method)
         {
             case AcpMethods.Agent.Initialize:
+                clientSubagents = request.Params?["clientCapabilities"] is JsonObject capabilities && capabilities["subagents"] is JsonObject;
+                markSubagentLiveState = request.Params?["_meta"]?[GorynychProtocol.MetaSubagentLiveState] is JsonValue live && live.TryGetValue<bool>(out var enabled) && enabled;
                 return AcpJson.ToNode(new Gorynych.Acp.InitializeResponse
                 {
                     ProtocolVersion = AcpMethods.ProtocolVersion,
@@ -723,6 +729,9 @@ sealed class CodexAgent : IAsyncDisposable
                 return await PromptAsync(request, ct);
             case GorynychProtocol.MethodSteering:
                 return await SteerAsync(request, ct);
+            case GorynychProtocol.MethodRefreshSubagentStates:
+                await RefreshNativeChildStatesAsync(RequireId(request), ct);
+                return new JsonObject();
             case AcpMethods.Agent.SessionSetConfigOption:
                 return SetConfigOption(request.ParamsAs<SetSessionConfigOptionRequest>());
             case GorynychProtocol.MethodCatchUp:
@@ -858,6 +867,22 @@ sealed class CodexAgent : IAsyncDisposable
     async Task<(CodexThread? Thread, string? Holder)> OpenOrReadAsync(string id, List<McpServer> servers, SystemPrompt? systemPrompt, CancellationToken ct,
         bool again = false)
     {
+        if (!again && !threads.ContainsKey(id))
+        {
+            try
+            {
+                var metadata = await app.SendRequestAsync(CodexMethods.Client.ThreadRead,
+                    new JsonObject { ["threadId"] = id, ["includeTurns"] = false }, ct);
+                if (metadata?["thread"] is JsonObject native &&
+                    ((string?)native["parentThreadId"] is { Length: > 0 } || (string?)native["threadSource"] == "subagent" ||
+                     native["source"] is JsonObject source && source["subAgent"] is not null))
+                    throw new JsonRpcException(JsonRpcException.InvalidRequest, "Native subagent sessions cannot be opened directly.");
+            }
+            catch (JsonRpcException e) when (e.Code == JsonRpcException.MethodNotFound)
+            {
+                Log("codex: thread/read unsupported; direct native-child detection unavailable");
+            }
+        }
         try
         {
             var t = await OpenAsync(id, servers, systemPrompt, ct);
@@ -1044,6 +1069,7 @@ sealed class CodexAgent : IAsyncDisposable
     /// <summary>Sends a thread's history from Codex, for a session the service has not journaled (made in Codex's own apps).</summary>
     async Task ReplayAsync(string id, CancellationToken ct)
     {
+        var replayedChildren = new HashSet<string>(StringComparer.Ordinal);
         string? cursor = null;
         for (var page = 0; page < 1000; page++)
         {
@@ -1057,7 +1083,10 @@ sealed class CodexAgent : IAsyncDisposable
             }, CodexJsonContext.Default.ThreadTurnsListParams), ct), CodexJsonContext.Default.ThreadTurnsListResponse);
             foreach (var turn in turns.Data)
                 foreach (var item in turn.Items)
+                {
+                    await ReplayNativeChildAsync(id, item, replayedChildren, ct);
                     if (ReplayOf(item) is { } update) await rpc.SendUpdateAsync(id, update);
+                }
             cursor = turns.NextCursor;
             if (cursor is null) return;
         }
@@ -1074,6 +1103,7 @@ sealed class CodexAgent : IAsyncDisposable
     /// </summary>
     async Task<JsonObject?> ReplayFromAsync(string id, JsonObject from, CancellationToken ct)
     {
+        var replayedChildren = new HashSet<string>(StringComparer.Ordinal);
         var mark = (string?)from["type"] == GorynychProtocol.ReplayAfterMark ? (string?)from["mark"] : null;
         try
         {
@@ -1126,13 +1156,17 @@ sealed class CodexAgent : IAsyncDisposable
                 {
                     if (!newer.Contains(turn.Id) || turn.Status == TurnStatus.InProgress) continue;
                     foreach (var item in turn.Items)
+                    {
+                        await ReplayNativeChildAsync(id, item, replayedChildren, ct);
                         if (ReplayOf(item) is { } update)
                         {
                             await rpc.SendUpdateAsync(id, update);
                             sent++;
                         }
+                    }
                 }
             }
+            if (found && clientSubagents) await ReplayOlderNativeChildrenAsync(id, replayedChildren, ct);
             Log($"codex: thread {id}: {newer.Count} turns ({sent} updates) replayed {(found ? "after " + mark : "from the start")}");
             return new JsonObject { ["from"] = found ? "mark" : "start", ["mark"] = newest };
         }
@@ -1168,7 +1202,7 @@ sealed class CodexAgent : IAsyncDisposable
         lockWatcher?.Saw(listed.Data.Select(th => th.Id), held);
         return AcpJson.ToNode(new ListSessionsResponse
         {
-            Sessions = listed.Data.Select(th => new SessionInfo
+            Sessions = listed.Data.Where(th => th.ParentThreadId is null && !nativeChildren.ContainsKey(th.Id)).Select(th => new SessionInfo
             {
                 SessionId = th.Id,
                 Cwd = th.Cwd,
@@ -1866,7 +1900,7 @@ sealed class CodexAgent : IAsyncDisposable
     }
 
 
-    CodexThread? Thread(string id) => threads.GetValueOrDefault(id);
+    CodexThread? Thread(string id) => threads.GetValueOrDefault(id) ?? nativeChildren.GetValueOrDefault(id)?.Thread;
 
     /// <summary>
     /// Codex says it unloaded a thread (<c>thread/closed</c>, status <c>notLoaded</c>). Such a note
@@ -1912,7 +1946,9 @@ sealed class CodexAgent : IAsyncDisposable
         if (t.Abandon() is { Length: > 0 } turnId) abandoned[turnId] = 0;
     }
 
-    Task Update(string threadId, SessionUpdate update) => rpc.SendUpdateAsync(threadId, update);
+    Task Update(string threadId, SessionUpdate update) =>
+        !clientSubagents && (nativeChildren.ContainsKey(threadId) || update.Tag is "subagent_update" or "session_message" or "session_message_chunk")
+            ? Task.CompletedTask : rpc.SendUpdateAsync(threadId, update);
 
     async Task OnServerNotificationAsync(string method, JsonNode? p)
     {
@@ -1939,12 +1975,14 @@ sealed class CodexAgent : IAsyncDisposable
             case CodexMethods.Notification.TurnStarted:
             {
                 var n = From(p, ctx.TurnStartedNotification);
+                await NativeChildStateAsync(n.ThreadId, "running");
                 if (Thread(n.ThreadId) is { } t) Named(t, n.Turn.Id);
                 break;
             }
             case CodexMethods.Notification.TurnCompleted:
             {
                 var n = From(p, ctx.TurnCompletedNotification);
+                await NativeChildTurnCompletedAsync(n.ThreadId, n.Turn.Status.Value);
                 if (abandoned.TryRemove(n.Turn.Id, out _)) break; // ended here already; not a later turn's end
                 Thread(n.ThreadId)?.Completed(n.Turn);
                 break;
@@ -1952,6 +1990,8 @@ sealed class CodexAgent : IAsyncDisposable
             case CodexMethods.Notification.ItemStarted:
             {
                 var n = From(p, ctx.ItemStartedNotification);
+                if (n.Item is SubAgentActivityThreadItem activity && activity.Kind.Value == "started")
+                    await AnnounceNativeChildAsync(n.ThreadId, activity.AgentThreadId, activity.AgentPath, CancellationToken.None);
                 if (ToolCallOf(n.Item, done: false) is { } call)
                 {
                     Thread(n.ThreadId)?.Started(n.Item, call.ToolCallId);
@@ -1963,8 +2003,13 @@ sealed class CodexAgent : IAsyncDisposable
             {
                 var n = From(p, ctx.ItemCompletedNotification);
                 var t = Thread(n.ThreadId);
+                if (n.Item is CollabAgentToolCallThreadItem collaboration)
+                    await NativeCollaborationAsync(n.ThreadId, collaboration, CancellationToken.None);
                 switch (n.Item)
                 {
+                    case UserMessageThreadItem u when nativeChildren.ContainsKey(n.ThreadId):
+                        await NativeChildMessageAsync(n.ThreadId, u);
+                        break;
                     case UserMessageThreadItem:
                         break; // the client's own prompt: ACP does not echo it, and only the service starts turns here
                     case AgentMessageThreadItem a when a.Text.Length > 0 && t?.WasStreamed(a.Id) != true:
@@ -2077,7 +2122,14 @@ sealed class CodexAgent : IAsyncDisposable
                     IdleThreadStatus or NotLoadedThreadStatus or SystemErrorThreadStatus => "idle",
                     _ => null,
                 };
-                if (state is not null)
+                if (nativeChildren.ContainsKey(n.ThreadId))
+                {
+                    // Only the child's turn/completed carries the stop reason. The status
+                    // update supplies the live wait state and the transition out of it.
+                    if (state is "running" or "requires_action") await NativeChildStateAsync(n.ThreadId, state);
+                    if (n.Status is NotLoadedThreadStatus) await NativeChildStateAsync(n.ThreadId, "unknown");
+                }
+                else if (state is not null)
                     await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = state } });
                 if (n.Status is not NotLoadedThreadStatus) break;
                 if (unloading.TryGetValue(n.ThreadId, out var closing)) closing.TrySetResult();
@@ -2087,7 +2139,8 @@ sealed class CodexAgent : IAsyncDisposable
             case CodexMethods.Notification.ThreadClosed:
             {
                 var n = From(p, ctx.ThreadClosedNotification);
-                await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = "idle" } });
+                if (nativeChildren.ContainsKey(n.ThreadId)) await NativeChildStateAsync(n.ThreadId, "unknown");
+                else await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = "idle" } });
                 if (unloading.TryGetValue(n.ThreadId, out var closing)) closing.TrySetResult();
                 if (Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "thread/closed");
                 break;
@@ -2112,6 +2165,13 @@ sealed class CodexAgent : IAsyncDisposable
 
     async Task<JsonNode?> OnServerRequestAsync(JsonRpcRequest request, CancellationToken ct)
     {
+        // Wait for earlier announcements before any request can mention a child.
+        await ServerNotificationsBeforeAsync();
+        if ((string?)request.Params?["threadId"] is { } nativeId && unexposedChildren.TryGetValue(nativeId, out var fallback)
+            && request.Params is JsonObject parameters)
+            parameters["threadId"] = fallback;
+        else if ((string?)request.Params?["threadId"] is { } unknown && Thread(unknown) is null && !IsTitleHelper(unknown))
+            throw new JsonRpcException(JsonRpcException.InvalidRequest, "Codex requested an interaction for an unobserved thread.");
         // A title thread never asks the person or the service: it has no tools, and anything it
         // still asks is refused here, off the visible connection.
         if (IsTitleHelper((string?)request.Params?["threadId"])) return TitleHelperRefusal(request.Method);
@@ -2157,7 +2217,7 @@ sealed class CodexAgent : IAsyncDisposable
     async Task<string?> AskAsync(string threadId, ToolCallUpdate call, List<PermissionOption> options, CancellationToken ct)
     {
         var answer = await rpc.RequestAsync<RequestPermissionRequest, RequestPermissionResponse>(AcpMethods.Client.SessionRequestPermission,
-            new RequestPermissionRequest { SessionId = threadId, ToolCall = call, Options = options }, ct);
+            new RequestPermissionRequest { SessionId = ClientSessionId(threadId), ToolCall = call, Options = options }, ct);
         if (answer.Outcome is not SelectedPermissionOutcome s) return null;
         if (options.Any(o => o.OptionId == s.OptionId)) return s.OptionId;
         var reject = options.FirstOrDefault(o => o.Kind == PermissionOptionKind.RejectOnce)?.OptionId;
@@ -2274,7 +2334,7 @@ sealed class CodexAgent : IAsyncDisposable
         if (mode == "form" && AcpJson.FromNode<ElicitationSchema>(@params?["requestedSchema"]) is { } schema)
         {
             var answer = await rpc.RequestAsync<CreateElicitationRequest, CreateElicitationResponse>(AcpMethods.Client.ElicitationCreate,
-                new ElicitationFormMode { SessionId = threadId, Message = (string?)@params?["message"] ?? "", RequestedSchema = schema }, ct);
+                new ElicitationFormMode { SessionId = ClientSessionId(threadId), Message = (string?)@params?["message"] ?? "", RequestedSchema = schema }, ct);
             return answer switch
             {
                 ElicitationAcceptAction a => new JsonObject
@@ -2305,7 +2365,7 @@ sealed class CodexAgent : IAsyncDisposable
                 : new StringPropertySchema { Title = q.Header, Description = q.Question };
         var answer = await rpc.RequestAsync<CreateElicitationRequest, CreateElicitationResponse>(AcpMethods.Client.ElicitationCreate, new ElicitationFormMode
         {
-            SessionId = p.ThreadId,
+            SessionId = ClientSessionId(p.ThreadId),
             ToolCallId = p.ItemId,
             Message = p.Questions.Count == 1 ? p.Questions[0].Question : "Codex asks you some questions",
             RequestedSchema = new ElicitationSchema { Type = ElicitationSchemaType.Object, Properties = properties, Required = properties.Keys.ToList() },

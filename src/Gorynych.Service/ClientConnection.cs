@@ -70,6 +70,8 @@ internal sealed class ClientConnection
 
     /// <summary>The client shows ACP's <c>notice</c> session updates (<c>clientCapabilities.session.notices</c>); none is sent to another.</summary>
     public bool TakesNotices => Init?.ClientCapabilities?.Session?.Notices is not null;
+    public bool TakesSubagents => Init?.ClientCapabilities?.Subagents is not null;
+    internal SubagentRouting Subagents { get; } = new();
 
     // What this client was told of each session's interactivity (null: full): on this connection, or
     // before it, as its resumable link says when it resumes the session after a reconnect.
@@ -99,6 +101,9 @@ internal sealed class ClientConnection
 
     async Task<JsonNode?> HandleAsync(JsonRpcRequest request, CancellationToken ct)
     {
+        if (request.Params?["sessionId"] is JsonValue id && id.TryGetValue<string>(out var sessionId)
+            && conductor.RootOfSubagent(sessionId) is not null)
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "A native subagent is available through its parent session.");
         switch (request.Method)
         {
             case AcpMethods.Agent.Initialize:
@@ -117,9 +122,9 @@ internal sealed class ClientConnection
             case AcpMethods.Agent.SessionNew:
                 return AcpJson.ToNode(await conductor.NewSessionAsync(this, request.ParamsAs<NewSessionRequest>(), request.AfterResult, ct));
             case AcpMethods.Agent.SessionLoad:
-                return await conductor.LoadAsync(this, request.ParamsAs<LoadSessionRequest>(), ct);
+                return await conductor.LoadAsync(this, request.ParamsAs<LoadSessionRequest>(), request.AfterResult, ct);
             case AcpMethods.Agent.SessionResume:
-                return await conductor.ResumeAsync(this, request.ParamsAs<ResumeSessionRequest>(), ct);
+                return await conductor.ResumeAsync(this, request.ParamsAs<ResumeSessionRequest>(), request.AfterResult, ct);
             case AcpMethods.Agent.SessionPrompt:
                 return await conductor.PromptAsync(this, request, ct);
             case GorynychProtocol.MethodSteering:
@@ -204,6 +209,7 @@ internal sealed class ClientConnection
         if (method is GorynychProtocol.MethodReportNote or GorynychProtocol.MethodReportNoteStatus or GorynychProtocol.MethodReportNoteAck or
             GorynychProtocol.MethodHostReportNote or GorynychProtocol.MethodHostReportNoteStatus or GorynychProtocol.MethodHostReportNoteAck or GorynychProtocol.MethodHostReportNoteReceipt) return;
         if ((string?)@params?["sessionId"] is not { } sid) return;
+        if (conductor.RootOfSubagent(sid) is not null) return;
         if (method == AcpMethods.Agent.SessionCancel) cancelledAt[sid] = Rpc.NotificationSequence;
         try { await conductor.ForwardNotificationAsync(method, @params, sid); }
             catch (Exception e) when (e is IOException or JsonRpcException) { ServiceLog.Warn($"{method} for {sid}: {e.Message}"); }

@@ -728,6 +728,15 @@ over app-server's JSON-RPC. The design and the probes behind it are in
   variant, and a source-generated `CodexJsonContext` for Native AOT. Only the types the adapter
   uses and those they reach are generated (the list is `Roots` in the generator). To move to a
   new Codex, generate the schema into a new folder and run the generator with its version.
+- **Native subagents.** The adapter correlates Codex collaboration items and child thread IDs
+  with the immediate parent. When it can verify the child and its workspace, it announces the
+  association before sending the child's tools, responses, or requests. The parent retains its
+  ordinary tool update for delegation. The adapter reads available child turns when replaying
+  the parent's history. It reports an outgoing task message only when the native event contains
+  the task text. Codex 0.170.0 `subAgentActivity` carries the child identity and path without
+  the task text. The adapter keeps the last live state it observed for each child. On request
+  from the service it republishes those states in native-event order. Replayed turns do not
+  populate this live state.
 - **Background work.** Claude headless reports complete native `background_tasks_changed`
   snapshots as `_claude_task` references, with native identities in `_meta`. Claude's task
   checklist tools remain ACP plans. Loaded Codex threads poll the experimental paginated

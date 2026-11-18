@@ -72,6 +72,12 @@ static class CodexMap
                 ToolCallId = a.Id, Title = "Codex sub-agent", Kind = ToolKind.Other,
                 Status = done ? ToolCallStatus.Completed : ToolCallStatus.InProgress,
             },
+            SubAgentActivityThreadItem a when a.Kind.Value == "started" => new ToolCall
+            {
+                ToolCallId = a.Id, Title = $"Codex sub-agent {a.AgentPath}", Kind = ToolKind.Other,
+                Status = done ? ToolCallStatus.Completed : ToolCallStatus.InProgress,
+                RawInput = new JsonObject { ["agentThreadId"] = a.AgentThreadId, ["agentPath"] = a.AgentPath },
+            },
             ImageGenerationThreadItem g => new ToolCall
             {
                 ToolCallId = g.Id, Title = "Generate an image", Kind = ToolKind.Other,

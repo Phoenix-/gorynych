@@ -395,6 +395,15 @@ public static class GorynychProtocol
     /// <summary>In <c>agentCapabilities._meta</c>: <c>true</c> when the adapter takes <see cref="MethodCatchUp"/>.</summary>
     public const string CapCatchUp = "gorynych/catchUp";
 
+    /// <summary>Service → adapter: republish the observed states of this root's native subagents.</summary>
+    public const string MethodRefreshSubagentStates = "_gorynych/refresh_subagent_states";
+
+    /// <summary>Private update marker for a fresh subagent snapshot that should not be journaled again.</summary>
+    public const string MetaSubagentSnapshot = "gorynych/subagentSnapshot";
+
+    /// <summary>Internal adapter/service negotiation and marker for a live subagent state observation.</summary>
+    public const string MetaSubagentLiveState = "gorynych/subagentLiveState";
+
     /// <summary>
     /// In <c>agentCapabilities._meta</c>: <c>true</c> when the adapter takes <see cref="MetaReplayFrom"/>
     /// on <c>session/resume</c> and reports <see cref="MetaHistoryMark"/> (docs/adapter-contract.md, §4).

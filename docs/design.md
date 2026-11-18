@@ -254,7 +254,8 @@ an ACP client. The types are generated from the published JSON schema
 | Loaded or not | `session/status` (`open`, `saved`) | draft RFD | the same words in `list_agents`; adopt when stable |
 | Title and archive | `session/set_title`, `session/archive` | draft RFDs | own `_gorynych/archive` and overlay names meanwhile; adopt when stable |
 | List changes | `session/list/subscribe` | open PR | own `_gorynych/sessions_changed` meanwhile |
-| Child sessions | subagents RFD (`subagent_update`) | active RFD | not used: it forbids prompting a child; own parent link instead ([below](#child-sessions)) |
+| Native Codex subagents | [Subagent Sessions Preview](https://agentclientprotocol.com/rfds/subagents) | ACP v1 preview | capability-gated associations and child traffic through the native parent's connection |
+| Gorynych child sessions | ordinary ACP sessions | stable v1 | the service's own parent link preserves direct prompting ([below](#child-sessions)) |
 | Questions between agents | none | — | own `_gorynych/opinion`, through the `gorynych` MCP server |
 | The service as an intermediary | [proxy-chains RFD](https://agentclientprotocol.com/rfds/proxy-chains.md): a conductor, `proxy/initialize`, `proxy/successor` | unstable RFD | the service is a conductor in that sense; no `proxy/*` methods until the RFD settles |
 | Transport | [stdio only](https://agentclientprotocol.com/protocol/transports); Streamable HTTP and WebSocket are an RFD draft | v1 / RFD | a named pipe locally, stdio through the bridge; remote over `ssh -T` (**planned**); a standard network transport once accepted |

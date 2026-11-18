@@ -651,6 +651,19 @@ open and prompt any of them directly. ACP's subagents RFD hides a subagent from
 session that names its parent in `_meta["gorynych/parentSessionId"]`; a stock client shows
 it as one more session, a Gorynych GUI can draw the tree.
 
+Codex's own subagents use the ACP [Subagent Sessions Preview](https://agentclientprotocol.com/rfds/subagents).
+The client opts in with `clientCapabilities.subagents: {}` at initialization. The
+service sends associations and subagent updates through the ordinary parent's
+connection, preserving the child session IDs. Clients without the capability
+receive ordinary tool updates and answer any child permission request through the
+parent. The service journals child traffic with the owning tree and keeps each
+announcement ahead of its child updates on replay. A native subagent is absent from
+`session/list` and has no directly callable session methods in this implementation.
+After a successful load or resume, the service requests current subagent states from the
+Codex adapter serving the parent. The service sends these snapshots after the response and
+does not add them to replay a second time. When the current adapter has no observation,
+child activity remains unconfirmed.
+
 The agent calls the peers server's `spawn_session {agent, prompt, cwd?, title?, mode?,
 config_options?, report?, initiation?}`, which sends `_gorynych/spawn` with its peer token.
 `initiation` says who wants the session: `user_asked` only when the user, in this turn,

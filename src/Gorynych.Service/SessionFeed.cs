@@ -12,6 +12,15 @@ namespace Gorynych.Service;
 /// </summary>
 internal sealed class SessionFeed(string sessionId, SessionJournal journal)
 {
+    // Both state ownership and delivery are serialized by gate, so a late host-loss callback
+    // cannot replace a newer host's already-delivered observation.
+    readonly Dictionary<string, (string Parent, JsonRpcConnection Source)> subagentStateOwners = new(StringComparer.Ordinal);
+    JsonRpcConnection? importingHistory;
+
+    public void BeginHistoryImport(JsonRpcConnection source) { lock (clientsGate) importingHistory = source; }
+    public void EndHistoryImport(JsonRpcConnection source) { lock (clientsGate) if (ReferenceEquals(importingHistory, source)) importingHistory = null; }
+    public bool IsHistoryImport(JsonRpcConnection? source) { lock (clientsGate) return source is not null && ReferenceEquals(importingHistory, source); }
+
     public SessionActivity Activity { get; init; } = new("standalone");
     int nativeActivity;
     bool backgroundUse;
@@ -220,7 +229,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// <summary>Keeps <paramref name="update"/> aside while a replay is collected; false otherwise.</summary>
     public bool CollectReplay(JsonObject update)
     {
-        if (!SessionJournal.IsTurnKind((string?)update["sessionUpdate"])) return false;
+        if (!SessionJournal.IsTurnKind((string?)update["sessionUpdate"]) && !SubagentRouting.IsPreview(update)) return false;
         lock (clientsGate)
         {
             if (replay is null) return false;
@@ -934,19 +943,26 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
 
     /// <summary>Journals an update, runs <paramref name="remember"/>, and sends it to the attached clients.</summary>
     /// <param name="journal">False sends it without journaling it.</param>
-    public async Task PublishAsync(JsonObject update, ClientConnection? except, Action remember, bool journal = true)
+    public async Task PublishAsync(JsonObject update, ClientConnection? except, Action remember, bool journal = true,
+        JsonRpcConnection? stateSource = null, bool historical = false)
     {
         await gate.WaitAsync();
         try
         {
             if (Retired) return; // a late update of a deleted session must not bring its journal back
-            StampMessageId(update);
-            RememberToolTitle(update);
+            if (stateSource?.IsClosed == true) return;
+            if (!historical && stateSource is not null && SubagentRouting.Announcement(update) is { } child && update["state"] is JsonObject)
+                subagentStateOwners[child] = (SubagentRouting.SessionOf(update) ?? SessionId, stateSource);
+            if (SubagentRouting.SessionOf(update) is null)
+            {
+                StampMessageId(update);
+                RememberToolTitle(update);
+            }
             if (journal) Journal.Append(update);
             remember();
             foreach (var client in Clients())
                 if (!ReferenceEquals(client, except))
-                    await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update.DeepClone()));
+                    await SendUpdateAsync(client, historical ? WithoutHistoricalState(update) : update);
         }
         finally
         {
@@ -968,14 +984,17 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             if (Retired) return;
             foreach (var update in updates)
             {
-                StampMessageId(update);
-                RememberToolTitle(update);
+                if (SubagentRouting.SessionOf(update) is null)
+                {
+                    StampMessageId(update);
+                    RememberToolTitle(update);
+                }
             }
             Journal.AppendMany(updates);
             if (trimmed) Journal.MarkTrimmed();
             foreach (var client in Clients())
                 foreach (var update in updates)
-                    if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update.DeepClone()))) break;
+                    if (!await SendUpdateAsync(client, WithoutHistoricalState(update))) break;
         }
         finally
         {
@@ -998,7 +1017,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             Journal.Replace(entries, now, mark, trimmed);
             foreach (var client in Clients())
                 foreach (var entry in entries)
-                    if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(entry.DeepClone()))) break;
+                    if (!await SendUpdateAsync(client, WithoutHistoricalState(entry))) break;
         }
         finally
         {
@@ -1024,8 +1043,8 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             JsonNode? journaled = null;
             foreach (var update in Journal.ReadAll())
             {
-                if (SessionJournal.IsCommands(update)) { journaled = update; continue; }
-                if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update))) return position;
+                if (SessionJournal.IsCommands(update) && !SubagentRouting.IsPreview(update)) { journaled = update; continue; }
+                if (!await SendUpdateAsync(client, update)) return position;
             }
             if ((commands?.DeepClone() ?? journaled) is { } list && !await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(list))) return position;
             Attach(client);
@@ -1051,9 +1070,19 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         {
             var position = Journal.LastPosition;
             if (Retired) return position;
+            if (client.TakesSubagents)
+                foreach (var update in Journal.ReadAll().Where(u => SubagentRouting.Announcement(u) is not null))
+                {
+                    var child = SubagentRouting.Announcement(update)!;
+                    if (client.Subagents.RootOf(child) is not null) continue;
+                    var association = (JsonObject)update.DeepClone();
+                    association.Remove("state");
+                    association.Remove("capabilities");
+                    if (!await SendUpdateAsync(client, association)) return position;
+                }
             if (after is { } from)
                 foreach (var update in Journal.ReadAfter(from))
-                    if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(update))) return position;
+                    if (!await SendUpdateAsync(client, update)) return position;
             if (commands?.DeepClone() is { } list && !await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(list))) return position;
             Attach(client);
             return position;
@@ -1307,10 +1336,57 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         return done;
     }
 
+    async Task<bool> SendUpdateAsync(ClientConnection client, JsonNode update)
+    {
+        if (SubagentRouting.IsPreview(update) && !client.TakesSubagents) return true;
+        var target = SubagentRouting.SessionOf(update);
+        if (target is not null && client.Subagents.RootOf(target) != SessionId) return true;
+        var outgoing = update.DeepClone();
+        if (!client.TakesSubagents && outgoing["content"] is JsonArray content)
+            for (var index = content.Count - 1; index >= 0; index--)
+                if ((string?)content[index]?["type"] == "session") content.RemoveAt(index);
+        if (!await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(outgoing))) return false;
+        if (SubagentRouting.Announcement(update) is { } child)
+            client.Subagents.Announce(target ?? SessionId, child, SessionId);
+        return true;
+    }
+
+    static JsonNode WithoutHistoricalState(JsonNode update)
+    {
+        if (SubagentRouting.Announcement(update) is null || update is not JsonObject obj || !obj.ContainsKey("state")) return update;
+        var copy = (JsonObject)obj.DeepClone();
+        copy.Remove("state");
+        return copy;
+    }
+
+    /// <summary>Withdraw only snapshots last observed on this lost connection.</summary>
+    public async Task SubagentHostLostAsync(JsonRpcConnection source)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (Retired) return;
+            foreach (var (child, owner) in subagentStateOwners.Where(p => ReferenceEquals(p.Value.Source, source)).ToArray())
+            {
+                subagentStateOwners.Remove(child);
+                var update = new JsonObject { ["sessionUpdate"] = "subagent_update", ["sessionId"] = child,
+                    ["state"] = new JsonObject { ["state"] = "unknown" } };
+                if (owner.Parent != SessionId) SubagentRouting.SetSession(update, owner.Parent);
+                foreach (var client in Clients()) await SendUpdateAsync(client, update);
+            }
+        }
+        finally { gate.Release(); }
+    }
+
     JsonObject Notification(JsonNode update)
     {
-        if (update["_meta"] is JsonObject meta && meta.Remove(Gorynych.Acp.Hosting.GorynychProtocol.MetaHostSeq) && meta.Count == 0)
-            ((JsonObject)update).Remove("_meta");
-        return new() { ["sessionId"] = SessionId, ["update"] = update };
+        var target = SubagentRouting.SessionOf(update) ?? SessionId;
+        if (update["_meta"] is JsonObject meta)
+        {
+            var hasPrivate = meta.Remove(Gorynych.Acp.Hosting.GorynychProtocol.MetaHostSeq);
+            hasPrivate |= meta.Remove(SubagentRouting.MetaSession);
+            if (hasPrivate && meta.Count == 0) ((JsonObject)update).Remove("_meta");
+        }
+        return new() { ["sessionId"] = target, ["update"] = update };
     }
 }

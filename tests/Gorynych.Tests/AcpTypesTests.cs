@@ -8,6 +8,26 @@ namespace Gorynych.Tests;
 public sealed class AcpTypesTests
 {
     [TestMethod]
+    public void SubagentPreviewCapability_RoundTripsPresence()
+    {
+        var capable = JsonSerializer.Deserialize("""{"subagents":{}}""", AcpJsonContext.Default.ClientCapabilities)!;
+        Assert.IsNotNull(capable.Subagents);
+        Assert.AreEqual("""{"subagents":{}}""", JsonSerializer.Serialize(capable, AcpJsonContext.Default.ClientCapabilities));
+        var ordinary = JsonSerializer.Deserialize("""{}""", AcpJsonContext.Default.ClientCapabilities)!;
+        Assert.IsNull(ordinary.Subagents);
+    }
+
+    [TestMethod]
+    public void SubagentPreviewUpdates_RoundTrip()
+    {
+        var json = """{"sessionId":"parent","update":{"sessionUpdate":"subagent_update","sessionId":"child","title":"Worker"}}""";
+        var notification = JsonSerializer.Deserialize(json, AcpJsonContext.Default.SessionNotification)!;
+        var update = (SubagentUpdate)notification.Update;
+        Assert.AreEqual("child", update.SessionId);
+        Assert.AreEqual(json, JsonSerializer.Serialize(notification, AcpJsonContext.Default.SessionNotification));
+    }
+
+    [TestMethod]
     public void SessionUpdate_RoundTripsKnownVariant_WithDiscriminatorFirst()
     {
         var json = """{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"},"messageId":"m1"}}""";

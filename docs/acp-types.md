@@ -20,6 +20,11 @@ dotnet run --project tools/Gorynych.AcpGen -- . v1.29.1
 
 The output, `src/Gorynych.Acp/Generated/Acp.g.cs`, is checked in.
 
+The default schema also overlays only the Subagent Sessions Preview definitions and
+variants from `schema.preview.json`, extracted from the official unstable schema at
+[43072100221a44728af67d1280f6b61aac93dd01](https://github.com/agentclientprotocol/agent-client-protocol/blob/43072100221a44728af67d1280f6b61aac93dd01/schema/v1/schema.unstable.json).
+These generated types alone do not enable the preview.
+
 **For now the types come from ACP's main branch, not a release.** The client-system-prompt
 RFD (`systemPrompt` on `session/new`, `session/load` and `session/resume`, and
 `sessionCapabilities.systemPrompt`) was completed on 2026-11-06 and is in the stable
