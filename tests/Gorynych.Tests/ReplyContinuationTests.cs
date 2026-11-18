@@ -363,6 +363,8 @@ public sealed class ReplyContinuationTests
             foreach (var id in new[] { parent, child, grandchild }) service.Store.Update(id, "kimi", r => r.Draft = false, durable: true);
             service.Store.Update(grandchild, "kimi", r => r.ParentSessionId = child, durable: true);
             service.ReplyMailbox.Accept("owner", parent, child, "owner", delegation: true);
+            Assert.IsTrue(service.ReplyMailbox.TryMarkStarted("owner", child));
+            service.ReplyMailbox.MarkDelivered("owner", child);
             if (source == "spawn") service.Store.CommitSpawnAssignment(grandchild, "target");
             else service.ReplyMailbox.Accept("target", child, grandchild, "target", delegation: true);
             var generation = (string)service.ReplyMailbox.FindAssignment("owner", child)!["generation"]!;

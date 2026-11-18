@@ -1,4 +1,6 @@
 using System.Text;
+using System.Security.Cryptography;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Gorynych.Acp.Hosting;
 using Gorynych.Acp.JsonRpc;
@@ -32,6 +34,17 @@ public sealed partial class Conductor
                 ["requestDelivery"] = requestDelivery, ["replyDelivery"] = wait?["replyDelivery"]?.DeepClone(),
                 ["reason"] = wait is null ? "Retained reply wait unavailable" : disposition is "undeliverable" or "unknown" ? requestDelivery : null };
         }
+        if ((string?)reference["kind"] == "background_task")
+        {
+            var taskId = (string)reference["taskId"]!; var current = CurrentBackgroundEvidence(actor);
+            var comparable = (string?)reference["nativeType"] == "_claude_task" && current is not null && current.HostId == (string?)reference["hostId"] &&
+                current.Stream == (string?)reference["stream"] && current.Revision >= (long)reference["revision"]!;
+            var present = comparable && current!.Items.Contains(taskId, StringComparer.Ordinal);
+            var finished = comparable && !present && current!.Revision > (long)reference["revision"]!;
+            return new JsonObject { ["kind"] = "background_task", ["nativeType"] = "_claude_task", ["taskId"] = taskId,
+                ["state"] = !comparable || !present && !finished ? "unknown" : finished ? "ready" : "waiting",
+                ["reason"] = finished ? "Task is no longer listed; inspect its result" : !comparable ? "Comparable background evidence unavailable" : null };
+        }
         if ((string?)reference["kind"] != "child_assignment") return null;
         var source = (string)reference["source"]!; var id = (string)reference["assignmentId"]!;
         var generation = (string)reference["generation"]!;
@@ -54,13 +67,51 @@ public sealed partial class Conductor
             ["generation"] = generation, ["state"] = childState, ["delivery"] = delivery, ["reason"] = reason };
     }
 
+    static readonly UTF8Encoding BackgroundReferenceUtf8 = new(false, true);
+    const int BackgroundReferenceLimit = 8192;
+    sealed record BackgroundSelection(string Host, string Stream, long Revision, string TaskId);
+
+    static string BackgroundReference(string actor, string host, string stream, long revision, string taskId)
+    {
+        var actorHash = Convert.ToHexString(SHA256.HashData(BackgroundReferenceUtf8.GetBytes(actor)));
+        var encoded = new JsonObject { ["actorHash"] = actorHash, ["host"] = host, ["stream"] = stream,
+            ["revision"] = revision, ["taskId"] = taskId }.ToJsonString();
+        return Convert.ToBase64String(BackgroundReferenceUtf8.GetBytes(encoded));
+    }
+
+    static BackgroundSelection ParseBackgroundReference(string actor, string token)
+    {
+        try
+        {
+            if (token.Length is < 1 or > BackgroundReferenceLimit) throw new FormatException();
+            var value = JsonNode.Parse(BackgroundReferenceUtf8.GetString(Convert.FromBase64String(token))) as JsonObject ?? throw new FormatException();
+            if (value.Count != 5 || value["host"] is not JsonValue h || !h.TryGetValue<string>(out var host) ||
+                string.IsNullOrWhiteSpace(host) || host.Length > 256 || value["stream"] is not JsonValue s || !s.TryGetValue<string>(out var stream) ||
+                !Guid.TryParseExact(stream, "N", out _) || value["revision"] is not JsonValue v || !v.TryGetValue<long>(out var revision) || revision < 1 ||
+                value["taskId"] is not JsonValue t || !t.TryGetValue<string>(out var task) || string.IsNullOrWhiteSpace(task) || task.Length > 256 ||
+                token != BackgroundReference(actor, host, stream, revision, task)) throw new FormatException();
+            return new BackgroundSelection(host, stream, revision, task);
+        }
+        catch (Exception e) when (e is FormatException or JsonException or DecoderFallbackException or EncoderFallbackException or InvalidOperationException)
+        { throw new JsonRpcException(JsonRpcException.InvalidParams, "Invalid background reference"); }
+    }
+
+    internal JsonObject ListBackgroundTasks(JsonRpcRequest request)
+    {
+        var actor = MailboxPeer(request); AssignmentParams(request);
+        var evidence = CurrentBackgroundEvidence(actor);
+        return new JsonObject { ["state"] = evidence is null ? "unknown" : "available",
+            ["items"] = new JsonArray((evidence?.Items ?? []).Select(id => (JsonNode)new JsonObject { ["nativeType"] = "_claude_task", ["taskId"] = id,
+                ["reference"] = BackgroundReference(actor, evidence!.HostId, evidence.Stream, evidence.Revision, id) }).ToArray()) };
+    }
+
     internal Action? ContinuationAfterLookupForTests { get; set; }
 
     internal JsonObject UpdateContinuation(JsonRpcRequest request)
     {
         if (Draining) throw Restarting();
         var actor = MailboxPeer(request);
-        var args = AssignmentParams(request, "source", "assignmentId", "generation", "expectedRevision", "operationId", "action", "messageId", "targetSource", "targetAssignmentId", "targetGeneration");
+        var args = AssignmentParams(request, "source", "assignmentId", "generation", "expectedRevision", "operationId", "action", "messageId", "targetSource", "targetAssignmentId", "targetGeneration", "backgroundRef");
         var (source, id) = AssignmentIdentity(args);
         var generation = RequiredMailboxText(args, "generation"); var operation = RequiredMailboxText(args, "operationId");
         var action = RequiredMailboxText(args, "action");
@@ -70,13 +121,21 @@ public sealed partial class Conductor
             throw new JsonRpcException(JsonRpcException.InvalidParams, "Invalid continuation operation");
         var hasMessage = args.ContainsKey("messageId");
         var hasChild = args.ContainsKey("targetSource") || args.ContainsKey("targetAssignmentId") || args.ContainsKey("targetGeneration");
-        if (action == "withdraw" && (hasMessage || hasChild) || action == "register" && hasMessage == hasChild)
+        var hasBackground = args.ContainsKey("backgroundRef");
+        if (action == "withdraw" && (hasMessage || hasChild || hasBackground) ||
+            action == "register" && (Convert.ToInt32(hasMessage) + Convert.ToInt32(hasChild) + Convert.ToInt32(hasBackground) != 1))
             throw new JsonRpcException(JsonRpcException.InvalidParams, "Register requires one target; withdraw accepts none");
-        string? message = null, childSource = null, childId = null, childGeneration = null;
+        string? message = null, childSource = null, childId = null, childGeneration = null, backgroundRef = null;
+        BackgroundSelection? selected = null;
         if (action == "register" && hasMessage)
         {
             message = RequiredMailboxText(args, "messageId");
             if (message.Length > 256) throw new JsonRpcException(JsonRpcException.InvalidParams, "Invalid message ID");
+        }
+        else if (action == "register" && hasBackground)
+        {
+            backgroundRef = RequiredMailboxText(args, "backgroundRef");
+            selected = ParseBackgroundReference(actor, backgroundRef);
         }
         else if (action == "register")
         {
@@ -95,6 +154,15 @@ public sealed partial class Conductor
                 target = mailbox.ContinuationWait(message, actor) ?? new JsonObject { ["messageId"] = message };
                 target["kind"] = "reply_wait"; target["confirmed"] = target["sequence"] is not null;
                 target.Remove("state"); target.Remove("requestDelivery"); target.Remove("replyDelivery");
+            }
+            else if (selected is not null)
+            {
+                var evidence = CurrentBackgroundEvidence(actor);
+                var matches = evidence is not null && evidence.HostId == selected.Host && evidence.Stream == selected.Stream &&
+                    evidence.Revision == selected.Revision && evidence.Items.Contains(selected.TaskId, StringComparer.Ordinal);
+                target = new JsonObject { ["kind"] = "background_task", ["nativeType"] = "_claude_task", ["taskId"] = selected.TaskId,
+                    ["hostId"] = matches ? evidence!.HostId : null, ["stream"] = matches ? evidence!.Stream : null,
+                    ["revision"] = matches ? evidence!.Revision : null, ["selector"] = backgroundRef, ["confirmed"] = matches };
             }
             else if (childId is not null)
             {

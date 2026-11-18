@@ -1,4 +1,6 @@
 using System.Text.Json.Nodes;
+using System.Text;
+using System.Security.Cryptography;
 
 namespace Gorynych.Service;
 
@@ -10,6 +12,8 @@ internal static class AssignmentContinuations
     {
         if ((string?)state["child"] != actor || (string?)state["generation"] != generation)
             throw new InvalidOperationException("Assignment unavailable or generation conflict");
+        var selector = (string?)target?["selector"];
+        var selectorFingerprint = selector is null ? null : Convert.ToHexString(SHA256.HashData(new UTF8Encoding(false, true).GetBytes(selector)));
         var ops = state["operations"]!.AsObject();
         if (ops[operation] is JsonObject prior)
         {
@@ -19,7 +23,10 @@ internal static class AssignmentContinuations
                 (string?)prior["targetKind"] != (string?)target?["kind"] ||
                 (string?)prior["targetSource"] != (string?)target?["source"] ||
                 (string?)prior["targetId"] != (string?)target?["assignmentId"] ||
-                (string?)prior["targetGeneration"] != (string?)target?["generation"])
+                (string?)prior["targetGeneration"] != (string?)target?["generation"] ||
+                (string?)prior["taskId"] != (string?)target?["taskId"] ||
+                (string?)prior["nativeType"] != (string?)target?["nativeType"] ||
+                (string?)prior["selectorFingerprint"] != selectorFingerprint)
                 throw new InvalidOperationException("Operation ID is already used");
             return (false, prior["result"]!.DeepClone().AsObject());
         }
@@ -30,7 +37,7 @@ internal static class AssignmentContinuations
         {
             if (state["continuation"] is not null) throw new InvalidOperationException("Withdraw the existing continuation first");
             if ((bool?)target?["confirmed"] != true) throw new InvalidOperationException("Continuation target unavailable");
-            var retained = target!.DeepClone().AsObject(); retained.Remove("confirmed");
+            var retained = target!.DeepClone().AsObject(); retained.Remove("confirmed"); retained.Remove("selector");
             state["continuation"] = retained;
         }
         else if (action == "withdraw")
@@ -46,7 +53,7 @@ internal static class AssignmentContinuations
         ops[operation] = new JsonObject { ["kind"] = "continuation", ["actor"] = actor, ["expectedRevision"] = revision,
             ["action"] = action, ["messageId"] = (string?)target?["messageId"], ["targetKind"] = (string?)target?["kind"],
             ["targetSource"] = (string?)target?["source"], ["targetId"] = (string?)target?["assignmentId"],
-            ["targetGeneration"] = (string?)target?["generation"], ["result"] = result.DeepClone() };
+            ["targetGeneration"] = (string?)target?["generation"], ["taskId"] = (string?)target?["taskId"], ["nativeType"] = (string?)target?["nativeType"], ["selectorFingerprint"] = selectorFingerprint, ["result"] = result.DeepClone() };
         return (true, result);
     }
 }

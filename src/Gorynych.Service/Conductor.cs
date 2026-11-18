@@ -1594,6 +1594,20 @@ public sealed partial class Conductor : IAsyncDisposable
             : throw new JsonRpcException(JsonRpcException.InvalidParams, $"Unknown agent '{name}'. Known: {string.Join(", ", agents.Keys)}");
     }
 
+    // Re-resolve both the session and its current route at every evidence read. The
+    // observation itself is never authority to select or reopen a session/host.
+    internal void InvalidateBackgroundEvidence(string sessionId, JsonRpcConnection source)
+    {
+        if (feeds.TryGetValue(sessionId, out var feed)) feed.InvalidateBackgroundEvidence(source);
+    }
+
+    internal BackgroundEvidence? CurrentBackgroundEvidence(string sessionId)
+    {
+        if (removed.ContainsKey(sessionId) || store.Get(sessionId) is not { Deleted: false, Agent: "claude" } ||
+            !agents.TryGetValue("claude", out var host)) return null;
+        return host.CurrentBackgroundEvidence(sessionId, Feed(sessionId));
+    }
+
     // ---------------------------------------------------------------- from agents
 
     internal async Task OnAgentNotificationAsync(AgentHost host, string method, JsonNode? @params, JsonRpcConnection? source = null)
@@ -1615,6 +1629,8 @@ public sealed partial class Conductor : IAsyncDisposable
                     if (!removed.ContainsKey(id) && store.Get(id) is { } record && record.Agent == host.Name && activity is JsonObject snapshot)
                     {
                         var restoredFeed = Feed(id);
+                        if (host.Name == "claude" && source is not null && snapshot.ContainsKey("backgroundEvidence"))
+                            host.ObserveBackgroundEvidence(id, source, snapshot["backgroundEvidence"], restoredFeed);
                         if (snapshot["backgroundHeld"] is JsonValue held && held.TryGetValue<bool>(out var pinned) && pinned) restoredFeed.PinBackground();
                         if (snapshot["backgroundKnownHeld"] is JsonValue knownHeld && knownHeld.TryGetValue<bool>(out var knownPinned) && knownPinned) restoredFeed.PinKnownBackground();
                         if ((string?)snapshot["foreground"] is { } foreground) NativeActivity(restoredFeed, foreground);
@@ -1694,6 +1710,8 @@ public sealed partial class Conductor : IAsyncDisposable
             var activityTurnHandled = false;
             if ((string?)update["sessionUpdate"] == "session_info_update" && update["_meta"] is JsonObject activityMeta && (activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork) || activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundKnown)))
             {
+                if (host.Name == "claude" && source is not null && activityMeta.ContainsKey(GorynychProtocol.MetaHostBackgroundEvidence))
+                    host.ObserveBackgroundEvidence(sessionId, source, activityMeta[GorynychProtocol.MetaHostBackgroundEvidence], feed);
                 if (activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork))
                     NativeBackground(feed, activityMeta[GorynychProtocol.MetaBackgroundWork], activityMeta[GorynychProtocol.MetaBackgroundProcessExited] is JsonValue exited && exited.TryGetValue<bool>(out var stopped) && stopped,
                         ReferenceEquals(host.RouteOf(sessionId)?.Rpc, source) ? source : null,
@@ -1706,6 +1724,7 @@ public sealed partial class Conductor : IAsyncDisposable
                     AgentTurn(feed, update);
                     activityTurnHandled = true;
                 }
+                activityMeta.Remove(GorynychProtocol.MetaHostBackgroundEvidence);
                 activityMeta.Remove(GorynychProtocol.MetaBackgroundCompleteStream);
                 activityMeta.Remove(GorynychProtocol.MetaBackgroundWork);
                 activityMeta.Remove(GorynychProtocol.MetaBackgroundKnown);
@@ -2846,7 +2865,7 @@ public sealed partial class Conductor : IAsyncDisposable
         if (request.Params is JsonObject raw && raw["_meta"] is JsonObject untrusted)
         {
             foreach (var name in new[] { GorynychProtocol.MetaReportId, GorynychProtocol.MetaReportCapture, GorynychProtocol.MetaReportDelivery,
-                GorynychProtocol.MetaAssignmentId, GorynychProtocol.MetaOrigin, GorynychProtocol.MetaMailboxMessage, GorynychProtocol.MetaExpectsReply, GorynychProtocol.MetaReplyReminder, GorynychProtocol.MetaBackgroundCompleteStream,
+                GorynychProtocol.MetaAssignmentId, GorynychProtocol.MetaOrigin, GorynychProtocol.MetaMailboxMessage, GorynychProtocol.MetaExpectsReply, GorynychProtocol.MetaReplyReminder, GorynychProtocol.MetaHostBackgroundEvidence, GorynychProtocol.MetaBackgroundCompleteStream,
                 GorynychProtocol.MetaSender, GorynychProtocol.MetaParentSessionId, GorynychProtocol.MetaFromSessionId }) untrusted.Remove(name);
             prompt.Meta = untrusted.DeepClone().AsObject();
         }

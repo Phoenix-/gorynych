@@ -151,6 +151,7 @@ internal sealed class ClientConnection
                 return conductor.Start(request);
             // Native report-note receipts are a private conductor-to-host protocol. Never send an
             // external ACP client's request through the generic session forwarding path.
+            case GorynychProtocol.MethodHostState:
             case GorynychProtocol.MethodReportNote:
             case GorynychProtocol.MethodReportNoteStatus:
             case GorynychProtocol.MethodReportNoteAck:
@@ -179,6 +180,8 @@ internal sealed class ClientConnection
                 return conductor.UpdateAssignment(request);
             case GorynychProtocol.MethodUpdateContinuation:
                 return conductor.UpdateContinuation(request);
+            case GorynychProtocol.MethodListBackgroundTasks:
+                return conductor.ListBackgroundTasks(request);
             case GorynychProtocol.MethodListReplyWaits:
                 return conductor.ListReplyWaits(request);
             case GorynychProtocol.MethodCancelReplyWait:
@@ -214,7 +217,7 @@ internal sealed class ClientConnection
 
     async Task OnNotificationAsync(string method, JsonNode? @params)
     {
-        if (method is GorynychProtocol.MethodReportNote or GorynychProtocol.MethodReportNoteStatus or GorynychProtocol.MethodReportNoteAck or
+        if (method is GorynychProtocol.MethodHostState or GorynychProtocol.MethodReportNote or GorynychProtocol.MethodReportNoteStatus or GorynychProtocol.MethodReportNoteAck or
             GorynychProtocol.MethodHostReportNote or GorynychProtocol.MethodHostReportNoteStatus or GorynychProtocol.MethodHostReportNoteAck or GorynychProtocol.MethodHostReportNoteReceipt) return;
         if ((string?)@params?["sessionId"] is not { } sid) return;
         if (conductor.RootOfSubagent(sid) is not null) return;
@@ -261,6 +264,7 @@ internal sealed class ClientConnection
         flags[GorynychProtocol.CapReplyWaits] = true;
         flags[GorynychProtocol.CapAssignments] = true;
         flags[GorynychProtocol.CapAssignmentContinuations] = true;
+        flags[GorynychProtocol.CapAssignmentBackgroundContinuations] = true;
         flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
         flags[GorynychProtocol.MetaSessionState] = 1;
         return flags;
