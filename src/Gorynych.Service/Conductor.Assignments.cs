@@ -9,15 +9,106 @@ namespace Gorynych.Service;
 
 public sealed partial class Conductor
 {
-    JsonObject PublicAssignment(JsonObject state) => new()
+    JsonObject PublicAssignment(JsonObject state, bool includeDiagnostic = false)
     {
-        ["source"] = state["source"]?.DeepClone(), ["assignmentId"] = state["assignmentId"]?.DeepClone(),
-        ["parent"] = state["parent"]?.DeepClone(), ["child"] = state["child"]?.DeepClone(),
-        ["generation"] = state["generation"]?.DeepClone(), ["status"] = state["status"]?.DeepClone(), ["revision"] = state["revision"]?.DeepClone(),
-        ["delivery"] = state["delivery"]?.DeepClone(), ["summary"] = state["summary"]?.DeepClone(),
-        ["outcomeReportId"] = state["outcomeReportId"]?.DeepClone(),
-        ["continuation"] = ContinuationView(state),
-    };
+        var continuation = ContinuationView(state);
+        var result = new JsonObject
+        {
+            ["source"] = state["source"]?.DeepClone(), ["assignmentId"] = state["assignmentId"]?.DeepClone(),
+            ["parent"] = state["parent"]?.DeepClone(), ["child"] = state["child"]?.DeepClone(),
+            ["generation"] = state["generation"]?.DeepClone(), ["status"] = state["status"]?.DeepClone(), ["revision"] = state["revision"]?.DeepClone(),
+            ["delivery"] = state["delivery"]?.DeepClone(), ["summary"] = state["summary"]?.DeepClone(),
+            ["outcomeReportId"] = state["outcomeReportId"]?.DeepClone(), ["continuation"] = continuation,
+        };
+        if (includeDiagnostic) result["diagnostic"] = AssignmentDiagnostic(state, continuation);
+        return result;
+    }
+
+    internal Action? AfterDiagnosticProofForTests { get; set; }
+
+    // This is a read-only projection, not a scheduler and not a claim about task success.
+    JsonObject AssignmentDiagnostic(JsonObject assignment, JsonObject? continuation)
+    {
+        var status = (string?)assignment["status"]; var delivery = (string?)assignment["delivery"];
+        var kind = (string?)continuation?["kind"]; var dependency = (string?)continuation?["state"];
+        var requestDelivery = (string?)continuation?["requestDelivery"]; var replyDelivery = (string?)continuation?["replyDelivery"];
+        var childDelivery = (string?)continuation?["delivery"];
+        var reason = status switch
+        {
+            "completed" => "terminal_completed", "failed" => "terminal_failed", "cancelled" => "terminal_cancelled",
+            "blocked" => "explicit_blocked", _ => null,
+        };
+        if (reason is null && status != "open") reason = "assignment_status_unknown";
+        reason ??= delivery switch
+        {
+            "queued" => "assignment_queued", "started" or "uncertain" => "assignment_handoff_unconfirmed",
+            "failed" or "not_started" or "suppressed" => "assignment_delivery_failed", "delivered" => null,
+            _ => "assignment_delivery_unknown",
+        };
+        if (reason is null && continuation is null && assignment["continuation"] is not null) reason = "dependency_unknown";
+        if (reason is null && continuation is not null)
+        {
+            reason = dependency switch
+            {
+                "cancelled" or "undeliverable" or "blocked" => "dependency_needs_attention",
+                "unknown" or "unavailable" => "dependency_unknown",
+                "ready" when kind == "reply_wait" && replyDelivery == "delivered" => "ready_to_inspect",
+                "ready" when kind == "reply_wait" && replyDelivery is "queued" => "reply_delivery_queued",
+                "ready" when kind == "reply_wait" && replyDelivery is "handoff_started" or "uncertain" => "reply_delivery_unconfirmed",
+                "ready" when kind == "reply_wait" && replyDelivery == "failed" => "reply_delivery_failed",
+                "ready" when kind == "reply_wait" => "reply_delivery_unknown",
+                "ready" => "ready_to_inspect",
+                "waiting" when kind == "reply_wait" && requestDelivery == "delivered" => "waiting_reply",
+                "waiting" when kind == "reply_wait" && requestDelivery == "queued" => "dependency_queued",
+                "waiting" when kind == "reply_wait" && requestDelivery == "handoff_started" => "dependency_handoff_unconfirmed",
+                "waiting" when kind == "child_assignment" && childDelivery == "delivered" => "waiting_child",
+                "waiting" when kind == "child_assignment" && childDelivery == "queued" => "dependency_queued",
+                "waiting" when kind == "child_assignment" && childDelivery == "started" => "dependency_handoff_unconfirmed",
+                "waiting" when kind == "background_task" => "waiting_background",
+                _ => "dependency_unknown",
+            };
+        }
+        // Session activity is deliberately separate: it may be an unrelated turn or job.
+        // An idle default is not authoritative evidence that this assignment was abandoned.
+        var observed = new JsonObject { ["route"] = "unavailable", ["state"] = "unknown", ["background"] = "unknown",
+            ["scope"] = "session_only", ["freshness"] = "unverified" };
+        if ((string?)assignment["child"] is { } child && store.Get(child) is { Deleted: false } record &&
+            agents.TryGetValue(record.Agent, out var host) && host.RouteOf(child) is not null && feeds.TryGetValue(child, out var feed))
+        {
+            var activity = feed.Activity.Snapshot(); var state = (string?)activity["state"];
+            observed["route"] = "connected";
+            if (state is "running" or "requires_action") observed["state"] = state;
+            if (activity["background"] is JsonArray full && full.Count > 0 || activity["backgroundKnown"] is JsonArray partial && partial.Count > 0)
+                observed["background"] = "present";
+        }
+        // Read both ephemeral facts together while route publication/removal is excluded.
+        // The assignment itself remains the participant-scoped durable snapshot read above.
+        (bool Terminal, bool LoadedIdle) proof = (false, false);
+        if ((string?)assignment["source"] == "delegation" && delivery == "delivered" &&
+            (string?)assignment["assignmentId"] is { } assignmentId && (string?)assignment["generation"] is { } generation &&
+            (string?)assignment["child"] is { } session && store.Get(session) is { Deleted: false } owner &&
+            agents.TryGetValue(owner.Agent, out var agent) && feeds.TryGetValue(session, out var assignmentFeed))
+            proof = agent.OnCurrentRoute(session, null, link => link.HostId is null ? (false, false) :
+                assignmentFeed.InitialAssignmentEvidence(link.Rpc, assignmentId, generation), (false, false));
+        if (reason is null && status == "open" && assignment["continuation"] is null && proof.Terminal && proof.LoadedIdle &&
+            (string?)assignment["assignmentId"] is { } checkedId && (string?)assignment["child"] is { } checkedChild)
+        {
+            // Do not nest mailbox and route locks. A concurrent durable mutation or eviction
+            // invalidates only the actionable reason; the public row remains its original snapshot.
+            AfterDiagnosticProofForTests?.Invoke();
+            var current = mailbox.FindAssignment(checkedId, checkedChild);
+            if (current is not null && (string?)current["source"] == "delegation" &&
+                (string?)current["parent"] == (string?)assignment["parent"] && (string?)current["child"] == checkedChild &&
+                (string?)current["generation"] == (string?)assignment["generation"] &&
+                (long?)current["revision"] == (long?)assignment["revision"] && (string?)current["status"] == "open" &&
+                (string?)current["delivery"] == "delivered" && current["continuation"] is null)
+                reason = "open_without_recorded_continuation";
+        }
+        var initialTurn = proof.Terminal ? "terminal_observed" : "unknown";
+        var foregroundIdle = proof.LoadedIdle ? "loaded_idle_observed" : "unknown";
+        return new JsonObject { ["reasonCode"] = reason ?? "no_correlated_execution", ["execution"] = "unknown",
+            ["initialTurn"] = initialTurn, ["foregroundIdle"] = foregroundIdle, ["sessionActivity"] = observed };
+    }
 
     JsonObject? ContinuationView(JsonObject owner)
     {
@@ -202,7 +293,7 @@ public sealed partial class Conductor
         var actor = MailboxPeer(request); var args = AssignmentParams(request, "source", "assignmentId");
         var (source, id) = AssignmentIdentity(args);
         var item = AssignmentFor(source, id, actor) ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "Assignment unavailable or not accessible");
-        return PublicAssignment(item);
+        return PublicAssignment(item, includeDiagnostic: true);
     }
 
     internal JsonObject ListAssignments(JsonRpcRequest request)
@@ -237,7 +328,7 @@ public sealed partial class Conductor
             next = Convert.ToBase64String(Encoding.UTF8.GetBytes(new JsonObject { ["actor"] = actor,
                 ["source"] = (string?)last["source"], ["id"] = (string?)last["assignmentId"] }.ToJsonString()));
         }
-        return new JsonObject { ["items"] = new JsonArray(items.Take(limit).Select(a => (JsonNode)PublicAssignment(a)).ToArray()), ["nextCursor"] = next };
+        return new JsonObject { ["items"] = new JsonArray(items.Take(limit).Select(a => (JsonNode)PublicAssignment(a, includeDiagnostic: true)).ToArray()), ["nextCursor"] = next };
     }
 
     internal JsonObject UpdateAssignment(JsonRpcRequest request)

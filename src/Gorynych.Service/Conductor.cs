@@ -1598,7 +1598,7 @@ public sealed partial class Conductor : IAsyncDisposable
     // observation itself is never authority to select or reopen a session/host.
     internal void InvalidateBackgroundEvidence(string sessionId, JsonRpcConnection source)
     {
-        if (feeds.TryGetValue(sessionId, out var feed)) feed.InvalidateBackgroundEvidence(source);
+        if (feeds.TryGetValue(sessionId, out var feed)) { feed.InvalidateBackgroundEvidence(source); feed.InvalidateAssignmentEvidence(source); }
     }
 
     internal BackgroundEvidence? CurrentBackgroundEvidence(string sessionId)
@@ -1707,6 +1707,23 @@ public sealed partial class Conductor : IAsyncDisposable
             }
             // From a host: taken once, though a host that comes back sends what it kept again.
             if (update["_meta"]?[GorynychProtocol.MetaHostSeq] is JsonValue s && s.TryGetValue<string>(out var hostSeq) && !feed.TakeFromHost(hostSeq)) return;
+            var privateActivity = update["_meta"] as JsonObject;
+            JsonNode? strictNode = null;
+            var hasStrict = privateActivity?.Remove(GorynychProtocol.MetaCodexLoadedIdle, out strictNode) == true;
+            void ObserveStrict()
+            {
+                var discontinuity = strictNode is JsonValue marker && marker.TryGetValue<string>(out var text) && text == "discontinuity";
+                if (host.Name != "codex" || source is null || feed.IsHistoryImport(source) && !discontinuity) return;
+                var strict = hasStrict && strictNode is JsonValue value && value.TryGetValue<bool>(out var loaded) && loaded &&
+                    (string?)privateActivity?[GorynychProtocol.MetaForegroundState] == "idle";
+                host.OnCurrentRoute(sessionId, source, link =>
+                { if (link.HostId is not null) feed.ObserveStrictLoadedIdle(source, strict, discontinuity); return true; }, false);
+            }
+            if (hasStrict && privateActivity is { Count: 0 } && (string?)update["sessionUpdate"] == "session_info_update")
+            {
+                ObserveStrict();
+                return;
+            }
             var activityTurnHandled = false;
             if ((string?)update["sessionUpdate"] == "session_info_update" && update["_meta"] is JsonObject activityMeta && (activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork) || activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundKnown)))
             {
@@ -1718,7 +1735,7 @@ public sealed partial class Conductor : IAsyncDisposable
                         activityMeta[GorynychProtocol.MetaBackgroundCompleteStream] is JsonValue stream && stream.TryGetValue<string>(out var token) &&
                             Guid.TryParseExact(token, "N", out _) ? token : null);
                 if (activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundKnown)) NativeKnownBackground(feed, activityMeta[GorynychProtocol.MetaBackgroundKnown]);
-                if ((string?)activityMeta[GorynychProtocol.MetaForegroundState] is { } accompanyingForeground) NativeActivity(feed, accompanyingForeground);
+                if ((string?)activityMeta[GorynychProtocol.MetaForegroundState] is { } accompanyingForeground) { NativeActivity(feed, accompanyingForeground); ObserveStrict(); }
                 if (activityMeta.ContainsKey(GorynychProtocol.MetaAgentTurn))
                 {
                     AgentTurn(feed, update);
@@ -1740,6 +1757,7 @@ public sealed partial class Conductor : IAsyncDisposable
             if ((string?)update["_meta"]?[GorynychProtocol.MetaForegroundState] is { } foreground)
             {
                 NativeActivity(feed, foreground);
+                ObserveStrict();
                 return;
             }
             // Whether the session can be prompted now: its state, not its history, so it is not journaled.

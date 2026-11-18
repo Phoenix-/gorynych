@@ -45,6 +45,30 @@ public sealed class JsonRpcTests
     }
 
     [TestMethod]
+    public async Task ReceiptObserverPrecedesFollowingNotificationsAndDoesNotChangeResultOrErrors()
+    {
+        var (client, agent) = Link();
+        await using (client) await using (agent)
+        {
+            var events = new List<string>();
+            agent.RequestHandler = (request, _) =>
+            {
+                if (request.Method == "failure") throw new JsonRpcException(JsonRpcException.InternalError, "native error");
+                request.AfterResult(() => agent.SendNotificationAsync("later", null));
+                return Task.FromResult<JsonNode?>(new JsonObject { ["value"] = 42 });
+            };
+            client.NotificationHandler = (_, _) => { lock (events) events.Add("notification"); return Task.CompletedTask; };
+            client.Start(); agent.Start();
+            var pending = await client.StartRequestObservedAsync("success", null, () => { lock (events) events.Add("receipt"); throw new InvalidOperationException("observer failure"); });
+            Assert.AreEqual(42, (int?)(await pending.WaitAsync(TimeSpan.FromSeconds(10)))!["value"]);
+            var failed = await client.StartRequestObservedAsync("failure", null, () => { lock (events) events.Add("wrong"); });
+            await Assert.ThrowsExactlyAsync<JsonRpcException>(async () => await failed.WaitAsync(TimeSpan.FromSeconds(10)));
+            await LinkHarness.Until(() => { lock (events) return events.Count >= 2; }, "response and following notification").WaitAsync(TimeSpan.FromSeconds(10));
+            lock (events) CollectionAssert.AreEqual(new[] { "receipt", "notification" }, events);
+        }
+    }
+
+    [TestMethod]
     public async Task WhatARequestDoesAfterItsResult_ReachesThePeerAfterTheResult_AndNothingAfterAnError()
     {
         var (client, agent) = Link();

@@ -67,7 +67,8 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     readonly Stream input;
     readonly Stream output;
     readonly SemaphoreSlim writeGate = new(1, 1);
-    readonly ConcurrentDictionary<long, TaskCompletionSource<JsonNode?>> pending = new();
+    sealed record PendingResponse(TaskCompletionSource<JsonNode?> Completion, Action? OnReceipt);
+    readonly ConcurrentDictionary<long, PendingResponse> pending = new();
     readonly ConcurrentDictionary<string, CancellationTokenSource> incoming = new();
     readonly CancellationTokenSource lifetime = new();
     // lifetime's token, taken once: a write may still run while DisposeAsync disposes lifetime,
@@ -138,17 +139,21 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     /// Sends a request and completes once it is written, returning the task of its result.
     /// Lets a caller order the request against later messages without waiting for the answer.
     /// </summary>
-    public async Task<Task<JsonNode?>> StartRequestAsync(string method, JsonNode? @params, CancellationToken ct = default)
+    public Task<Task<JsonNode?>> StartRequestAsync(string method, JsonNode? @params, CancellationToken ct = default) =>
+        StartRequestObservedAsync(method, @params, null, ct);
+
+    /// <summary>Samples a successful response on the reader before completing its task. The callback must be cheap and nonblocking.</summary>
+    public async Task<Task<JsonNode?>> StartRequestObservedAsync(string method, JsonNode? @params, Action? onReceipt, CancellationToken ct = default)
     {
         var id = Interlocked.Increment(ref nextId);
         var tcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        pending[id] = tcs;
+        pending[id] = new PendingResponse(tcs, onReceipt);
         if (IsClosed) { pending.TryRemove(id, out _); throw new IOException($"{Name}: connection closed"); }
         var message = new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["method"] = method };
         if (@params is not null) message["params"] = @params;
         var registration = ct.Register(() =>
         {
-            if (pending.TryRemove(id, out var p) && p.TrySetCanceled(ct))
+            if (pending.TryRemove(id, out var p) && p.Completion.TrySetCanceled(ct))
                 _ = SendNotificationAsync(CancelNotification, new JsonObject { ["requestId"] = id });
         });
         _ = tcs.Task.ContinueWith(_ => registration.Dispose(), TaskScheduler.Default);
@@ -281,7 +286,8 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         long key;
         if (id is JsonValue v && (v.TryGetValue(out key) || (v.TryGetValue<string>(out var str) && long.TryParse(str, out key))))
         {
-            if (!pending.TryRemove(key, out var tcs)) return;
+            if (!pending.TryRemove(key, out var pendingResponse)) return;
+            var tcs = pendingResponse.Completion;
             if (message["error"] is JsonObject error)
             {
                 var code = error["code"] is JsonValue c && c.TryGetValue<int>(out var ci) ? ci : JsonRpcException.InternalError;
@@ -292,6 +298,8 @@ public sealed class JsonRpcConnection : IAsyncDisposable
             {
                 var result = message["result"];
                 message.Remove("result");
+                try { pendingResponse.OnReceipt?.Invoke(); }
+                catch (Exception e) { Log?.Invoke($"{Name}: response receipt observer failed: {e}"); }
                 tcs.TrySetResult(result);
             }
         }
@@ -345,7 +353,7 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     {
         if (!closed.TrySetResult()) return;
         foreach (var (id, tcs) in pending)
-            if (pending.TryRemove(id, out _)) tcs.TrySetException(new IOException($"{Name}: connection closed"));
+            if (pending.TryRemove(id, out _)) tcs.Completion.TrySetException(new IOException($"{Name}: connection closed"));
         foreach (var (_, cts) in incoming)
             try { cts.Cancel(); } catch (ObjectDisposedException) { }
     }

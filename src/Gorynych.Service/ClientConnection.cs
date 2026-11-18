@@ -264,6 +264,7 @@ internal sealed class ClientConnection
         flags[GorynychProtocol.CapReplyWaits] = true;
         flags[GorynychProtocol.CapAssignments] = true;
         flags[GorynychProtocol.CapAssignmentContinuations] = true;
+        flags[GorynychProtocol.CapAssignmentDiagnostics] = true;
         flags[GorynychProtocol.CapAssignmentBackgroundContinuations] = true;
         flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
         flags[GorynychProtocol.MetaSessionState] = 1;

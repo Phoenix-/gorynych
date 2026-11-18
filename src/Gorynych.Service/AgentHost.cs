@@ -661,6 +661,14 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         lock (linksGate) return route.TryGetValue(sessionId, out var link) && !link.Rpc.IsClosed ? link : null;
     }
 
+    // Execute while route publication/removal is excluded. Never authorizes a new route.
+    internal T OnCurrentRoute<T>(string sessionId, JsonRpcConnection? expected, Func<HostLink, T> read, T missing)
+    {
+        lock (linksGate)
+            return route.TryGetValue(sessionId, out var link) && !link.Rpc.IsClosed &&
+                (expected is null || ReferenceEquals(expected, link.Rpc)) ? read(link) : missing;
+    }
+
     /// <summary>The session is open in a host of an earlier generation: it moves once it is idle.</summary>
     internal bool IsStale(string sessionId) => RouteOf(sessionId) is { Current: false };
 

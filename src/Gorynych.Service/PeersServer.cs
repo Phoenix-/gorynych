@@ -818,11 +818,11 @@ public static class PeersServer
             ["inputSchema"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = false,
                 ["properties"] = properties, ["required"] = required },
         };
-        var listAssignments = AssignmentTool("list_assignments", "List bounded assignment records where you are parent or child. Follow nextCursor.",
+        var listAssignments = AssignmentTool("list_assignments", "List bounded assignment records and passive diagnostics where you are parent or child. Follow nextCursor.",
             new JsonObject { ["cursor"] = new JsonObject { ["type"] = "string" }, ["limit"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1, ["maximum"] = 100 } }, new JsonArray());
         JsonObject IdentityProperties() => new() { ["source"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("spawn", "delegation") },
             ["assignment_id"] = new JsonObject { ["type"] = "string" } };
-        var readAssignment = AssignmentTool("read_assignment", "Read one retained assignment by source and assignment_id. A turn ending does not complete it.",
+        var readAssignment = AssignmentTool("read_assignment", "Read one retained assignment and passive diagnostic by source and assignment_id. A turn ending does not complete it.",
             IdentityProperties(), new JsonArray("source", "assignment_id"));
         var updateProperties = IdentityProperties();
         updateProperties["generation"] = new JsonObject { ["type"] = "string", ["description"] = "exact generation returned by read_assignment or list_assignments" };

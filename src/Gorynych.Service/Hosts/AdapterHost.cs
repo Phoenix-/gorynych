@@ -597,6 +597,13 @@ public sealed class AdapterHost
             {
                 // Adapter-supplied values cannot impersonate this host-generated observation.
                 activityMeta.Remove(GorynychProtocol.MetaHostBackgroundEvidence);
+                // Private live evidence is only accepted from the actual Codex adapter while
+                // the session is open and no history operation can emit historical updates.
+                var discontinuity = activityMeta[GorynychProtocol.MetaCodexLoadedIdle] is JsonValue marker &&
+                    marker.TryGetValue<string>(out var markerText) && markerText == "discontinuity";
+                if (options.Adapter != "codex" || !live.Contains(sessionId) ||
+                    !discontinuity && forwarded.Values.Any(f => f.SessionId == sessionId && IsHistoryOperation(f.Method)))
+                    activityMeta.Remove(GorynychProtocol.MetaCodexLoadedIdle);
                 var foreground = Text(activityMeta[GorynychProtocol.MetaForegroundState]);
                 var turn = Text(activityMeta[GorynychProtocol.MetaAgentTurn]);
                 var hasBackground = Text(update["sessionUpdate"]) == "session_info_update" && activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork);
@@ -648,7 +655,10 @@ public sealed class AdapterHost
         var backgroundSnapshot = Text(message["method"]) == AcpMethods.Client.SessionUpdate
             && Text(carrier?["sessionUpdate"]) == "session_info_update"
             && carrier?["_meta"] is JsonObject backgroundMeta && (backgroundMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork) || backgroundMeta.ContainsKey(GorynychProtocol.MetaBackgroundKnown));
-        var replayMessage = backgroundSnapshot ? (JsonObject)message.DeepClone() : message;
+        var privateIdle = carrier?["_meta"] is JsonObject privateMeta && privateMeta.ContainsKey(GorynychProtocol.MetaCodexLoadedIdle);
+        var replayMessage = backgroundSnapshot || privateIdle ? (JsonObject)message.DeepClone() : message;
+        if (privateIdle && replayMessage["params"]?["update"]?["_meta"] is JsonObject privateReplay)
+            privateReplay.Remove(GorynychProtocol.MetaCodexLoadedIdle);
         var replayCarrier = Text(message["method"]) == AcpMethods.Client.SessionUpdate ? replayMessage["params"]?["update"] as JsonObject : replayMessage["params"] as JsonObject;
         if (backgroundSnapshot && replayCarrier?["_meta"] is JsonObject replayMeta)
         {
@@ -665,14 +675,15 @@ public sealed class AdapterHost
                 replayMeta.Remove(GorynychProtocol.MetaAgentTurn);
             if (replayMeta.Count == 0) replayCarrier.Remove("_meta");
         }
-        var emptyActivity = backgroundSnapshot && Text(replayCarrier?["sessionUpdate"]) == "session_info_update"
-            && replayCarrier!.Count == 1;
+        var emptyActivity = (backgroundSnapshot || privateIdle) && Text(replayCarrier?["sessionUpdate"]) == "session_info_update"
+            && replayCarrier!.All(pair => pair.Key == "sessionUpdate" || pair.Key == "_meta" && pair.Value is JsonObject m &&
+                m.All(entry => entry.Key == GorynychProtocol.MetaHostSeq));
         var kept = carrier is not null && sessionId is not null && !emptyActivity;
         if (kept)
         {
             if (carrier!["_meta"] is not JsonObject meta) carrier["_meta"] = meta = [];
             meta[GorynychProtocol.MetaHostSeq] = $"{options.HostId}/{number}";
-            if (backgroundSnapshot && replayCarrier is not null)
+            if ((backgroundSnapshot || privateIdle) && replayCarrier is not null)
             {
                 if (replayCarrier["_meta"] is not JsonObject stampedMeta) replayCarrier["_meta"] = stampedMeta = [];
                 stampedMeta[GorynychProtocol.MetaHostSeq] = $"{options.HostId}/{number}";
@@ -680,7 +691,7 @@ public sealed class AdapterHost
         }
         var line = message.ToJsonString(Wire);
         if (!kept) return line;
-        var replayLine = backgroundSnapshot ? replayMessage.ToJsonString(Wire) : line;
+        var replayLine = backgroundSnapshot || privateIdle ? replayMessage.ToJsonString(Wire) : line;
         buffer.Enqueue(new Kept(number, sessionId!, replayLine));
         bufferedBytes += replayLine.Length;
         while (buffer.Count > options.BufferLimit || (bufferedBytes > options.BufferBytes && buffer.Count > 1))

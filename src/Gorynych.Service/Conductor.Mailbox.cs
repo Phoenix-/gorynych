@@ -11,6 +11,7 @@ public sealed partial class Conductor
     MailboxStore mailbox = null!;
     internal MailboxStore ReplyMailbox => mailbox;
     internal Action? BeforeMailboxMarkStarted { get; set; }
+    internal Func<Task>? AfterMailboxResponseForTests { get; set; }
     readonly Lock mailboxGate = new();
     readonly Dictionary<string, Task> mailboxWorkers = new(StringComparer.Ordinal);
 
@@ -244,6 +245,8 @@ public sealed partial class Conductor
         string? promptId = null;
         long? key = null;
         var handed = false;
+        long? assignmentRouteEpoch = null;
+        long responseActivityFence = -1;
         ReportAdmission? report = null;
         try
         {
@@ -301,6 +304,9 @@ public sealed partial class Conductor
                     HostOf(use.Record).RouteOf(recipient)?.Rpc != rpc || (InFullAccess(recipient) && !authorityModeHeld) ||
                     !ReminderAuthorityAllows(recipient, authoritySource)))
                     throw new IOException("Reminder authority or live activity changed before dispatch; handoff remains unconfirmed.");
+                if (isDelegation && assignmentGeneration is not null)
+                    assignmentRouteEpoch = HostOf(use.Record).OnCurrentRoute<long?>(recipient, rpc,
+                        link => link.HostId is not null ? feed.AssignmentEvidenceEpoch : null, null);
                 if (!mailbox.TryMarkStarted(id, recipient, (long)item["sequence"]!)) return;
                 if (isDelegation)
                 {
@@ -311,7 +317,8 @@ public sealed partial class Conductor
                 { SessionId = recipient, Prompt = [block], Meta = meta }), messageId), report);
                 feed.BeginReminderActivityEpoch();
                 startAttempted = true;
-                response = await rpc.StartRequestAsync(AcpMethods.Agent.SessionPrompt, forwarded, CancellationToken.None);
+                response = await rpc.StartRequestObservedAsync(AcpMethods.Agent.SessionPrompt, forwarded,
+                    assignmentRouteEpoch is null ? null : () => Interlocked.Exchange(ref responseActivityFence, feed.AssignmentActivityFence), CancellationToken.None);
                 handed = true;
                 feed.Handed(key ?? throw new InvalidOperationException("Mailbox prompt was not started"));
             }
@@ -321,7 +328,7 @@ public sealed partial class Conductor
                 finally { authorityGate?.Release(); authorityGate = null; feed.ForwardGate.Release(); forwardHeld = false; }
             }
             JsonNode? result;
-            try { result = await response; }
+            try { result = await response; if (AfterMailboxResponseForTests is { } barrier) await barrier(); }
             catch (JsonRpcException error) { ImportLocalReport(report, feed, null, error); await HandleReportResponseErrorAsync(report, error); throw; }
             ImportLocalReport(report, feed, result);
             await RequireImportedAsync(report);
@@ -331,6 +338,15 @@ public sealed partial class Conductor
             mailbox.MarkDelivered(id, recipient);
             KeepMark(feed, result);
             await MarkPromptEndAsync(feed, promptId, result, null);
+            if (assignmentRouteEpoch is { } epoch && assignmentGeneration is not null &&
+                (string?)result?["stopReason"] == "end_turn" && feed.HasEndMark(promptId) &&
+                mailbox.FindAssignment(id, recipient) is { } assignment &&
+                (string?)assignment["generation"] == assignmentGeneration && (string?)assignment["delivery"] == "delivered")
+                HostOf(use.Record).OnCurrentRoute(recipient, rpc, link =>
+                {
+                    if (link.HostId is not null) feed.ObserveInitialAssignmentTurn(epoch, Interlocked.Read(ref responseActivityFence), id, assignmentGeneration, promptId, rpc);
+                    return true;
+                }, false);
             ReportTurnEnd(recipient, Outcome(result), feed.EndTurnText());
         }
         catch (Exception e)

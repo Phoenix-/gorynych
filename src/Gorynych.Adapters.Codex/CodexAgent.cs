@@ -2130,7 +2130,11 @@ sealed partial class CodexAgent : IAsyncDisposable
                     if (n.Status is NotLoadedThreadStatus) await NativeChildStateAsync(n.ThreadId, "unknown");
                 }
                 else if (state is not null)
-                    await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = state } });
+                    await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = state,
+                        [GorynychProtocol.MetaCodexLoadedIdle] = n.Status is NotLoadedThreadStatus or SystemErrorThreadStatus || n.Status is IdleThreadStatus && Thread(n.ThreadId) is not { Loaded: true }
+                            ? JsonValue.Create("discontinuity") : JsonValue.Create(n.Status is IdleThreadStatus) } });
+                else
+                    await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaCodexLoadedIdle] = "discontinuity" } });
                 if (n.Status is not NotLoadedThreadStatus) break;
                 if (unloading.TryGetValue(n.ThreadId, out var closing)) closing.TrySetResult();
                 if (Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "status notLoaded");
@@ -2140,7 +2144,8 @@ sealed partial class CodexAgent : IAsyncDisposable
             {
                 var n = From(p, ctx.ThreadClosedNotification);
                 if (nativeChildren.ContainsKey(n.ThreadId)) await NativeChildStateAsync(n.ThreadId, "unknown");
-                else await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = "idle" } });
+                else await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = "idle",
+                    [GorynychProtocol.MetaCodexLoadedIdle] = "discontinuity" } });
                 if (unloading.TryGetValue(n.ThreadId, out var closing)) closing.TrySetResult();
                 if (Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "thread/closed");
                 break;

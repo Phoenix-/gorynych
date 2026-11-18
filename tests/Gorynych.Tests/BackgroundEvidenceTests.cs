@@ -253,6 +253,7 @@ public sealed class BackgroundEvidenceTests
             var original = Register(child);
             var registered = await Call(GorynychProtocol.MethodUpdateContinuation, original);
             Assert.AreEqual("waiting", (string?)registered!["continuation"]!["state"]);
+            if (ownerSource == "delegation") Assert.AreEqual("waiting_background", (string?)(await Call(GorynychProtocol.MethodReadAssignment, Read(child)))!["diagnostic"]!["reasonCode"]);
             var saved = Owner()["continuation"]!;
             var first = service.CurrentBackgroundEvidence(child)!;
             Assert.AreEqual(first.HostId, (string?)saved["hostId"]); Assert.AreEqual(first.Stream, (string?)saved["stream"]);
@@ -266,6 +267,7 @@ public sealed class BackgroundEvidenceTests
             await LinkHarness.Until(() => service.CurrentBackgroundEvidence(child)?.Revision > first.Revision, "reattached observation").WaitAsync(Wait);
             var ready = await Call(GorynychProtocol.MethodReadAssignment, Read(parent));
             Assert.AreEqual("ready", (string?)ready!["continuation"]!["state"]); Assert.AreEqual("open", (string?)ready["status"]); Assert.AreEqual(2L, (long?)ready["revision"]);
+            if (ownerSource == "delegation") Assert.AreEqual("ready_to_inspect", (string?)ready["diagnostic"]!["reasonCode"]);
             Assert.AreEqual("b", service.CurrentBackgroundEvidence(child)!.Items.Single(), "unrelated task remains active");
             await Update(null, stream);
             await LinkHarness.Until(() => service.CurrentBackgroundEvidence(child) is null, "unknown observation").WaitAsync(Wait);

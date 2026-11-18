@@ -141,6 +141,7 @@ public static class GorynychProtocol
     public const string CapAssignments = "gorynych/assignments";
     public const string MethodUpdateContinuation = "_gorynych/update_continuation";
     public const string CapAssignmentContinuations = "gorynych/assignmentContinuations";
+    public const string CapAssignmentDiagnostics = "gorynych/assignmentDiagnostics";
     public const string MethodListBackgroundTasks = "_gorynych/list_background_tasks";
     public const string CapAssignmentBackgroundContinuations = "gorynych/assignmentBackgroundContinuations";
     public const string MethodListReplyWaits = "_gorynych/list_reply_waits";
@@ -249,6 +250,7 @@ public static class GorynychProtocol
     public const string MethodSessionState = "_gorynych/session_state";
     /// <summary>Adapter's authoritative foreground state, never inferred from a pending permission.</summary>
     public const string MetaForegroundState = "gorynych/foregroundState";
+    public const string MetaCodexLoadedIdle = "gorynych/_codexLoadedIdle";
     /// <summary>Trusted adapter confirms a full background change stream for its current process.</summary>
     public const string MetaBackgroundCompleteStream = "gorynych/backgroundCompleteStream";
     public const string MetaBackgroundWork = "gorynych/backgroundWork";

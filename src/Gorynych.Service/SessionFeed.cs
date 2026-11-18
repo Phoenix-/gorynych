@@ -26,6 +26,48 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     JsonRpcConnection? confirmedIdleRoute;
     public void ConfirmIdle(JsonRpcConnection rpc) => Volatile.Write(ref confirmedIdleRoute, rpc);
     public bool HasConfirmedIdle(JsonRpcConnection rpc) => ReferenceEquals(Volatile.Read(ref confirmedIdleRoute), rpc);
+    // Volatile in-memory evidence only; route lifecycle invalidation changes the epoch.
+    JsonRpcConnection? strictLoadedIdleRoute;
+    int evidencePrompts;
+    bool strictIdleEligible;
+    long assignmentActivityFence;
+    internal long AssignmentActivityFence { get { lock (nativeActivityGate) return assignmentActivityFence; } }
+    long assignmentEvidenceEpoch;
+    (string Id, string Generation, string Prompt, JsonRpcConnection Route)? initialAssignmentTurn;
+    internal long AssignmentEvidenceEpoch { get { lock (nativeActivityGate) return assignmentEvidenceEpoch; } }
+    internal void InvalidateAssignmentEvidence(JsonRpcConnection source)
+    {
+        lock (nativeActivityGate) { assignmentEvidenceEpoch++; if (initialAssignmentTurn?.Route == source) { initialAssignmentTurn = null; strictIdleEligible = false; } if (strictLoadedIdleRoute == source) strictLoadedIdleRoute = null; }
+    }
+    internal void ObserveInitialAssignmentTurn(long epoch, long responseFence, string id, string generation, string prompt, JsonRpcConnection source)
+    {
+        lock (nativeActivityGate) if (assignmentEvidenceEpoch == epoch) { initialAssignmentTurn = (id, generation, prompt, source); strictLoadedIdleRoute = null;
+            strictIdleEligible = responseFence >= 0 && assignmentActivityFence == responseFence && !AgentTurnRunning && Asking == 0 && PendingRequests == 0; }
+    }
+    internal bool HasInitialAssignmentTurn(string id, string generation, JsonRpcConnection source)
+    {
+        lock (nativeActivityGate) return initialAssignmentTurn is { } fact && fact.Id == id && fact.Generation == generation && fact.Route == source;
+    }
+    internal void RevokeStrictLoadedIdle() { lock (nativeActivityGate) strictLoadedIdleRoute = null; }
+    internal void ObserveStrictLoadedIdle(JsonRpcConnection source, bool strict, bool discontinuity)
+    {
+        lock (nativeActivityGate)
+        {
+            if (discontinuity) { assignmentActivityFence++; strictIdleEligible = false; }
+            strictLoadedIdleRoute = strict && strictIdleEligible && initialAssignmentTurn?.Route == source &&
+                TurnGate.CurrentCount == 1 && evidencePrompts == 0 && !AgentTurnRunning && Asking == 0 && PendingRequests == 0 ? source : null;
+        }
+    }
+    internal (bool Terminal, bool LoadedIdle) InitialAssignmentEvidence(JsonRpcConnection source, string id, string generation)
+    {
+        lock (nativeActivityGate)
+        {
+            var terminal = initialAssignmentTurn is { } fact && fact.Route == source && fact.Id == id && fact.Generation == generation;
+            var idle = terminal && strictIdleEligible && strictLoadedIdleRoute == source && TurnGate.CurrentCount == 1 &&
+                evidencePrompts == 0 && !AgentTurnRunning && Asking == 0 && PendingRequests == 0;
+            return (terminal, idle);
+        }
+    }
     int nativeActivity;
     bool backgroundUse;
     bool knownBackgroundUse;
@@ -131,7 +173,10 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     public void BeginNativeActivity()
     {
         lock (nativeActivityGate)
+        {
+            strictLoadedIdleRoute = null; strictIdleEligible = false; assignmentActivityFence++;
             if (Interlocked.Exchange(ref nativeActivity, 1) == 0) { Volatile.Write(ref confirmedIdleRoute, null); EnterUse(); }
+        }
     }
     public bool EndNativeActivity()
     {
@@ -462,7 +507,11 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     {
         lock (agentActivityGate)
         {
-            if (Interlocked.Exchange(ref agentTurn, 1) != 0) return false;
+            lock (nativeActivityGate)
+            {
+                strictLoadedIdleRoute = null; strictIdleEligible = false; assignmentActivityFence++;
+                if (Interlocked.Exchange(ref agentTurn, 1) != 0) return false;
+            }
             BeginReminderActivityEpoch();
             Activity.Begin();
             return true;
@@ -531,7 +580,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// </summary>
     public int Asking => Volatile.Read(ref asking);
 
-    public void BeginAsking() => Interlocked.Increment(ref asking);
+    public void BeginAsking() { lock (nativeActivityGate) { strictLoadedIdleRoute = null; strictIdleEligible = false; assignmentActivityFence++; Interlocked.Increment(ref asking); } }
 
     public void EndAsking()
     {
@@ -1176,6 +1225,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// </summary>
     public long BeginPrompt(string? promptId)
     {
+        lock (nativeActivityGate) { strictLoadedIdleRoute = null; strictIdleEligible = false; assignmentActivityFence++; evidencePrompts++; }
         long key;
         lock (clientsGate)
         {
@@ -1203,7 +1253,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     {
         bool removed;
         lock (clientsGate) removed = prompts.Remove(key);
-        if (removed) Activity.End();
+        if (removed) { lock (nativeActivityGate) evidencePrompts--; Activity.End(); }
     }
 
     /// <summary>The IDs of the client prompts in progress that reached their agent (<see cref="Handed"/>).</summary>
