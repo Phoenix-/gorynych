@@ -671,7 +671,8 @@ public sealed partial class ClaudeHeadlessTests
 
         var timeoutDir = TestDirs.New();
         var timeoutToken = "timeout-token-" + Guid.NewGuid().ToString("N");
-        var (slowAgent, slowAcp, slowUpdates) = await DirectTitleAsync(timeoutDir, timeout: TimeSpan.FromMilliseconds(150));
+        var timeoutLog = new List<string>();
+        var (slowAgent, slowAcp, slowUpdates) = await DirectTitleAsync(timeoutDir, timeoutLog, timeout: TimeSpan.FromSeconds(3));
         try
         {
             await slowAcp.RequestAsync<InitializeRequest, InitializeResponse>(AcpMethods.Agent.Initialize, new InitializeRequest { ProtocolVersion = 1 });
@@ -683,9 +684,14 @@ public sealed partial class ClaudeHeadlessTests
             {
                 ["sessionId"] = id, ["title"] = "Fix the login test", ["input"] = "timeout-title fix the login test " + timeoutToken,
             });
-            await UntilTitleLaunch(timeoutToken);
-            await Task.Delay(750);
+            // The timeout may kill FakeClaude before it records its arguments. Observe the
+            // adapter's timeout, then close the session to join the title job before checking it.
+            await LinkHarness.Until(() => { lock (timeoutLog) return timeoutLog.Contains("claude: the title helper timed out"); },
+                "the title helper timed out");
+            await slowAcp.SendRequestAsync(AcpMethods.Agent.SessionClose, new JsonObject { ["sessionId"] = id });
             lock (slowUpdates) Assert.IsFalse(slowUpdates.Any(u => (string?)u["title"] == "Fake generated title"));
+            Assert.IsFalse(Controls(id).Any(c => (string?)c["subtype"] == "rename_session"),
+                "the timed-out helper left the provisional title in place");
         }
         finally
         {
