@@ -2602,3 +2602,21 @@ to the waiter. The immutable first correlated reply resolves an open wait in the
 mailbox commit that accepts the reply; cancellation never retracts a message. Delivery
 dispositions are distinct from wait state. Retention and uncertainty are described in
 [messaging.md](messaging.md).
+
+
+### Reply reminder metadata
+
+When a wait is scheduled, participant-only `list_reply_waits` metadata contains a bounded
+`reminders` object with the group, admitted/review/overdue timestamps, reminder and
+escalation dispositions, optional message IDs and reasons, and overdue/reciprocal details.
+`_gorynych/status` exposes policy state and aggregate counts without message content.
+An adapter can attest a complete live background change stream for its current process
+by carrying a per-process opaque `gorynych/backgroundCompleteStream` ID alongside a complete
+`gorynych/backgroundWork` snapshot in `_meta`. Claude headless emits this only after a
+supported native startup or a valid native background change. The service binds it to the
+actual live RPC route; unknown, process exit, lost route, and host-state recovery without a
+new live attestation do not establish a stream. Claude refuses reminder prompts if that ID no
+longer identifies its live native process and never launches a new process for one. An empty partial `backgroundKnown` is not
+a substitute. Service-generated reminder prompts carry `gorynych/replyReminder` under `_meta`, naming
+the original message and kind. The policy and retention guarantees are described in
+[messaging.md](messaging.md#targeted-reply-reminders).

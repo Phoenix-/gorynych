@@ -459,8 +459,9 @@ When the scheme settles, the parent link is a candidate for its own ACP RFD (**p
 
 **Iteration 1 built, 17 November 2026:** `delegate_task` continues authorized work
 with an immediate child, checked by the service, with a stable assignment correlation
-ID. The initial spawned assignment has the same form of correlation. Full results,
-service-tracked obligations and guarded reminders remain **planned**.
+ID. The initial spawned assignment has the same form of correlation. Iterations 2 and 3
+added durable full-result reports and explicit reply waits. Opt-in targeted reminders are
+implemented for review; assignment outcomes and broader supervision remain **planned**.
 Automatic child reports remain broad: peer- or user-initiated continuation is not
 by itself a reason to discard a result. Turn completion is separate from explicit
 assignment completion. The states, dependency edges, transitions, recovery rules

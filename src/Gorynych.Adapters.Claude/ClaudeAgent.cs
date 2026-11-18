@@ -391,8 +391,14 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 if (!StreamJson.HasContent(p.Prompt)) throw new JsonRpcException(JsonRpcException.InvalidParams, "The prompt has no text.");
                 var sequence = request.Sequence;
                 state.Update(session.Id, session.Cwd, r => KeepSettings(session, r));
-                var stop = await session.PromptAsync(p.Prompt,
-                    () => cancelledAt.TryGetValue(session.Id, out var at) && at > sequence, ct, request.Sequence);
+                var reminder = p.Meta?[GorynychProtocol.MetaReplyReminder] as JsonObject;
+                var stream = (string?)reminder?["backgroundStream"];
+                if (reminder is not null && (session is not HeadlessSession || string.IsNullOrWhiteSpace(stream)))
+                    throw new JsonRpcException(JsonRpcException.InvalidRequest, "A reminder requires a confirmed live headless Claude process.");
+                Func<bool> cancelled = () => cancelledAt.TryGetValue(session.Id, out var at) && at > sequence;
+                var stop = reminder is not null
+                    ? await ((HeadlessSession)session).ReminderPromptAsync(p.Prompt, cancelled, ct, request.Sequence, stream!)
+                    : await session.PromptAsync(p.Prompt, cancelled, ct, request.Sequence);
                 state.Update(session.Id, session.Cwd, r => r.UpdatedAt = DateTimeOffset.UtcNow);
                 return AcpJson.ToNode(new PromptResponse { StopReason = stop, Meta = await MarkMetaAsync(session) });
             }

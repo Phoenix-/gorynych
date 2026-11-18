@@ -128,6 +128,57 @@ public sealed partial class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task FullBackgroundStreamSurvivesOrdinaryTurnsThroughAdapterHost()
+    {
+        var dir = TestDirs.New(); File.WriteAllText(Path.Combine(dir, "background-supported"), "");
+        var adapter = new ClaudeAdapter(Options(dir)); var hosts = new InProcessHosts(_ => adapter);
+        await using var conductor = hosts.Conductor(dir, adapter); hosts.Service = conductor;
+        await using var client = await TestClient.ConnectAsync(conductor);
+        var id = await NewAsync(client, dir);
+        try
+        {
+            var route = conductor.Agents["claude"].RouteOf(id)!.Rpc;
+            JsonObject Reminder(string stream, string text) => new()
+            {
+                ["sessionId"] = id, ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = text }),
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaReplyReminder] = new JsonObject { ["backgroundStream"] = stream } },
+            };
+            var beforeStart = await Assert.ThrowsExactlyAsync<Gorynych.Acp.JsonRpc.JsonRpcException>(() =>
+                route.SendRequestAsync(AcpMethods.Agent.SessionPrompt, Reminder("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "must not start")));
+            StringAssert.Contains(beforeStart.Message, "changed or exited");
+            Assert.IsFalse(File.Exists(Path.Combine(FakeRoot, id + ".inputs.jsonl")), "a reminder never starts a native process");
+            await PromptAsync(client, id, "hello").WaitAsync(TimeSpan.FromSeconds(20));
+            var feed = conductor.Feed(id);
+            await LinkHarness.Until(() => feed.HasFreshReminderBackground(route), "initial full Claude stream").WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.IsNull(feed.Activity.Snapshot()["backgroundKnown"]);
+            Assert.IsTrue(feed.HasConfirmedIdle(route));
+            await PromptAsync(client, id, "another ordinary turn").WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.IsTrue(feed.HasFreshReminderBackground(route), "no fabricated second background update is needed");
+            Assert.IsNull(feed.Activity.Snapshot()["backgroundKnown"]);
+            var inputs = Path.Combine(FakeRoot, id + ".inputs.jsonl"); var before = File.ReadAllLines(inputs).Length;
+            var mismatch = await Assert.ThrowsExactlyAsync<Gorynych.Acp.JsonRpc.JsonRpcException>(() =>
+                route.SendRequestAsync(AcpMethods.Agent.SessionPrompt, Reminder("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "must not be written")));
+            StringAssert.Contains(mismatch.Message, "changed or exited"); Assert.AreEqual(before, File.ReadAllLines(inputs).Length);
+            var stream = feed.ReminderBackgroundStream(route)!;
+            await route.SendRequestAsync(AcpMethods.Agent.SessionPrompt, Reminder(stream, "same process reminder")).WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.AreEqual(before + 1, File.ReadAllLines(inputs).Length, "the attested process receives exactly one native input");
+            await PromptAsync(client, id, "background snapshot probe").WaitAsync(TimeSpan.FromSeconds(20));
+            await LinkHarness.Until(() => feed.HasBackgroundWork, "native background became busy").WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.IsFalse(feed.HasFreshReminderBackground(route));
+            var busyCount = File.ReadAllLines(inputs).Length;
+            var busy = await Assert.ThrowsExactlyAsync<Gorynych.Acp.JsonRpc.JsonRpcException>(() =>
+                route.SendRequestAsync(AcpMethods.Agent.SessionPrompt, Reminder(stream, "must not wake busy process")));
+            StringAssert.Contains(busy.Message, "not sent");
+            Assert.AreEqual(busyCount, File.ReadAllLines(inputs).Length, "known busy background blocks native input");
+            File.WriteAllText(Path.Combine(dir, "release-background"), "");
+            await LinkHarness.Until(() => feed.HasFreshReminderBackground(route) && !feed.HasBackgroundWork,
+                "native complete stream became empty again").WaitAsync(TimeSpan.FromSeconds(20));
+        }
+        finally { File.WriteAllText(Path.Combine(dir, "release-background"), ""); }
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task FirstPrompt_AsksTrustOnce_StreamsText_AndKeepsOneProcess()
     {
         var dir = TestDirs.New();

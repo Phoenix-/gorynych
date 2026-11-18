@@ -79,6 +79,8 @@ internal sealed class ClaudeProcess : IAsyncDisposable
     public void BeginReading() => begin.TrySetResult();
 
     public int Id => process.Id;
+    // Stable only for this native process; never accepted from a user prompt.
+    public string BackgroundStreamId { get; } = Guid.NewGuid().ToString("N");
 
     /// <summary>Completes with the exit code once the process has exited and its output is read.</summary>
     public Task<int> Exited => exited.Task;

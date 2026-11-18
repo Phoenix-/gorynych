@@ -139,6 +139,7 @@ public static class GorynychProtocol
     public const string MethodCancelReplyWait = "_gorynych/cancel_reply_wait";
     public const string CapReplyWaits = "gorynych/replyWaits";
     public const string MetaExpectsReply = "gorynych/expectsReply";
+    public const string MetaReplyReminder = "gorynych/replyReminder";
     public const string MethodReplyMessage = "_gorynych/reply_message";
     public const string MetaMessageRequestId = "gorynych/messageRequestId";
     public const string MetaMailboxMessage = "gorynych/mailboxMessage";
@@ -240,6 +241,8 @@ public static class GorynychProtocol
     public const string MethodSessionState = "_gorynych/session_state";
     /// <summary>Adapter's authoritative foreground state, never inferred from a pending permission.</summary>
     public const string MetaForegroundState = "gorynych/foregroundState";
+    /// <summary>Trusted adapter confirms a full background change stream for its current process.</summary>
+    public const string MetaBackgroundCompleteStream = "gorynych/backgroundCompleteStream";
     public const string MetaBackgroundWork = "gorynych/backgroundWork";
     /// <summary>A partial live observation; it does not establish the complete background snapshot.</summary>
     public const string MetaBackgroundKnown = "gorynych/backgroundKnown";

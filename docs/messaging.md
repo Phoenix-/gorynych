@@ -48,6 +48,40 @@ if the original message is still retained; it does not recreate the expectation.
 waits. These tools neither grant authority nor change mode or approval checks. Outside
 agents cannot create or inspect waits; no scheduling or task-completion inference is implied.
 
+## Targeted reply reminders
+
+Automatic reminders are disabled unless the service data directory contains a valid
+`reply-reminders.json` identifying one existing UI group with `projectKey` and `groupId`.
+Optional integer `delaySeconds`, `overdueSeconds` and `sweepSeconds` default to 120,
+600 and 30. The accepted ranges are 1–86400, 1–604800 and 1–3600 respectively.
+The file is read at service startup; changing or removing it takes effect after a service
+restart. Invalid or missing configuration and a missing group are shown in service status.
+Only newly admitted waits whose two participants belong to the group receive a schedule;
+older waits stay passive. Group membership is checked again before a delivery claim.
+
+The review deadline starts at confirmed original delivery; overdue is measured from
+admission. At most one reminder and one escalation notice are claimed per wait. Their
+stable service message IDs and native delivery dispositions are retained with the wait.
+A reply or cancellation before claim suppresses delivery; an already claimed turn can
+finish. A started claim without a confirmed result is uncertain and is never replayed.
+Overdue metadata remains visible to the two wait participants even when no notice can be
+delivered, and a direct reciprocal open wait is escalated at review without alternating reminders.
+
+Automatic delivery only uses a current already-open route, positive idle evidence from a
+completed native response and live activity observed on that route, a known-empty complete
+native background change stream confirmed by the current adapter via its opaque
+`gorynych/backgroundCompleteStream` ID, no known nonempty partial background snapshot,
+and a known recipient permission mode. Unknown
+or stale activity, busy turns, pending approvals, read-only, archive,
+maintenance and the existing full-access boundary defer delivery. While a claimed reminder
+turn is running, target mode/config changes wait for its native response. If the target is
+in full access, the source must have confirmed current-route evidence of full access and its
+mode/config changes also wait to preserve the authority check;
+ordinary mailbox acceptance and session cancellation remain available. Waits on older hosts
+without the stream marker, or adapters exposing only partial background observations, remain
+visible but are not auto-woken by this policy. A reminder is a service notice, not a user instruction, and the recipient
+replies to the original message ID. Ordinary mailbox messages and reports are unchanged.
+
 ## Delivery and authority
 
 This first implementation serializes delivery through ordinary ACP `session/prompt`

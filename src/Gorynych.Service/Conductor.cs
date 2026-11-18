@@ -206,6 +206,7 @@ public sealed partial class Conductor : IAsyncDisposable
         Directory.CreateDirectory(journalDirectory);
         store = new SessionStore(Path.Combine(options.DataDirectory, "sessions.json"));
         uiMetadata = new UiMetadataStore(Path.Combine(options.DataDirectory, "ui-metadata.json"));
+        reminderPolicy = ReplyReminderPolicy.Load(Path.Combine(options.DataDirectory, "reply-reminders.json"), out reminderPolicyStatus);
         startupDrafts = store.All().Where(r => r.Draft).Select(r => r.SessionId).ToList();
         foreach (var a in adapters) agents[a.Name] = new AgentHost(a, this);
         DefaultAgent = options.DefaultAgent ?? agents.Keys.FirstOrDefault() ?? throw new ArgumentException("no adapters");
@@ -223,6 +224,7 @@ public sealed partial class Conductor : IAsyncDisposable
             }
         reports = new ReportStore(Path.Combine(options.DataDirectory, "reports"));
         InitializeMailbox();
+        StartReminderSweep();
         Track(Task.Run(() => { QueueReportDeliveries(); return ReconcileReportInventoryAsync(); }));
     }
 
@@ -1671,7 +1673,7 @@ public sealed partial class Conductor : IAsyncDisposable
                 Track(Task.Run(async () =>
                 {
                     await feed.WaitForSteeringAsync();
-                    await OnAgentNotificationAsync(host, method, terminal);
+                    await OnAgentNotificationAsync(host, method, terminal, source);
                 }));
                 return;
             }
@@ -1681,7 +1683,10 @@ public sealed partial class Conductor : IAsyncDisposable
             if ((string?)update["sessionUpdate"] == "session_info_update" && update["_meta"] is JsonObject activityMeta && (activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork) || activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundKnown)))
             {
                 if (activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundWork))
-                    NativeBackground(feed, activityMeta[GorynychProtocol.MetaBackgroundWork], activityMeta[GorynychProtocol.MetaBackgroundProcessExited] is JsonValue exited && exited.TryGetValue<bool>(out var stopped) && stopped);
+                    NativeBackground(feed, activityMeta[GorynychProtocol.MetaBackgroundWork], activityMeta[GorynychProtocol.MetaBackgroundProcessExited] is JsonValue exited && exited.TryGetValue<bool>(out var stopped) && stopped,
+                        ReferenceEquals(host.RouteOf(sessionId)?.Rpc, source) ? source : null,
+                        activityMeta[GorynychProtocol.MetaBackgroundCompleteStream] is JsonValue stream && stream.TryGetValue<string>(out var token) &&
+                            Guid.TryParseExact(token, "N", out _) ? token : null);
                 if (activityMeta.ContainsKey(GorynychProtocol.MetaBackgroundKnown)) NativeKnownBackground(feed, activityMeta[GorynychProtocol.MetaBackgroundKnown]);
                 if ((string?)activityMeta[GorynychProtocol.MetaForegroundState] is { } accompanyingForeground) NativeActivity(feed, accompanyingForeground);
                 if (activityMeta.ContainsKey(GorynychProtocol.MetaAgentTurn))
@@ -1689,6 +1694,7 @@ public sealed partial class Conductor : IAsyncDisposable
                     AgentTurn(feed, update);
                     activityTurnHandled = true;
                 }
+                activityMeta.Remove(GorynychProtocol.MetaBackgroundCompleteStream);
                 activityMeta.Remove(GorynychProtocol.MetaBackgroundWork);
                 activityMeta.Remove(GorynychProtocol.MetaBackgroundKnown);
                 activityMeta.Remove(GorynychProtocol.MetaBackgroundProcessExited);
@@ -1748,12 +1754,12 @@ public sealed partial class Conductor : IAsyncDisposable
         if (foreground == "idle" && feed.EndNativeActivity()) IdleFromNow(feed.SessionId);
     }
 
-    void NativeBackground(SessionFeed feed, JsonNode? value, bool processExited)
+    void NativeBackground(SessionFeed feed, JsonNode? value, bool processExited, JsonRpcConnection? source = null, string? stream = null)
     {
         var valid = BackgroundWorkSnapshot.TryParse(value, out var snapshot);
         var released = valid && value is null && processExited
             ? feed.ReleaseBackground()
-            : feed.ReportBackground(valid ? snapshot : null);
+            : feed.ReportBackground(valid ? snapshot : null, source, stream);
         if (released) IdleFromNow(feed.SessionId);
     }
 
@@ -2825,7 +2831,7 @@ public sealed partial class Conductor : IAsyncDisposable
         if (request.Params is JsonObject raw && raw["_meta"] is JsonObject untrusted)
         {
             foreach (var name in new[] { GorynychProtocol.MetaReportId, GorynychProtocol.MetaReportCapture, GorynychProtocol.MetaReportDelivery,
-                GorynychProtocol.MetaAssignmentId, GorynychProtocol.MetaOrigin, GorynychProtocol.MetaMailboxMessage, GorynychProtocol.MetaExpectsReply,
+                GorynychProtocol.MetaAssignmentId, GorynychProtocol.MetaOrigin, GorynychProtocol.MetaMailboxMessage, GorynychProtocol.MetaExpectsReply, GorynychProtocol.MetaReplyReminder, GorynychProtocol.MetaBackgroundCompleteStream,
                 GorynychProtocol.MetaSender, GorynychProtocol.MetaParentSessionId, GorynychProtocol.MetaFromSessionId }) untrusted.Remove(name);
             prompt.Meta = untrusted.DeepClone().AsObject();
         }
@@ -3258,6 +3264,7 @@ public sealed partial class Conductor : IAsyncDisposable
                 if (client.CancelledAfter(record.SessionId, request.Sequence)) return Cancelled();
                 report = AdmitReport(record, rpc, promptId!, "user:" + messageId, ReportCause.User, null, messageId);
                 var forwarded = WithReport(WithMessageId(request.Params, messageId), report);
+                feed.BeginReminderActivityEpoch();
                 startAttempted = true;
                 response = await rpc.StartRequestAsync(request.Method, forwarded, CancellationToken.None);
                 handed();
@@ -3273,6 +3280,7 @@ public sealed partial class Conductor : IAsyncDisposable
             catch (JsonRpcException error) { ImportLocalReport(report, feed, null, error); await HandleReportResponseErrorAsync(report, error); throw; }
             ImportLocalReport(report, feed, result);
             await RequireImportedAsync(report);
+            feed.ConfirmIdle(rpc);
             KeepMark(feed, result);
             return result;
         }
@@ -3379,34 +3387,75 @@ public sealed partial class Conductor : IAsyncDisposable
 
     internal async Task<JsonNode?> ForwardAsync(JsonRpcRequest request, string sessionId, CancellationToken ct)
     {
+        // Once a setting has been handed to the native agent, client cancellation must not
+        // cancel the native RPC or release its authority gate before the result is observed.
+        if (request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode)
+        {
+            var operation = ForwardCoreAsync(request, sessionId, ct);
+            try { return await operation.WaitAsync(ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                _ = operation.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+                throw;
+            }
+        }
+        return await ForwardCoreAsync(request, sessionId, ct);
+    }
+
+    async Task<JsonNode?> ForwardCoreAsync(JsonRpcRequest request, string sessionId, CancellationToken ct)
+    {
         using var use = await UseAsync(sessionId, ct);
         var (rpc, _) = await EnsureLiveAsync(use.Record, ct);
-        // A change of a session its agent opened for reading only: opened again first, which takes it
-        // if it is free now, and refused in the same words as a prompt while it is still read-only.
-        if (use.Feed.OpenedReadOnly && request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode or "session/set_model")
-            rpc = await RetakeAsync(HostOf(use.Record), use.Record, rpc, ReadOnlyUse.Setting, ct);
-        var response = await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
-        // A change one client made reaches the session's other clients as if its agent had said it (an AHP client
-        // and Zed on one session, say): the session's state, not its history, so not journaled.
-        switch (request.Method)
+        var modeChange = request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode;
+        if (modeChange) await use.Feed.ReminderModeGate.WaitAsync(ct);
+        try
         {
-            case AcpMethods.Agent.SessionSetConfigOption:
-                use.Feed.CaptureState(response); // the full list with the new values
-                if (response?["configOptions"] is JsonArray options)
-                    await use.Feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "config_option_update", ["configOptions"] = options.DeepClone() },
-                        except: null, () => { }, journal: false);
-                break;
-            case AcpMethods.Agent.SessionSetMode:
-                use.Feed.SetCurrent("modes", "currentModeId", request.Params?["modeId"]);
-                if (request.Params?["modeId"] is JsonValue mode)
-                    await use.Feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "current_mode_update", ["currentModeId"] = mode.DeepClone() },
-                        except: null, () => { }, journal: false);
-                break;
-            case "session/set_model": // unstable in ACP; agents that have it answer the same way
-                use.Feed.SetCurrent("models", "currentModelId", request.Params?["modelId"]);
-                break;
+            // A change of a session its agent opened for reading only: opened again first, which takes it
+            // if it is free now, and refused in the same words as a prompt while it is still read-only.
+            if (use.Feed.OpenedReadOnly && request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode or "session/set_model")
+                rpc = await RetakeAsync(HostOf(use.Record), use.Record, rpc, ReadOnlyUse.Setting, ct);
+            JsonNode? response;
+            if (modeChange)
+            {
+                Task<JsonNode?> pending;
+                await use.Feed.ForwardGate.WaitAsync(ct);
+                try
+                {
+                    ct.ThrowIfCancellationRequested();
+                    use.Feed.InvalidateReminderMode();
+                    // StartRequestAsync may have written even if it throws. Keep the mode
+                    // unknown on any failure and do not tie native settlement to the client.
+                    try { pending = await rpc.StartRequestAsync(request.Method, request.Params?.DeepClone(), CancellationToken.None); }
+                    catch { use.Feed.InvalidateReminderMode(); throw; }
+                }
+                finally { use.Feed.ForwardGate.Release(); }
+                try { response = await pending; }
+                catch { use.Feed.InvalidateReminderMode(); throw; }
+            }
+            else response = await rpc.SendRequestAsync(request.Method, request.Params?.DeepClone(), ct);
+            // A change one client made reaches the session's other clients as if its agent had said it (an AHP client
+            // and Zed on one session, say): the session's state, not its history, so not journaled.
+            switch (request.Method)
+            {
+                case AcpMethods.Agent.SessionSetConfigOption:
+                    use.Feed.CaptureState(response); // the full list with the new values
+                    if (response?["configOptions"] is JsonArray options)
+                        await use.Feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "config_option_update", ["configOptions"] = options.DeepClone() },
+                            except: null, () => { }, journal: false);
+                    break;
+                case AcpMethods.Agent.SessionSetMode:
+                    use.Feed.SetCurrent("modes", "currentModeId", request.Params?["modeId"]);
+                    if (request.Params?["modeId"] is JsonValue mode)
+                        await use.Feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "current_mode_update", ["currentModeId"] = mode.DeepClone() },
+                            except: null, () => { }, journal: false);
+                    break;
+                case "session/set_model": // unstable in ACP; agents that have it answer the same way
+                    use.Feed.SetCurrent("models", "currentModelId", request.Params?["modelId"]);
+                    break;
+            }
+            return response;
         }
-        return response;
+        finally { if (modeChange) use.Feed.ReminderModeGate.Release(); }
     }
 
     internal async Task ForwardNotificationAsync(string method, JsonNode? @params, string sessionId)
@@ -5803,7 +5852,8 @@ public sealed partial class Conductor : IAsyncDisposable
         ["build"] = HostGeneration.ThisBuild,
         ["maintenance"] = MaintenanceStatus(),
         ["_meta"] = new JsonObject { ["gorynych/reportRecovery"] = ReportRecoveryStatus(), ["gorynych/reportDelivery"] = ReportDeliveryStatus(),
-            ["gorynych/replyWaits"] = new JsonObject { ["open"] = mailbox.OpenReplyWaitCount } },
+            ["gorynych/replyWaits"] = new JsonObject { ["open"] = mailbox.OpenReplyWaitCount,
+                ["reminders"] = new JsonObject { ["policy"] = ReminderPolicyStatus(), ["counts"] = mailbox.ReminderCounts(options.Time.GetUtcNow()) } } },
         ["agents"] = new JsonArray(agents.Values.Select(a => (JsonNode)a.Describe(s => !removed.ContainsKey(s) && Feed(s).TurnRunning, WhyNotMoved)).ToArray()),
         ["sessionDetails"] = SessionStatus(),
         ["ahp"] = AhpStatus?.Invoke(),
@@ -5915,6 +5965,7 @@ public sealed partial class Conductor : IAsyncDisposable
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         cleanupStop.Cancel();
         Volatile.Read(ref reclaimSweep)?.Dispose();
+        reminderTimer?.Dispose();
         try { await Task.WhenAll(autoTitleTasks.Keys).WaitAsync(TimeSpan.FromSeconds(2)); }
         catch (Exception e) { ServiceLog.Warn($"generated titles at exit: {e.Message}"); }
         try { await Task.WhenAll(cleanups.Keys).WaitAsync(TimeSpan.FromSeconds(5)); }
