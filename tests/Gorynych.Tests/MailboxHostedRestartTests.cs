@@ -12,11 +12,13 @@ public sealed class MailboxHostedRestartTests
     static readonly TimeSpan Wait = TimeSpan.FromSeconds(20);
 
     [TestMethod]
-    [DataRow(false, false, DisplayName = "accepted message queued behind a surviving native turn")]
-    [DataRow(true, false, DisplayName = "mailbox turn already handed to a surviving host")]
-    [DataRow(false, true, DisplayName = "delegation retry across restart behind a surviving native turn")]
+    [DataRow(false, false, false, DisplayName = "accepted message queued behind a surviving native turn")]
+    [DataRow(true, false, false, DisplayName = "mailbox turn already handed to a surviving host")]
+    [DataRow(false, true, false, DisplayName = "delegation retry across restart behind a surviving native turn")]
+    [DataRow(false, false, true, DisplayName = "reply wait queued across a surviving native turn")]
+    [DataRow(true, false, true, DisplayName = "reply wait retains uncertain handoff across restart")]
     [Timeout(60000, CooperativeCancellation = true)]
-    public async Task HostedRestart_PreservesTheQueue_AndNeverSilentlyReplaysAnUncertainHandoff(bool inFlight, bool delegation)
+    public async Task HostedRestart_PreservesTheQueue_AndNeverSilentlyReplaysAnUncertainHandoff(bool inFlight, bool delegation, bool expectReply)
     {
         var directory = TestDirs.New();
         var recipient = new LifecycleAgent("claude", canDelete: false);
@@ -64,7 +66,7 @@ public sealed class MailboxHostedRestartTests
                 await entered.Task.WaitAsync(Wait);
             }
             var messageId = Guid.NewGuid().ToString("N");
-            var method = delegation ? GorynychProtocol.MethodDelegateTask : GorynychProtocol.MethodSendMessage;
+            var method = delegation ? GorynychProtocol.MethodDelegateTask : expectReply ? GorynychProtocol.MethodRequestReply : GorynychProtocol.MethodSendMessage;
             JsonObject Message() => new()
             {
                 ["sessionId"] = to, ["text"] = marker, ["_meta"] = new JsonObject
@@ -95,6 +97,16 @@ public sealed class MailboxHostedRestartTests
             await LinkHarness.Until(() => service.Feed(to).Adopted is not null,
                 "the new conductor adopts the turn still running in its surviving host");
 
+            if (expectReply)
+            {
+                var retryWait = await client.Rpc.SendRequestAsync(method, Message()).WaitAsync(Wait);
+                Assert.AreEqual(messageId, (string?)retryWait!["messageId"]);
+                Assert.AreEqual(true, (bool?)retryWait["replyExpected"]);
+                var page = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodListReplyWaits,
+                    new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = service.Store.Get(from)!.PeerToken } }).WaitAsync(Wait);
+                Assert.AreEqual("waiting", (string?)page!["items"]![0]!["state"]);
+                Assert.AreEqual(messageId, (string?)page["items"]![0]!["messageId"]);
+            }
             if (delegation)
             {
                 var retry = await client.Rpc.SendRequestAsync(method, Message()).WaitAsync(Wait);
@@ -108,6 +120,13 @@ public sealed class MailboxHostedRestartTests
                     lock (sender.Prompts) return sender.Prompts.Any(p => p.SessionId == from &&
                         p.Text.Contains("processing is uncertain", StringComparison.Ordinal));
                 }, "explicit uncertainty notice after hosted mailbox handoff");
+            if (inFlight && expectReply)
+            {
+                var page = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodListReplyWaits,
+                    new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = service.Store.Get(from)!.PeerToken } }).WaitAsync(Wait);
+                Assert.AreEqual("uncertain", (string?)page!["items"]![0]!["requestDelivery"]);
+                Assert.AreEqual("waiting", (string?)page["items"]![0]!["state"]);
+            }
 
             hold.TrySetResult();
             if (!inFlight)

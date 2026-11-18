@@ -2734,7 +2734,7 @@ public sealed partial class Conductor : IAsyncDisposable
         if (request.Params is JsonObject raw && raw["_meta"] is JsonObject untrusted)
         {
             foreach (var name in new[] { GorynychProtocol.MetaReportId, GorynychProtocol.MetaReportCapture, GorynychProtocol.MetaReportDelivery,
-                GorynychProtocol.MetaAssignmentId, GorynychProtocol.MetaOrigin, GorynychProtocol.MetaMailboxMessage,
+                GorynychProtocol.MetaAssignmentId, GorynychProtocol.MetaOrigin, GorynychProtocol.MetaMailboxMessage, GorynychProtocol.MetaExpectsReply,
                 GorynychProtocol.MetaSender, GorynychProtocol.MetaParentSessionId, GorynychProtocol.MetaFromSessionId }) untrusted.Remove(name);
             prompt.Meta = untrusted.DeepClone().AsObject();
         }
@@ -5710,7 +5710,8 @@ public sealed partial class Conductor : IAsyncDisposable
         ["hosts"] = options.Hosts is not null,
         ["build"] = HostGeneration.ThisBuild,
         ["maintenance"] = MaintenanceStatus(),
-        ["_meta"] = new JsonObject { ["gorynych/reportRecovery"] = ReportRecoveryStatus(), ["gorynych/reportDelivery"] = ReportDeliveryStatus() },
+        ["_meta"] = new JsonObject { ["gorynych/reportRecovery"] = ReportRecoveryStatus(), ["gorynych/reportDelivery"] = ReportDeliveryStatus(),
+            ["gorynych/replyWaits"] = new JsonObject { ["open"] = mailbox.OpenReplyWaitCount } },
         ["agents"] = new JsonArray(agents.Values.Select(a => (JsonNode)a.Describe(s => !removed.ContainsKey(s) && Feed(s).TurnRunning, WhyNotMoved)).ToArray()),
         ["sessionDetails"] = SessionStatus(),
         ["ahp"] = AhpStatus?.Invoke(),

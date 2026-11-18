@@ -27,6 +27,27 @@ full-access consent precede acceptance, so these steps can still take time or fa
 acceptance, cancelling the sending call does not withdraw its message. A lost response is
 uncertain; the shim retries with the same transport-generated request ID.
 
+## Explicit reply expectations
+
+Managed peers can use `request_reply {session_id,text}` when they explicitly need a
+correlated response. Acceptance atomically records the ordinary message and a wait keyed
+by its `messageId`; it does not wait for delivery or a response. The recipient replies with
+`reply_message` and the first accepted reply atomically resolves an open wait. If already
+cancelled, the wait stays cancelled while retaining the first reply identity for retries. `list_reply_waits
+{cursor?,limit?}` pages metadata for either participant; `cancel_reply_wait {message_id}`
+lets only the waiter cancel an open expectation. Cancellation does not retract the message
+or prevent later ordinary replies. The states `waiting`, `replied` and `cancelled` describe
+the expectation, separately from request and reply delivery disposition. An uncertain
+handoff is not replayed merely because a wait remains open.
+
+The mailbox retains at most 1000 wait records independently of its message history.
+Open waits are never evicted; admission fails when all slots are open. Oldest terminal
+waits are evicted first. While retained, the wait preserves retry fingerprints and reply
+correlation even if message bodies expire. A retry after its wait has expired is rejected
+if the original message is still retained; it does not recreate the expectation. Existing mailbox stores load without implicit
+waits. These tools neither grant authority nor change mode or approval checks. Outside
+agents cannot create or inspect waits; no scheduling or task-completion inference is implied.
+
 ## Delivery and authority
 
 This first implementation serializes delivery through ordinary ACP `session/prompt`

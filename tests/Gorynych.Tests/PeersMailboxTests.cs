@@ -77,6 +77,35 @@ public sealed class PeersMailboxTests
     }
 
     [TestMethod]
+    public async Task RequestReplyAndWaitToolsUseAuthenticatedServiceBoundary()
+    {
+        using var http = new HttpClient(new FailHttp());
+        string? requestId = null;
+        var route = Route((_, request, _) =>
+        {
+            Assert.AreEqual("token", (string?)request.Params!["_meta"]![GorynychProtocol.MetaPeerToken]);
+            if (request.Method == GorynychProtocol.MethodRequestReply)
+            {
+                requestId = (string?)request.Params["_meta"]![GorynychProtocol.MetaMessageRequestId];
+                Assert.AreEqual("recipient", (string?)request.Params["sessionId"]);
+                return Task.FromResult<JsonNode?>(new JsonObject { ["messageId"] = requestId, ["status"] = "accepted", ["replyExpected"] = true });
+            }
+            if (request.Method == GorynychProtocol.MethodListReplyWaits)
+                return Task.FromResult<JsonNode?>(new JsonObject { ["items"] = new JsonArray(new JsonObject { ["messageId"] = requestId, ["state"] = "waiting" }) });
+            Assert.AreEqual(GorynychProtocol.MethodCancelReplyWait, request.Method);
+            Assert.AreEqual(requestId, (string?)request.Params["messageId"]);
+            return Task.FromResult<JsonNode?>(new JsonObject { ["messageId"] = requestId, ["state"] = "cancelled" });
+        });
+        async Task<JsonNode> Call(string name, JsonObject args) => await PeersServer.CallAsync(http, route, "token", null, name, args, CancellationToken.None);
+        var sent = await Call("request_reply", new JsonObject { ["session_id"] = "recipient", ["text"] = "question" });
+        Assert.AreEqual(false, (bool?)sent["isError"]);
+        var listed = await Call("list_reply_waits", new JsonObject());
+        Assert.AreEqual("waiting", (string?)JsonNode.Parse((string)listed["content"]![0]!["text"]!)!["items"]![0]!["state"]);
+        var cancelled = await Call("cancel_reply_wait", new JsonObject { ["message_id"] = requestId });
+        Assert.AreEqual("cancelled", (string?)JsonNode.Parse((string)cancelled["content"]![0]!["text"]!)!["state"]);
+    }
+
+    [TestMethod]
     public async Task UnknownAcceptanceAndInvalidArgumentsAreReported()
     {
         var route = Route(async (_, _, server) => { await server.DisposeAsync(); return null; }, seconds: 0.1);

@@ -255,8 +255,22 @@ public sealed class PeersTests
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
             StringAssert.Contains((string?)init["instructions"], "Use delegate_task to continue already user-authorized work with your immediate child");
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports" },
+            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports", "request_reply", "list_reply_waits", "cancel_reply_wait" },
                 tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
+
+            var malformedWait = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_reply_waits", ["arguments"] = new JsonArray() });
+            Assert.AreEqual(true, (bool?)malformedWait!["isError"]);
+            var requested = await mcp.SendRequestAsync("tools/call", new JsonObject
+            {
+                ["name"] = "request_reply", ["arguments"] = new JsonObject { ["session_id"] = "answering", ["text"] = "Please reply" },
+            });
+            Assert.AreEqual(false, (bool?)requested!["isError"]);
+            var requestId = (string)JsonNode.Parse((string)requested["content"]![0]!["text"]!)!["messageId"]!;
+            var waits = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_reply_waits", ["arguments"] = new JsonObject() });
+            Assert.AreEqual(requestId, (string?)JsonNode.Parse((string)waits!["content"]![0]!["text"]!)!["items"]![0]!["messageId"]);
+            var cancelled = await mcp.SendRequestAsync("tools/call", new JsonObject
+            { ["name"] = "cancel_reply_wait", ["arguments"] = new JsonObject { ["message_id"] = requestId } });
+            Assert.AreEqual("cancelled", (string?)JsonNode.Parse((string)cancelled!["content"]![0]!["text"]!)!["state"]);
 
             StringAssert.Contains((string?)init["instructions"], "read_report");
             var wrongArgs = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_reports", ["arguments"] = new JsonArray() });

@@ -2574,3 +2574,18 @@ settlement, the service records `confirmed_host_exit` as a separate ledger-relea
 an adapter ACK or new delivery evidence. A live or uninspectable process and legacy claims without
 process identity remain unresolved. `read_report`, `list_reports` and status expose pending ACK and
 conflict metadata without a body.
+
+
+### Reply expectations
+
+Managed peers discover `gorynych/replyWaits` in `_meta`. ACP methods
+`_gorynych/request_reply`, `_gorynych/list_reply_waits`, and
+`_gorynych/cancel_reply_wait` require the existing authenticated peer token. Request uses
+`sessionId`, `text`, and the transport-generated `gorynych/messageRequestId` in `_meta`;
+it returns `messageId`, `status: accepted`, and `replyExpected: true` after the message
+and wait commit together. List accepts `cursor` and `limit` (1..100) and returns
+participant-only `items` and `nextCursor`. Cancel accepts `messageId` and is restricted
+to the waiter. The immutable first correlated reply resolves an open wait in the same
+mailbox commit that accepts the reply; cancellation never retracts a message. Delivery
+dispositions are distinct from wait state. Retention and uncertainty are described in
+[messaging.md](messaging.md).

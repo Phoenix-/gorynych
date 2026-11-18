@@ -164,6 +164,12 @@ internal sealed class ClientConnection
                 return await conductor.DelegateTaskAsync(request, ct);
             case GorynychProtocol.MethodSendMessage:
                 return await conductor.SendMessageAsync(request, reply: false, ct);
+            case GorynychProtocol.MethodRequestReply:
+                return await conductor.SendMessageAsync(request, reply: false, ct, expectReply: true);
+            case GorynychProtocol.MethodListReplyWaits:
+                return conductor.ListReplyWaits(request);
+            case GorynychProtocol.MethodCancelReplyWait:
+                return conductor.CancelReplyWait(request);
             case GorynychProtocol.MethodReplyMessage:
                 return await conductor.SendMessageAsync(request, reply: true, ct);
             case GorynychProtocol.MethodPeers:
@@ -238,6 +244,7 @@ internal sealed class ClientConnection
         flags[GorynychProtocol.CapGroups] = true;
         flags[GorynychProtocol.CapDelegateTask] = true;
         flags[GorynychProtocol.CapReportRetrieval] = true;
+        flags[GorynychProtocol.CapReplyWaits] = true;
         flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
         flags[GorynychProtocol.MetaSessionState] = 1;
         return flags;
