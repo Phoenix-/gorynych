@@ -152,6 +152,44 @@ public sealed class MailboxDeliveryTests
     }
 
     [TestMethod]
+    public async Task RequestReplyRecordsFastCorrelatedResponseAndExcludesOtherPeers()
+    {
+        var a = new Peer("alpha"); var b = new Peer("beta"); var c = new Peer("gamma");
+        await using var service = Create(TestDirs.New(), a, b, c);
+        await using var client = await TestClient.ConnectAsync(service);
+        await New(client, a, b, c);
+        var replied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        b.Prompt = async (_, prompt, text) =>
+        {
+            if (!text.Contains("message_id question-1", StringComparison.Ordinal)) return;
+            Assert.AreEqual(true, (bool?)prompt.Meta?[GorynychProtocol.MetaExpectsReply]);
+            await Send(client, b, "question-1", "answer", "reply-1", reply: true);
+            replied.TrySetResult();
+        };
+        var receipt = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodRequestReply, new JsonObject
+        {
+            ["sessionId"] = b.Id, ["text"] = "question", ["_meta"] = new JsonObject
+            {
+                [GorynychProtocol.MetaPeerToken] = a.Token,
+                [GorynychProtocol.MetaMessageRequestId] = "question-1",
+            },
+        }).WaitAsync(Wait);
+        Assert.AreEqual(true, (bool?)receipt!["replyExpected"]);
+        await replied.Task.WaitAsync(Wait);
+        async Task<JsonNode?> List(Peer peer) => await client.Rpc.SendRequestAsync(GorynychProtocol.MethodListReplyWaits,
+            new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = peer.Token } }).WaitAsync(Wait);
+        foreach (var participant in new[] { a, b })
+        {
+            var item = (await List(participant))!["items"]![0]!;
+            Assert.AreEqual("replied", (string?)item["state"]);
+            Assert.AreEqual("reply-1", (string?)item["replyId"]);
+        }
+        Assert.AreEqual(0, (await List(c))!["items"]!.AsArray().Count);
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => client.Rpc.SendRequestAsync(GorynychProtocol.MethodCancelReplyWait,
+            new JsonObject { ["messageId"] = "question-1", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = c.Token } }));
+    }
+
+    [TestMethod]
     public async Task ReviewerCanMessageAnotherReviewer_AndForeignReplyIsRejected()
     {
         var a = new Peer("alpha"); var b = new Peer("beta"); var c = new Peer("gamma");

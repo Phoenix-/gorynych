@@ -354,6 +354,7 @@ public sealed class ArchiveTests
             "mcp__gorynych__reply", "mcp__gorynych__list_agents", "mcp__gorynych__ask_agent",
             "mcp__gorynych__send_message", "mcp__gorynych__reply_message",
             "mcp__gorynych__read_report", "mcp__gorynych__list_reports",
+            "mcp__gorynych__request_reply", "mcp__gorynych__list_reply_waits", "mcp__gorynych__cancel_reply_wait",
             "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", "mcp__gorynych__spawn_session",
         }, ChannelHost.PreAllowedTools.ToArray());
         CollectionAssert.AreEquivalent(ChannelHost.PreAllowedTools.Where(t => t != "mcp__gorynych__spawn_session").ToArray(), ChannelHost.AllowedTools);

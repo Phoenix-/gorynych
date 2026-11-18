@@ -134,6 +134,11 @@ public static class GorynychProtocol
     public const string MetaAssignmentId = "gorynych/assignmentId";
     /// <summary>Durably enqueue an inter-session message without waiting for a reply.</summary>
     public const string MethodSendMessage = "_gorynych/send_message";
+    public const string MethodRequestReply = "_gorynych/request_reply";
+    public const string MethodListReplyWaits = "_gorynych/list_reply_waits";
+    public const string MethodCancelReplyWait = "_gorynych/cancel_reply_wait";
+    public const string CapReplyWaits = "gorynych/replyWaits";
+    public const string MetaExpectsReply = "gorynych/expectsReply";
     public const string MethodReplyMessage = "_gorynych/reply_message";
     public const string MetaMessageRequestId = "gorynych/messageRequestId";
     public const string MetaMailboxMessage = "gorynych/mailboxMessage";
@@ -443,6 +448,7 @@ public static class GorynychProtocol
     [
         "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent",
         "mcp__gorynych__send_message", "mcp__gorynych__reply_message",
+        "mcp__gorynych__request_reply", "mcp__gorynych__list_reply_waits", "mcp__gorynych__cancel_reply_wait",
         "mcp__gorynych__read_report", "mcp__gorynych__list_reports",
         "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", SpawnTool,
     ];
