@@ -132,6 +132,21 @@ internal sealed partial class MailboxStore
         }
     }
 
+    // A bounded service-owned scan, ordered by the public assignment ID. No text
+    // or peer credentials leave the store. Claimed generations never re-enter it.
+    internal JsonObject[] CompletionAutoCandidates(string? after, int limit)
+    {
+        lock (gate)
+            return assignments.Where(p => (after is null || string.CompareOrdinal(p.Key, after) > 0) &&
+                    p.Value is JsonObject a && (string?)a["source"] == "delegation" &&
+                    (string?)a["status"] == "open" && (string?)a["delivery"] == "delivered" &&
+                    a["continuation"] is null && a["completionReminder"] is null)
+                .OrderBy(p => p.Key, StringComparer.Ordinal).Take(limit)
+                .Select(p => new JsonObject { ["assignmentId"] = p.Key, ["parent"] = p.Value!["parent"]!.DeepClone(),
+                    ["child"] = p.Value!["child"]!.DeepClone(), ["generation"] = p.Value!["generation"]!.DeepClone(),
+                    ["revision"] = p.Value!["revision"]!.DeepClone() }).ToArray();
+    }
+
     internal JsonObject[] AssignmentViews(string participant)
     {
         lock (gate) return assignments.Where(p => p.Value is JsonObject a &&

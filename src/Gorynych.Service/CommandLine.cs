@@ -70,6 +70,7 @@ internal sealed class CommandLine
                                                 separate read-only observation scope; all three required
           --completion-project <key> --completion-group <id> --completion-instance <uuid>
                                                 one explicit manual completion reminder scope; all three required
+          --completion-auto                    opt in to automatic completion reminders for the selected group
           --no-channel  --no-peers
           --console                             also log to the console (not for acp and task install)
 
@@ -86,7 +87,7 @@ internal sealed class CommandLine
 
     /// <summary>The adapters a host runs, as the service names them.</summary>
     public static readonly string[] AdapterNames = ["claude", "kimi", "codex", "dsh"];
-    static readonly string[] ServiceFlags = ["--no-channel", "--no-peers"];
+    static readonly string[] ServiceFlags = ["--no-channel", "--no-peers", "--completion-auto"];
 
     readonly List<(string Name, string? Value)> options = [];
 
@@ -179,7 +180,7 @@ internal sealed class CommandLine
                 known = (["--pipe", "--timeout"], ["--no-wait", "--force"]);
                 break;
             case "host":
-                known = (HostValues, [.. ServiceFlags, "--console"]);
+                known = (HostValues, ["--no-channel", "--no-peers", "--console"]);
                 break;
             case "peers":
                 known = (["--pipe", "--token", "--channel-url", "--reply-url"], []);
