@@ -190,6 +190,8 @@ internal sealed class ClientConnection
                 return await conductor.SendMessageAsync(request, reply: false, ct);
             case GorynychProtocol.MethodRequestReply:
                 return await conductor.SendMessageAsync(request, reply: false, ct, expectReply: true);
+            case GorynychProtocol.MethodObserveCompletionGroup:
+                return await conductor.ObserveCompletionGroupAsync(request, ct);
             case GorynychProtocol.MethodRecoverCompletionReminder:
                 return await conductor.RecoverCompletionOwnerAsync(request, ct);
             case GorynychProtocol.MethodRequestCompletionReminder:
@@ -301,6 +303,7 @@ internal sealed class ClientConnection
         flags[GorynychProtocol.CapReplyWaits] = true;
         flags[GorynychProtocol.CapAssignments] = true;
         flags[GorynychProtocol.CapCompletionNotices] = true;
+        flags[GorynychProtocol.CapCompletionGroupObservation] = conductor.CompletionGroupObservationAvailable;
         flags[GorynychProtocol.CapCompletionOwnerTrigger] = conductor.CompletionOwnerTriggerAvailable;
         flags[GorynychProtocol.CapCompletionOwnerRecovery] = true;
         flags[GorynychProtocol.CapAssignmentContinuations] = true;

@@ -255,7 +255,7 @@ public sealed class PeersTests
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
             StringAssert.Contains((string?)init["instructions"], "Use delegate_task to continue already user-authorized work with your immediate child");
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports", "request_reply", "list_reply_waits", "cancel_reply_wait", "recover_completion_reminder", "request_completion_reminder", "list_completion_notices", "ack_completion_notice", "list_assignments", "read_assignment", "update_assignment", "update_continuation", "list_background_tasks" },
+            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports", "request_reply", "list_reply_waits", "cancel_reply_wait", "observe_completion_group", "recover_completion_reminder", "request_completion_reminder", "list_completion_notices", "ack_completion_notice", "list_assignments", "read_assignment", "update_assignment", "update_continuation", "list_background_tasks" },
                 tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
 
             StringAssert.Contains((string?)init["instructions"], "list_assignments");

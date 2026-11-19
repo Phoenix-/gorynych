@@ -17,6 +17,7 @@ public sealed class ConductorOptions
     public required string ServiceId { get; init; }
     public string? DefaultAgent { get; init; }
     internal (string Project, string Group, string Instance)? CompletionConfiguration { get; init; }
+    internal (string Project, string Group, string Instance)? CompletionObservationConfiguration { get; init; }
     internal string? TestCompletionLedgerPath { get; init; }
     internal TimeSpan? TestCompletionObservationTimeout { get; init; }
 
@@ -148,6 +149,7 @@ public sealed partial class Conductor : IAsyncDisposable
     readonly SessionStore store;
     readonly UiMetadataStore uiMetadata;
     readonly (string Project, string Group, string Instance)? completionScope;
+    readonly (string Project, string Group, string Instance)? completionObservationScope;
     internal bool CompletionScopeIsCurrent
     {
         get
@@ -225,6 +227,11 @@ public sealed partial class Conductor : IAsyncDisposable
             !string.IsNullOrWhiteSpace(configured.Group) && configured.Group.Length <= 256 &&
             Guid.TryParseExact(configured.Instance, "N", out _) && configured.Instance == configured.Instance.ToLowerInvariant())
             completionScope = configured;
+        if (options.CompletionObservationConfiguration is { } observed &&
+            !string.IsNullOrWhiteSpace(observed.Project) && observed.Project.Length <= 512 &&
+            !string.IsNullOrWhiteSpace(observed.Group) && observed.Group.Length <= 256 &&
+            Guid.TryParseExact(observed.Instance, "N", out _) && observed.Instance == observed.Instance.ToLowerInvariant())
+            completionObservationScope = observed;
         if (options.CompletionConfiguration is not null && !CompletionScopeIsCurrent)
             ServiceLog.Warn("completion reminder: configured group instance is unavailable; disabled");
         reminderPolicy = ReplyReminderPolicy.Load(Path.Combine(options.DataDirectory, "reply-reminders.json"), out reminderPolicyStatus);

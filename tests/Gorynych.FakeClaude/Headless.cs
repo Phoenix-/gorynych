@@ -106,6 +106,17 @@ static partial class FakeHeadless
             Inbox.Writer.TryComplete();
         });
 
+        // Fixture-only native background transition after a settled prompt.
+        if (File.Exists(Path.Combine(cwd, "observation-background-probe")))
+            _ = Task.Run(async () =>
+            {
+                while (!File.Exists(Path.Combine(cwd, "emit-observation-background")) && !reading.IsCompleted)
+                    await Task.Delay(20);
+                if (!reading.IsCompleted)
+                    await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "background_tasks_changed",
+                        ["session_id"] = sessionId, ["tasks"] = new JsonArray(new JsonObject {
+                            ["task_id"] = "observation-background", ["task_type"] = "local_agent", ["description"] = "fixture" }) });
+            });
         while (await Inbox.Reader.WaitToReadAsync())
         {
             while (File.Exists(Path.Combine(cwd, "hold-guard-dequeue")) && !File.Exists(Path.Combine(cwd, "release-guard-dequeue"))) await Task.Delay(20);
