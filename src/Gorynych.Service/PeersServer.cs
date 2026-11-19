@@ -80,7 +80,7 @@ public static class PeersServer
                 requested is "read_report" or "list_reports" && req.Params?["arguments"] is not null && req.Params?["arguments"] is not JsonObject
                 => Text("Report arguments must be an object", error: true),
             "tools/call" when req.Params?["name"] is JsonValue assignmentName && assignmentName.TryGetValue<string>(out var assignmentTool) &&
-                assignmentTool is "recover_completion_reminder" or "request_completion_reminder" or "list_completion_notices" or "ack_completion_notice" or "list_assignments" or "read_assignment" or "update_assignment" or "update_continuation" or "list_background_tasks" &&
+                assignmentTool is "observe_completion_group" or "recover_completion_reminder" or "request_completion_reminder" or "list_completion_notices" or "ack_completion_notice" or "list_assignments" or "read_assignment" or "update_assignment" or "update_continuation" or "list_background_tasks" &&
                 req.Params?["arguments"] is not null && req.Params?["arguments"] is not JsonObject
                 => Text("Assignment arguments must be an object", error: true),
             "tools/call" when req.Params?["name"] is JsonValue waitName && waitName.TryGetValue<string>(out var waitTool) &&
@@ -287,6 +287,16 @@ public static class PeersServer
                     if (args.TryGetPropertyValue("cursor", out var cursor)) query["cursor"] = cursor?.DeepClone();
                     if (args.TryGetPropertyValue("limit", out var limit)) query["limit"] = limit?.DeepClone();
                     var result = await RequestAsync(route!, read ? GorynychProtocol.MethodReadReport : GorynychProtocol.MethodListReports, query, ct);
+                    return Text(result?.ToJsonString(AcpJson.TextOptions) ?? "null");
+                }
+                case "observe_completion_group" when pipe is not null && token is not null:
+                {
+                    args ??= new JsonObject();
+                    foreach (var property in args)
+                        if (property.Key is not ("cursor" or "limit")) return Text("Unknown observation argument: " + property.Key, error: true);
+                    var query = new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token } };
+                    foreach (var property in args) query[property.Key] = property.Value?.DeepClone();
+                    var result = await RequestAsync(route!, GorynychProtocol.MethodObserveCompletionGroup, query, ct);
                     return Text(result?.ToJsonString(AcpJson.TextOptions) ?? "null");
                 }
                 case "recover_completion_reminder" or "request_completion_reminder" when pipe is not null && token is not null:
@@ -844,6 +854,8 @@ public static class PeersServer
             ["inputSchema"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = false,
                 ["properties"] = properties, ["required"] = required },
         };
+        var observeCompletionGroup = AssignmentTool("observe_completion_group", "Read a bounded, non-dispatching observation of your assignments in the separately opted-in group.",
+            new JsonObject { ["cursor"] = new JsonObject { ["type"] = "string" }, ["limit"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1, ["maximum"] = 16 } }, new JsonArray());
         var recoverCompletionReminder = AssignmentTool("recover_completion_reminder", "Recover your exact assignment's pending completion attempt only after its original producer has exited; never resends input.",
             new JsonObject { ["assignment_id"] = new JsonObject { ["type"] = "string" }, ["generation"] = new JsonObject { ["type"] = "string" } },
             new JsonArray("assignment_id", "generation"));
@@ -885,7 +897,7 @@ public static class PeersServer
         var updateContinuation = AssignmentTool("update_continuation", "Register your retained reply wait, immediate child assignment or observed background task, or withdraw the current continuation. This does not start a turn or change the assignment outcome.",
             continuationProperties, new JsonArray("source", "assignment_id", "generation", "expected_revision", "operation_id", "action"));
         return [list, send, delegateTask, spawn, archive, restore, replyMessage, readReport, listReports, requestReply, listWaits, cancelWait,
-            recoverCompletionReminder, requestCompletionReminder, listCompletionNotices, ackCompletionNotice, listAssignments, readAssignment, updateAssignment, updateContinuation, backgroundTasks];
+            observeCompletionGroup, recoverCompletionReminder, requestCompletionReminder, listCompletionNotices, ackCompletionNotice, listAssignments, readAssignment, updateAssignment, updateContinuation, backgroundTasks];
     }
 }
 

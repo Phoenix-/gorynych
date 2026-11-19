@@ -149,6 +149,9 @@ await using var conductor = new Conductor(new ConductorOptions
     DataDirectory = dataDirectory,
     ServiceId = state.ServiceId,
     DefaultAgent = line.Value("--default-agent"),
+    CompletionObservationConfiguration = line.Value("--completion-observe-project") is { } observeProject &&
+        line.Value("--completion-observe-group") is { } observeGroup && line.Value("--completion-observe-instance") is { } observeInstance
+        ? (observeProject, observeGroup, observeInstance) : null,
     CompletionConfiguration = line.Value("--completion-project") is { } completionProject &&
         line.Value("--completion-group") is { } completionGroup && line.Value("--completion-instance") is { } completionInstance
         ? (completionProject, completionGroup, completionInstance) : null,

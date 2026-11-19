@@ -137,6 +137,8 @@ public static class GorynychProtocol
     public const string MethodRequestReply = "_gorynych/request_reply";
     public const string CapCompletionOwnerTrigger = "gorynych/completionOwnerTrigger";
     public const string CapCompletionOwnerRecovery = "gorynych/completionOwnerRecovery";
+    public const string MethodObserveCompletionGroup = "_gorynych/observe_completion_group";
+    public const string CapCompletionGroupObservation = "gorynych/completionGroupObservation";
     public const string MethodRecoverCompletionReminder = "_gorynych/recover_completion_reminder";
     public const string MethodRequestCompletionReminder = "_gorynych/request_completion_reminder";
     public const string MethodListCompletionNotices = "_gorynych/list_completion_notices";
@@ -503,7 +505,7 @@ public static class GorynychProtocol
         "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent",
         "mcp__gorynych__send_message", "mcp__gorynych__reply_message",
         "mcp__gorynych__request_reply", "mcp__gorynych__list_reply_waits", "mcp__gorynych__cancel_reply_wait",
-        "mcp__gorynych__recover_completion_reminder", "mcp__gorynych__request_completion_reminder", "mcp__gorynych__list_completion_notices", "mcp__gorynych__ack_completion_notice", "mcp__gorynych__list_assignments", "mcp__gorynych__read_assignment", "mcp__gorynych__update_assignment", "mcp__gorynych__update_continuation", "mcp__gorynych__list_background_tasks",
+        "mcp__gorynych__observe_completion_group", "mcp__gorynych__recover_completion_reminder", "mcp__gorynych__request_completion_reminder", "mcp__gorynych__list_completion_notices", "mcp__gorynych__ack_completion_notice", "mcp__gorynych__list_assignments", "mcp__gorynych__read_assignment", "mcp__gorynych__update_assignment", "mcp__gorynych__update_continuation", "mcp__gorynych__list_background_tasks",
         "mcp__gorynych__read_report", "mcp__gorynych__list_reports",
         "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", SpawnTool,
     ];

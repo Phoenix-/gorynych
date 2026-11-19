@@ -2754,3 +2754,53 @@ held against automatic cleanup while such a legacy claim is pending. This veto i
 of producer identity and cannot authorize status, abort, settlement or a resend; a live
 legacy producer remains unresolved without exact evidence.
 This does not alter the public process-start timestamp or authorize a retry.
+
+### Group completion observation pilot
+
+A separate, default-off observation scope may be selected at service launch with
+`--completion-observe-project <key> --completion-observe-group <id>
+--completion-observe-instance <uuid>`. Obtain the existing immutable `instanceId`
+from `_gorynych/groups/list`. All three options must identify the current group
+instance. They do not enable the manual reminder or any scheduler. A deleted and
+recreated group has a different instance and requires an explicit new launch scope.
+
+For a short observation, launch the reviewed service build with its usual data directory,
+pipe and `--hosts on`, adding the three options above. A coordinator in that group can
+call the managed MCP tool `observe_completion_group` with `{"limit": 16}`, then
+repeat with the returned `nextCursor` until it is null. The existing peer token
+authenticates the coordinator session; only assignments owned by that session and
+assigned to current members are returned. A session token is not human or OS isolation.
+Restart without these three options to disable observation; use the normal graceful
+service restart and host adoption procedure. Check
+`agentCapabilities._meta["gorynych/completionGroupObservation"]` on the new service.
+Do not launch a second service against a live data directory.
+
+Each bounded page returns identity, revision, outcome/delivery and continuation states,
+sanitized session activity and a `decision` and `reason`. It omits prompt and report
+text, native payload and credentials. Current supported positive evidence is an exact
+hosted Claude delegation with a same-process settled prompt and complete empty
+background observation. Unknown route, native state, busy/pending input, unsafe mode,
+unsettled prior handoff, or unavailable correlation defer. Durable reply/child waits,
+blocked and terminal outcomes keep their own reasons. Each host pull has a two-second
+bound, and a page has at most sixteen rows. The pulls are sequential: at most 32 seconds
+of RPC timeout per page, plus local processing and transport overhead. For a live team,
+start with `limit: 4` (at most 8 seconds of RPC timeout per page); cancel the request
+if the inspection window ends. A pass performs no claim, native input, assignment update,
+session opening or notification.
+
+For a bounded manual sample, have the coordinator call the tool, page to completion,
+and repeat a small explicitly chosen number of times only while observation is wanted.
+Compare `waiting_reply`, `waiting_child`, `waiting_background`, `explicit_blocked`,
+`recipient_busy_or_pending`, `background_active_or_unconfirmed`,
+`claude_evidence_unknown`, and `evidence_or_assignment_changed` with the separate
+`sessionActivity.state` and `sessionActivity.background` values. For example,
+`requires_action` is session-level intervention evidence, not proof that this assignment
+requires user action. A background value of `unknown` is not an empty inventory. A
+`shadow_candidate` remains a snapshot for review, not an instruction to send.
+
+A candidate is an advisory observation at separately sampled store and route boundaries,
+not permission to dispatch or proof of future idleness. The assignment and relevant
+evidence are rechecked after the host pull; a concurrent change can still occur after
+the last check. Restart or stream replacement can discard ephemeral evidence and turn a
+candidate into a defer. The pass reports only current coordinator-visible assignments;
+paging is ordered by source and assignment ID and is not a transactional snapshot.
