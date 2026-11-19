@@ -2742,3 +2742,15 @@ does not authorize submit on the stale host. Automatic migration and idle unload
 bounded status-only reconciliation and retain that exact route while its receipt is unresolved;
 other sessions may still move. Explicit cancellation, close and maintenance retain their
 normal policy fences.
+
+For a Linux completion handoff the private durable producer identity uses the kernel
+boot ID and the process start ticks from `/proc/<pid>/stat`, scoped to the process ID.
+Both the conductor and host must be able to read the same procfs identity. If either
+cannot, or the identities differ, the guarded path is unavailable. Windows continues
+to use the process creation time. A wall-clock timestamp from an older Linux build is
+not comparable to a kernel identity: a live PID with such a legacy record cannot be
+declared exited merely from a different clock-derived timestamp. An authenticated admitted session route with the same host ID and generation is conservatively
+held against automatic cleanup while such a legacy claim is pending. This veto is not proof
+of producer identity and cannot authorize status, abort, settlement or a resend; a live
+legacy producer remains unresolved without exact evidence.
+This does not alter the public process-start timestamp or authorize a retry.

@@ -103,7 +103,7 @@ public sealed partial class ClaudeHeadlessTests
         var digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(reminder)));
         var binding = new CompletionReminderBinding("project", "group", Guid.NewGuid().ToString("N"), prompt,
             (string)witness["nativeUuid"]!, (string)witness["stream"]!, (long)witness["revision"]!, digest,
-            route.HostId!, route.Generation!.Key, route.ProcessId, route.ProcessStart);
+            route.HostId!, route.Generation!.Key, route.ProcessId, route.CompletionProcessStart);
         var attempt = Guid.NewGuid().ToString("N");
         var claim = ledger.ClaimFromMailbox(service.ReplyMailbox, "delegation", "private-assignment", parent, child, generation, 1, attempt, binding);
         Assert.IsTrue(claim.Acquired); var record = claim.Claim!;
@@ -114,6 +114,12 @@ public sealed partial class ClaudeHeadlessTests
         var missing = fields.DeepClone().AsObject(); var missingAttempt = Guid.NewGuid().ToString("N"); missing["attemptId"] = missingAttempt;
         await Assert.ThrowsExactlyAsync<Gorynych.Acp.JsonRpc.JsonRpcException>(() => route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedSubmit, new JsonObject { ["_meta"] = missing }));
         Assert.AreEqual(0, InputCount(child, Guid.ParseExact(missingAttempt, "N").ToString("D")));
+        var wrongProducer = fields.DeepClone().AsObject();
+        wrongProducer["producerStart"] = "2001-01-01T00:00:00.0000000Z";
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => route.Rpc.SendRequestAsync(
+            GorynychProtocol.MethodHostCompletionGuardedSubmit, new JsonObject { ["_meta"] = wrongProducer }));
+        Assert.AreEqual(0, InputCount(child, Guid.ParseExact(attempt, "N").ToString("D")),
+            "a mismatched producer cannot dispatch the admitted attempt");
         var sent = await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedSubmit, new JsonObject { ["_meta"] = fields.DeepClone() });
         Assert.AreEqual("observed", (string?)sent?["_meta"]?["adapterState"], sent?.ToJsonString());
         var wrongStatus = identity.DeepClone().AsObject(); wrongStatus["digest"] = new string('F', 64);
@@ -219,11 +225,24 @@ public sealed partial class ClaudeHeadlessTests
                 service.ReplyMailbox.MarkStarted("old-group-assignment", child); service.ReplyMailbox.MarkDelivered("old-group-assignment", child);
                 var oldGeneration = (string)service.ReplyMailbox.FindAssignment("old-group-assignment", parent)!["generation"]!;
                 var route = service.Agents["claude"].RouteOf(child)!;
+                // Simulate an old Linux timestamp with the current PID (which may be reused).
+                // Neither may authorize recovery; the admitted route is only held
+                // conservatively so its potentially unique receipt is not destroyed.
+                var legacy = OperatingSystem.IsLinux();
                 var oldBinding = new CompletionReminderBinding("old-project", "old-group", Guid.NewGuid().ToString("N"), "old-prompt",
                     Guid.NewGuid().ToString("D"), Guid.NewGuid().ToString("N"), 1, new string('A', 64),
-                    route.HostId!, route.Generation!.Key, route.ProcessId, route.ProcessStart);
+                    route.HostId!, route.Generation!.Key, route.ProcessId,
+                    legacy ? "2001-01-01T00:00:00.0000000Z" : route.CompletionProcessStart);
                 Assert.IsTrue(new CompletionHostLedger(ledgerPath).ClaimFromMailbox(service.ReplyMailbox, "delegation", "old-group-assignment",
                     parent, child, oldGeneration, 1, Guid.NewGuid().ToString("N"), oldBinding).Acquired);
+                Assert.IsTrue(service.CompletionPendingOnRoute(child, route, out var cleanupClaim));
+                if (legacy)
+                {
+                    Assert.IsNull(cleanupClaim, "legacy veto must not authorize exact recovery");
+                    var foreignRoute = new HostLink(route.Rpc, route.Info) { HostId = "foreign-host",
+                        Generation = route.Generation, ProcessId = route.ProcessId, CompletionProcessStart = route.CompletionProcessStart };
+                    Assert.IsFalse(service.CompletionPendingOnRoute(child, foreignRoute, out _), "other hosts do not inherit the veto");
+                }
             }
             var result = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "request_completion_reminder",
                 ["arguments"] = new JsonObject { ["assignment_id"] = "owner-assignment", ["generation"] = generation } });
@@ -234,6 +253,33 @@ public sealed partial class ClaudeHeadlessTests
                 Assert.AreEqual("busy", (string?)body["reason"]);
                 Assert.IsNull(service.ReplyMailbox.ReadCompletionReminder("owner-assignment", parent, child, generation));
                 Assert.AreEqual(1, File.ReadAllLines(Path.Combine(FakeRoot, child + ".inputs.jsonl")).Length);
+                if (OperatingSystem.IsLinux())
+                {
+                    var original = service.Agents["claude"].RouteOf(child)!;
+                    launcher.Service = null; launcher.BreakConnection();
+                    await LinkHarness.Until(() => original.Rpc.IsClosed, "legacy route disconnected").WaitAsync(TimeSpan.FromSeconds(15));
+                    await client.DisposeAsync(); await service.DisposeAsync();
+                    await using var reopened = new Conductor(new ConductorOptions { DataDirectory = data, ServiceId = "owner-host", Time = clock,
+                        Hosts = launcher, HostToken = InProcessHosts.Token, TestCompletionLedgerPath = ledgerPath,
+                        HostGeneration = _ => new HostGeneration("new-build", []) }, [adapter]);
+                    launcher.Service = reopened;
+                    await using var after = await TestClient.ConnectAsync(reopened);
+                    await LinkHarness.Until(() => reopened.Agents["claude"].RouteOf(child) is not null,
+                        "legacy host reattached").WaitAsync(TimeSpan.FromSeconds(20));
+                    var legacyRoute = reopened.Agents["claude"].RouteOf(child)!;
+                    Assert.IsFalse(legacyRoute.Current); Assert.AreEqual(original.HostId, legacyRoute.HostId);
+                    Assert.AreEqual(Conductor.Move.Stay, await reopened.TryMoveAsync(child, false, CancellationToken.None),
+                        "legacy claim must veto automatic migration");
+                    Assert.IsTrue(reopened.CompletionPendingOnRoute(child, legacyRoute, out var authority));
+                    Assert.IsNull(authority, "veto cannot authorize recovery");
+                    var old = reopened.ReplyMailbox.FindAssignment("old-group-assignment", parent)!;
+                    var recover = await after.Rpc.SendRequestAsync(GorynychProtocol.MethodRecoverCompletionReminder, new JsonObject {
+                        ["assignmentId"] = "old-group-assignment", ["generation"] = (string?)old["generation"],
+                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = reopened.Store.Get(parent)!.PeerToken } });
+                    Assert.AreEqual("unresolved", (string?)recover!["state"]);
+                    Assert.AreEqual(Conductor.Move.Done, await reopened.TryMoveAsync(parent, false, CancellationToken.None));
+                    Assert.AreEqual(1, File.ReadAllLines(Path.Combine(FakeRoot, child + ".inputs.jsonl")).Length);
+                }
                 return;
             }
             Assert.AreEqual("settled", (string?)body["state"], body.ToJsonString());
@@ -480,7 +526,7 @@ public sealed partial class ClaudeHeadlessTests
                 var digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(reminder)));
                 var binding = new CompletionReminderBinding("project", "group", Guid.NewGuid().ToString("N"), prompt,
                     (string)witness["nativeUuid"]!, (string)witness["stream"]!, (long)witness["revision"]!, digest,
-                    route.HostId!, route.Generation!.Key, route.ProcessId, route.ProcessStart);
+                    route.HostId!, route.Generation!.Key, route.ProcessId, route.CompletionProcessStart);
                 var attempt = Guid.NewGuid().ToString("N");
                 var claim = ledger.ClaimFromMailbox(service.ReplyMailbox, "delegation", id, parent, child, generation, 1, attempt, binding);
                 Assert.IsTrue(claim.Acquired, $"iteration {n}"); var record = claim.Claim!;
@@ -580,7 +626,7 @@ public sealed partial class ClaudeHeadlessTests
             var digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
             var binding = new CompletionReminderBinding("project", "group", Guid.NewGuid().ToString("N"), prompt,
                 (string)witness["nativeUuid"]!, (string)witness["stream"]!, (long)witness["revision"]!, digest,
-                route.HostId!, route.Generation!.Key, route.ProcessId, route.ProcessStart);
+                route.HostId!, route.Generation!.Key, route.ProcessId, route.CompletionProcessStart);
             var attempt = Guid.NewGuid().ToString("N");
             var claim = ledger.ClaimFromMailbox(service.ReplyMailbox, "delegation", "recovery-assignment", parent, child, generation, 1, attempt, binding).Claim!;
             var identity = CompletionHostLedger.Identity("delegation", "recovery-assignment", parent, child, generation, 1, attempt, binding, claim.Stream!, claim.Number);
@@ -693,7 +739,7 @@ public sealed partial class ClaudeHeadlessTests
                 var digest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
                 var binding = new CompletionReminderBinding("project", "group", Guid.NewGuid().ToString("N"), prompt,
                     (string)witness["nativeUuid"]!, (string)witness["stream"]!, (long)witness["revision"]!, digest,
-                    route.HostId!, route.Generation!.Key, route.ProcessId, route.ProcessStart);
+                    route.HostId!, route.Generation!.Key, route.ProcessId, route.CompletionProcessStart);
                 var attempt = Guid.NewGuid().ToString("N");
                 var claim = ledger.ClaimFromMailbox(service.ReplyMailbox, "delegation", id, parent, child, generation, 1, attempt, binding);
                 Assert.IsTrue(claim.Acquired); var record = claim.Claim!;
@@ -789,7 +835,7 @@ public sealed partial class ClaudeHeadlessTests
         while (repository is not null && !File.Exists(Path.Combine(repository.FullName, "Gorynych.slnx"))) repository = repository.Parent;
         var serviceExe = Directory.EnumerateFiles(Path.Combine(repository!.FullName, "src", "Gorynych.Service", "bin"),
             TestDirs.Exe("Gorynych.Service"), SearchOption.AllDirectories).OrderByDescending(File.GetLastWriteTimeUtc).First();
-        await using var launcher = new CompletionProcessHost(dir, ledgerPath, FakeClaude());
+        var launcher = new CompletionProcessHost(dir, ledgerPath, FakeClaude());
         var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true));
         var service = new Conductor(new ConductorOptions { DataDirectory = data, ServiceId = "live-recovery", Time = clock,
             Hosts = launcher, HostToken = InProcessHosts.Token, CompletionConfiguration = ("project", "group", instance),
@@ -798,6 +844,13 @@ public sealed partial class ClaudeHeadlessTests
         launcher.Service = service; using var stop = new CancellationTokenSource(); var listener = PipeListener.RunAsync(service, pipe, stop.Token);
         var client = await TestClient.ConnectAsync(service); Process? peer = null; JsonRpcConnection? mcp = null; var nativeClosed = false;
         var releasePath = Path.Combine(dir, "release-completion-result");
+        Exception? originalFailure = null;
+        async Task Cleanup(Func<Task> action)
+        {
+            try { await action(); }
+            catch (Exception e) when (originalFailure is not null)
+            { Console.Error.WriteLine($"Cleanup after test failure: {e}"); }
+        }
         try
         {
             async Task<string> New() => (string)(await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew,
@@ -860,19 +913,32 @@ public sealed partial class ClaudeHeadlessTests
                 File.WriteAllText(Path.Combine(dir, "fail-completion-ack-record"), "");
                 File.WriteAllText(Path.Combine(dir, "fail-completion-retire-record"), "");
                 File.WriteAllText(releasePath, "");
-                JsonNode? recovered = null; var sawTakenWhileUnresolved = false;
+                JsonNode? recovered = null; var sawTakenWhileUnresolved = (bool?)before?["nativeTaken"] == true;
                 for (var i = 0; i < 80; i++)
                 {
                     recovered = await after.Rpc.SendRequestAsync(GorynychProtocol.MethodRecoverCompletionReminder, Recovery(ownerToken));
-                    if ((string?)recovered?["state"] == "settled") break;
+                    if ((string?)recovered?["state"] == "settled" ||
+                        staleBuild && (string?)recovered?["state"] == "native_ended") break;
                     if ((bool?)recovered?["nativeTaken"] == true) sawTakenWhileUnresolved = true;
                     await Task.Delay(50);
                 }
-                Assert.AreEqual("settled", (string?)recovered?["state"], recovered?.ToJsonString());
+                if (staleBuild && (string?)recovered?["state"] == "native_ended")
+                {
+                    // Automatic stale migration may have already settled this exact claim.
+                    var durable = reopened.ReplyMailbox.ReadCompletionReminder("late-assignment", parent, child, generation);
+                    Assert.IsNotNull(durable);
+                    Assert.AreEqual(attempt, durable.AttemptId);
+                    Assert.AreEqual(1L, durable.AssignmentRevision);
+                    Assert.AreEqual("native_ended", durable.Disposition);
+                }
+                else
+                {
+                    Assert.AreEqual("settled", (string?)recovered?["state"], recovered?.ToJsonString());
+                    Assert.AreEqual("native_ended", (string?)recovered?["disposition"]);
+                }
                 Assert.IsTrue(sawTakenWhileUnresolved, "native echo remains visible while acknowledgement is unresolved");
                 Assert.IsFalse(File.Exists(Path.Combine(dir, "fail-completion-ack-record")), "host ACK persistence fault was exercised");
                 Assert.IsFalse(File.Exists(Path.Combine(dir, "fail-completion-retire-record")), "host retire persistence fault was exercised");
-                Assert.AreEqual("native_ended", (string?)recovered?["disposition"]);
                 var repeated = await after.Rpc.SendRequestAsync(GorynychProtocol.MethodRecoverCompletionReminder, Recovery(ownerToken));
                 Assert.AreEqual("native_ended", (string?)repeated?["state"]);
                 Assert.AreEqual("completed", (string?)reopened.ReplyMailbox.FindAssignment("late-assignment", parent)?["status"]);
@@ -880,20 +946,38 @@ public sealed partial class ClaudeHeadlessTests
                 Assert.AreEqual(1, InputCount(child, Guid.ParseExact(attempt, "N").ToString("D")));
                 Assert.AreEqual(2, File.ReadAllLines(Path.Combine(FakeRoot, child + ".inputs.jsonl")).Length);
                 if (staleBuild)
+                {
                     Assert.AreEqual(Conductor.Move.Done, await reopened.TryMoveAsync(child, false, CancellationToken.None),
                         "after exact settlement stale migration may proceed");
-                await launcher.CloseNativeGracefully(); nativeClosed = true;
+                    Assert.IsFalse(ReferenceEquals(reattached, reopened.Agents["claude"].RouteOf(child)),
+                        "the child must no longer use the retiring route");
+                    await launcher.WaitExited();
+                }
+                else await launcher.CloseNativeGracefully();
+                nativeClosed = true;
             }
-            finally { await after.DisposeAsync(); await reopened.DisposeAsync(); }
+            catch (Exception e) { originalFailure = e; throw; }
+            finally
+            {
+                await Cleanup(async () => await after.DisposeAsync());
+                await Cleanup(async () => await reopened.DisposeAsync());
+            }
         }
+        catch (Exception e) { originalFailure = e; throw; }
         finally
         {
-            File.WriteAllText(releasePath, "");
-            if (mcp is not null) await mcp.DisposeAsync();
-            if (peer is not null) { await peer.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15)); peer.Dispose(); }
-            stop.Cancel(); try { await listener; } catch (OperationCanceledException) { }
-            if (!nativeClosed) await launcher.CloseNativeGracefully();
-            await client.DisposeAsync(); await service.DisposeAsync();
+            await Cleanup(() => { File.WriteAllText(releasePath, ""); return Task.CompletedTask; });
+            if (mcp is not null) await Cleanup(async () => await mcp.DisposeAsync());
+            if (peer is not null) await Cleanup(async () => { await peer.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15)); peer.Dispose(); });
+            stop.Cancel(); await Cleanup(async () => { try { await listener; } catch (OperationCanceledException) { } });
+            if (!nativeClosed) await Cleanup(async () =>
+            {
+                if (!launcher.IsAlive("claude", "")) await launcher.WaitExited();
+                else await launcher.CloseNativeGracefully();
+            });
+            await Cleanup(async () => await client.DisposeAsync());
+            await Cleanup(async () => await service.DisposeAsync());
+            await Cleanup(async () => await launcher.DisposeAsync());
         }
     }
 

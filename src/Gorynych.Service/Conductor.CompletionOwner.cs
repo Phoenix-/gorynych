@@ -130,7 +130,7 @@ public sealed partial class Conductor
             !CompletionReminderBinding.CanonicalProducerStart(start) ||
             store.Get(assignee) is not { Deleted: false, Agent: "claude" } session ||
             !agents.TryGetValue(session.Agent, out var host) || host.RouteOf(assignee) is not { Current: true } route || route.Rpc.IsClosed ||
-            route.HostId != b.HostId || route.Generation?.Key != b.HostGeneration || route.ProcessId != pid || route.ProcessStart != start)
+            route.HostId != b.HostId || route.Generation?.Key != b.HostGeneration || route.ProcessId != pid || route.CompletionProcessStart != start)
             return "unresolved";
         var identity = CompletionHostLedger.Identity("delegation", id, owner, assignee, generation, saved.OriginalRevision,
             attempt, b, saved.Stream, saved.Number);
@@ -246,7 +246,7 @@ public sealed partial class Conductor
             !CompletionReminderBinding.CanonicalProducerStart(start) ||
             !agents.TryGetValue("claude", out var host) || host.RouteOf(saved.Assignee) is not { } route ||
             route.Rpc.IsClosed || route.HostId != b.HostId || route.Generation?.Key != b.HostGeneration ||
-            route.ProcessId != pid || route.ProcessStart != start ||
+            route.ProcessId != pid || route.CompletionProcessStart != start ||
             route.Info.Meta?[GorynychProtocol.CapHostCompletionGuarded] is not JsonValue capability ||
             !capability.TryGetValue<bool>(out var supported) || !supported) return Unknown();
         bool Current() => !route.Rpc.IsClosed && host.RouteOf(saved.Assignee) == route &&
@@ -307,7 +307,7 @@ public sealed partial class Conductor
 
     // Automatic migration and idle unload must not destroy a live producer's only
     // receipt. This is status-only; a stale route never gains submit authority.
-    bool CompletionPendingOnRoute(string session, HostLink route, out CompletionReminderRecovery? saved)
+    internal bool CompletionPendingOnRoute(string session, HostLink route, out CompletionReminderRecovery? saved)
     {
         var pending = mailbox.CompletionReminderPending(null, null, session);
         saved = null;
@@ -316,8 +316,15 @@ public sealed partial class Conductor
         {
             var b = item.Binding;
             if (item.Assignee == session && b.HostId == route.HostId && b.HostGeneration == route.Generation?.Key &&
-                b.ProducerPid == route.ProcessId && b.ProducerStart == route.ProcessStart)
+                b.ProducerPid == route.ProcessId && b.ProducerStart == route.CompletionProcessStart)
             { saved = item; return true; }
+            // Legacy Linux wall timestamps cannot identify a process incarnation.
+            // Only veto automatic cleanup on the authenticated admitted route; never
+            // return the claim for status, abort, settlement, or as an exit proof.
+            if (OperatingSystem.IsLinux() && item.Assignee == session && route.HostId is not null &&
+                route.Generation is not null && b.HostId == route.HostId && b.HostGeneration == route.Generation.Key &&
+                b.ProducerStart is { } legacy && CompletionReminderBinding.CanonicalProducerStart(legacy) &&
+                !ProcessIncarnation.ValidLinux(legacy)) return true;
         }
         return false;
     }
@@ -364,9 +371,7 @@ public sealed partial class Conductor
             if ((string?)live["state"] == "settled") return live;
             var binding = saved.Binding;
             if (!binding.Valid() || binding.ProducerPid is not { } pid || binding.ProducerStart is not { } start ||
-                !CompletionReminderBinding.CanonicalProducerStart(start) || !ProducerDefinitelyExited(new ReportIdentity(
-                    "completion-recovery", saved.Assignee, owner, ReportCause.Delegation, HostId: binding.HostId,
-                    HostGeneration: binding.HostGeneration, HostProcessId: pid, HostProcessStart: start)))
+                !CompletionReminderBinding.CanonicalProducerStart(start) || !ProcessIncarnation.DefinitelyExited(pid, start))
                 return alreadySettled ? new JsonObject { ["state"] = saved.Disposition } : live;
             var ledger = new CompletionHostLedger(options.TestCompletionLedgerPath ?? Path.Combine(options.DataDirectory, "completion-host-ledger.json"));
             return new JsonObject { ["state"] = ledger.RecoverAfterProducerExit(saved, mailbox) };
@@ -395,7 +400,7 @@ public sealed partial class Conductor
             (string?)row["status"] != "open" || (string?)row["delivery"] != "delivered" || row["continuation"] is not null) return Defer("assignment");
         if (store.Get(owner) is not { Deleted: false, Archived: false } || store.Get(child) is not { Deleted: false, Archived: false, Agent: "claude" } session ||
             Draining || IsStopping(session.Agent) || !agents.TryGetValue("claude", out var host) || host.RouteOf(child) is not { Current: true } route ||
-            route.Rpc.IsClosed || route.HostId is null || route.Generation is null || route.ProcessId <= 0 || route.ProcessStart is not { } started ||
+            route.Rpc.IsClosed || route.HostId is null || route.Generation is null || route.ProcessId <= 0 || route.CompletionProcessStart is not { } started ||
             !CompletionReminderBinding.CanonicalProducerStart(started) || !feeds.TryGetValue(child, out var feed)) return Defer("route");
         if (route.Info.Meta?[GorynychProtocol.CapHostCompletionGuarded] is not JsonValue guardedCapability ||
             !guardedCapability.TryGetValue<bool>(out var guardedSupported) || !guardedSupported) return Defer("guarded_unsupported");

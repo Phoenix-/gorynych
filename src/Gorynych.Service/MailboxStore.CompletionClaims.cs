@@ -19,7 +19,7 @@ internal sealed record CompletionReminderBinding(string ProjectKey, string Group
         ["nativeUuid"] = NativeUuid, ["stream"] = Stream, ["observationRevision"] = ObservationRevision, ["digest"] = Digest,
         ["hostId"] = HostId, ["hostGeneration"] = HostGeneration, ["producerPid"] = ProducerPid, ["producerStart"] = ProducerStart };
     internal static bool CanonicalProducerStart(string value) =>
-        DateTime.TryParseExact(value, "O", System.Globalization.CultureInfo.InvariantCulture,
+        ProcessIncarnation.ValidLinux(value) || DateTime.TryParseExact(value, "O", System.Globalization.CultureInfo.InvariantCulture,
             System.Globalization.DateTimeStyles.RoundtripKind, out var parsed) && parsed.Kind == DateTimeKind.Utc &&
         parsed.ToString("O", System.Globalization.CultureInfo.InvariantCulture) == value;
     internal bool Valid() => ProjectKey is { Length: > 0 and <= 512 } && GroupId is { Length: > 0 and <= 256 } &&

@@ -44,6 +44,7 @@ public sealed class HostLink
 
     public int ProcessId { get; init; }
     public string? ProcessStart { get; init; }
+    internal string? CompletionProcessStart { get; init; }
 
     internal readonly HashSet<string> Sessions = new(StringComparer.Ordinal); // under the AgentHost's linksGate
     internal int Opening; // opens on their way to it; under linksGate
@@ -505,6 +506,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         {
             HostId = hello.HostId, Slot = hello.Slot, Generation = hello.Generation, ProcessId = hello.ProcessId,
             ProcessStart = ProcessStartedAt(hello.ProcessId),
+            CompletionProcessStart = ProcessIncarnation.Read(hello.ProcessId),
             Current = expected is null || expected.Same(hello.Generation),
             ForSession = hello.Slot.Contains('.'),
         };

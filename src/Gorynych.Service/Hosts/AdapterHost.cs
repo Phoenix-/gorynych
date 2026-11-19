@@ -1131,7 +1131,7 @@ public sealed class AdapterHost
                             throw new ArgumentException("Invalid process or host identity");
                         var assignment = Field("assignmentId"); var assignmentGeneration = Field("assignmentGeneration"); var owner = Field("ownerId");
                         var project = Field("projectKey", 512); var group = Field("groupId");
-                        var producerStart = AgentHost.ProcessStartedAt(Environment.ProcessId);
+                        var producerStart = ProcessIncarnation.Read(Environment.ProcessId);
                         var text = Field("text", 32000);
                         if (meta["assignmentRevision"] is not JsonValue ar || !ar.TryGetValue<long>(out var assignmentRevision) || assignmentRevision <= 0 ||
                             meta["observationRevision"] is not JsonValue ov || !ov.TryGetValue<long>(out var observationRevision) || observationRevision < 0)
@@ -1146,7 +1146,7 @@ public sealed class AdapterHost
                         guardedIdentity = CompletionHostLedger.Identity("delegation", assignment, owner, session, assignmentGeneration,
                             assignmentRevision, guardedAttempt, binding, ledgerStream, ledgerNumber);
                         foreach (var field in guardedIdentity)
-                            if (!JsonNode.DeepEquals(meta[field.Key], field.Value)) throw new InvalidOperationException("Submit identity mismatch");
+                            if (!JsonNode.DeepEquals(meta[field.Key], field.Value)) throw new InvalidOperationException("Submit identity mismatch: " + field.Key);
                         var existingAttempt = store.ReadAttempt(guardedAttempt) ?? throw new InvalidOperationException("No durable admission");
                         if (!JsonNode.DeepEquals(existingAttempt["identity"], guardedIdentity) ||
                             (long?)existingAttempt["number"] != ledgerNumber || (string?)existingAttempt["state"] != "admitted" ||
@@ -1180,7 +1180,7 @@ public sealed class AdapterHost
                             var producerStart = Text(guardedIdentity["producerStart"]);
                             if ((int?)guardedIdentity["producerPid"] != Environment.ProcessId || producerStart is null ||
                                 !CompletionReminderBinding.CanonicalProducerStart(producerStart) ||
-                                producerStart != AgentHost.ProcessStartedAt(Environment.ProcessId))
+                                producerStart != ProcessIncarnation.Read(Environment.ProcessId))
                             {
                                 row["abortState"] = "unresolved";
                                 await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
@@ -1224,7 +1224,7 @@ public sealed class AdapterHost
                         var originalStart = Text(guardedIdentity["producerStart"]);
                         if (Text(guardedIdentity["hostId"]) != options.HostId || Text(guardedIdentity["hostGeneration"]) != options.Generation?.Key ||
                             (int?)guardedIdentity["producerPid"] != Environment.ProcessId || originalStart is null ||
-                            !CompletionReminderBinding.CanonicalProducerStart(originalStart) || originalStart != AgentHost.ProcessStartedAt(Environment.ProcessId))
+                            !CompletionReminderBinding.CanonicalProducerStart(originalStart) || originalStart != ProcessIncarnation.Read(Environment.ProcessId))
                         {
                             row["adapterState"] = "unknown";
                             await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row }));
