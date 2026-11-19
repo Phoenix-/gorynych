@@ -54,6 +54,10 @@ public sealed class AdapterHostOptions
     internal ReportStore? ReportStore { get; init; }
     internal Action<ReportCapture>? CaptureOpened { get; init; }
     internal Action? BeforeProducerEvidence { get; init; }
+    // Isolated protocol tests only. Production remains disabled until conductor integration.
+    internal bool FilterCodexIdleForTests { get; init; }
+    internal Action? IdleFrameProcessedForTests { get; init; }
+    internal Func<string, Task>? BeforeIdleResponseAdmissionForTests { get; init; }
     public Action<string>? Log { get; init; }
 }
 
@@ -85,6 +89,9 @@ public sealed class AdapterHost
     readonly AdapterHostOptions options;
     readonly Lock state = new();
     readonly SubagentRouting subagents = new();
+    readonly Dictionary<string, IdleEligibility> idleEligibility = new(StringComparer.Ordinal); // under state
+    readonly Dictionary<string, long> idleAdmissions = new(StringComparer.Ordinal); // under state; one per live session
+    long nextIdleAdmission;
     string? noteReceiptFailure;
     readonly SemaphoreSlim sendGate = new(1, 1); // what goes to the conductor in the agent's order, and the switch to the next one
     readonly SemaphoreSlim agentGate = new(1, 1); // writes to the agent
@@ -306,7 +313,7 @@ public sealed class AdapterHost
         }
         if (request.Method == AcpMethods.Agent.Initialize)
         {
-            if (message["result"] is JsonObject result) message["result"] = WithHostMeta(result, reattached: false);
+            if (message["result"] is JsonObject result) message["result"] = WithHostMeta(result, request.Connection, reattached: false);
             initialized.TrySetResult();
         }
         if (request.ReportId is { } completedId && request.Method == AcpMethods.Agent.SessionPrompt)
@@ -382,7 +389,24 @@ public sealed class AdapterHost
         if (message["error"]?["data"] is JsonObject nativeErrorData)
             nativeErrorData.Remove(GorynychProtocol.MetaReportRefused);
         message["id"] = request.ConductorId.DeepClone();
-        if (!request.Connection.IsLost) await TryWriteAsync(request.Connection, message);
+        var answered = !request.Connection.IsLost && await TryWriteAsync(request.Connection, message);
+        if (answered && IdleSupported(request.Connection) &&
+            request.Method == AcpMethods.Agent.SessionPrompt && request.SessionId is { } eligibleSession &&
+            request.PromptId is { Length: > 0 and <= 256 } eligiblePrompt &&
+            Text(message["result"]?["stopReason"]) == "end_turn" &&
+            Text(message["result"]?["_meta"]?[GorynychProtocol.MetaHistoryMark]) is { Length: > 0 and <= 256 } nativeTurn)
+        {
+            if (options.BeforeIdleResponseAdmissionForTests is { } beforeAdmission) await beforeAdmission(eligiblePrompt);
+            await sendGate.WaitAsync();
+            try
+            {
+                lock (state)
+                    if (current == request.Connection && !current.IsLost && live.Contains(eligibleSession) && subagents.RootOf(eligibleSession) is null &&
+                        request.IdleAdmission is { } admission && idleAdmissions.GetValueOrDefault(eligibleSession) == admission)
+                        idleEligibility[eligibleSession] = new IdleEligibility(request.Connection, eligiblePrompt, nativeTurn);
+            }
+            finally { sendGate.Release(); }
+        }
         if (request.Method == GorynychProtocol.MethodSteering) await FlushTerminalsAsync();
     }
 
@@ -452,6 +476,12 @@ public sealed class AdapterHost
 
     async Task AgentNotifiedAsync(string method, JsonObject message, bool released = false)
     {
+        if (method is GorynychProtocol.MethodCodexProvisionalIdle or GorynychProtocol.MethodHostCodexProvisionalIdle)
+        {
+            if (method == GorynychProtocol.MethodCodexProvisionalIdle) await FilterIdleFrameAsync(message);
+            options.IdleFrameProcessedForTests?.Invoke();
+            return;
+        }
         // Host-state is generated only by this host; the adapter cannot forge its retained inventory.
         if (method == GorynychProtocol.MethodHostState) return;
         if (method == GorynychProtocol.MethodHostReportNoteReceipt)
@@ -496,6 +526,49 @@ public sealed class AdapterHost
             return;
         }
         await EmitAsync(message);
+    }
+
+    bool IdleSupported(Connection connection) => options.Adapter == "codex" && (options.FilterCodexIdleForTests ||
+        (connection.AcceptsIdle && initialize?["_meta"]?[GorynychProtocol.CapCodexIdleAdapter] is JsonValue v && v.TryGetValue<bool>(out var supported) && supported));
+
+    // Never enters Number/buffer/replay. Only the producing live adapter and the same
+    // admitted conductor connection can use a successful response's exact identity.
+    async Task FilterIdleFrameAsync(JsonObject message)
+    {
+        if (options.Adapter != "codex" || message["params"] is not JsonObject parameters ||
+            parameters.Count != 1 || parameters["_meta"] is not JsonObject meta || meta.Count != 6 ||
+            Text(meta["sessionId"]) is not { Length: > 0 and <= 256 } session ||
+            Text(meta["promptId"]) is not { Length: > 0 and <= 256 } prompt ||
+            Text(meta["nativeTurnId"]) is not { Length: > 0 and <= 256 } native ||
+            Text(meta["state"]) is not ("confirmed" or "revoked") ||
+            meta["turnEpoch"] is not JsonValue e || !e.TryGetValue<long>(out var epoch) || epoch < 1 ||
+            meta["ingressRevision"] is not JsonValue r || !r.TryGetValue<long>(out var revision) || revision < 0) return;
+        await sendGate.WaitAsync();
+        try
+        {
+            Connection? destination;
+            lock (state)
+            {
+                if (!live.Contains(session) || subagents.RootOf(session) is not null || current is null || current.IsLost || !IdleSupported(current) ||
+                    !idleEligibility.TryGetValue(session, out var entry) || entry.Owner != current ||
+                    entry.Prompt != prompt || entry.NativeTurn != native) return;
+                var frameState = Text(meta["state"]);
+                if (frameState == "confirmed")
+                {
+                    if (entry.Seen || entry.Revoked) return;
+                    entry.Seen = true; entry.Epoch = epoch; entry.Revision = revision;
+                }
+                else
+                {
+                    if (!entry.Seen || entry.Revoked || entry.Epoch != epoch || entry.Revision != revision) return;
+                    entry.Revoked = true;
+                }
+                destination = current;
+            }
+            await TryWriteAsync(destination, Notification(GorynychProtocol.MethodHostCodexProvisionalIdle,
+                new JsonObject { ["_meta"] = meta.DeepClone() }));
+        }
+        finally { sendGate.Release(); }
     }
 
     async Task AgentAsksAsync(JsonNode id, string method, JsonObject message)
@@ -977,6 +1050,12 @@ public sealed class AdapterHost
         {
             case AcpMethods.Agent.Initialize:
             {
+                if (message["params"] is not JsonObject initParams) message["params"] = initParams = new JsonObject();
+                if (initParams["_meta"] is not JsonObject initMeta) initParams["_meta"] = initMeta = new JsonObject();
+                connection.AcceptsIdle = initMeta[GorynychProtocol.CapHostCodexProvisionalIdle] is JsonValue requested && requested.TryGetValue<bool>(out var accepted) && accepted;
+                initMeta.Remove(GorynychProtocol.CapHostCodexProvisionalIdle);
+                initMeta.Remove(GorynychProtocol.CapCodexIdleHostReceiver);
+                initMeta[GorynychProtocol.CapCodexIdleHostReceiver] = options.Adapter == "codex";
                 JsonObject? known;
                 bool forward;
                 lock (state)
@@ -1009,7 +1088,7 @@ public sealed class AdapterHost
                 }
                 if (known is not null)
                 {
-                    await TryWriteAsync(connection, Response(id, WithHostMeta((JsonObject)known.DeepClone(), reattached: true)));
+                    await TryWriteAsync(connection, Response(id, WithHostMeta((JsonObject)known.DeepClone(), connection, reattached: true)));
                     return;
                 }
                 break;
@@ -1033,6 +1112,10 @@ public sealed class AdapterHost
         ReportCapture? capture = null;
         var provenUnstarted = reportId is not null;
         Exception? refusal = null;
+        JsonObject? admissionRevocation = null;
+        var idleAdmissionGate = IdleSupported(connection) && sessionId is not null &&
+            (IsHistoryOperation(method) || method is AcpMethods.Agent.SessionPrompt or AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete);
+        if (idleAdmissionGate) await sendGate.WaitAsync();
         try
         {
             lock (state)
@@ -1041,6 +1124,15 @@ public sealed class AdapterHost
               {
                 if (stopping.IsCancellationRequested) throw new InvalidOperationException("The host is stopping");
                 var history = IsHistoryOperation(method);
+                long? idleAdmission = null;
+                if (idleAdmissionGate && sessionId is not null)
+                {
+                    if (idleEligibility.Remove(sessionId, out var oldIdle) && oldIdle.Seen && !oldIdle.Revoked && oldIdle.Owner == current && !oldIdle.Owner.IsLost)
+                        admissionRevocation = oldIdle.Frame(sessionId, "revoked");
+                    if (method is AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete || !live.Contains(sessionId)) idleAdmissions.Remove(sessionId);
+                    else idleAdmissions[sessionId] = ++nextIdleAdmission;
+                    if (method == AcpMethods.Agent.SessionPrompt && idleAdmissions.TryGetValue(sessionId, out var admitted)) idleAdmission = admitted;
+                }
                 if (sessionId is not null && (history || method == AcpMethods.Agent.SessionPrompt) &&
                     forwarded.Values.Any(f => f.SessionId == sessionId && f.Capture is not null))
                     throw new InvalidOperationException("A report capture is active for this session; retry after its turn ends");
@@ -1062,7 +1154,7 @@ public sealed class AdapterHost
                 key = ++nextToAgent;
                 forwarded[key] = new Forwarded
                 {
-                Connection = connection, ConductorId = id.DeepClone(), Method = method, SessionId = Text(@params?["sessionId"]),
+                Connection = connection, ConductorId = id.DeepClone(), Method = method, SessionId = Text(@params?["sessionId"]), IdleAdmission = idleAdmission,
                 PromptId = Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]), ReportId = reportId, Capture = capture,
                 NoteStatusReport = noteStatusReport, NoteAttempt = noteAttempt, NoteDigest = noteDigest,
                 NoteAckUuid = noteAckUuid, NoteAckRevision = noteAckRevision,
@@ -1090,6 +1182,15 @@ public sealed class AdapterHost
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or KeyNotFoundException)
         {
             capture?.Dispose(); refusal = e;
+        }
+        finally
+        {
+            if (idleAdmissionGate)
+            {
+                try { if (admissionRevocation is not null && current is { IsLost: false } target)
+                    await TryWriteAsync(target, Notification(GorynychProtocol.MethodHostCodexProvisionalIdle, admissionRevocation)); }
+                finally { sendGate.Release(); }
+            }
         }
         if (refusal is not null)
         {
@@ -1247,7 +1348,7 @@ public sealed class AdapterHost
             if (!await TryWriteAsync(connection, Notification(GorynychProtocol.MethodHostState, snapshot)))
                 throw new IOException("the connection went");
             current = connection;
-            lock (state) aloneSince = long.MaxValue;
+            lock (state) { idleEligibility.Clear(); idleAdmissions.Clear(); aloneSince = long.MaxValue; }
             foreach (var question in questions) await AskAsync(connection, question);
             connection.Activated.TrySetResult();
             Log($"a conductor took the host: {replay.Count} updates sent again, {questions.Count} questions asked again");
@@ -1272,7 +1373,7 @@ public sealed class AdapterHost
         try
         {
             wasCurrent = current == connection;
-            if (wasCurrent) current = null;
+            if (wasCurrent) { current = null; lock (state) { idleEligibility.Clear(); idleAdmissions.Clear(); } }
         }
         finally
         {
@@ -1286,11 +1387,15 @@ public sealed class AdapterHost
 
     // ---------------------------------------------------------------- writing
 
-    JsonObject WithHostMeta(JsonObject result, bool reattached)
+    JsonObject WithHostMeta(JsonObject result, Connection connection, bool reattached)
     {
         var meta = result["_meta"] as JsonObject ?? [];
         // Capability belongs to the host implementation, not the wrapped adapter.
         meta.Remove(GorynychProtocol.CapHostBackgroundEvidence);
+        meta.Remove(GorynychProtocol.CapHostCodexProvisionalIdle);
+        var adapterIdle = meta[GorynychProtocol.CapCodexIdleAdapter] is JsonValue v && v.TryGetValue<bool>(out var supported) && supported;
+        meta.Remove(GorynychProtocol.CapCodexIdleAdapter);
+        if (options.Adapter == "codex" && ((connection.AcceptsIdle && adapterIdle) || options.FilterCodexIdleForTests)) meta[GorynychProtocol.CapHostCodexProvisionalIdle] = true;
         if (options.Adapter == "claude") meta[GorynychProtocol.CapHostBackgroundEvidence] = true;
         meta[GorynychProtocol.MetaHost] = new JsonObject
         {
@@ -1380,6 +1485,16 @@ public sealed class AdapterHost
     /// <summary>A session's notification as the host sent it, kept for a conductor that comes back.</summary>
     sealed record Kept(long Seq, string SessionId, string Line);
 
+    sealed class IdleEligibility(Connection owner, string prompt, string nativeTurn)
+    {
+        public Connection Owner { get; } = owner;
+        public string Prompt { get; } = prompt;
+        public string NativeTurn { get; } = nativeTurn;
+        public bool Seen; public bool Revoked; public long Epoch; public long Revision;
+        public JsonObject Frame(string session, string state) => new() { ["_meta"] = new JsonObject { ["sessionId"] = session,
+            ["promptId"] = Prompt, ["nativeTurnId"] = NativeTurn, ["turnEpoch"] = Epoch, ["ingressRevision"] = Revision, ["state"] = state } };
+    }
+
     /// <summary>A conductor's request on its way to the agent.</summary>
     sealed class Forwarded
     {
@@ -1388,6 +1503,7 @@ public sealed class AdapterHost
         public required string Method { get; init; }
         public string? SessionId { get; init; }
         public string? PromptId { get; init; }
+        public long? IdleAdmission { get; init; }
         public string? ReportId { get; init; }
         public string? NoteStatusReport { get; init; }
         public string? NoteAttempt { get; init; }
@@ -1439,6 +1555,7 @@ public sealed class AdapterHost
         public TaskCompletionSource Activated { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Gone { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public long NextAsk;
+        public bool AcceptsIdle;
         public bool IsLost => Lost.IsCancellationRequested;
     }
 }

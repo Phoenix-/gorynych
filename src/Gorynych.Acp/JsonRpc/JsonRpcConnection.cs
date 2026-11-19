@@ -177,12 +177,27 @@ public sealed class JsonRpcConnection : IAsyncDisposable
     }
 
     /// <summary>
+    /// Commits a notification under the ordinary write gate. The synchronous guard is called
+    /// after the closed check, immediately before the frame is written. It must not block.
+    /// False suppresses the entire frame; true is the ordered publication point.
+    /// </summary>
+    public Task<bool> SendGuardedNotificationAsync(string method, JsonNode? @params, Func<bool> commit)
+    {
+        ArgumentNullException.ThrowIfNull(commit);
+        var message = new JsonObject { ["jsonrpc"] = "2.0", ["method"] = method };
+        if (@params is not null) message["params"] = @params;
+        return WriteCoreAsync(message, commit);
+    }
+
+    /// <summary>
     /// Writes one message. On a connection that is closed, or closes meanwhile, it fails with an
     /// <see cref="IOException"/>, never anything else: callers take that as "the peer is gone" (the
     /// service then asks another client), so a write that races <see cref="DisposeAsync"/> must not
     /// surface as a cancellation or a disposed object.
     /// </summary>
-    async Task WriteAsync(JsonObject message)
+    async Task WriteAsync(JsonObject message) => await WriteCoreAsync(message, null).ConfigureAwait(false);
+
+    async Task<bool> WriteCoreAsync(JsonObject message, Func<bool>? commit)
     {
         var text = message.ToJsonString(WireOptions);
         var bytes = Encoding.UTF8.GetBytes(text);
@@ -197,6 +212,7 @@ public sealed class JsonRpcConnection : IAsyncDisposable
         try
         {
             if (IsClosed) throw new IOException($"{Name}: connection closed");
+            if (commit is not null && !commit()) return false;
             await output.WriteAsync(bytes, stopping).ConfigureAwait(false);
             await output.WriteAsync(NewLine, stopping).ConfigureAwait(false);
             await output.FlushAsync(stopping).ConfigureAwait(false);
@@ -214,6 +230,7 @@ public sealed class JsonRpcConnection : IAsyncDisposable
             writeGate.Release();
         }
         Trace?.Invoke(">", text);
+        return true;
     }
 
     async Task ReadLoopAsync()

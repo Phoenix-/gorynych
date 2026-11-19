@@ -149,7 +149,8 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             Subagents = Name is "codex" or "claude" ? new SubagentCapabilities() : null,
         },
         ClientInfo = new Implementation { Name = "gorynych", Title = "Gorynych", Version = Version },
-        Meta = Name is "codex" or "claude" ? new JsonObject { [GorynychProtocol.MetaSubagentLiveState] = true } : null,
+        Meta = Name is "codex" or "claude" ? new JsonObject { [GorynychProtocol.MetaSubagentLiveState] = true,
+            [GorynychProtocol.CapHostCodexProvisionalIdle] = Name == "codex" && Hosts is not null } : null,
     };
 
     /// <summary>The adapter-wide connection, for a list or what no session has open: started, or waited for.</summary>

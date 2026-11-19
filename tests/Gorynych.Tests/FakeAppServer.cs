@@ -113,6 +113,10 @@ sealed class FakeAppServer
         lock (calls) return calls.Where(c => c.Method == method).Select(c => c.Params).ToArray();
     }
 
+    /// <summary>Emit the observed native idle-before-completed ordering for a normal fake turn.</summary>
+    public bool IdleBeforeTurnCompleted { get; set; }
+    public Func<Task>? BeforeEarlyIdle { get; set; }
+
     /// <summary>When set, <c>turn/start</c> answers only once it completes.</summary>
     public TaskCompletionSource? HoldTurnStart { get; set; }
 
@@ -693,6 +697,11 @@ sealed class FakeAppServer
             await Item(t, turnId, new JsonObject { ["type"] = "agentMessage", ["id"] = msg, ["text"] = answer, ["phase"] = "final_answer" });
         }
         t.Durable = true;
+        if (IdleBeforeTurnCompleted)
+        {
+            if (BeforeEarlyIdle is { } beforeIdle) await beforeIdle();
+            await Notify("thread/status/changed", new JsonObject { ["threadId"] = t.Id, ["status"] = new JsonObject { ["type"] = "idle" } });
+        }
         await Notify("turn/completed", new JsonObject
         {
             ["threadId"] = t.Id, ["turn"] = new JsonObject { ["id"] = turnId, ["items"] = new JsonArray(), ["status"] = status, ["error"] = error },

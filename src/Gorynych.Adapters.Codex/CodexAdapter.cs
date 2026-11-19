@@ -76,6 +76,15 @@ public sealed class CodexAdapterOptions
     /// <summary>The longest generated title kept, in characters.</summary>
     public int TitleMaxChars { get; init; } = 60;
 
+    /// <summary>Permit negotiation of private idle evidence on the enclosing host link.</summary>
+    public bool HostedIdleEvidence { get; init; }
+    internal bool EmitProvisionalIdleForTests { get; init; }
+    internal Func<Stream, Stream>? AdapterOutputForTests { get; init; }
+    internal Func<string, string?, Task>? BeforeNativeEventForTests { get; init; }
+    internal Action<string, string?>? NativeIngressForTests { get; init; }
+    internal Action<string, string>? NativeTurnNamedForTests { get; init; }
+    internal Action<CodexProvisionalIdleWitness>? ProvisionalIdleConfirmedForTests { get; init; }
+
     public Action<string>? Log { get; init; }
 }
 
@@ -99,7 +108,7 @@ public sealed class CodexAdapter(CodexAdapterOptions options) : IAgentAdapter
         // The app-server's own locks are the threads Gorynych has open: they do not count.
         var locks = options.LocksDirectory ?? CodexThreadHolders.DefaultDirectory();
         var holders = options.FindHolders ?? new CodexThreadHolders(locks, () => appServerPid is { } pid ? [pid] : []).Find;
-        var agent = new CodexAgent(options, new JsonRpcConnection(agentIn, agentOut, "codex-adapter"), appServer, holders, locks);
+        var agent = new CodexAgent(options, new JsonRpcConnection(agentIn, options.AdapterOutputForTests?.Invoke(agentOut) ?? agentOut, "codex-adapter"), appServer, holders, locks);
         try
         {
             await agent.StartAsync(ct);

@@ -251,6 +251,11 @@ public static class GorynychProtocol
     /// <summary>Adapter's authoritative foreground state, never inferred from a pending permission.</summary>
     public const string MetaForegroundState = "gorynych/foregroundState";
     public const string MetaCodexLoadedIdle = "gorynych/_codexLoadedIdle";
+    public const string MethodCodexProvisionalIdle = "_gorynych/codex_provisional_idle";
+    public const string MethodHostCodexProvisionalIdle = "_gorynych/host_codex_provisional_idle";
+    public const string CapHostCodexProvisionalIdle = "gorynych/hostCodexProvisionalIdle";
+    public const string CapCodexIdleHostReceiver = "gorynych/codexIdleHostReceiver";
+    public const string CapCodexIdleAdapter = "gorynych/codexIdleAdapter";
     /// <summary>Trusted adapter confirms a full background change stream for its current process.</summary>
     public const string MetaBackgroundCompleteStream = "gorynych/backgroundCompleteStream";
     public const string MetaBackgroundWork = "gorynych/backgroundWork";

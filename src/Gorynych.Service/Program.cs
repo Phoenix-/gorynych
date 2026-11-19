@@ -219,7 +219,7 @@ static async Task<AhpFaceRun?> AhpFaceStart(CommandLine line, string dataDirecto
 static string DataDirectory(CommandLine line) => line.Value("--data") is { } data ? Path.GetFullPath(data) : DataFolder.DefaultPath();
 
 // The adapters, as the service runs them in its process or a host runs one of them.
-static List<IAgentAdapter> Adapters(CommandLine line, string dataDirectory) =>
+static List<IAgentAdapter> Adapters(CommandLine line, string dataDirectory, bool hosted = false) =>
 [
     new ClaudeAdapter(new ClaudeAdapterOptions
     {
@@ -232,7 +232,7 @@ static List<IAgentAdapter> Adapters(CommandLine line, string dataDirectory) =>
         Log = ServiceLog.Info,
     }),
     new KimiAdapter(new KimiAdapterOptions { Log = ServiceLog.Info }),
-    new CodexAdapter(new CodexAdapterOptions { Log = ServiceLog.Info, ClientVersion = AgentHost.Version, AutoTitle = true }),
+    new CodexAdapter(new CodexAdapterOptions { Log = ServiceLog.Info, ClientVersion = AgentHost.Version, AutoTitle = true, HostedIdleEvidence = hosted }),
     new DshAdapter(new DshAdapterOptions
     {
         DataDirectory = Path.Combine(dataDirectory, "dsh"),
@@ -292,7 +292,7 @@ static async Task<int> HostCommand(CommandLine line)
         ServiceLog.Error($"host {adapterName}: no {Gorynych.Service.Hosts.HostNames.TokenPath(data)}; the service writes it before it starts a host");
         return 1;
     }
-    var adapter = Adapters(line, data).Single(a => a.Name == adapterName);
+    var adapter = Adapters(line, data, hosted: true).Single(a => a.Name == adapterName);
     AgentInstance agent;
     try
     {

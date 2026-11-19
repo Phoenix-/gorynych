@@ -50,6 +50,8 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
     public ReportStore? HostReportStore { get; set; }
     public Action<ReportCapture>? CaptureOpened { get; set; }
     public Action? BeforeProducerEvidence { get; set; }
+    public bool FilterCodexIdleForTests { get; set; }
+    public Action? IdleFrameProcessedForTests { get; set; }
     public List<string> Said { get; } = [];
     public int Launches => Volatile.Read(ref launches);
 
@@ -97,6 +99,7 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
             OrphanIdle = OrphanIdle, OrphanBusy = OrphanBusy, CancelGrace = CancelGrace, BufferBytes = BufferBytes,
             ReportStore = CaptureReports ? HostReportStore ?? Service?.ReportStorage : null, CaptureOpened = CaptureOpened,
             BeforeProducerEvidence = BeforeProducerEvidence,
+            FilterCodexIdleForTests = FilterCodexIdleForTests, IdleFrameProcessedForTests = IdleFrameProcessedForTests,
             Log = m => { lock (Said) Said.Add(m); },
         });
         var running = new Running(adapter, slot, Build, host, host.RunAsync(), agent);

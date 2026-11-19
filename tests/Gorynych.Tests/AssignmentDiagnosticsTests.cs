@@ -471,6 +471,191 @@ public sealed class AssignmentDiagnosticsTests
     }
 
     [TestMethod]
+    [DataRow(0)]
+    [DataRow(1)]
+    [DataRow(2)]
+    [DataRow(3)]
+    [DataRow(4)]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task EarlyIdleHostConfirmationJoinsExactDurableTerminalAndRevocation(int variant)
+    {
+        var named = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { IdleBeforeTurnCompleted = true, BeforeEarlyIdle = () => named.Task.WaitAsync(Wait) };
+        var adapter = new CodexAdapter(new CodexAdapterOptions { Launch = fake.StartAsync, ClientVersion = "test",
+            NativeTurnNamedForTests = (_, _) => named.TrySetResult(), HostedIdleEvidence = true,
+            FindHolders = _ => new Dictionary<string, string>(), LocksDirectory = Path.Combine(TestDirs.New(), "no-native-locks") });
+        var processed = System.Threading.Channels.Channel.CreateUnbounded<bool>();
+        var hosts = new InProcessHosts(_ => adapter) { IdleFrameProcessedForTests = () => processed.Writer.TryWrite(true) };
+        var data = TestDirs.New(); var service = hosts.Conductor(data, adapter); hosts.Service = service;
+        var client = await TestClient.ConnectAsync(service);
+        var arrived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        service.AfterMailboxResponseForTests = async () => { arrived.TrySetResult(); await release.Task.WaitAsync(Wait); };
+        try
+        {
+            var parent = await HostTests.NewSession(client); var child = await HostTests.NewSession(client);
+            service.Store.Update(child, "codex", r => { r.ParentSessionId = parent; r.ReportToParent = false; });
+            var token = service.Store.Get(parent)!.PeerToken;
+            async Task<JsonNode?> Read() => await client.Rpc.SendRequestAsync(GorynychProtocol.MethodReadAssignment, new JsonObject
+                { ["source"] = "delegation", ["assignmentId"] = "early-e2e", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token } }).WaitAsync(Wait);
+            await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject { ["sessionId"] = child, ["text"] = "early e2e",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token, [GorynychProtocol.MetaMessageRequestId] = "early-e2e" } }).WaitAsync(Wait);
+            await arrived.Task.WaitAsync(Wait); await processed.Reader.ReadAsync().AsTask().WaitAsync(Wait);
+            await LinkHarness.Until(() => service.Feed(child).EarlyIdleStateForTests.Seen, "confirmation staged before durable terminal").WaitAsync(Wait);
+            Assert.AreEqual("unknown", (string?)(await Read())!["diagnostic"]!["foregroundIdle"], "confirmation alone is not durable terminal proof");
+            async Task Revoke()
+            {
+                await Assert.ThrowsExactlyAsync<JsonRpcException>(() => fake.Rpc!.SendRequestAsync("unknown/local", new JsonObject { ["threadId"] = child }).WaitAsync(Wait));
+                await processed.Reader.ReadAsync().AsTask().WaitAsync(Wait);
+            }
+            if (variant == 1)
+            {
+                await Revoke();
+                await LinkHarness.Until(() => service.Feed(child).EarlyIdleStateForTests.Revoked, "revocation consumed before durable terminal").WaitAsync(Wait);
+            }
+            release.TrySetResult();
+            await LinkHarness.Until(() => (string?)service.ReplyMailbox.FindAssignment("early-e2e", parent)?["delivery"] == "delivered" &&
+                service.Feed(child).TurnGate.CurrentCount == 1, "durable terminal and gate release").WaitAsync(Wait);
+            var row = await Read(); Assert.AreEqual("terminal_observed", (string?)row!["diagnostic"]!["initialTurn"]);
+            Assert.AreEqual(variant == 1 ? "unknown" : "loaded_idle_observed", (string?)row["diagnostic"]!["foregroundIdle"]);
+            Assert.AreEqual(variant == 1 ? "no_correlated_execution" : "open_without_recorded_continuation", (string?)row["diagnostic"]!["reasonCode"]);
+            if (variant == 0)
+            {
+                var managedConnections = new List<TestClient>();
+                var managed = new PeersServer.ServiceRoute(async _ =>
+                {
+                    var connection = await TestClient.ConnectAsync(service, "early-e2e-mcp");
+                    managedConnections.Add(connection); return connection.Rpc;
+                }, "in-process");
+                try
+                {
+                    using var http = new HttpClient();
+                    var mcp = await PeersServer.CallAsync(http, managed, token!, null, "read_assignment",
+                        new JsonObject { ["source"] = "delegation", ["assignment_id"] = "early-e2e" }, CancellationToken.None).WaitAsync(Wait);
+                    Assert.AreEqual(false, (bool?)mcp["isError"]);
+                    var body = JsonNode.Parse((string)mcp["content"]![0]!["text"]!)!;
+                    Assert.AreEqual("open_without_recorded_continuation", (string?)body["diagnostic"]!["reasonCode"]);
+                    var historyRoute = service.Agents["codex"].RouteOf(child)!.Rpc;
+                    service.Feed(child).BeginHistoryImport(historyRoute);
+                    try
+                    {
+                        await Revoke();
+                        await LinkHarness.Until(() => service.Feed(child).EarlyIdleStateForTests.Revoked, "published proof revoked during history import").WaitAsync(Wait);
+                    }
+                    finally { service.Feed(child).EndHistoryImport(historyRoute); }
+                    var after = await PeersServer.CallAsync(http, managed, token!, null, "read_assignment",
+                        new JsonObject { ["source"] = "delegation", ["assignment_id"] = "early-e2e" }, CancellationToken.None).WaitAsync(Wait);
+                    var afterBody = JsonNode.Parse((string)after["content"]![0]!["text"]!)!;
+                    Assert.AreEqual("unknown", (string?)afterBody["diagnostic"]!["foregroundIdle"]);
+                }
+                finally { foreach (var connection in managedConnections) await connection.DisposeAsync(); }
+
+                Assert.AreEqual("unknown", (string?)(await Read())!["diagnostic"]!["foregroundIdle"]);
+            }
+            if (variant == 2)
+            {
+                var host = service.Agents["codex"]; var route = host.RouteOf(child)!;
+                host.MarkClosed(child); host.MarkLive(child, route.Rpc);
+                Assert.AreEqual("unknown", (string?)(await Read())!["diagnostic"]!["foregroundIdle"]);
+                await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostReplay, new JsonObject { ["after"] = new JsonObject { [child] = 0 } }).WaitAsync(Wait);
+                Assert.AreEqual("unknown", (string?)(await Read())!["diagnostic"]!["foregroundIdle"], "old private evidence is not replayed into a replacement route");
+            }
+            if (variant == 3)
+            {
+                await HostTests.RestartAsync(service); await client.DisposeAsync(); await HostTests.GoneAsync(service, null, hosts);
+                service = HostTests.Next(data, hosts, null, adapter); client = await TestClient.ConnectAsync(service);
+                await LinkHarness.Until(() => service.Agents["codex"].RouteOf(child) is not null, "surviving host reattached").WaitAsync(Wait);
+                Assert.AreEqual("unknown", (string?)(await Read())!["diagnostic"]!["foregroundIdle"], "fresh conductor cannot adopt old ephemeral proof");
+            }
+            if (variant == 4)
+            {
+                await fake.Rpc!.DisposeAsync();
+                await LinkHarness.Until(() => service.Agents["codex"].RouteOf(child) is null, "host route removed after app-server EOF").WaitAsync(Wait);
+                Assert.AreEqual("unknown", (string?)(await Read())!["diagnostic"]!["foregroundIdle"], "EOF invalidates prior evidence");
+            }
+            Assert.AreEqual("open", (string?)(await Read())!["status"]);
+            Assert.AreEqual(1, fake.All("turn/start").Count(x => (string?)x["threadId"] == child));
+        }
+        finally { release.TrySetResult(); await client.DisposeAsync(); await service.DisposeAsync(); }
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task NativeIngressInvalidatesIdleAlreadyWaitingInNotificationQueue()
+    {
+        var named = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { IdleBeforeTurnCompleted = true, BeforeEarlyIdle = () => named.Task.WaitAsync(Wait) };
+        var held = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var released = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var activeArrived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var confirmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        string? child = null;
+        var adapter = new CodexAdapter(new CodexAdapterOptions { Launch = fake.StartAsync, ClientVersion = "test", NativeTurnNamedForTests = (_, _) => named.TrySetResult(),
+            FindHolders = _ => new Dictionary<string, string>(), LocksDirectory = Path.Combine(TestDirs.New(), "no-native-locks"),
+            NativeIngressForTests = (method, id) => { if (id == child && method == "thread/status/changed" && held.Task.IsCompleted) activeArrived.TrySetResult(); },
+            BeforeNativeEventForTests = async (method, id) =>
+            {
+                if (id == child && method == "thread/status/changed" && !held.Task.IsCompleted)
+                { held.TrySetResult(); await released.Task.WaitAsync(Wait); }
+            },
+            ProvisionalIdleConfirmedForTests = _ => confirmed.TrySetResult() });
+        var hosts = new InProcessHosts(_ => adapter); var service = hosts.Conductor(TestDirs.New(), adapter); hosts.Service = service;
+        await using (service)
+        await using (var client = await TestClient.ConnectAsync(service))
+        try
+        {
+            var parent = await HostTests.NewSession(client); child = await HostTests.NewSession(client);
+            service.Store.Update(child, "codex", r => { r.ParentSessionId = parent; r.ReportToParent = false; });
+            var token = service.Store.Get(parent)!.PeerToken;
+            await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject { ["sessionId"] = child, ["text"] = "queued idle",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token, [GorynychProtocol.MetaMessageRequestId] = "queued-idle" } }).WaitAsync(Wait);
+            await held.Task.WaitAsync(Wait);
+            await fake.Rpc!.SendNotificationAsync("thread/status/changed", new JsonObject { ["threadId"] = child,
+                ["status"] = new JsonObject { ["type"] = "active", ["activeFlags"] = new JsonArray() } });
+            await activeArrived.Task.WaitAsync(Wait);
+            released.TrySetResult();
+            await LinkHarness.Until(() => (string?)service.ReplyMailbox.FindAssignment("queued-idle", parent)?["delivery"] == "delivered", "queued turn delivered").WaitAsync(Wait);
+            await LinkHarness.Until(() => service.Feed(child).TurnGate.CurrentCount == 1, "queued turn finished").WaitAsync(Wait);
+            Assert.IsFalse(confirmed.Task.IsCompleted, "the stale queued idle must not create a witness");
+            Assert.AreEqual(1, fake.All("turn/start").Count(x => (string?)x["threadId"] == child));
+        }
+        finally { released.TrySetResult(); }
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task NativeEarlyIdleIsNotYetPromotedWithoutCrossStreamProof()
+    {
+        var named = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { IdleBeforeTurnCompleted = true, BeforeEarlyIdle = () => named.Task.WaitAsync(Wait) };
+        var confirmed = new TaskCompletionSource<CodexProvisionalIdleWitness>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var adapter = new CodexAdapter(new CodexAdapterOptions { Launch = fake.StartAsync, ClientVersion = "test", NativeTurnNamedForTests = (_, _) => named.TrySetResult(),
+            FindHolders = _ => new Dictionary<string, string>(), LocksDirectory = Path.Combine(TestDirs.New(), "no-native-locks"),
+            ProvisionalIdleConfirmedForTests = witness => confirmed.TrySetResult(witness) });
+        var hosts = new InProcessHosts(_ => adapter); var service = hosts.Conductor(TestDirs.New(), adapter); hosts.Service = service;
+        await using (service)
+        await using (var client = await TestClient.ConnectAsync(service))
+        {
+            var parent = await HostTests.NewSession(client); var child = await HostTests.NewSession(client);
+            service.Store.Update(child, "codex", r => { r.ParentSessionId = parent; r.ReportToParent = false; });
+            var token = service.Store.Get(parent)!.PeerToken;
+            await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject { ["sessionId"] = child, ["text"] = "early idle",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token, [GorynychProtocol.MetaMessageRequestId] = "early-idle" } }).WaitAsync(Wait);
+            await LinkHarness.Until(() => (string?)service.ReplyMailbox.FindAssignment("early-idle", parent)?["delivery"] == "delivered", "delegation delivered").WaitAsync(Wait);
+            await LinkHarness.Until(() => service.Feed(child).TurnGate.CurrentCount == 1, "delegation ended").WaitAsync(Wait);
+            var read = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodReadAssignment, new JsonObject { ["source"] = "delegation", ["assignmentId"] = "early-idle",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token } }).WaitAsync(Wait);
+            var witness = await confirmed.Task.WaitAsync(Wait);
+            Assert.AreEqual(child, witness.SessionId); Assert.AreEqual(fake.LastTurnId, witness.NativeTurnId);
+            Assert.IsFalse(string.IsNullOrWhiteSpace(witness.PromptId));
+            Assert.AreEqual("terminal_observed", (string?)read!["diagnostic"]!["initialTurn"]);
+            Assert.AreEqual("unknown", (string?)read["diagnostic"]!["foregroundIdle"], "provisional native ordering is not yet cross-stream proof");
+            Assert.AreEqual("open", (string?)read["status"]);
+            Assert.AreEqual(1, fake.All("turn/start").Count(x => (string?)x["threadId"] == child));
+        }
+    }
+
+    [TestMethod]
     [DataRow(false)]
     [DataRow(true)]
     [Timeout(60000, CooperativeCancellation = true)]

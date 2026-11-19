@@ -1648,6 +1648,26 @@ public sealed partial class Conductor : IAsyncDisposable
             OnAgentListChanged(host, @params);
             return;
         }
+        if (method == GorynychProtocol.MethodHostCodexProvisionalIdle)
+        {
+            if (host.Name != "codex" || source is null || @params is not JsonObject idleParams || idleParams.Count != 1 ||
+                idleParams["_meta"] is not JsonObject idle || idle.Count != 6 ||
+                TextOf(idle["sessionId"]) is not { Length: > 0 and <= 256 } session ||
+                TextOf(idle["promptId"]) is not { Length: > 0 and <= 256 } prompt ||
+                TextOf(idle["nativeTurnId"]) is not { Length: > 0 and <= 256 } native ||
+                TextOf(idle["state"]) is not ("confirmed" or "revoked") ||
+                idle["turnEpoch"] is not JsonValue ev || !ev.TryGetValue<long>(out var turnEpoch) || turnEpoch < 1 ||
+                idle["ingressRevision"] is not JsonValue rv || !rv.TryGetValue<long>(out var revision) || revision < 0 ||
+                !feeds.TryGetValue(session, out var idleFeed) || (TextOf(idle["state"]) == "confirmed" && idleFeed.IsHistoryImport(source))) return;
+            host.OnCurrentRoute(session, source, link =>
+            {
+                if (link.HostId is not null && link.Info.Meta?[GorynychProtocol.CapHostCodexProvisionalIdle] is JsonValue cap &&
+                    cap.TryGetValue<bool>(out var supported) && supported)
+                    idleFeed.ObserveEarlyIdleFrame(source, prompt, native, turnEpoch, revision, TextOf(idle["state"]) == "revoked");
+                return true;
+            }, false);
+            return;
+        }
         if (method == GorynychProtocol.MethodTurnEnded)
         {
             if (@params is JsonObject report) await OnTurnEndedAsync(host, report);
@@ -2884,7 +2904,8 @@ public sealed partial class Conductor : IAsyncDisposable
         {
             foreach (var name in new[] { GorynychProtocol.MetaReportId, GorynychProtocol.MetaReportCapture, GorynychProtocol.MetaReportDelivery,
                 GorynychProtocol.MetaAssignmentId, GorynychProtocol.MetaOrigin, GorynychProtocol.MetaMailboxMessage, GorynychProtocol.MetaExpectsReply, GorynychProtocol.MetaReplyReminder, GorynychProtocol.MetaHostBackgroundEvidence, GorynychProtocol.MetaBackgroundCompleteStream,
-                GorynychProtocol.MetaSender, GorynychProtocol.MetaParentSessionId, GorynychProtocol.MetaFromSessionId }) untrusted.Remove(name);
+                GorynychProtocol.MetaSender, GorynychProtocol.MetaParentSessionId, GorynychProtocol.MetaFromSessionId,
+                GorynychProtocol.MetaCodexLoadedIdle }) untrusted.Remove(name);
             prompt.Meta = untrusted.DeepClone().AsObject();
         }
         var promptId = PromptIdOf(prompt);

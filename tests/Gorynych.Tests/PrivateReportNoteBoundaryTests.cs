@@ -28,16 +28,18 @@ public sealed class PrivateReportNoteBoundaryTests
             { ["reportId"] = report, ["attemptId"] = attempt } } };
         async Task Refused()
         {
-            foreach (var method in new[] { GorynychProtocol.MethodReportNote, GorynychProtocol.MethodReportNoteStatus, GorynychProtocol.MethodReportNoteAck, GorynychProtocol.MethodHostReportNoteAck, GorynychProtocol.MethodHostReportNote, GorynychProtocol.MethodHostReportNoteStatus, GorynychProtocol.MethodHostReportNoteReceipt })
+            foreach (var method in new[] { GorynychProtocol.MethodReportNote, GorynychProtocol.MethodReportNoteStatus, GorynychProtocol.MethodReportNoteAck, GorynychProtocol.MethodHostReportNoteAck, GorynychProtocol.MethodHostReportNote, GorynychProtocol.MethodHostReportNoteStatus, GorynychProtocol.MethodHostReportNoteReceipt, GorynychProtocol.MethodCodexProvisionalIdle, GorynychProtocol.MethodHostCodexProvisionalIdle })
             {
                 var error = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => client.Rpc.SendRequestAsync(method, Args()));
                 Assert.AreEqual(JsonRpcException.MethodNotFound, error.Code);
             }
         }
-        int NativeCalls() { lock (agent.Adapter.Methods) return agent.Adapter.Methods.Count(m => m is GorynychProtocol.MethodReportNote or GorynychProtocol.MethodReportNoteStatus or GorynychProtocol.MethodReportNoteAck or GorynychProtocol.MethodHostReportNoteAck or GorynychProtocol.MethodHostReportNote or GorynychProtocol.MethodHostReportNoteStatus or GorynychProtocol.MethodHostReportNoteReceipt); }
+        int NativeCalls() { lock (agent.Adapter.Methods) return agent.Adapter.Methods.Count(m => m is GorynychProtocol.MethodReportNote or GorynychProtocol.MethodReportNoteStatus or GorynychProtocol.MethodReportNoteAck or GorynychProtocol.MethodHostReportNoteAck or GorynychProtocol.MethodHostReportNote or GorynychProtocol.MethodHostReportNoteStatus or GorynychProtocol.MethodHostReportNoteReceipt or GorynychProtocol.MethodCodexProvisionalIdle or GorynychProtocol.MethodHostCodexProvisionalIdle); }
         var updated = service.Store.Get(session)!.UpdatedAt; var users = service.Feed(session).Users;
         var prompts = agent.Prompts.Count;
         await Refused();
+        await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodCodexProvisionalIdle, Args());
+        await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodHostCodexProvisionalIdle, Args());
         await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodHostReportNoteReceipt, Args());
         await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodHostReportNoteAck, Args());
         await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodReportNoteAck, Args());

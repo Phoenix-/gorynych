@@ -311,6 +311,14 @@ public sealed partial class Conductor
                 if (isDelegation)
                 {
                     key = feed.BeginPrompt(promptId);
+                    if (assignmentRouteEpoch is { } earlyEpoch && assignmentGeneration is not null)
+                        HostOf(use.Record).OnCurrentRoute(recipient, rpc, link =>
+                        {
+                            if (link.HostId is not null && link.Info.Meta?[GorynychProtocol.CapHostCodexProvisionalIdle] is JsonValue cap &&
+                                cap.TryGetValue<bool>(out var supported) && supported)
+                                feed.BeginEarlyIdleCandidate(earlyEpoch, id, assignmentGeneration, promptId, rpc);
+                            return true;
+                        }, false);
                     await PublishMessageAsync();
                 }
                 var forwarded = WithReport(WithMessageId(AcpJson.ToNode(new PromptRequest
@@ -344,7 +352,8 @@ public sealed partial class Conductor
                 (string?)assignment["generation"] == assignmentGeneration && (string?)assignment["delivery"] == "delivered")
                 HostOf(use.Record).OnCurrentRoute(recipient, rpc, link =>
                 {
-                    if (link.HostId is not null) feed.ObserveInitialAssignmentTurn(epoch, Interlocked.Read(ref responseActivityFence), id, assignmentGeneration, promptId, rpc);
+                    if (link.HostId is not null) feed.ObserveInitialAssignmentTurn(epoch, Interlocked.Read(ref responseActivityFence), id, assignmentGeneration, promptId, rpc,
+                        TextOf(result?["_meta"]?[GorynychProtocol.MetaHistoryMark]));
                     return true;
                 }, false);
             ReportTurnEnd(recipient, Outcome(result), feed.EndTurnText());

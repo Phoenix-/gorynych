@@ -32,17 +32,68 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     bool strictIdleEligible;
     long assignmentActivityFence;
     internal long AssignmentActivityFence { get { lock (nativeActivityGate) return assignmentActivityFence; } }
+    sealed class PendingEarlyIdle(string id, string generation, string prompt, JsonRpcConnection route, long epoch)
+    {
+        public string Id = id, Generation = generation, Prompt = prompt;
+        public JsonRpcConnection Route = route; public long Epoch = epoch;
+        public long EarlyFence = -1, ResponseFence = -1, TurnEpoch, IngressRevision;
+        public string? NativeTurn, TerminalTurn; public bool Seen, Revoked, Terminal;
+    }
+    PendingEarlyIdle? pendingEarlyIdle;
+    bool strictIdleFromEarly;
     long assignmentEvidenceEpoch;
     (string Id, string Generation, string Prompt, JsonRpcConnection Route)? initialAssignmentTurn;
     internal long AssignmentEvidenceEpoch { get { lock (nativeActivityGate) return assignmentEvidenceEpoch; } }
     internal void InvalidateAssignmentEvidence(JsonRpcConnection source)
     {
-        lock (nativeActivityGate) { assignmentEvidenceEpoch++; if (initialAssignmentTurn?.Route == source) { initialAssignmentTurn = null; strictIdleEligible = false; } if (strictLoadedIdleRoute == source) strictLoadedIdleRoute = null; }
+        lock (nativeActivityGate) { assignmentEvidenceEpoch++; if (initialAssignmentTurn?.Route == source) { initialAssignmentTurn = null; strictIdleEligible = false; } if (pendingEarlyIdle?.Route == source) pendingEarlyIdle = null; if (strictLoadedIdleRoute == source) { strictLoadedIdleRoute = null; strictIdleFromEarly = false; } }
     }
-    internal void ObserveInitialAssignmentTurn(long epoch, long responseFence, string id, string generation, string prompt, JsonRpcConnection source)
+    internal void BeginEarlyIdleCandidate(long epoch, string id, string generation, string prompt, JsonRpcConnection source)
     {
-        lock (nativeActivityGate) if (assignmentEvidenceEpoch == epoch) { initialAssignmentTurn = (id, generation, prompt, source); strictLoadedIdleRoute = null;
-            strictIdleEligible = responseFence >= 0 && assignmentActivityFence == responseFence && !AgentTurnRunning && Asking == 0 && PendingRequests == 0; }
+        lock (nativeActivityGate) if (assignmentEvidenceEpoch == epoch) pendingEarlyIdle = new(id, generation, prompt, source, epoch);
+    }
+    internal void ObserveInitialAssignmentTurn(long epoch, long responseFence, string id, string generation, string prompt, JsonRpcConnection source, string? nativeTurn = null)
+    {
+        lock (nativeActivityGate) if (assignmentEvidenceEpoch == epoch)
+        {
+            initialAssignmentTurn = (id, generation, prompt, source); strictLoadedIdleRoute = null; strictIdleFromEarly = false;
+            strictIdleEligible = responseFence >= 0 && assignmentActivityFence == responseFence && !AgentTurnRunning && Asking == 0 && PendingRequests == 0;
+            if (pendingEarlyIdle is { } pending && pending.Epoch == epoch && pending.Route == source && pending.Id == id &&
+                pending.Generation == generation && pending.Prompt == prompt)
+            { pending.Terminal = true; pending.TerminalTurn = nativeTurn; pending.ResponseFence = responseFence;
+                if (pending.Revoked) strictIdleEligible = false;
+                ApplyEarlyIdle(pending); }
+        }
+    }
+    internal (bool Seen, bool Revoked) EarlyIdleStateForTests
+    { get { lock (nativeActivityGate) return (pendingEarlyIdle?.Seen == true, pendingEarlyIdle?.Revoked == true); } }
+    void ApplyEarlyIdle(PendingEarlyIdle pending)
+    {
+        if (pending.Terminal && pending.Seen && !pending.Revoked && pending.NativeTurn is not null &&
+            pending.TerminalTurn == pending.NativeTurn && pending.EarlyFence >= 0 && pending.EarlyFence == pending.ResponseFence &&
+            assignmentActivityFence == pending.ResponseFence && pending.Epoch == assignmentEvidenceEpoch && strictIdleEligible &&
+            initialAssignmentTurn is { } fact && fact.Route == pending.Route && fact.Prompt == pending.Prompt &&
+            fact.Id == pending.Id && fact.Generation == pending.Generation && evidencePrompts <= 1 &&
+            !AgentTurnRunning && Asking == 0 && PendingRequests == 0)
+        { strictLoadedIdleRoute = pending.Route; strictIdleFromEarly = true; }
+    }
+    internal void ObserveEarlyIdleFrame(JsonRpcConnection source, string prompt, string nativeTurn, long turnEpoch, long ingressRevision, bool revoked)
+    {
+        lock (nativeActivityGate)
+        {
+            if (pendingEarlyIdle is not { } pending || pending.Route != source || pending.Prompt != prompt || pending.Epoch != assignmentEvidenceEpoch) return;
+            if (!revoked)
+            {
+                if (pending.Seen || pending.Revoked || pending.EarlyFence < 0) return;
+                pending.Seen = true; pending.NativeTurn = nativeTurn; pending.TurnEpoch = turnEpoch; pending.IngressRevision = ingressRevision;
+                ApplyEarlyIdle(pending);
+            }
+            else if (pending.Seen && !pending.Revoked && pending.NativeTurn == nativeTurn && pending.TurnEpoch == turnEpoch && pending.IngressRevision == ingressRevision)
+            {
+                pending.Revoked = true; assignmentActivityFence++; strictIdleEligible = false;
+                if (strictIdleFromEarly && strictLoadedIdleRoute == source) { strictLoadedIdleRoute = null; strictIdleFromEarly = false; }
+            }
+        }
     }
     internal bool HasInitialAssignmentTurn(string id, string generation, JsonRpcConnection source)
     {
@@ -54,6 +105,9 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         lock (nativeActivityGate)
         {
             if (discontinuity) { assignmentActivityFence++; strictIdleEligible = false; }
+            if (strict && pendingEarlyIdle is { } pending && pending.Route == source && pending.Epoch == assignmentEvidenceEpoch && !pending.Terminal)
+                pending.EarlyFence = assignmentActivityFence;
+            strictIdleFromEarly = false;
             strictLoadedIdleRoute = strict && strictIdleEligible && initialAssignmentTurn?.Route == source &&
                 TurnGate.CurrentCount == 1 && evidencePrompts == 0 && !AgentTurnRunning && Asking == 0 && PendingRequests == 0 ? source : null;
         }
@@ -1225,7 +1279,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// </summary>
     public long BeginPrompt(string? promptId)
     {
-        lock (nativeActivityGate) { strictLoadedIdleRoute = null; strictIdleEligible = false; assignmentActivityFence++; evidencePrompts++; }
+        lock (nativeActivityGate) { strictLoadedIdleRoute = null; strictIdleEligible = false; strictIdleFromEarly = false; pendingEarlyIdle = null; assignmentActivityFence++; evidencePrompts++; }
         long key;
         lock (clientsGate)
         {
