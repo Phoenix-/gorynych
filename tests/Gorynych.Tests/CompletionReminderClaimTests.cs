@@ -18,7 +18,7 @@ public sealed class CompletionReminderClaimTests
     static CompletionReminderAdmission Claim(MailboxStore store, string generation, string attempt, long revision = 1) =>
         store.ClaimCompletionReminder("delegation", "task", "parent", "child", generation, revision, attempt, DefaultBinding);
 
-    static CompletionReminderBinding Binding() => new("project", "group", "prompt", Guid.NewGuid().ToString("D"),
+    static CompletionReminderBinding Binding() => new("project", "group", Guid.NewGuid().ToString("N"), "prompt", Guid.NewGuid().ToString("D"),
         Guid.NewGuid().ToString("N"), 17, new string('A', 64), "host", "generation", 123, "2026-01-01T00:00:00.0000000Z");
 
     [TestMethod]
@@ -36,6 +36,7 @@ public sealed class CompletionReminderClaimTests
         Assert.IsTrue(store.ClaimCompletionReminder("delegation", "task", "parent", "child", generation, 1, attempt, binding).Acquired);
         Assert.IsFalse(store.ClaimCompletionReminder("delegation", "task", "parent", "child", generation, 1, attempt, binding).Acquired);
         Assert.IsNull(store.ClaimCompletionReminder("delegation", "task", "parent", "child", generation, 1, attempt, binding with { GroupId = "foreign" }).Claim);
+        Assert.IsNull(store.ClaimCompletionReminder("delegation", "task", "parent", "child", generation, 1, attempt, binding with { GroupInstance = Guid.NewGuid().ToString("N") }).Claim);
         store.TransitionAssignment("task", "parent", 1, "cancel", "cancelled", "stop", generation: generation);
         var reopened = new MailboxStore(path);
         var recovered = reopened.ReadCompletionRecovery("task", "parent", "child", generation, attempt);

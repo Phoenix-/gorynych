@@ -298,7 +298,7 @@ public sealed class PeersTests
             conductor.ReplyMailbox.MarkDelivered("mcp-notice", "answering");
             var noticeGeneration = (string)conductor.ReplyMailbox.FindAssignment("mcp-notice", "asking")!["generation"]!;
             var noticeAttempt = Guid.NewGuid().ToString("N");
-            Assert.IsTrue(conductor.ReplyMailbox.ClaimCompletionReminder("delegation", "mcp-notice", "asking", "answering", noticeGeneration, 1, noticeAttempt, new CompletionReminderBinding("project", "group", "prompt", Guid.NewGuid().ToString("D"), Guid.NewGuid().ToString("N"), 1, new string('A', 64), "host", "generation", null, null)).Acquired);
+            Assert.IsTrue(conductor.ReplyMailbox.ClaimCompletionReminder("delegation", "mcp-notice", "asking", "answering", noticeGeneration, 1, noticeAttempt, new CompletionReminderBinding("project", "group", Guid.NewGuid().ToString("N"), "prompt", Guid.NewGuid().ToString("D"), Guid.NewGuid().ToString("N"), 1, new string('A', 64), "host", "generation", null, null)).Acquired);
             Assert.IsTrue(conductor.ReplyMailbox.CloseCompletionReminderUnknown("delegation", "mcp-notice", "asking", "answering", noticeGeneration, 1, noticeAttempt));
             var noticeList = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_completion_notices", ["arguments"] = new JsonObject() });
             Assert.AreEqual(1, JsonNode.Parse((string)noticeList!["content"]![0]!["text"]!)!["items"]!.AsArray().Count);

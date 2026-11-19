@@ -25,7 +25,7 @@ public sealed class CompletionNoticeApiTests
         mailbox.MarkStarted("task", child); mailbox.MarkDelivered("task", child);
         var generation = (string)mailbox.FindAssignment("task", owner)!["generation"]!;
         var attempt = Guid.NewGuid().ToString("N");
-        Assert.IsTrue(mailbox.ClaimCompletionReminder("delegation", "task", owner, child, generation, 1, attempt, new CompletionReminderBinding("project", "group", "prompt", Guid.NewGuid().ToString("D"), Guid.NewGuid().ToString("N"), 1, new string('A', 64), "host", "generation", null, null)).Acquired);
+        Assert.IsTrue(mailbox.ClaimCompletionReminder("delegation", "task", owner, child, generation, 1, attempt, new CompletionReminderBinding("project", "group", Guid.NewGuid().ToString("N"), "prompt", Guid.NewGuid().ToString("D"), Guid.NewGuid().ToString("N"), 1, new string('A', 64), "host", "generation", null, null)).Acquired);
         Assert.IsTrue(mailbox.CloseCompletionReminderUnknown("delegation", "task", owner, child, generation, 1, attempt));
         JsonObject Auth(string who) => new() { ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = agent.Tokens[who] } };
         async Task<JsonNode?> Call(string method, JsonObject query) => await client.Rpc.SendRequestAsync(method, query).WaitAsync(TimeSpan.FromSeconds(20));

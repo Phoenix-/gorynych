@@ -11,11 +11,11 @@ internal sealed record CompletionReminderAdmission(bool Acquired, CompletionRemi
 
 // Service-owned immutable facts captured before the final handoff claim. Missing producer
 // PID/start is allowed, but cannot be used as evidence that an old owner exited.
-internal sealed record CompletionReminderBinding(string ProjectKey, string GroupId, string PromptId,
+internal sealed record CompletionReminderBinding(string ProjectKey, string GroupId, string GroupInstance, string PromptId,
     string NativeUuid, string Stream, long ObservationRevision, string Digest, string HostId,
     string HostGeneration, int? ProducerPid, string? ProducerStart)
 {
-    internal JsonObject ToJson() => new() { ["projectKey"] = ProjectKey, ["groupId"] = GroupId, ["promptId"] = PromptId,
+    internal JsonObject ToJson() => new() { ["projectKey"] = ProjectKey, ["groupId"] = GroupId, ["groupInstance"] = GroupInstance, ["promptId"] = PromptId,
         ["nativeUuid"] = NativeUuid, ["stream"] = Stream, ["observationRevision"] = ObservationRevision, ["digest"] = Digest,
         ["hostId"] = HostId, ["hostGeneration"] = HostGeneration, ["producerPid"] = ProducerPid, ["producerStart"] = ProducerStart };
     internal static bool CanonicalProducerStart(string value) =>
@@ -23,6 +23,7 @@ internal sealed record CompletionReminderBinding(string ProjectKey, string Group
             System.Globalization.DateTimeStyles.RoundtripKind, out var parsed) && parsed.Kind == DateTimeKind.Utc &&
         parsed.ToString("O", System.Globalization.CultureInfo.InvariantCulture) == value;
     internal bool Valid() => ProjectKey is { Length: > 0 and <= 512 } && GroupId is { Length: > 0 and <= 256 } &&
+        Guid.TryParseExact(GroupInstance, "N", out _) && GroupInstance == GroupInstance.ToLowerInvariant() &&
         PromptId is { Length: > 0 and <= 256 } && Guid.TryParseExact(NativeUuid, "D", out _) && Guid.TryParseExact(Stream, "N", out _) &&
         ObservationRevision >= 0 && Digest is { Length: 64 } && Digest.All(c => c is >= '0' and <= '9' or >= 'A' and <= 'F') &&
         HostId is { Length: > 0 and <= 256 } && HostGeneration is { Length: > 0 and <= 256 } &&
@@ -31,8 +32,8 @@ internal sealed record CompletionReminderBinding(string ProjectKey, string Group
     {
         try
         {
-            if (obj is null || obj.Count != 11) return null;
-            var binding = new CompletionReminderBinding((string)obj["projectKey"]!, (string)obj["groupId"]!, (string)obj["promptId"]!,
+            if (obj is null || obj.Count != 12) return null;
+            var binding = new CompletionReminderBinding((string)obj["projectKey"]!, (string)obj["groupId"]!, (string)obj["groupInstance"]!, (string)obj["promptId"]!,
                 (string)obj["nativeUuid"]!, (string)obj["stream"]!, (long)obj["observationRevision"]!, (string)obj["digest"]!,
                 (string)obj["hostId"]!, (string)obj["hostGeneration"]!, (int?)obj["producerPid"], (string?)obj["producerStart"]);
             return binding.Valid() ? binding : null;
