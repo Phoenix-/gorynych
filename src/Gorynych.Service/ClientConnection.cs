@@ -159,6 +159,8 @@ internal sealed class ClientConnection
             case GorynychProtocol.MethodHostReportNote:
             case GorynychProtocol.MethodHostReportNoteStatus:
             case GorynychProtocol.MethodHostReportNoteReceipt:
+            case GorynychProtocol.MethodCodexProvisionalIdle:
+            case GorynychProtocol.MethodHostCodexProvisionalIdle:
                 throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {request.Method}");
             case GorynychProtocol.MethodOpinion:
                 return await conductor.OpinionAsync(request, ct, linkGone: () => Rpc.IsClosed);
@@ -218,7 +220,8 @@ internal sealed class ClientConnection
     async Task OnNotificationAsync(string method, JsonNode? @params)
     {
         if (method is GorynychProtocol.MethodHostState or GorynychProtocol.MethodReportNote or GorynychProtocol.MethodReportNoteStatus or GorynychProtocol.MethodReportNoteAck or
-            GorynychProtocol.MethodHostReportNote or GorynychProtocol.MethodHostReportNoteStatus or GorynychProtocol.MethodHostReportNoteAck or GorynychProtocol.MethodHostReportNoteReceipt) return;
+            GorynychProtocol.MethodHostReportNote or GorynychProtocol.MethodHostReportNoteStatus or GorynychProtocol.MethodHostReportNoteAck or GorynychProtocol.MethodHostReportNoteReceipt or
+            GorynychProtocol.MethodCodexProvisionalIdle or GorynychProtocol.MethodHostCodexProvisionalIdle) return;
         if ((string?)@params?["sessionId"] is not { } sid) return;
         if (conductor.RootOfSubagent(sid) is not null) return;
         if (method == AcpMethods.Agent.SessionCancel) cancelledAt[sid] = Rpc.NotificationSequence;
@@ -264,6 +267,7 @@ internal sealed class ClientConnection
         flags[GorynychProtocol.CapReplyWaits] = true;
         flags[GorynychProtocol.CapAssignments] = true;
         flags[GorynychProtocol.CapAssignmentContinuations] = true;
+        flags[GorynychProtocol.CapAssignmentDiagnostics] = true;
         flags[GorynychProtocol.CapAssignmentBackgroundContinuations] = true;
         flags[GorynychProtocol.CapLink] = GorynychProtocol.LinkVersion;
         flags[GorynychProtocol.MetaSessionState] = 1;

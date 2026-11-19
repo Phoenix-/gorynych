@@ -149,7 +149,8 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             Subagents = Name is "codex" or "claude" ? new SubagentCapabilities() : null,
         },
         ClientInfo = new Implementation { Name = "gorynych", Title = "Gorynych", Version = Version },
-        Meta = Name is "codex" or "claude" ? new JsonObject { [GorynychProtocol.MetaSubagentLiveState] = true } : null,
+        Meta = Name is "codex" or "claude" ? new JsonObject { [GorynychProtocol.MetaSubagentLiveState] = true,
+            [GorynychProtocol.CapHostCodexProvisionalIdle] = Name == "codex" && Hosts is not null } : null,
     };
 
     /// <summary>The adapter-wide connection, for a list or what no session has open: started, or waited for.</summary>
@@ -659,6 +660,14 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     {
         // Closing the RPC can wake a prompt before its completion callback removes this route.
         lock (linksGate) return route.TryGetValue(sessionId, out var link) && !link.Rpc.IsClosed ? link : null;
+    }
+
+    // Execute while route publication/removal is excluded. Never authorizes a new route.
+    internal T OnCurrentRoute<T>(string sessionId, JsonRpcConnection? expected, Func<HostLink, T> read, T missing)
+    {
+        lock (linksGate)
+            return route.TryGetValue(sessionId, out var link) && !link.Rpc.IsClosed &&
+                (expected is null || ReferenceEquals(expected, link.Rpc)) ? read(link) : missing;
     }
 
     /// <summary>The session is open in a host of an earlier generation: it moves once it is idle.</summary>

@@ -22,10 +22,17 @@ sealed partial class CodexAgent
     // notifications in transport order while the association and workspace are verified.
     Task QueueServerNotification(string method, JsonNode? value)
     {
+        var thread = (string?)value?["threadId"] is { } nativeId ? Thread(nativeId) : null;
+        var idle = method == CodexMethods.Notification.ThreadStatusChanged && (string?)value?["status"]?["type"] == "idle";
+        if (thread is not null && !idle && method != CodexMethods.Notification.TurnCompleted)
+            InvalidateIdle(thread);
+        var idleIngress = idle ? thread?.CaptureProvisionalIdleIngress() : null;
+        options.NativeIngressForTests?.Invoke(method, (string?)value?["threadId"]);
         EnqueueNativeEvent(async () =>
         {
+            if (options.BeforeNativeEventForTests is { } barrier) await barrier(method, (string?)value?["threadId"]);
             if ((string?)value?["threadId"] is { } id && unexposedChildren.ContainsKey(id)) return;
-            await OnServerNotificationAsync(method, value);
+            await OnServerNotificationAsync(method, value, thread, idleIngress);
         });
         return Task.CompletedTask;
     }

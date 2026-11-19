@@ -1677,6 +1677,117 @@ public sealed class CodexAdapterTests
     }
 
     [TestMethod]
+    [DataRow(0)]
+    [DataRow(1)]
+    [DataRow(2)]
+    [Timeout(30000, CooperativeCancellation = true)]
+    public async Task ProvisionalIdlePrivateFramesAreOptInAndRevokedInOrder(int variant)
+    {
+        var named = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { IdleBeforeTurnCompleted = true, BeforeEarlyIdle = () => named.Task.WaitAsync(Wait) };
+        var observed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var frames = System.Threading.Channels.Channel.CreateUnbounded<JsonNode>();
+        var options = new CodexAdapterOptions { Launch = fake.StartAsync, ClientVersion = "test", NativeTurnNamedForTests = (_, _) => named.TrySetResult(),
+            FindHolders = _ => new Dictionary<string, string>(), LocksDirectory = Path.Combine(TestDirs.New(), "no-native-locks"),
+            EmitProvisionalIdleForTests = variant != 0, ProvisionalIdleConfirmedForTests = _ => observed.TrySetResult() };
+        var (agent, acp) = await DirectAsync(fake, options: options);
+        await using (agent) await using (acp)
+        {
+            acp.NotificationHandler = (method, args) =>
+            {
+                if (method == CodexAgent.PrivateIdleMethod) frames.Writer.TryWrite(args!.DeepClone());
+                return Task.CompletedTask;
+            };
+            var id = await NewDirectAsync(acp);
+            var response = await acp.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject { ["sessionId"] = id,
+                ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "guarded idle" }),
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPromptId] = "exact-prompt" } }).WaitAsync(Wait);
+            Assert.AreEqual("end_turn", (string?)response!["stopReason"]);
+            await observed.Task.WaitAsync(Wait);
+            if (variant == 0) { Assert.IsFalse(frames.Reader.TryRead(out _), "private producer is disabled by default"); return; }
+            var confirmation = await frames.Reader.ReadAsync().AsTask().WaitAsync(Wait);
+            Assert.AreEqual("confirmed", (string?)confirmation["_meta"]!["state"]);
+            Assert.AreEqual(id, (string?)confirmation["_meta"]!["sessionId"]);
+            Assert.AreEqual("exact-prompt", (string?)confirmation["_meta"]!["promptId"]);
+            Assert.AreEqual(fake.LastTurnId, (string?)confirmation["_meta"]!["nativeTurnId"]);
+            if (variant == 2)
+                await Assert.ThrowsExactlyAsync<JsonRpcException>(() => fake.Rpc!.SendRequestAsync("unknown/locallyHandled", new JsonObject { ["threadId"] = id }).WaitAsync(Wait));
+            else
+                await fake.Rpc!.SendNotificationAsync("thread/status/changed", new JsonObject { ["threadId"] = id,
+                    ["status"] = new JsonObject { ["type"] = "active", ["activeFlags"] = new JsonArray() } });
+            var revoked = await frames.Reader.ReadAsync().AsTask().WaitAsync(Wait);
+            Assert.AreEqual("revoked", (string?)revoked["_meta"]!["state"]);
+            foreach (var key in new[] { "sessionId", "promptId", "nativeTurnId", "turnEpoch", "ingressRevision" })
+                Assert.IsTrue(JsonNode.DeepEquals(confirmation["_meta"]![key], revoked["_meta"]![key]), key);
+            Assert.AreEqual(1, fake.All("turn/start").Count(x => (string?)x["threadId"] == id));
+        }
+    }
+
+    [TestMethod]
+    [Timeout(30000, CooperativeCancellation = true)]
+    public async Task IdleRevocationFollowsConfirmationWhenIngressArrivesDuringPhysicalWrite()
+    {
+        var named = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeAppServer { IdleBeforeTurnCompleted = true, BeforeEarlyIdle = () => named.Task.WaitAsync(Wait) };
+        var blocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ingress = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var frames = System.Threading.Channels.Channel.CreateUnbounded<JsonNode>();
+        string? session = null;
+        var options = new CodexAdapterOptions { Launch = fake.StartAsync, ClientVersion = "test", NativeTurnNamedForTests = (_, _) => named.TrySetResult(),
+            FindHolders = _ => new Dictionary<string, string>(), LocksDirectory = Path.Combine(TestDirs.New(), "no-native-locks"),
+            EmitProvisionalIdleForTests = true,
+            AdapterOutputForTests = output => new HoldIdleConfirmationStream(output, blocked, release),
+            NativeIngressForTests = (method, id) => { if (id == session && method == "thread/status/changed" && blocked.Task.IsCompleted) ingress.TrySetResult(); } };
+        var (agent, acp) = await DirectAsync(fake, options: options);
+        await using (agent) await using (acp)
+        try
+        {
+            acp.NotificationHandler = (method, args) =>
+            { if (method == CodexAgent.PrivateIdleMethod) frames.Writer.TryWrite(args!.DeepClone()); return Task.CompletedTask; };
+            session = await NewDirectAsync(acp);
+            var response = await acp.SendRequestAsync(AcpMethods.Agent.SessionPrompt, new JsonObject { ["sessionId"] = session,
+                ["prompt"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "blocked confirmation" }),
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPromptId] = "during-write" } }).WaitAsync(Wait);
+            Assert.AreEqual("end_turn", (string?)response!["stopReason"]);
+            await blocked.Task.WaitAsync(Wait);
+            await fake.Rpc!.SendNotificationAsync("thread/status/changed", new JsonObject { ["threadId"] = session,
+                ["status"] = new JsonObject { ["type"] = "active", ["activeFlags"] = new JsonArray() } });
+            await ingress.Task.WaitAsync(Wait); // accepted while the committed confirmation has not reached the wire
+            release.TrySetResult();
+            var confirmation = await frames.Reader.ReadAsync().AsTask().WaitAsync(Wait);
+            var revocation = await frames.Reader.ReadAsync().AsTask().WaitAsync(Wait);
+            Assert.AreEqual("confirmed", (string?)confirmation["_meta"]!["state"]);
+            Assert.AreEqual("revoked", (string?)revocation["_meta"]!["state"]);
+            foreach (var key in new[] { "sessionId", "promptId", "nativeTurnId", "turnEpoch", "ingressRevision" })
+                Assert.IsTrue(JsonNode.DeepEquals(confirmation["_meta"]![key], revocation["_meta"]![key]), key);
+            Assert.AreEqual("during-write", (string?)confirmation["_meta"]!["promptId"]);
+            Assert.AreEqual(1, fake.All("turn/start").Count(x => (string?)x["threadId"] == session));
+        }
+        finally { release.TrySetResult(); }
+    }
+
+    sealed class HoldIdleConfirmationStream(Stream inner, TaskCompletionSource blocked, TaskCompletionSource release) : Stream
+    {
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            var text = System.Text.Encoding.UTF8.GetString(buffer.Span);
+            if (text.Contains(CodexAgent.PrivateIdleMethod, StringComparison.Ordinal) && text.Contains("confirmed", StringComparison.Ordinal))
+            { blocked.TrySetResult(); await release.Task.WaitAsync(ct); }
+            await inner.WriteAsync(buffer, ct);
+        }
+        public override Task FlushAsync(CancellationToken ct) => inner.FlushAsync(ct);
+        public override bool CanRead => false; public override bool CanSeek => false; public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => inner.Flush();
+        public override int Read(byte[] b, int o, int c) => throw new NotSupportedException();
+        public override long Seek(long o, SeekOrigin s) => throw new NotSupportedException();
+        public override void SetLength(long v) => throw new NotSupportedException();
+        public override void Write(byte[] b, int o, int c) => throw new NotSupportedException();
+    }
+
+    [TestMethod]
     public void ACancelHandledBeforeItsPromptBegins_StopsThatTurn_ButNotALaterOne()
     {
         var t = new CodexThread("t", Cwd, new CodexMap.CodexSettings("gpt-fake", "low", null, null, "user"));

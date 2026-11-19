@@ -16,6 +16,9 @@ namespace Gorynych.Adapters.Codex;
 /// app-server's notifications and requests touch it from different tasks, so its state is under
 /// one lock; the private helpers expect it held.
 /// </summary>
+internal sealed record CodexProvisionalIdleWitness(string SessionId, string PromptId, string NativeTurnId, long TurnEpoch, long IngressRevision);
+internal sealed record CodexProvisionalIdleIngress(string NativeTurnId, long TurnEpoch, long IngressRevision);
+
 sealed class CodexThread
 {
     readonly Lock gate = new();
@@ -28,6 +31,14 @@ sealed class CodexThread
     TaskCompletionSource<string>? named;
     CancellationTokenSource? localCommand;
     string? turnId;
+    // A provisional native observation only; it is deliberately not published to ACP.
+    // Cross-connection response ordering must be established before this can be evidence.
+    string? earlyIdleTurn;
+    TaskCompletionSource<Turn>? earlyIdleCompleted;
+    CodexProvisionalIdleWitness? committedIdle;
+    CodexProvisionalIdleWitness? pendingIdleWitness;
+    long turnEpoch;
+    long ingressRevision;
     bool stopAsked;
     long cancelledAt;
 
@@ -210,9 +221,13 @@ sealed class CodexThread
         lock (gate)
         {
             if (turn is not null) return null;
+            turnEpoch++;
             turn = new TaskCompletionSource<Turn>(TaskCreationOptions.RunContinuationsAsynchronously);
             named = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
             turnId = null;
+            earlyIdleTurn = null;
+            earlyIdleCompleted = null;
+            pendingIdleWitness = null;
             stopAsked = cancelledAt > sequence;
             streamed.Clear();
             tools.Clear();
@@ -237,11 +252,70 @@ sealed class CodexThread
     {
         lock (gate)
         {
-            if (turn is null || turnId is not null) return false;
+            if (turn is null) return false;
+            if (turnId is not null) { if (turnId != id) { ingressRevision++; earlyIdleTurn = null; earlyIdleCompleted = null; } return false; }
             turnId = id;
             named?.TrySetResult(id);
             return stopAsked;
         }
+    }
+
+    internal long ProvisionalIngressRevision { get { lock (gate) return ingressRevision; } }
+
+    internal CodexProvisionalIdleIngress? CaptureProvisionalIdleIngress()
+    {
+        lock (gate) return Loaded && turn is not null && turnId is { Length: > 0 } id && !stopAsked && !turn.Task.IsCompleted
+            ? new CodexProvisionalIdleIngress(id, turnEpoch, ingressRevision) : null;
+    }
+
+    internal void ObserveProvisionalIdle(CodexProvisionalIdleIngress? ingress)
+    {
+        lock (gate)
+            if (ingress is not null && ingress.IngressRevision == ingressRevision && ingress.TurnEpoch == turnEpoch &&
+                Loaded && turn is not null && turnId == ingress.NativeTurnId && !stopAsked && !turn.Task.IsCompleted)
+                earlyIdleTurn = ingress.NativeTurnId;
+    }
+
+    internal void ObserveProvisionalIdle() => ObserveProvisionalIdle(CaptureProvisionalIdleIngress());
+
+    internal CodexProvisionalIdleWitness? InvalidateProvisionalIdle()
+    {
+        lock (gate)
+        {
+            ingressRevision++; earlyIdleTurn = null; earlyIdleCompleted = null; pendingIdleWitness = null;
+            var revoked = committedIdle; committedIdle = null; return revoked;
+        }
+    }
+
+    internal bool CommitProvisionalWitness(CodexProvisionalIdleWitness witness)
+    {
+        lock (gate)
+        {
+            if (committedIdle is not null || !ValidateProvisionalWitness(witness)) return false;
+            committedIdle = witness; return true;
+        }
+    }
+
+    internal CodexProvisionalIdleWitness? CaptureProvisionalWitness(TaskCompletionSource<Turn> expected, string promptId, string id)
+    {
+        lock (gate)
+        {
+            if (Id.Length is not (> 0 and <= 256) || promptId.Length is not (> 0 and <= 256) || id.Length is not (> 0 and <= 256) ||
+                !HasProvisionalIdleFor(expected, id)) return null;
+            return pendingIdleWitness = new CodexProvisionalIdleWitness(Id, promptId, id, turnEpoch, ingressRevision);
+        }
+    }
+
+    internal bool ValidateProvisionalWitness(CodexProvisionalIdleWitness witness)
+    {
+        lock (gate) return Loaded && turn is null && ReferenceEquals(pendingIdleWitness, witness) && witness.SessionId == Id && witness.PromptId.Length > 0 &&
+            witness.NativeTurnId.Length > 0 && witness.TurnEpoch == turnEpoch && witness.IngressRevision == ingressRevision;
+    }
+
+    internal bool HasProvisionalIdleFor(TaskCompletionSource<Turn> expected, string id)
+    {
+        lock (gate) return Loaded && ReferenceEquals(turn, expected) && ReferenceEquals(earlyIdleCompleted, expected) &&
+            earlyIdleTurn == id && turnId == id && !stopAsked;
     }
 
     /// <summary>The running turn's name, or a failure once it ends, is abandoned, or never was: a steer behind it never attaches to a later turn.</summary>
@@ -285,6 +359,7 @@ sealed class CodexThread
         lock (gate)
         {
             cancelledAt = Math.Max(cancelledAt, sequence);
+            ingressRevision++; earlyIdleTurn = null; earlyIdleCompleted = null; pendingIdleWitness = null;
             if (turn is null) return (false, null);
             stopAsked = true;
             localCommand?.Cancel();
@@ -298,6 +373,12 @@ sealed class CodexThread
         lock (gate)
         {
             done = turnId is null || turnId == ended.Id ? turn : null;
+            if (done?.Task.IsCompleted != true)
+            {
+                earlyIdleCompleted = done is not null && turnId == ended.Id && earlyIdleTurn == ended.Id &&
+                    ended.Status == TurnStatus.Completed && !stopAsked && Loaded ? done : null;
+                if (done is null || earlyIdleCompleted is null) earlyIdleTurn = null;
+            }
             if (done is not null) named?.TrySetException(new InvalidOperationException("The turn ended before Codex named it."));
         }
         done?.TrySetResult(ended);
@@ -315,6 +396,7 @@ sealed class CodexThread
         lock (gate)
         {
             localCommand?.Cancel();
+            ingressRevision++; earlyIdleTurn = null; earlyIdleCompleted = null; pendingIdleWitness = null;
             (done, id) = (turn, turnId);
             named?.TrySetException(new InvalidOperationException("The turn was abandoned before Codex named it."));
         }
@@ -327,6 +409,7 @@ sealed class CodexThread
         lock (gate)
         {
             localCommand?.Cancel();
+            ingressRevision++; earlyIdleTurn = null; earlyIdleCompleted = null; pendingIdleWitness = null;
             done = turn;
             named?.TrySetException(e);
         }
@@ -344,6 +427,7 @@ sealed class CodexThread
             turn = null;
             named = null;
             turnId = null;
+            earlyIdleTurn = null; earlyIdleCompleted = null;
             stopAsked = false;
         }
     }
@@ -526,6 +610,8 @@ sealed partial class CodexAgent : IAsyncDisposable
     int disposed;
     int backgroundUnsupported;
     bool clientSubagents;
+    bool negotiatedIdleEvidence;
+    bool EmitIdleEvidence => negotiatedIdleEvidence || options.EmitProvisionalIdleForTests;
     bool markSubagentLiveState;
 
     public CodexAgent(CodexAdapterOptions options, JsonRpcConnection rpc, AgentInstance appServer,
@@ -539,6 +625,7 @@ sealed partial class CodexAgent : IAsyncDisposable
         app = new JsonRpcConnection(appServer.Input, appServer.Output, "codex-app-server")
         {
             RequestHandler = OnServerRequestAsync,
+            RequestArrived = OnAppRequestArrived,
             NotificationHandler = QueueServerNotification,
             Log = Log,
         };
@@ -550,10 +637,36 @@ sealed partial class CodexAgent : IAsyncDisposable
     }
 
     /// <summary>A prompt or steer is ordered at arrival, before its handler runs: a steer behind a prompt waits for it, and a cancel behind both waits for them.</summary>
+    internal const string PrivateIdleMethod = GorynychProtocol.MethodCodexProvisionalIdle;
+
+    static JsonObject IdleFrame(CodexProvisionalIdleWitness witness, string state) => new()
+    {
+        ["_meta"] = new JsonObject { ["sessionId"] = witness.SessionId, ["promptId"] = witness.PromptId,
+            ["nativeTurnId"] = witness.NativeTurnId, ["turnEpoch"] = witness.TurnEpoch,
+            ["ingressRevision"] = witness.IngressRevision, ["state"] = state },
+    };
+
+    // Called synchronously at ingress; queued revocations follow any already committed frame.
+    void InvalidateIdle(CodexThread thread)
+    {
+        var revoked = thread.InvalidateProvisionalIdle();
+        if (revoked is not null && EmitIdleEvidence)
+            _ = EnqueueNativeEvent(() => rpc.SendNotificationAsync(PrivateIdleMethod, IdleFrame(revoked, "revoked")));
+    }
+
+    void OnAppRequestArrived(JsonRpcRequest request)
+    {
+        if ((string?)request.Params?["threadId"] is not { } id) return;
+        if (unexposedChildren.TryGetValue(id, out var fallback)) id = fallback;
+        if (Thread(id) is { } thread) InvalidateIdle(thread);
+    }
+
     void OnRequestArrived(JsonRpcRequest request)
     {
-        if (request.Method is not (AcpMethods.Agent.SessionPrompt or GorynychProtocol.MethodSteering)) return;
         if ((string?)request.Params?["sessionId"] is not { } id || !threads.TryGetValue(id, out var thread)) return;
+        if (request.Method is AcpMethods.Agent.SessionPrompt or GorynychProtocol.MethodSteering or AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete or AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionResume)
+            InvalidateIdle(thread);
+        if (request.Method is not (AcpMethods.Agent.SessionPrompt or GorynychProtocol.MethodSteering)) return;
         thread.NoteArrival(request.Sequence);
         arrivals.AddOrUpdate(request, new Arrival(thread, request.Sequence));
     }
@@ -648,6 +761,7 @@ sealed partial class CodexAgent : IAsyncDisposable
         switch (request.Method)
         {
             case AcpMethods.Agent.Initialize:
+                negotiatedIdleEvidence = options.HostedIdleEvidence && request.Params?["_meta"]?[GorynychProtocol.CapCodexIdleHostReceiver] is JsonValue hostCap && hostCap.TryGetValue<bool>(out var hostEnabled) && hostEnabled;
                 clientSubagents = request.Params?["clientCapabilities"] is JsonObject capabilities && capabilities["subagents"] is JsonObject;
                 markSubagentLiveState = request.Params?["_meta"]?[GorynychProtocol.MetaSubagentLiveState] is JsonValue live && live.TryGetValue<bool>(out var enabled) && enabled;
                 return AcpJson.ToNode(new Gorynych.Acp.InitializeResponse
@@ -685,7 +799,7 @@ sealed partial class CodexAgent : IAsyncDisposable
                     },
                     AuthMethods = [],
                     // The shared steering extension, at the top level as its agreed wire shape says.
-                    Meta = new JsonObject { [GorynychProtocol.MetaSteering] = new JsonObject { ["supported"] = true } },
+                    Meta = new JsonObject { [GorynychProtocol.MetaSteering] = new JsonObject { ["supported"] = true }, [GorynychProtocol.CapCodexIdleAdapter] = negotiatedIdleEvidence },
                 });
             case AcpMethods.Agent.SessionNew:
                 return await NewAsync(request.ParamsAs<NewSessionRequest>(), ct);
@@ -790,11 +904,14 @@ sealed partial class CodexAgent : IAsyncDisposable
         var sequence = rpc.NotificationSequence;
         // The stop is noted at once; the interrupt is not waited for, so the read loop goes on.
         if (method == AcpMethods.Agent.SessionCancel && (string?)@params?["sessionId"] is { } id && threads.TryGetValue(id, out var t))
+        {
+            InvalidateIdle(t);
             _ = Task.Run(async () =>
             {
                 await t.WaitArrivalsBefore(sequence, CancellationToken.None);
                 await StopAsync(t, sequence);
             });
+        }
         return Task.CompletedTask;
     }
 
@@ -1364,6 +1481,20 @@ sealed partial class CodexAgent : IAsyncDisposable
             if (change is not null) t.Applied(change);
             Named(t, started.Turn.Id);
             var reason = StopOf(await done.Task);
+            var promptId = (string?)p.Meta?[GorynychProtocol.MetaPromptId];
+            var witness = reason == StopReason.EndTurn && promptId is { Length: > 0 }
+                ? t.CaptureProvisionalWitness(done, promptId, started.Turn.Id) : null;
+            if (witness is not null && (EmitIdleEvidence || options.ProvisionalIdleConfirmedForTests is not null))
+                request.AfterResult(() => EnqueueNativeEvent(async () =>
+                {
+                    if (EmitIdleEvidence)
+                    {
+                        if (await rpc.SendGuardedNotificationAsync(PrivateIdleMethod, IdleFrame(witness, "confirmed"), () => t.CommitProvisionalWitness(witness)))
+                            options.ProvisionalIdleConfirmedForTests?.Invoke(witness);
+                    }
+                    else if (t.ValidateProvisionalWitness(witness)) options.ProvisionalIdleConfirmedForTests?.Invoke(witness);
+                }));
+            // The private producer is enabled only by a hosted adapter handshake.
             // The turn is the thread's newest: the journal now holds the thread up to it.
             return AcpJson.ToNode(new PromptResponse { StopReason = reason, Meta = new JsonObject { [GorynychProtocol.MetaHistoryMark] = started.Turn.Id } });
         }
@@ -1507,6 +1638,7 @@ sealed partial class CodexAgent : IAsyncDisposable
     /// </summary>
     async Task StopAsync(CodexThread t, long sequence = 0)
     {
+        InvalidateIdle(t);
         var (running, turnId) = t.Stop(sequence);
         if (turnId is not null) await InterruptAsync(t.Id, turnId);
         else if (running) Log($"codex {t.Id}: stop asked before Codex named the turn; it is interrupted once named");
@@ -1516,6 +1648,7 @@ sealed partial class CodexAgent : IAsyncDisposable
     void Named(CodexThread t, string turnId)
     {
         if (t.Named(turnId)) _ = InterruptAsync(t.Id, turnId);
+        options.NativeTurnNamedForTests?.Invoke(t.Id, turnId);
     }
 
     /// <summary>Sends <c>turn/interrupt</c>, waiting for Codex's answer no longer than <see cref="CodexAdapterOptions.TurnEndWait"/>.</summary>
@@ -1943,6 +2076,7 @@ sealed partial class CodexAgent : IAsyncDisposable
     /// <summary>Ends a thread's running turn here (<see cref="CodexThread.Abandon"/>) and notes it, as instances of a thread come and go.</summary>
     void Abandon(CodexThread t)
     {
+        InvalidateIdle(t);
         if (t.Abandon() is { Length: > 0 } turnId) abandoned[turnId] = 0;
     }
 
@@ -1950,11 +2084,11 @@ sealed partial class CodexAgent : IAsyncDisposable
         !clientSubagents && (nativeChildren.ContainsKey(threadId) || update.Tag is "subagent_update" or "session_message" or "session_message_chunk")
             ? Task.CompletedTask : rpc.SendUpdateAsync(threadId, update);
 
-    async Task OnServerNotificationAsync(string method, JsonNode? p)
+    async Task OnServerNotificationAsync(string method, JsonNode? p, CodexThread? ingressThread, CodexProvisionalIdleIngress? idleIngress)
     {
         try
         {
-            await OnServerNotificationCoreAsync(method, p);
+            await OnServerNotificationCoreAsync(method, p, ingressThread, idleIngress);
         }
         catch (Exception e) when (e is System.Text.Json.JsonException or IOException)
         {
@@ -1962,7 +2096,7 @@ sealed partial class CodexAgent : IAsyncDisposable
         }
     }
 
-    async Task OnServerNotificationCoreAsync(string method, JsonNode? p)
+    async Task OnServerNotificationCoreAsync(string method, JsonNode? p, CodexThread? ingressThread, CodexProvisionalIdleIngress? idleIngress)
     {
         if (IsTitleHelper((string?)p?["threadId"]))
         {
@@ -2115,6 +2249,11 @@ sealed partial class CodexAgent : IAsyncDisposable
             {
                 // Codex unloaded the thread: a turn still running ends, as no turn/completed comes for it.
                 var n = From(p, ctx.ThreadStatusChangedNotification);
+                if (Thread(n.ThreadId) is { } observedThread)
+                {
+                    if (n.Status is IdleThreadStatus && ReferenceEquals(observedThread, ingressThread))
+                        observedThread.ObserveProvisionalIdle(idleIngress);
+                }
                 var state = n.Status switch
                 {
                     ActiveThreadStatus active when active.ActiveFlags.Any(f => f == ThreadActiveFlag.WaitingOnApproval || f == ThreadActiveFlag.WaitingOnUserInput) => "requires_action",
@@ -2130,7 +2269,11 @@ sealed partial class CodexAgent : IAsyncDisposable
                     if (n.Status is NotLoadedThreadStatus) await NativeChildStateAsync(n.ThreadId, "unknown");
                 }
                 else if (state is not null)
-                    await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = state } });
+                    await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = state,
+                        [GorynychProtocol.MetaCodexLoadedIdle] = n.Status is NotLoadedThreadStatus or SystemErrorThreadStatus || n.Status is IdleThreadStatus && Thread(n.ThreadId) is not { Loaded: true }
+                            ? JsonValue.Create("discontinuity") : JsonValue.Create(n.Status is IdleThreadStatus) } });
+                else
+                    await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaCodexLoadedIdle] = "discontinuity" } });
                 if (n.Status is not NotLoadedThreadStatus) break;
                 if (unloading.TryGetValue(n.ThreadId, out var closing)) closing.TrySetResult();
                 if (Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "status notLoaded");
@@ -2139,8 +2282,10 @@ sealed partial class CodexAgent : IAsyncDisposable
             case CodexMethods.Notification.ThreadClosed:
             {
                 var n = From(p, ctx.ThreadClosedNotification);
+                if (Thread(n.ThreadId) is { } closedThread) InvalidateIdle(closedThread);
                 if (nativeChildren.ContainsKey(n.ThreadId)) await NativeChildStateAsync(n.ThreadId, "unknown");
-                else await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = "idle" } });
+                else await Update(n.ThreadId, new SessionInfoUpdate { Meta = new JsonObject { [GorynychProtocol.MetaForegroundState] = "idle",
+                    [GorynychProtocol.MetaCodexLoadedIdle] = "discontinuity" } });
                 if (unloading.TryGetValue(n.ThreadId, out var closing)) closing.TrySetResult();
                 if (Thread(n.ThreadId) is { Loaded: true } t) Unloading(t, "thread/closed");
                 break;
@@ -2172,6 +2317,7 @@ sealed partial class CodexAgent : IAsyncDisposable
             parameters["threadId"] = fallback;
         else if ((string?)request.Params?["threadId"] is { } unknown && Thread(unknown) is null && !IsTitleHelper(unknown))
             throw new JsonRpcException(JsonRpcException.InvalidRequest, "Codex requested an interaction for an unobserved thread.");
+        if ((string?)request.Params?["threadId"] is { } requestThread && Thread(requestThread) is { } requested) InvalidateIdle(requested);
         // A title thread never asks the person or the service: it has no tools, and anything it
         // still asks is refused here, off the visible connection.
         if (IsTitleHelper((string?)request.Params?["threadId"])) return TitleHelperRefusal(request.Method);
@@ -2383,6 +2529,14 @@ sealed partial class CodexAgent : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        // App-server EOF ends the evidence stream even if host teardown is delayed.
+        foreach (var t in threads.Values)
+        {
+            InvalidateIdle(t);
+            try { await Update(t.Id, new SessionInfoUpdate { Meta = new JsonObject
+                { [GorynychProtocol.MetaCodexLoadedIdle] = "discontinuity" } }); }
+            catch (Exception e) when (e is IOException or ObjectDisposedException or JsonRpcException) { }
+        }
         foreach (var t in threads.Values) { t.CancelTitleJob(); t.StopBackground(); }
         foreach (var t in threads.Values) if (t.BackgroundTask is { } backgroundTask) await backgroundTask;
         if (appServer.Exited.IsCompleted)
