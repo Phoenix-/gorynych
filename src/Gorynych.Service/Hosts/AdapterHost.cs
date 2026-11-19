@@ -52,6 +52,9 @@ public sealed class AdapterHostOptions
     public TimeSpan InitializeWait { get; init; } = TimeSpan.FromSeconds(60);
 
     internal ReportStore? ReportStore { get; init; }
+    internal CompletionHostLedger? CompletionHostLedger { get; init; }
+    internal Action? BeforeCompletionAckRecordForTests { get; init; }
+    internal Action? BeforeCompletionRetireRecordForTests { get; init; }
     internal Action<ReportCapture>? CaptureOpened { get; init; }
     internal Action? BeforeProducerEvidence { get; init; }
     // Isolated protocol tests only. Production remains disabled until conductor integration.
@@ -90,6 +93,7 @@ public sealed class AdapterHost
     readonly Lock state = new();
     readonly SubagentRouting subagents = new();
     readonly Dictionary<string, IdleEligibility> idleEligibility = new(StringComparer.Ordinal); // under state
+    readonly Dictionary<string, (Connection Owner, string Prompt, long Admission)> claudeObservations = new(StringComparer.Ordinal);
     readonly Dictionary<string, long> idleAdmissions = new(StringComparer.Ordinal); // under state; one per live session
     long nextIdleAdmission;
     string? noteReceiptFailure;
@@ -311,6 +315,91 @@ public sealed class AdapterHost
         {
             sendGate.Release();
         }
+        if (request.GuardedAttempt is { } guardedAttempt && request.GuardedIdentity is { } guardedIdentity && options.CompletionHostLedger is { } guardedStore)
+        {
+            try
+            {
+                if (message["error"] is not null) { /* Admission remains unresolved; never retry it. */ }
+                else if (request.GuardedIsAbort && message["result"]?["_meta"] is JsonObject abort && Text(abort["state"]) is "confirmed_precommit" or "already_committed")
+                {
+                    guardedStore.RecordAbort(guardedAttempt, guardedIdentity, abort);
+                    var retained = guardedStore.ReadAttempt(guardedAttempt)!;
+                    retained["attemptId"] = guardedAttempt;
+                    message["result"] = new JsonObject { ["_meta"] = retained };
+                }
+                else if (request.GuardedRetireRevision is { } retireRevision && message["result"]?["_meta"] is JsonObject retired && Text(retired["state"]) == "retired")
+                {
+                    options.BeforeCompletionRetireRecordForTests?.Invoke();
+                    var retained = guardedStore.RecordRetire(guardedAttempt, guardedIdentity, retireRevision, retired);
+                    retained["adapterState"] = "retired";
+                    message["result"] = new JsonObject { ["_meta"] = retained };
+                }
+                else if (request.GuardedAckRevision is { } ackRevision && message["result"]?["_meta"] is JsonObject ack && Text(ack["state"]) == "acknowledged")
+                {
+                    options.BeforeCompletionAckRecordForTests?.Invoke();
+                    var retained = guardedStore.RecordAck(guardedAttempt, guardedIdentity, ackRevision, ack);
+                    retained["adapterState"] = "acknowledged";
+                    message["result"] = new JsonObject { ["_meta"] = retained };
+                }
+                else if (!request.GuardedIsAbort && request.GuardedAckRevision is null && request.GuardedRetireRevision is null && message["result"]?["_meta"] is JsonObject facts && Text(facts["state"]) == "receipt" && Text(facts["attemptId"]) == guardedAttempt)
+                {
+                    var retained = guardedStore.Record(guardedAttempt, guardedIdentity, facts);
+                    retained["adapterState"] = "observed";
+                    message["result"] = new JsonObject { ["_meta"] = retained };
+                }
+                else
+                {
+                    var retained = guardedStore.ReadAttempt(guardedAttempt) ?? new JsonObject();
+                    retained["adapterState"] = "unknown";
+                    message["result"] = new JsonObject { ["_meta"] = retained };
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or System.Text.Json.JsonException)
+            {
+                message.Remove("result");
+                message["error"] = new JsonObject { ["code"] = JsonRpcException.InternalError, ["message"] = "Guarded receipt persistence unresolved; do not retry input: " + e.Message };
+            }
+        }
+        if (request.GuardedAttempt is not null)
+        {
+            await sendGate.WaitAsync();
+            try
+            {
+                lock (state)
+                    if (current != request.Connection || request.Connection.IsLost || !request.Connection.AcceptsCompletionGuarded ||
+                        request.Connection.CompletionGuardedEpoch != request.GuardedEpoch) return;
+                message["id"] = request.ConductorId.DeepClone();
+                await TryWriteAsync(request.Connection, message);
+            }
+            finally { sendGate.Release(); }
+            return;
+        }
+        if (request.ClaudeObservationAdmission is { } queryAdmission)
+        {
+            await sendGate.WaitAsync();
+            try
+            {
+                bool valid;
+                lock (state) valid = current == request.Connection && !request.Connection.IsLost && ClaudeObservationSupported(request.Connection) &&
+                    request.ClaudeObservationEpoch == request.Connection.ClaudeObservationEpoch &&
+                    request.SessionId is { } querySession && request.PromptId is { } queryPrompt &&
+                    live.Contains(querySession) && subagents.RootOf(querySession) is null &&
+                    claudeObservations.TryGetValue(querySession, out var candidate) && candidate.Owner == request.Connection &&
+                    candidate.Prompt == queryPrompt && candidate.Admission == queryAdmission && idleAdmissions.GetValueOrDefault(querySession) == queryAdmission;
+                var meta = message["result"]?["_meta"] as JsonObject;
+                if (!valid || meta is null || meta.Count != 6 || Text(meta["state"]) != "observed" ||
+                    Text(meta["sessionId"]) != request.SessionId || Text(meta["promptId"]) != request.PromptId ||
+                    !Guid.TryParseExact(Text(meta["nativeUuid"]), "D", out _) || !Guid.TryParseExact(Text(meta["stream"]), "N", out _) ||
+                    meta["revision"] is not JsonValue revision || !revision.TryGetValue<long>(out var number) || number < 0)
+                {
+                    message["result"] = new JsonObject { ["_meta"] = new JsonObject { ["state"] = "unknown" } };
+                }
+                message.Remove("error"); message["id"] = request.ConductorId.DeepClone();
+                if (!request.Connection.IsLost) await TryWriteAsync(request.Connection, message);
+            }
+            finally { sendGate.Release(); }
+            return;
+        }
         if (request.Method == AcpMethods.Agent.Initialize)
         {
             if (message["result"] is JsonObject result) message["result"] = WithHostMeta(result, request.Connection, reattached: false);
@@ -404,6 +493,23 @@ public sealed class AdapterHost
                     if (current == request.Connection && !current.IsLost && live.Contains(eligibleSession) && subagents.RootOf(eligibleSession) is null &&
                         request.IdleAdmission is { } admission && idleAdmissions.GetValueOrDefault(eligibleSession) == admission)
                         idleEligibility[eligibleSession] = new IdleEligibility(request.Connection, eligiblePrompt, nativeTurn);
+            }
+            finally { sendGate.Release(); }
+        }
+        if (answered && ClaudeObservationSupported(request.Connection) && request.Method == AcpMethods.Agent.SessionPrompt &&
+            request.TurnKind != "report" && request.SessionId is { } observedSession && request.PromptId is { Length: > 0 and <= 256 } observedPrompt &&
+            Text(message["result"]?["stopReason"]) == "end_turn")
+        {
+            await sendGate.WaitAsync();
+            try
+            {
+                lock (state)
+                {
+                    if (current == request.Connection && !current.IsLost && live.Contains(observedSession) &&
+                        subagents.RootOf(observedSession) is null && request.ClaudeObservationEpoch == request.Connection.ClaudeObservationEpoch &&
+                        request.IdleAdmission is { } admission && idleAdmissions.GetValueOrDefault(observedSession) == admission)
+                        claudeObservations[observedSession] = (request.Connection, observedPrompt, admission);
+                }
             }
             finally { sendGate.Release(); }
         }
@@ -527,6 +633,9 @@ public sealed class AdapterHost
         }
         await EmitAsync(message);
     }
+
+    bool ClaudeObservationSupported(Connection connection) => options.Adapter == "claude" && connection.AcceptsClaudeObservation &&
+        initialize?["_meta"]?[GorynychProtocol.CapClaudePromptObservation] is JsonValue value && value.TryGetValue<bool>(out var supported) && supported;
 
     bool IdleSupported(Connection connection) => options.Adapter == "codex" && (options.FilterCodexIdleForTests ||
         (connection.AcceptsIdle && initialize?["_meta"]?[GorynychProtocol.CapCodexIdleAdapter] is JsonValue v && v.TryGetValue<bool>(out var supported) && supported));
@@ -905,6 +1014,19 @@ public sealed class AdapterHost
                 var id = message["id"];
                 if (method is null) await ConductorAnsweredAsync(connection, id, message);
                 else if (id is null) await ConductorNotifiedAsync(connection, method, message);
+                else if (options.CompletionHostLedger is not null && method is (GorynychProtocol.MethodHostCompletionGuardedSubmit or GorynychProtocol.MethodHostCompletionGuardedStatus or GorynychProtocol.MethodHostCompletionGuardedAck or GorynychProtocol.MethodHostCompletionGuardedRetire or GorynychProtocol.MethodHostCompletionGuardedAbort))
+                {
+                    // Abort and retire must remain available while a submit waits at its writer.
+                    var abort = method is GorynychProtocol.MethodHostCompletionGuardedAbort or GorynychProtocol.MethodHostCompletionGuardedRetire;
+                    bool alreadyForwarded;
+                    lock (state) alreadyForwarded = forwarded.Values.Any(f => f.Connection == connection && f.GuardedAttempt is not null &&
+                        (f.GuardedIsAbort || f.GuardedRetireRevision is not null) == abort);
+                    ref var slot = ref (abort ? ref connection.GuardedAbortInFlight : ref connection.CompletionGuardedInFlight);
+                    if (alreadyForwarded || Interlocked.CompareExchange(ref slot, 1, 0) != 0)
+                        await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                            ["error"] = new JsonObject { ["code"] = JsonRpcException.InvalidRequest, ["message"] = "Guarded bridge busy" } });
+                    else _ = HandleCompletionGuardedRequestAsync(connection, id.DeepClone(), method, message, abort);
+                }
                 else await ConductorAsksAsync(connection, id, method, message);
             }
         }
@@ -914,6 +1036,19 @@ public sealed class AdapterHost
             Log($"the connection to the conductor failed: {e.GetType().Name}: {e.Message}");
         }
         await LostAsync(connection);
+    }
+
+    // A bounded detached operation keeps the private host reader responsive. Keeping the reader live lets it
+    // observe disconnect and capability changes while a guarded write is waiting for a gate.
+    async Task HandleCompletionGuardedRequestAsync(Connection connection, JsonNode id, string method, JsonObject message, bool abort)
+    {
+        try { await ConductorAsksAsync(connection, id, method, message); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or OperationCanceledException)
+        {
+            await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                ["error"] = new JsonObject { ["code"] = JsonRpcException.InternalError, ["message"] = "Guarded bridge unresolved" } });
+        }
+        finally { if (abort) Interlocked.Exchange(ref connection.GuardedAbortInFlight, 0); else Interlocked.Exchange(ref connection.CompletionGuardedInFlight, 0); }
     }
 
     async Task ConductorAnsweredAsync(Connection connection, JsonNode? id, JsonObject message)
@@ -932,6 +1067,17 @@ public sealed class AdapterHost
 
     async Task ConductorNotifiedAsync(Connection connection, string method, JsonObject message)
     {
+        if (method is GorynychProtocol.MethodClaudePromptObservation or GorynychProtocol.MethodHostClaudePromptObservation or
+            GorynychProtocol.MethodCompletionGuardedSubmit or GorynychProtocol.MethodCompletionGuardedStatus or GorynychProtocol.MethodCompletionGuardedAck or GorynychProtocol.MethodCompletionGuardedRetire or GorynychProtocol.MethodCompletionGuardedAbort or
+            GorynychProtocol.MethodHostCompletionGuardedSubmit or GorynychProtocol.MethodHostCompletionGuardedStatus or GorynychProtocol.MethodHostCompletionGuardedAck or GorynychProtocol.MethodHostCompletionGuardedRetire or GorynychProtocol.MethodHostCompletionGuardedAbort) return;
+        if (method == AcpMethods.Agent.SessionCancel && Text(message["params"]?["sessionId"]) is { } session && ClaudeObservationSupported(connection))
+        {
+            await sendGate.WaitAsync();
+            try { lock (state) if (current == connection && !connection.IsLost) { claudeObservations.Remove(session);
+                if (live.Contains(session)) idleAdmissions[session] = ++nextIdleAdmission; else idleAdmissions.Remove(session);
+ } }
+            finally { sendGate.Release(); }
+        }
         if (method == AcpMethods.Protocol.CancelRequest)
         {
             var conductorId = message["params"]?["requestId"];
@@ -947,6 +1093,191 @@ public sealed class AdapterHost
 
     async Task ConductorAsksAsync(Connection connection, JsonNode id, string method, JsonObject message)
     {
+        JsonObject? guardedIdentity = null;
+        long? guardedAdmissionNumber = null, guardedEpoch = null, guardedWriteAdmission = null, guardedAckRevision = null, guardedRetireRevision = null;
+        string? guardedAttempt = null;
+        var guardedIsAbort = method == GorynychProtocol.MethodHostCompletionGuardedAbort;
+        var guardedIsRetire = method == GorynychProtocol.MethodHostCompletionGuardedRetire;
+        if (method is GorynychProtocol.MethodCompletionGuardedSubmit or GorynychProtocol.MethodCompletionGuardedStatus or GorynychProtocol.MethodCompletionGuardedAck or GorynychProtocol.MethodCompletionGuardedRetire or GorynychProtocol.MethodCompletionGuardedAbort)
+        {
+            await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                ["error"] = new JsonObject { ["code"] = JsonRpcException.MethodNotFound, ["message"] = "Private adapter method" } });
+            return;
+        }
+        if (method is GorynychProtocol.MethodHostCompletionGuardedSubmit or GorynychProtocol.MethodHostCompletionGuardedStatus or GorynychProtocol.MethodHostCompletionGuardedAck or GorynychProtocol.MethodHostCompletionGuardedRetire or GorynychProtocol.MethodHostCompletionGuardedAbort)
+        {
+            try
+            {
+                var store = options.CompletionHostLedger ?? throw new InvalidOperationException("Completion bridge disabled");
+                var p = message["params"] as JsonObject ?? throw new ArgumentException("Missing params");
+                var meta = p["_meta"] as JsonObject ?? throw new ArgumentException("Missing metadata");
+                string Field(string key, int max = 256) => Text(meta[key]) is { Length: > 0 } value && value.Length <= max
+                    ? value : throw new ArgumentException("Invalid " + key);
+                var session = Field("sessionId"); guardedAttempt = Field("attemptId", 32);
+                if (!Guid.TryParseExact(guardedAttempt, "N", out _) || guardedAttempt != guardedAttempt.ToLowerInvariant()) throw new ArgumentException("Invalid attempt");
+                await sendGate.WaitAsync();
+                try
+                {
+                    lock (state)
+                        if (current != connection || connection.IsLost || !connection.AcceptsCompletionGuarded || options.Adapter != "claude" ||
+                            !live.Contains(session) || subagents.RootOf(session) is not null ||
+                            initialize?["_meta"]?[GorynychProtocol.CapCompletionGuardedAdapter]?.GetValue<bool>() != true)
+                            throw new InvalidOperationException("Completion bridge unavailable");
+                    if (method == GorynychProtocol.MethodHostCompletionGuardedSubmit)
+                    {
+                        var prompt = Field("promptId"); var native = Field("nativeUuid"); var stream = Field("stream");
+                        if (!Guid.TryParseExact(native, "D", out _) || !Guid.TryParseExact(stream, "N", out _) ||
+                            options.HostId.Length is < 1 or > 256 || options.Generation?.Key is not { Length: > 0 and <= 256 })
+                            throw new ArgumentException("Invalid process or host identity");
+                        var assignment = Field("assignmentId"); var assignmentGeneration = Field("assignmentGeneration"); var owner = Field("ownerId");
+                        var project = Field("projectKey", 512); var group = Field("groupId");
+                        var producerStart = ProcessIncarnation.Read(Environment.ProcessId);
+                        var text = Field("text", 32000);
+                        if (meta["assignmentRevision"] is not JsonValue ar || !ar.TryGetValue<long>(out var assignmentRevision) || assignmentRevision <= 0 ||
+                            meta["observationRevision"] is not JsonValue ov || !ov.TryGetValue<long>(out var observationRevision) || observationRevision < 0)
+                            throw new ArgumentException("Invalid revision");
+                        var instance = Field("groupInstance"); var ledgerStream = Field("ledgerStream");
+                        if (meta["ledgerNumber"] is not JsonValue lv || !lv.TryGetValue<long>(out var ledgerNumber) || ledgerNumber < 1 ||
+                            !Guid.TryParseExact(ledgerStream, "N", out _)) throw new ArgumentException("Invalid ledger identity");
+                        var binding = new CompletionReminderBinding(project, group, instance, prompt, native, stream, observationRevision,
+                            Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(text))),
+                            options.HostId, options.Generation!.Key, producerStart is null ? null : Environment.ProcessId, producerStart);
+                        if (!binding.Valid()) throw new ArgumentException("Invalid completion binding");
+                        guardedIdentity = CompletionHostLedger.Identity("delegation", assignment, owner, session, assignmentGeneration,
+                            assignmentRevision, guardedAttempt, binding, ledgerStream, ledgerNumber);
+                        foreach (var field in guardedIdentity)
+                            if (!JsonNode.DeepEquals(meta[field.Key], field.Value)) throw new InvalidOperationException("Submit identity mismatch: " + field.Key);
+                        var existingAttempt = store.ReadAttempt(guardedAttempt) ?? throw new InvalidOperationException("No durable admission");
+                        if (!JsonNode.DeepEquals(existingAttempt["identity"], guardedIdentity) ||
+                            (long?)existingAttempt["number"] != ledgerNumber || (string?)existingAttempt["state"] != "admitted" ||
+                            (bool?)existingAttempt["forwardStarted"] != false)
+                            throw new InvalidOperationException("Admission unavailable or already forwarded");
+                        lock (state)
+                            if (!claudeObservations.TryGetValue(session, out var previous) || previous.Owner != connection || previous.Prompt != prompt ||
+                                idleAdmissions.GetValueOrDefault(session) != previous.Admission)
+                                throw new InvalidOperationException("No matching live prompt admission");
+                            else guardedAdmissionNumber = previous.Admission;
+                        method = GorynychProtocol.MethodCompletionGuardedSubmit;
+                    }
+                    else
+                    {
+                        var row = store.ReadAttempt(guardedAttempt);
+                        if (row is null) throw new InvalidOperationException("Unknown attempt");
+                        guardedIdentity = row["identity"] as JsonObject ?? throw new InvalidDataException("Invalid identity");
+                        foreach (var field in guardedIdentity)
+                            if (!JsonNode.DeepEquals(field.Value, meta[field.Key])) throw new InvalidOperationException("Status identity mismatch");
+                        if (guardedIsAbort)
+                        {
+                            foreach (var field in new[] { "hostId", "hostGeneration", "producerPid", "producerStart", "projectKey", "groupId", "groupInstance", "source", "digest", "ledgerStream", "ledgerNumber" })
+                                if (!JsonNode.DeepEquals(guardedIdentity[field], meta[field])) throw new InvalidOperationException("Abort identity mismatch");
+                            if (Text(guardedIdentity["hostId"]) != options.HostId || Text(guardedIdentity["hostGeneration"]) != options.Generation?.Key)
+                            {
+                                row["abortState"] = "unresolved";
+                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
+                            }
+                            // A matching name and generation do not identify a restarted OS
+                            // producer. Only the original instance can fence its live adapter.
+                            var producerStart = Text(guardedIdentity["producerStart"]);
+                            if ((int?)guardedIdentity["producerPid"] != Environment.ProcessId || producerStart is null ||
+                                !CompletionReminderBinding.CanonicalProducerStart(producerStart) ||
+                                producerStart != ProcessIncarnation.Read(Environment.ProcessId))
+                            {
+                                row["abortState"] = "unresolved";
+                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
+                            }
+                            if ((string?)row["abortVerdict"] is "confirmed_precommit" or "already_committed")
+                            {
+                                row["attemptId"] = guardedAttempt;
+                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
+                            }
+                            var verdict = store.AbortBeforeForward(guardedAttempt, guardedIdentity);
+                            if (verdict != "needs_adapter")
+                            {
+                                row = store.ReadAttempt(guardedAttempt)!; row["attemptId"] = guardedAttempt;
+                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
+                            }
+                        }
+                        if (method == GorynychProtocol.MethodHostCompletionGuardedAck)
+                        {
+                            if (meta["receiptRevision"] is not JsonValue rv || !rv.TryGetValue<long>(out var requestedRevision) || requestedRevision < 0)
+                                throw new ArgumentException("Invalid receipt revision");
+                            guardedAckRevision = requestedRevision;
+                            row = store.PrepareAck(guardedAttempt, guardedIdentity, requestedRevision);
+                            if ((long?)row["ackRevision"] == requestedRevision)
+                            {
+                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row }));
+                                return;
+                            }
+                        }
+                        if (guardedIsRetire)
+                        {
+                            if (meta["receiptRevision"] is not JsonValue rv || !rv.TryGetValue<long>(out var requestedRevision) || requestedRevision < 0)
+                                throw new ArgumentException("Invalid receipt revision");
+                            guardedRetireRevision = requestedRevision;
+                            row = store.PrepareRetire(guardedAttempt, guardedIdentity, requestedRevision);
+                            if ((long?)row["retiredRevision"] == requestedRevision)
+                            {
+                                row["adapterState"] = "retired";
+                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
+                            }
+                        }
+                        var originalStart = Text(guardedIdentity["producerStart"]);
+                        if (Text(guardedIdentity["hostId"]) != options.HostId || Text(guardedIdentity["hostGeneration"]) != options.Generation?.Key ||
+                            (int?)guardedIdentity["producerPid"] != Environment.ProcessId || originalStart is null ||
+                            !CompletionReminderBinding.CanonicalProducerStart(originalStart) || originalStart != ProcessIncarnation.Read(Environment.ProcessId))
+                        {
+                            row["adapterState"] = "unknown";
+                            await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row }));
+                            return;
+                        }
+                        guardedIdentity = (JsonObject)guardedIdentity.DeepClone();
+                        method = guardedIsAbort ? GorynychProtocol.MethodCompletionGuardedAbort : guardedIsRetire ? GorynychProtocol.MethodCompletionGuardedRetire : guardedAckRevision is null ? GorynychProtocol.MethodCompletionGuardedStatus : GorynychProtocol.MethodCompletionGuardedAck;
+                    }
+                    meta["digest"] = guardedIdentity!["digest"]!.DeepClone();
+                    guardedEpoch = connection.CompletionGuardedEpoch;
+                    p["sessionId"] = session;
+                    message["method"] = method;
+                }
+                finally { sendGate.Release(); }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or System.Text.Json.JsonException)
+            {
+                await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                    ["error"] = new JsonObject { ["code"] = JsonRpcException.InvalidRequest, ["message"] = "Guarded bridge unresolved: " + e.Message } });
+                return;
+            }
+        }
+        string? observationSession = null, observationPrompt = null;
+        long? observationAdmission = null, observationCapabilityEpoch = null;
+        if (method == GorynychProtocol.MethodClaudePromptObservation)
+        {
+            await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                ["error"] = new JsonObject { ["code"] = JsonRpcException.MethodNotFound, ["message"] = "Private adapter method" } });
+            return;
+        }
+        if (method == GorynychProtocol.MethodHostClaudePromptObservation)
+        {
+            var args = message["params"] as JsonObject; var meta = args?["_meta"] as JsonObject;
+            observationSession = Text(meta?["sessionId"]); observationPrompt = Text(meta?["promptId"]);
+            await sendGate.WaitAsync();
+            try
+            {
+                lock (state)
+                    if (args?.Count == 1 && meta?.Count == 2 && observationSession is { Length: > 0 and <= 256 } session &&
+                        observationPrompt is { Length: > 0 and <= 256 } prompt && current == connection && !connection.IsLost &&
+                        ClaudeObservationSupported(connection) && live.Contains(session) && subagents.RootOf(session) is null &&
+                        claudeObservations.TryGetValue(session, out var existing) && existing.Owner == connection && existing.Prompt == prompt &&
+                        idleAdmissions.GetValueOrDefault(session) == existing.Admission)
+                    { observationAdmission = existing.Admission; observationCapabilityEpoch = connection.ClaudeObservationEpoch; }
+                if (observationAdmission is null)
+                {
+                    await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = new JsonObject { ["state"] = "unknown" } }));
+                    return;
+                }
+            }
+            finally { sendGate.Release(); }
+            method = GorynychProtocol.MethodClaudePromptObservation; message["method"] = method;
+        }
         string? noteStatusReport = null;
         string? noteAttempt = null, noteDigest = null, noteAckUuid = null;
         long? noteAckRevision = null;
@@ -1052,6 +1383,28 @@ public sealed class AdapterHost
             {
                 if (message["params"] is not JsonObject initParams) message["params"] = initParams = new JsonObject();
                 if (initParams["_meta"] is not JsonObject initMeta) initParams["_meta"] = initMeta = new JsonObject();
+                var acceptsCompletionGuarded = options.CompletionHostLedger is not null && initMeta[GorynychProtocol.CapHostCompletionGuarded] is JsonValue testValue && testValue.TryGetValue<bool>(out var testAccepted) && testAccepted;
+                initMeta.Remove(GorynychProtocol.CapHostCompletionGuarded);
+                initMeta.Remove(GorynychProtocol.CapCompletionGuardedReceiver);
+                if (options.Adapter == "claude" && options.CompletionHostLedger is not null)
+                    initMeta[GorynychProtocol.CapCompletionGuardedReceiver] = true;
+                var acceptsClaude = initMeta[GorynychProtocol.CapHostClaudePromptObservation] is JsonValue requestedClaude && requestedClaude.TryGetValue<bool>(out var acceptedClaude) && acceptedClaude;
+                await sendGate.WaitAsync();
+                try
+                {
+                    lock (state)
+                    {
+                        connection.ClaudeObservationEpoch++;
+                        connection.CompletionGuardedEpoch++;
+                        connection.AcceptsCompletionGuarded = acceptsCompletionGuarded;
+                        connection.AcceptsClaudeObservation = acceptsClaude;
+                        foreach (var session in claudeObservations.Where(p => p.Value.Owner == connection).Select(p => p.Key).ToArray()) claudeObservations.Remove(session);
+                    }
+                }
+                finally { sendGate.Release(); }
+                initMeta.Remove(GorynychProtocol.CapHostClaudePromptObservation);
+                initMeta.Remove(GorynychProtocol.CapClaudeObservationReceiver);
+                initMeta[GorynychProtocol.CapClaudeObservationReceiver] = options.Adapter == "claude";
                 connection.AcceptsIdle = initMeta[GorynychProtocol.CapHostCodexProvisionalIdle] is JsonValue requested && requested.TryGetValue<bool>(out var accepted) && accepted;
                 initMeta.Remove(GorynychProtocol.CapHostCodexProvisionalIdle);
                 initMeta.Remove(GorynychProtocol.CapCodexIdleHostReceiver);
@@ -1107,14 +1460,16 @@ public sealed class AdapterHost
         }
         long key = 0;
         var @params = message["params"] as JsonObject;
-        var sessionId = Text(@params?["sessionId"]);
+        var sessionId = observationSession ?? Text(@params?["sessionId"]);
         var reportId = method == AcpMethods.Agent.SessionPrompt ? Text(@params?["_meta"]?[GorynychProtocol.MetaReportId]) : null;
         ReportCapture? capture = null;
         var provenUnstarted = reportId is not null;
         Exception? refusal = null;
         JsonObject? admissionRevocation = null;
-        var idleAdmissionGate = IdleSupported(connection) && sessionId is not null &&
-            (IsHistoryOperation(method) || method is AcpMethods.Agent.SessionPrompt or AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete);
+        var sharedIdleAdmission = IsHistoryOperation(method) || method is AcpMethods.Agent.SessionPrompt or AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete;
+        var claudeInputAdmission = method is GorynychProtocol.MethodSteering or GorynychProtocol.MethodNote or GorynychProtocol.MethodOpinion or GorynychProtocol.MethodReportNote or GorynychProtocol.MethodCompletionGuardedSubmit;
+        var idleAdmissionGate = sessionId is not null && ((guardedAttempt is not null) || (IdleSupported(connection) && sharedIdleAdmission) ||
+            (ClaudeObservationSupported(connection) && (sharedIdleAdmission || claudeInputAdmission)));
         if (idleAdmissionGate) await sendGate.WaitAsync();
         try
         {
@@ -1123,15 +1478,22 @@ public sealed class AdapterHost
               try
               {
                 if (stopping.IsCancellationRequested) throw new InvalidOperationException("The host is stopping");
+                if (guardedAttempt is not null && (current != connection || connection.IsLost || !connection.AcceptsCompletionGuarded ||
+                    guardedEpoch != connection.CompletionGuardedEpoch || sessionId is null || !live.Contains(sessionId) ||
+                    method == GorynychProtocol.MethodCompletionGuardedSubmit && (guardedAdmissionNumber is null || idleAdmissions.GetValueOrDefault(sessionId) != guardedAdmissionNumber)))
+                    throw new InvalidOperationException("Guarded admission changed before forwarding");
                 var history = IsHistoryOperation(method);
                 long? idleAdmission = null;
-                if (idleAdmissionGate && sessionId is not null)
+                if (idleAdmissionGate && sessionId is not null && (sharedIdleAdmission || claudeInputAdmission))
                 {
+                    claudeObservations.Remove(sessionId);
                     if (idleEligibility.Remove(sessionId, out var oldIdle) && oldIdle.Seen && !oldIdle.Revoked && oldIdle.Owner == current && !oldIdle.Owner.IsLost)
                         admissionRevocation = oldIdle.Frame(sessionId, "revoked");
                     if (method is AcpMethods.Agent.SessionClose or AcpMethods.Agent.SessionDelete || !live.Contains(sessionId)) idleAdmissions.Remove(sessionId);
                     else idleAdmissions[sessionId] = ++nextIdleAdmission;
+
                     if (method == AcpMethods.Agent.SessionPrompt && idleAdmissions.TryGetValue(sessionId, out var admitted)) idleAdmission = admitted;
+                    if (method == GorynychProtocol.MethodCompletionGuardedSubmit && idleAdmissions.TryGetValue(sessionId, out var guardedAdmission)) guardedWriteAdmission = guardedAdmission;
                 }
                 if (sessionId is not null && (history || method == AcpMethods.Agent.SessionPrompt) &&
                     forwarded.Values.Any(f => f.SessionId == sessionId && f.Capture is not null))
@@ -1154,8 +1516,10 @@ public sealed class AdapterHost
                 key = ++nextToAgent;
                 forwarded[key] = new Forwarded
                 {
-                Connection = connection, ConductorId = id.DeepClone(), Method = method, SessionId = Text(@params?["sessionId"]), IdleAdmission = idleAdmission,
-                PromptId = Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]), ReportId = reportId, Capture = capture,
+                Connection = connection, ConductorId = id.DeepClone(), Method = method, SessionId = sessionId, IdleAdmission = idleAdmission,
+                GuardedAttempt = guardedAttempt, GuardedIdentity = guardedIdentity, GuardedEpoch = guardedEpoch, GuardedWriteAdmission = guardedWriteAdmission, GuardedAckRevision = guardedAckRevision, GuardedRetireRevision = guardedRetireRevision, GuardedIsAbort = guardedIsAbort,
+                ClaudeObservationAdmission = observationAdmission,
+                ClaudeObservationEpoch = observationCapabilityEpoch ?? connection.ClaudeObservationEpoch, PromptId = observationPrompt ?? Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]), ReportId = reportId, Capture = capture,
                 NoteStatusReport = noteStatusReport, NoteAttempt = noteAttempt, NoteDigest = noteDigest,
                 NoteAckUuid = noteAckUuid, NoteAckRevision = noteAckRevision,
                 Delivery = method == AcpMethods.Agent.SessionPrompt && Text(@params?["_meta"]?[GorynychProtocol.MetaOrigin]) == "report"
@@ -1201,7 +1565,13 @@ public sealed class AdapterHost
             return;
         }
         message["id"] = key;
-        await WriteToAgentAsync(message);
+        if (guardedAttempt is not null)
+        {
+            if (!await WriteCompletionGuardedToAgentAsync(message, connection, key, guardedEpoch, guardedIsAbort))
+                await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                    ["error"] = new JsonObject { ["code"] = JsonRpcException.InvalidRequest, ["message"] = "Guarded admission unresolved" } });
+        }
+        else await WriteToAgentAsync(message);
     }
 
     static bool IsHistoryOperation(string method) => method is AcpMethods.Agent.SessionLoad or AcpMethods.Agent.SessionResume or GorynychProtocol.MethodCatchUp;
@@ -1348,7 +1718,7 @@ public sealed class AdapterHost
             if (!await TryWriteAsync(connection, Notification(GorynychProtocol.MethodHostState, snapshot)))
                 throw new IOException("the connection went");
             current = connection;
-            lock (state) { idleEligibility.Clear(); idleAdmissions.Clear(); aloneSince = long.MaxValue; }
+            lock (state) { claudeObservations.Clear(); idleEligibility.Clear(); idleAdmissions.Clear(); aloneSince = long.MaxValue; }
             foreach (var question in questions) await AskAsync(connection, question);
             connection.Activated.TrySetResult();
             Log($"a conductor took the host: {replay.Count} updates sent again, {questions.Count} questions asked again");
@@ -1373,7 +1743,7 @@ public sealed class AdapterHost
         try
         {
             wasCurrent = current == connection;
-            if (wasCurrent) { current = null; lock (state) { idleEligibility.Clear(); idleAdmissions.Clear(); } }
+            if (wasCurrent) { current = null; lock (state) { claudeObservations.Clear(); idleEligibility.Clear(); idleAdmissions.Clear(); } }
         }
         finally
         {
@@ -1391,8 +1761,17 @@ public sealed class AdapterHost
     {
         var meta = result["_meta"] as JsonObject ?? [];
         // Capability belongs to the host implementation, not the wrapped adapter.
+        meta.Remove(GorynychProtocol.CapHostCompletionGuarded);
+        var guardedAdapter = meta[GorynychProtocol.CapCompletionGuardedAdapter] is JsonValue tv && tv.TryGetValue<bool>(out var ts) && ts;
+        meta.Remove(GorynychProtocol.CapCompletionGuardedAdapter);
+        if (options.CompletionHostLedger is not null && connection.AcceptsCompletionGuarded && options.Adapter == "claude" && guardedAdapter)
+            meta[GorynychProtocol.CapHostCompletionGuarded] = true;
         meta.Remove(GorynychProtocol.CapHostBackgroundEvidence);
         meta.Remove(GorynychProtocol.CapHostCodexProvisionalIdle);
+        meta.Remove(GorynychProtocol.CapHostClaudePromptObservation);
+        var claudeObservation = meta[GorynychProtocol.CapClaudePromptObservation] is JsonValue co && co.TryGetValue<bool>(out var cs) && cs;
+        meta.Remove(GorynychProtocol.CapClaudePromptObservation);
+        if (options.Adapter == "claude" && connection.AcceptsClaudeObservation && claudeObservation) meta[GorynychProtocol.CapHostClaudePromptObservation] = true;
         var adapterIdle = meta[GorynychProtocol.CapCodexIdleAdapter] is JsonValue v && v.TryGetValue<bool>(out var supported) && supported;
         meta.Remove(GorynychProtocol.CapCodexIdleAdapter);
         if (options.Adapter == "codex" && ((connection.AcceptsIdle && adapterIdle) || options.FilterCodexIdleForTests)) meta[GorynychProtocol.CapHostCodexProvisionalIdle] = true;
@@ -1408,6 +1787,66 @@ public sealed class AdapterHost
                 ["durableRouting"] = (bool?)result["_meta"]?[GorynychProtocol.CapReportNoteAck] == true };
         result["_meta"] = meta;
         return result;
+    }
+
+    // Commit the frame under the ordered current-connection gate after taking the adapter writer.
+    // Never hold either host state lock across I/O. A lost/downgraded connection leaves the
+    // already durable attempt unresolved and cannot cause a second forward.
+    async Task<bool> WriteCompletionGuardedToAgentAsync(JsonObject message, Connection connection, long key, long? epoch, bool isAbort)
+    {
+        var bytes = Encoding.UTF8.GetBytes(message.ToJsonString(Wire) + "\n");
+        if (isAbort && !agentGate.Wait(0)) { lock (state) forwarded.Remove(key); return false; }
+        if (!isAbort)
+        {
+            var waiting = agentGate.WaitAsync();
+            await waiting;
+        }
+        try
+        {
+            if (isAbort && !sendGate.Wait(0)) { lock (state) forwarded.Remove(key); return false; }
+            if (!isAbort) await sendGate.WaitAsync();
+            ValueTask write;
+            try
+            {
+                Forwarded guardedRequest;
+                lock (state)
+                {
+                    if (stopping.IsCancellationRequested || current != connection || connection.IsLost ||
+                        !connection.AcceptsCompletionGuarded || connection.CompletionGuardedEpoch != epoch ||
+                        !forwarded.TryGetValue(key, out guardedRequest!) || guardedRequest.SessionId is not { } session ||
+                        !live.Contains(session) || subagents.RootOf(session) is not null ||
+                        guardedRequest.Method == GorynychProtocol.MethodCompletionGuardedSubmit &&
+                            (guardedRequest.GuardedWriteAdmission is null || idleAdmissions.GetValueOrDefault(session) != guardedRequest.GuardedWriteAdmission))
+                    {
+                        forwarded.Remove(key);
+                        return false;
+                    }
+                }
+                if (guardedRequest.Method == GorynychProtocol.MethodCompletionGuardedSubmit)
+                {
+                    try
+                    {
+                        if (guardedRequest.GuardedAttempt is null || guardedRequest.GuardedIdentity is null || options.CompletionHostLedger is null ||
+                            !options.CompletionHostLedger.BeginForward(guardedRequest.GuardedAttempt, guardedRequest.GuardedIdentity))
+                        { lock (state) forwarded.Remove(key); return false; }
+                    }
+                    catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or System.Text.Json.JsonException)
+                    { lock (state) forwarded.Remove(key); return false; }
+                }
+                write = agent.Output.WriteAsync(bytes);
+            }
+            finally { sendGate.Release(); }
+            await write;
+            await agent.Output.FlushAsync();
+            return true;
+        }
+        catch (Exception e) when (e is IOException or ObjectDisposedException or NotSupportedException or InvalidOperationException)
+        {
+            lock (state) forwarded.Remove(key);
+            ended.TrySetResult(0);
+            return false;
+        }
+        finally { agentGate.Release(); }
     }
 
     async Task WriteToAgentAsync(JsonObject message)
@@ -1498,12 +1937,21 @@ public sealed class AdapterHost
     /// <summary>A conductor's request on its way to the agent.</summary>
     sealed class Forwarded
     {
+        public string? GuardedAttempt { get; init; }
+        public JsonObject? GuardedIdentity { get; init; }
+        public long? GuardedEpoch { get; init; }
+        public long? GuardedWriteAdmission { get; init; }
+        public long? GuardedAckRevision { get; init; }
+        public long? GuardedRetireRevision { get; init; }
+        public bool GuardedIsAbort { get; init; }
         public required Connection Connection { get; init; }
         public required JsonNode ConductorId { get; init; }
         public required string Method { get; init; }
         public string? SessionId { get; init; }
         public string? PromptId { get; init; }
         public long? IdleAdmission { get; init; }
+        public long? ClaudeObservationAdmission { get; init; }
+        public long ClaudeObservationEpoch { get; init; }
         public string? ReportId { get; init; }
         public string? NoteStatusReport { get; init; }
         public string? NoteAttempt { get; init; }
@@ -1556,6 +2004,11 @@ public sealed class AdapterHost
         public TaskCompletionSource Gone { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public long NextAsk;
         public bool AcceptsIdle;
+        public int CompletionGuardedInFlight, GuardedAbortInFlight;
+        public bool AcceptsCompletionGuarded;
+        public long CompletionGuardedEpoch;
+        public bool AcceptsClaudeObservation;
+        public long ClaudeObservationEpoch;
         public bool IsLost => Lost.IsCancellationRequested;
     }
 }

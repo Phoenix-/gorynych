@@ -481,3 +481,73 @@ For a hosted explicit delegation, `diagnostic.initialTurn` can be `terminal_obse
 `diagnostic.foregroundIdle` is a separate, ephemeral observation. For the exact currently retained hosted delegation terminal, `loaded_idle_observed` requires a live Codex observation for a loaded thread on the same uninterrupted host route. A later `IdleThreadStatus` or a [negotiated early-idle confirmation](service-protocol.md#passive-assignment-diagnostics) can supply this observation. Both paths require no subsequent prompt, native activity or permission request and no currently pending foreground work. Replay, history, generic idle, not-loaded, errors, closed or replaced routes and other adapters cannot establish it. A new activity invalidates the correlation even if another idle arrives later. Otherwise the observation is `unknown`.
 
 The exact response arrival samples an in-memory activity fence synchronously before the RPC response task completes. Activity or permission intervention before terminal publication invalidates later idle correlation even if it has already ended; the independently observed terminal can still be retained. Codex notLoaded, thread/closed, systemError and unknown lifecycle status revoke this correlation for the old terminal, including during history import. A later idle on the same connection cannot restore it; a new exact terminal is needed.
+
+
+### Completion reminder storage checkpoint
+
+The service contains an internal, bounded mailbox storage primitive for a future manual
+completion reminder. It is not a user-facing control, does not authorize dispatch, and
+does not schedule or send input. Its final handoff record is separate from the assignment
+outcome and the original delivery. A claim checks the delegation identity and generation,
+revision, open status, delivered input and absence of a continuation in the mailbox COW
+transaction. A prior claim for that generation consumes the attempt even after settlement.
+A started record projects as uncertain after reopening; a disconnect alone cannot prove
+that input was not sent.
+
+The storage reserves bounded space for a possible owner notice before acquiring a claim.
+Unresolved attempts hold their assignment rows; a trusted exact settlement or explicit
+unknown closure releases that hold. An unacknowledged unknown notice survives ordinary
+assignment eviction and is not silently evicted. The notice records that delivery was
+unknown at closure; later definitive evidence does not rewrite the notice. Full capacity
+defers new attempts rather than blocking ordinary messages or assignments. Owner-scoped receipt methods use the existing peer-token boundary: the service derives
+the owner session from the token, rather than a client-supplied actor. The ACP
+`_gorynych/list_completion_notices` and `_gorynych/ack_completion_notice` methods, and
+their managed MCP counterparts, expose only that owner’s notices. ACK is idempotent
+while its receipt is retained and never changes the assignment outcome.
+
+This checkpoint does not provide a production host ledger, adapter acknowledgement,
+policy ordering, trusted user control, or a manual trigger. The claim requires an exact immutable binding; a legacy unbound record cannot support
+recovery by inventing a current host. A future production caller must also enforce the
+operator opt-in, owner-token authority and full dispatch and recovery checks before this
+storage can be used to send input.
+
+The planned authority boundary separates operator configuration from a manual owner
+request. A future launch-time opt-in must select one exact project and group instance;
+there is no runtime RPC that enables it. The request and owner notice acknowledgements
+must resolve the session from its peer token and verify it against the durable assignment
+owner. This is service-level session identity, not proof of a human or OS isolation from
+other processes of the same user. The shared ACP pipe, client metadata and an absent token
+do not establish user authority.
+
+The UI metadata store can allocate an internal durable group instance token. Renaming
+the group preserves it; deleting the group removes it atomically, so recreation of the
+same public key gets another token. The future configuration must retain and compare
+the originally approved token, including across restart, and must not silently bind a
+replacement group. Allocation of this token does not grant opt-in or send anything.
+
+The in-progress completion handoff storage uses a durable mailbox stream incarnation
+and monotonic claim number. A bounded host ledger retains a watermark while compacting
+only a proven pre-commit abort or an exact released receipt after durable consumer
+settlement. A missing row below that watermark is stale/unknown, not proof of no input.
+The ledger has a separate incarnation anchor; initial creation requires a durable
+mailbox stream with no prior claims. These primitives are not wired into dispatch or
+recovery yet. They do not promise safety if a person manually rolls the canonical data
+directory back to an older backup.
+
+If initialization was interrupted after writing the ledger anchor, a missing ledger can
+be repaired only when the exact mailbox stream is still durably pristine. A previously
+used or mismatched stream remains unknown. After independently proving exit of the
+exact original producer, an admitted row may be compacted only after the matching
+mailbox transaction durably records `unknown_closed` and its owner notice. This is
+independent of adapter ACK and never establishes that input was absent. These internal
+operations still require the production authenticated host/adapter integration.
+
+A hosted headless Claude adapter and its authenticated current AdapterHost connection can
+negotiate a private guarded handoff and prompt-observation capability. The host accepts
+a submit only for an already published exact mailbox-derived ledger row and matching
+current host, session, prompt, stream, sequence and digest. The durable `BeginForward`
+marker is committed immediately before the adapter writer; missing or stale admission
+is not a no-input proof. Adapter receipt revisions and ACK are retained by the host
+before consumer settlement. External ACP requests and notifications cannot invoke
+these private methods. The current driver is internal; the owner trigger, policy fence,
+and automatic recovery integration are not yet connected.

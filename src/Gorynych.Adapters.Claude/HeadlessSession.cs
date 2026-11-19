@@ -23,7 +23,7 @@ namespace Gorynych.Adapters.Claude;
 /// client's prompt ends with the result of the turn that replayed its <c>uuid</c>, never with
 /// another's.
 /// </remarks>
-internal sealed class HeadlessSession : IClaudeSession
+internal sealed partial class HeadlessSession : IClaudeSession
 {
     readonly ClaudeAgent agent;
     readonly ClaudeAdapterOptions options;
@@ -32,6 +32,29 @@ internal sealed class HeadlessSession : IClaudeSession
     readonly SemaphoreSlim backgroundGate = new(1, 1);
     readonly SemaphoreSlim inputGate = new(1, 1); // orders writes against interrupts
     readonly Lock stateGate = new();
+    // In-memory only, one exact prompt per session. No I/O or authority is attached to it.
+    internal sealed record PromptObservation(string SessionId, string PromptId, string NativeUuid, string Stream, long IngressRevision);
+    PromptObservation? promptObservation;
+    ClaudeProcess? observedBackgroundOwner;
+    bool observationClosing;
+    int observingInputs;
+    long observationIngress;
+    long guardedCancelRevision;
+    int observingControls;
+    internal void ObserveInputArrival() { lock (stateGate) { observingInputs++; promptObservation = null; observationIngress++; } }
+    internal void ObserveInputDone() { lock (stateGate) if (observingInputs > 0) observingInputs--; }
+    internal PromptObservation? ReadPromptObservation(string promptId)
+    {
+        lock (stateGate)
+        {
+            var evidence = promptObservation;
+            var result = !observationClosing && evidence is not null && evidence.PromptId == promptId && process is { Exited.IsCompleted: false } live &&
+                !live.PhysicallyExited && ReferenceEquals(observedBackgroundOwner, live) && live.BackgroundStreamId == evidence.Stream && processUp && reminderBackgroundEmpty == true &&
+                !active && !ownOpen && incoming is null && turn is null && pending.Count == 0 && steers.Count == 0 &&
+                observingInputs == 0 && observingControls == 0 && asks.IsEmpty ? evidence : null;
+            return result;
+        }
+    }
     readonly CancellationTokenSource lifetime = new();
     ClaudeProcess? process;
     /// <summary>The <c>--permission-mode</c> of the latest launch.</summary>
@@ -54,6 +77,7 @@ internal sealed class HeadlessSession : IClaudeSession
     bool ownOpen;           // ... its ACP turn is open across native result cycles (an accepted steer is pending)
     readonly HashSet<string> taken = new(StringComparer.Ordinal);   // uuids the running turn replayed
     readonly List<string> pending = [];                              // written, not replayed yet
+    readonly HashSet<string> guardedPending = new(StringComparer.Ordinal); // committed guarded inputs
     readonly Dictionary<string, Note> notes = new(StringComparer.Ordinal);
     // Bounded for this adapter process only; unresolved receipts are never evicted.
     readonly Dictionary<string, ReportNoteAttempt> reportNotes = new(StringComparer.Ordinal);
@@ -167,6 +191,9 @@ internal sealed class HeadlessSession : IClaudeSession
     public Task<StopReason> PromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct, long arrivalSequence = 0) =>
         PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null, requiredStream: null);
 
+    internal Task<StopReason> ObservedPromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct,
+        long arrivalSequence, string? promptId) => PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null, requiredStream: null, promptId);
+
     internal Task<StopReason> ReminderPromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct,
         long arrivalSequence, string requiredStream) => PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null, requiredStream);
 
@@ -189,12 +216,12 @@ internal sealed class HeadlessSession : IClaudeSession
     }
 
     async Task<StopReason> PromptCoreAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct,
-        long arrivalSequence, TaskCompletionSource? started, string? requiredStream)
+        long arrivalSequence, TaskCompletionSource? started, string? requiredStream, string? promptId = null)
     {
         if (requiredStream is null) await promptGate.WaitAsync(ct);
         else if (!await promptGate.WaitAsync(0, ct))
             throw new JsonRpcException(JsonRpcException.InvalidRequest, "Claude is busy; the reminder was not sent.");
-        var current = new Turn(Guid.NewGuid().ToString());
+        var current = new Turn(Guid.NewGuid().ToString()) { PromptId = promptId is { Length: > 0 and <= 256 } ? promptId : null, ArrivalSequence = arrivalSequence };
         lock (stateGate) incoming = current;
         AdmitArrival(arrivalSequence); // a steer behind it waits for its input write, not for this admission
         try
@@ -271,7 +298,11 @@ internal sealed class HeadlessSession : IClaudeSession
                 started?.TrySetResult();
             }
             ScheduleStallCheck();
-            await using var registration = ct.Register(() => current.TryComplete(StopReason.Cancelled));
+            await using var registration = ct.Register(() =>
+            {
+                lock (stateGate) { promptObservation = null; observationIngress++; }
+                current.TryComplete(StopReason.Cancelled);
+            });
             if (await Task.WhenAny(current.Task, claude.Exited) != current.Task)
             {
                 // The result may still be on its way when the process exits right after it.
@@ -366,6 +397,7 @@ internal sealed class HeadlessSession : IClaudeSession
                 lock (stateGate)
                 {
                     steers.Remove(steer.Uuid);
+                    if (steer.Owner is { } owner) owner.SteerLost = true;
                     pending.Remove(steer.Uuid);
                     UpdateIdle();
                 }
@@ -397,9 +429,12 @@ internal sealed class HeadlessSession : IClaudeSession
         Turn? current;
         bool written, run;
         long serial;
+        string? guardedUuid;
+        GuardedReceipt? guardedObserver = null;
         var observed = new List<ReportNoteAttempt>();
         lock (stateGate)
         {
+            promptObservation = null; observationIngress++; guardedCancelRevision++;
             current = turn;
             if (current is not null) current.CancelRequested = true;
             // A note-owned native turn can have no client Turn. Preserve cancellation on
@@ -409,7 +444,14 @@ internal sealed class HeadlessSession : IClaudeSession
                     if (receipt.CycleResult is null) { receipt.CancelRequested = true; receipt.ObserverReferences++; observed.Add(receipt); }
             written = current?.Written == true;
             // A turn of Claude's own has no client prompt: it is interrupted by its active state.
-            run = active || written || ownOpen;
+            guardedUuid = guardedPending.FirstOrDefault();
+            if (guardedUuid is not null && guardedReceiptsByUuid.TryGetValue(guardedUuid, out var guardedReceipt) &&
+                ReferenceEquals(guardedReceipt.Owner, process))
+            {
+                guardedReceipt.CancelRequested = true; guardedReceipt.Revision++;
+                if (current is not { Task.IsCompleted: true }) { guardedReceipt.CancelObservers++; guardedObserver = guardedReceipt; }
+            }
+            run = active || written || ownOpen || guardedUuid is not null;
             serial = generation;
             var wake = cancelSignal;
             cancelSignal = NewSignal();
@@ -418,14 +460,18 @@ internal sealed class HeadlessSession : IClaudeSession
         foreach (var receipt in observed) QueueObservedReceipt(receipt);
         // Not written yet: the prompt sees the cancel and writes nothing.
         if (!run || current is { Task.IsCompleted: true }) return;
-        _ = InterruptAfterArrivalsAsync(current, serial, arrivalSequence);
+        _ = InterruptAfterArrivalsAsync(current, serial, arrivalSequence, guardedObserver);
     }
 
     /// <summary>A cancel goes after the prompts and steers that arrived before it, so a steer before it is written first.</summary>
-    async Task InterruptAfterArrivalsAsync(Turn? current, long serial, long arrivalSequence)
+    async Task InterruptAfterArrivalsAsync(Turn? current, long serial, long arrivalSequence, GuardedReceipt? guarded)
     {
-        await WaitArrivalsBefore(arrivalSequence, CancellationToken.None);
-        await InterruptAsync(current, serial);
+        try
+        {
+            await WaitArrivalsBefore(arrivalSequence, CancellationToken.None);
+            await InterruptAsync(current, serial, guarded);
+        }
+        finally { if (guarded is not null) lock (stateGate) { guarded.CancelObservers--; guarded.Revision++; } }
     }
 
     /// <summary>Withdraws the approvals still open; Claude does not wait for them once its turn is over.</summary>
@@ -443,11 +489,12 @@ internal sealed class HeadlessSession : IClaudeSession
     /// The turn ends with its result; without one, Claude's process is stopped, and the next prompt
     /// resumes the conversation in a new one.
     /// </summary>
-    async Task InterruptAsync(Turn? current, long serial)
+    async Task InterruptAsync(Turn? current, long serial, GuardedReceipt? guarded)
     {
         if (options.BeforeInterrupt is { } hook) await hook();
         if (process is not { Exited.IsCompleted: false } claude)
         {
+            if (guarded is not null) lock (stateGate) { guarded.CancelUnresolved = true; guarded.Uncertain = true; guarded.Revision++; }
             current?.TryComplete(StopReason.Cancelled);
             return;
         }
@@ -458,9 +505,20 @@ internal sealed class HeadlessSession : IClaudeSession
             // The turn may have ended while this waited; an interrupt now would stop the next prompt.
             lock (stateGate)
             {
+                if (!ReferenceEquals(process, claude))
+                {
+                    if (guarded is not null) { guarded.CancelUnresolved = true; guarded.Uncertain = true; guarded.Revision++; }
+                    return;
+                }
                 if (current is not null)
                     if (!ReferenceEquals(turn, current) || current.Task.IsCompleted) return;
-                if (current is null && ((!active && !ownOpen) || generation != serial)) return;
+                if (guarded is not null && (!ReferenceEquals(guarded.Owner, claude) ||
+                    !guardedPending.Contains(guarded.Uuid) || guarded.CycleResult is not null || guarded.NativeCancelled))
+                {
+                    // A guarded-only cancellation must not interrupt the next native cycle.
+                    if (current is null) return;
+                }
+                else if (current is null && guarded is null && ((!active && !ownOpen) || generation != serial)) return;
                 foreach (var uuid in pending.Concat(taken).Distinct(StringComparer.Ordinal))
                     if (reportNotesByUuid.TryGetValue(uuid, out var receipt)) lock (receipt)
                     {
@@ -470,15 +528,36 @@ internal sealed class HeadlessSession : IClaudeSession
                     }
             }
             foreach (var receipt in cancellingReceipts) agent.QueueReportReceipt(Id, receipt);
-            var response = await claude.ControlAsync(new JsonObject { ["subtype"] = "interrupt", ["cancel_queued"] = true }, TimeSpan.FromSeconds(5));
+            var request = new JsonObject { ["subtype"] = "interrupt", ["cancel_queued"] = true };
+            JsonObject? response;
+            if (current is null && guarded is not null)
+            {
+                bool StillTargeted()
+                {
+                    lock (stateGate)
+                        return ReferenceEquals(process, claude) && ReferenceEquals(guarded.Owner, claude) &&
+                            !claude.Exited.IsCompleted && !claude.PhysicallyExited && generation == serial &&
+                            guardedReceiptsByUuid.TryGetValue(guarded.Uuid, out var found) && ReferenceEquals(found, guarded) &&
+                            guardedPending.Contains(guarded.Uuid) && guarded.CycleResult is null && !guarded.NativeCancelled;
+                }
+                response = await claude.ControlGuardedAsync(request, TimeSpan.FromSeconds(5), StillTargeted);
+                if (response is null)
+                {
+                    foreach (var receipt in cancellingReceipts) lock (receipt) receipt.CancelReceiptPending = false;
+                    foreach (var receipt in cancellingReceipts) QueueObservedReceipt(receipt);
+                    return;
+                }
+            }
+            else response = await claude.ControlAsync(request, TimeSpan.FromSeconds(5));
             // Probed with 2.1.302: {still_queued: [], cancelled: [uuids it dropped from the queue]}.
             if (response["cancelled"] is not JsonArray cancelled || cancelled.Any(n => n is not JsonValue v || !v.TryGetValue<string>(out _)))
                 throw new IOException("Native interrupt did not return a valid cancelled UUID list");
-            foreach (var uuid in cancelled.Select(n => (string)n!)) Drop(uuid, error: null);
+            foreach (var uuid in cancelled.Select(n => (string)n!)) Drop(uuid, error: null, claude);
             foreach (var receipt in cancellingReceipts) lock (receipt) receipt.CancelReceiptPending = false;
         }
         catch (Exception e) when (e is IOException or TimeoutException or ClaudeControlException or ObjectDisposedException)
         {
+            if (guarded is not null) lock (stateGate) { guarded.CancelUnresolved = true; guarded.Uncertain = true; guarded.Revision++; }
             foreach (var receipt in cancellingReceipts) lock (receipt)
                 receipt.Uncertainty = "Native interrupt receipt was not confirmed; do not retry blindly";
             agent.Log($"claude {Id}: interrupt failed: {e.Message}");
@@ -500,6 +579,9 @@ internal sealed class HeadlessSession : IClaudeSession
                 await Task.Delay(50);
             }
         }
+        // A tainted stream is already closing gracefully. Do not detach/kill its owner or
+        // permit a competing resume before the original process has actually exited.
+        if (claude.InputTainted) { current?.TryComplete(StopReason.Cancelled); return; }
         // Given up before the turn ends, so a prompt sent as soon as the client reads the end starts a new process.
         Abandon(claude, "no result after the interrupt; the next prompt resumes the session in a new process");
         current?.TryComplete(StopReason.Cancelled);
@@ -510,7 +592,7 @@ internal sealed class HeadlessSession : IClaudeSession
     /// with the process. A live note's waiter learns of it; the client's prompt ends with
     /// <paramref name="error"/>, or as cancelled without one.
     /// </summary>
-    void Drop(string uuid, Exception? error)
+    void Drop(string uuid, Exception? error, ClaudeProcess? cancellationOwner = null)
     {
         Note? note;
         Steer? steer;
@@ -518,8 +600,17 @@ internal sealed class HeadlessSession : IClaudeSession
         ReportNoteAttempt? observedReceipt = null; bool retiredReference = false;
         lock (stateGate)
         {
-            pending.Remove(uuid);
+            pending.Remove(uuid); guardedPending.Remove(uuid);
+            if (guardedReceiptsByUuid.TryGetValue(uuid, out var guarded))
+            {
+                if (error is null && cancellationOwner is not null && !cancellationOwner.PhysicallyExited && !cancellationOwner.Exited.IsCompleted &&
+                    ReferenceEquals(guarded.Owner, cancellationOwner) && ReferenceEquals(process, cancellationOwner))
+                { guarded.NativeCancelled = true; if (guarded.Taken) guarded.Contradiction = true; }
+                else guarded.Uncertain = true;
+                guarded.Revision++;
+            }
             steers.Remove(uuid, out steer);
+            if (steer?.Owner is { } owner) owner.SteerLost = true;
             notes.Remove(uuid, out note);
             var receipt = reportNotesByUuid.GetValueOrDefault(uuid);
             if (receipt is null) { receipt = agent.FindRetiredReportNote(uuid, Id); retiredReference = receipt is not null; }
@@ -795,6 +886,9 @@ internal sealed class HeadlessSession : IClaudeSession
                     running = process is { Exited.IsCompleted: false } p ? p : null;
                     busy = Busy;
                 }
+                if (running?.InputTainted == true)
+                    throw new JsonRpcException(JsonRpcException.InternalError,
+                        "Claude is retiring an uncertain input stream; retry after the process exits.");
                 if (isFull && !wasFull)
                 {
                     // Claude cannot enter bypassPermissions in a process started without it (only
@@ -807,9 +901,15 @@ internal sealed class HeadlessSession : IClaudeSession
                 }
                 else if (running is not null)
                 {
-                    try { await running.ControlAsync(request, TimeSpan.FromSeconds(15), ct); }
+                    try
+                    {
+                        await running.ControlAsync(request, TimeSpan.FromSeconds(15), ct);
+                    }
                     catch (Exception e) when (e is ClaudeControlException or IOException or TimeoutException)
                     {
+                        if (running.InputTainted)
+                            throw new JsonRpcException(JsonRpcException.InternalError,
+                                "Claude is retiring an uncertain input stream; the mode change was not confirmed.");
                         if (!(wasFull && !isFull)) throw new JsonRpcException(JsonRpcException.InternalError, $"Claude did not take the change: {e.Message}");
                         // Leaving Full access must hold before Claude's next tool call: a Claude that kept it is stopped.
                         Abandon(running, $"it did not leave full access ({e.Message})");
@@ -973,7 +1073,12 @@ internal sealed class HeadlessSession : IClaudeSession
             ObjectDisposedException.ThrowIf(disposed, this);
             if (process is { } previous)
             {
-                if (!previous.Exited.IsCompleted) return previous;
+                if (!previous.Exited.IsCompleted)
+                {
+                    if (previous.InputTainted) throw new JsonRpcException(JsonRpcException.InternalError,
+                        "Claude is retiring an uncertain input stream; retry after the process exits.");
+                    return previous;
+                }
                 OnExited(previous, previous.Exited.Result); // whichever runs first resets the state
             }
             Task reset;
@@ -1020,7 +1125,7 @@ internal sealed class HeadlessSession : IClaudeSession
             {
                 titleReady.TrySetResult(false);
                 // Nothing runs that was not checked: a launch that failed, timed out or was cancelled is stopped.
-                lock (stateGate) if (ReferenceEquals(process, claude)) process = null;
+                lock (stateGate) if (ReferenceEquals(process, claude)) { process = null; observedBackgroundOwner = null; reminderBackgroundEmpty = null; promptObservation = null; }
                 await claude.StopAsync(TimeSpan.FromMilliseconds(options.CloseTimeoutMs));
                 await claude.DisposeAsync();
                 throw;
@@ -1061,17 +1166,20 @@ internal sealed class HeadlessSession : IClaudeSession
         ClaudeProcess? started = null;
         // Lines of a process the session gave up (abandoned, or replaced) are dropped: they must not start turns or answer approvals.
         var claude = ClaudeProcess.Start(exe, args, Cwd, ClaudeEnvironment.ForSession(), Path.Combine(Folder, "stderr.log"),
-            m => IsCurrent(started!) ? OnMessageAsync(started!, m) : Task.CompletedTask, agent.Log);
+            m => IsCurrent(started!) ? OnMessageAsync(started!, m) : Task.CompletedTask, agent.Log, allowForceKill: !options.DisableForceKillForTests);
         started = claude;
+        options.NativeProcessStartedForTests?.Invoke(claude);
         lock (stateGate)
         {
             process = claude;
+            observedBackgroundOwner = null; reminderBackgroundEmpty = null;
+            promptObservation = null; observationIngress++;
             processUp = false;
             backgroundReported = false;
             active = activeOwn = activeMarked = false;
             ownOpen = false;
             taken.Clear();
-            pending.Clear();
+            pending.Clear(); guardedPending.Clear();
             notes.Clear();
             steers.Clear();
             UpdateIdle();
@@ -1103,12 +1211,17 @@ internal sealed class HeadlessSession : IClaudeSession
         {
             if (!ReferenceEquals(process, claude)) return;
             process = null;
+            foreach (var guarded in guardedReceipts.Values)
+                if (ReferenceEquals(guarded.Owner, claude) && guarded.Committed && guarded.CycleResult is null && !guarded.NativeCancelled)
+                    { guarded.Uncertain = true; guarded.Revision++; }
+            observedBackgroundOwner = null; reminderBackgroundEmpty = null;
+            promptObservation = null; observationIngress++;
             if (agent.ClientHasSubagents) nativeSubagentReset = Task.Run(LoseNativeSubagentsAsync);
             own = ownOpen || (active && activeOwn && activeMarked);
             active = activeOwn = activeMarked = false;
             ownOpen = false;
             taken.Clear();
-            pending.Clear();
+            pending.Clear(); guardedPending.Clear();
             steers.Clear();
             lost = notes.Values.ToList();
             observed = [];
@@ -1165,6 +1278,7 @@ internal sealed class HeadlessSession : IClaudeSession
                 if ((owner is not null && !ReferenceEquals(process, owner)) || (exited && process is not null)) return;
                 if (initial && backgroundReported) return;
                 reminderBackgroundEmpty = owner is not null && tasks is not null ? tasks.Count == 0 : null;
+                observedBackgroundOwner = owner is not null && tasks is not null ? owner : null;
                 if (owner is not null && !initial) backgroundReported = true;
             }
             await EmitAsync(new SessionInfoUpdate { Meta = new JsonObject
@@ -1184,9 +1298,29 @@ internal sealed class HeadlessSession : IClaudeSession
         lock (stateGate) return ReferenceEquals(process, claude);
     }
 
+    // This frame can preserve an existing exact result witness, never create one.
+    internal static bool PreservesCompletedCommandObservation(JsonObject m, PromptObservation? witness,
+        bool currentLiveOwner, string stream, string session)
+    {
+        static string? Text(JsonNode? node) => node is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+        return witness is not null && currentLiveOwner && witness.Stream == stream && witness.SessionId == session &&
+            Text(m["type"]) == "command_lifecycle" && Text(m["state"]) == "completed" &&
+            Text(m["command_uuid"]) == witness.NativeUuid &&
+            (!m.ContainsKey("session_id") || Text(m["session_id"]) == session);
+    }
+
     async Task OnMessageAsync(ClaudeProcess claude, JsonObject m)
     {
-        lock (stateGate) lastOutput = Environment.TickCount64;
+        lock (stateGate)
+        {
+            var preserves = PreservesCompletedCommandObservation(m, promptObservation,
+                ReferenceEquals(process, claude) && !claude.PhysicallyExited && !claude.Exited.IsCompleted && processUp && !observationClosing,
+                claude.BackgroundStreamId, Id);
+            lastOutput = Environment.TickCount64; observationIngress++;
+            if (preserves) promptObservation = promptObservation! with { IngressRevision = observationIngress };
+            else promptObservation = null;
+            if (StreamJson.Type(m) == "control_request") observingControls++;
+        }
         if (agent.ClientHasSubagents)
         {
             await nativeSubagentGate.WaitAsync();
@@ -1246,7 +1380,7 @@ internal sealed class HeadlessSession : IClaudeSession
                 if (StreamJson.IsSubagent(m)) return;
                 if (StreamJson.IsReplay(m))
                 {
-                    await OnReplayAsync(m);
+                    await OnReplayAsync(claude, m);
                     return;
                 }
                 foreach (var detail in StreamJson.ToolResultDetails(m, id => toolNames.GetValueOrDefault(id)))
@@ -1275,10 +1409,10 @@ internal sealed class HeadlessSession : IClaudeSession
                 await ReportBackgroundAsync(ParseBackgroundTasks(m), claude);
                 return;
             case "result":
-                await OnResultAsync(m);
+                await OnResultAsync(claude, m);
                 return;
             case "control_request":
-                _ = OnControlRequestAsync(claude, m);
+                _ = ObserveControlAsync(claude, m);
                 return;
             case "control_cancel_request":
                 if ((string?)m["request_id"] is { } withdrawn && asks.TryRemove(withdrawn, out var cts))
@@ -1286,6 +1420,12 @@ internal sealed class HeadlessSession : IClaudeSession
                     catch (ObjectDisposedException) { }
                 return;
         }
+    }
+
+    async Task ObserveControlAsync(ClaudeProcess claude, JsonObject message)
+    {
+        try { await OnControlRequestAsync(claude, message); }
+        finally { lock (stateGate) observingControls--; }
     }
 
     /// <summary>Starts a turn in the state when none runs; under stateGate.</summary>
@@ -1313,8 +1453,9 @@ internal sealed class HeadlessSession : IClaudeSession
         if (mark) await MarkOwnTurnAsync("started");
     }
 
-    async Task OnReplayAsync(JsonObject m)
+    async Task OnReplayAsync(ClaudeProcess owner, JsonObject m)
     {
+        lock (stateGate) if (!ReferenceEquals(process, owner)) return;
         var uuid = (string?)m["uuid"] ?? "";
         Note? note;
         Steer? steer;
@@ -1322,6 +1463,7 @@ internal sealed class HeadlessSession : IClaudeSession
         var mark = false;
         lock (stateGate)
         {
+            if (!ReferenceEquals(process, owner)) return;
             // Claude's record of a command it ran (set_model's "Set model to …"): no message it takes,
             // so no turn starts and no result comes. Counted as a turn, it would hold every later prompt.
             if (!pending.Contains(uuid) && StreamJson.UserText(m) is { } text && StreamJson.IsCommandRecord(text)) return;
@@ -1354,12 +1496,20 @@ internal sealed class HeadlessSession : IClaudeSession
             {
                 if (!active) BeginTurn(own: turn?.Uuid != uuid);
                 taken.Add(uuid);
+                if (turn is { } promptTurn && promptTurn.Uuid == uuid) promptTurn.Echoed = true;
                 if (note is not null)
                 {
                     mark = activeOwn && !activeMarked && !ownOpen;
                     activeMarked = true;
                     if (mark) ownOpen = true;
                 }
+            }
+            if (guardedReceiptsByUuid.TryGetValue(uuid, out var guarded) && guarded.Committed &&
+                ReferenceEquals(guarded.Owner, owner) && ReferenceEquals(process, owner) && !owner.PhysicallyExited &&
+                !owner.Exited.IsCompleted && guarded.CycleResult is null)
+            {
+                guarded.Taken = true; guarded.TakenCycle = generation; guarded.Revision++;
+                if (guarded.NativeCancelled) guarded.Contradiction = true;
             }
             UpdateIdle();
         }
@@ -1385,7 +1535,7 @@ internal sealed class HeadlessSession : IClaudeSession
         return text[..end] + (end < text.Length ? " [truncated]" : "");
     }
 
-    async Task OnResultAsync(JsonObject m)
+    async Task OnResultAsync(ClaudeProcess owner, JsonObject m)
     {
         Turn? current;
         bool own, waiting, deferred = false;
@@ -1393,6 +1543,7 @@ internal sealed class HeadlessSession : IClaudeSession
         var observedReceipts = new List<ReportNoteAttempt>();
         lock (stateGate)
         {
+            if (!ReferenceEquals(process, owner)) return;
             // Only the turn that took the client's prompt, or one waiting for its accepted steers,
             // ends it. A later native cycle that took a pending steer stays part of that ACP turn.
             current = turn is { } t && (taken.Contains(t.Uuid) || t.Deferred is not null) ? t : null;
@@ -1418,7 +1569,20 @@ internal sealed class HeadlessSession : IClaudeSession
                     }
                     receipt.Uncertainty = null;
                 }
+            if (ReferenceEquals(process, owner) && !owner.PhysicallyExited && !owner.Exited.IsCompleted)
+                foreach (var uuid in taken)
+                    if (guardedReceiptsByUuid.TryGetValue(uuid, out var guarded) && ReferenceEquals(guarded.Owner, owner) &&
+                        guarded.Taken && guarded.TakenCycle == generation && guarded.CycleResult is null)
+                    {
+                        // A cancel request alone is not proof the native result was cancelled.
+                        var stop = StreamJson.StopReasonOf(m, false);
+                        guarded.CycleResult = nativeError is not null ? "failed" : stop == StopReason.EndTurn ? "ended" : "stopped";
+                        guarded.NativeStop = stop.ToString(); guarded.NativeSubtype = BoundedReportNativeField(m["subtype"]);
+                        guarded.NativeTerminal = BoundedReportNativeField(m["terminal_reason"]); guarded.Revision++;
+                        if (guarded.NativeCancelled) guarded.Contradiction = true;
+                    }
             active = activeOwn = activeMarked = false;
+            foreach (var uuid in taken) guardedPending.Remove(uuid);
             taken.Clear();
             generation++;
             authError = authenticationError;
@@ -1440,6 +1604,14 @@ internal sealed class HeadlessSession : IClaudeSession
             }
             if (!deferred && !hasPending) ownOpen = false;
             waiting = pending.Count > 0;
+            if (current is { Echoed: true, CancelRequested: false, SteerLost: false, PromptId: { } exact } && !current.Task.IsCompleted && !deferred && !hasPending &&
+                error is null && !waiting && steers.Count == 0 && observingControls == 0 && asks.IsEmpty &&
+                observingInputs == 1 && current.ArrivalSequence != 0 && process is { Exited.IsCompleted: false } live &&
+                ReferenceEquals(owner, live) && !live.PhysicallyExited && ReferenceEquals(observedBackgroundOwner, live) && !observationClosing && processUp && reminderBackgroundEmpty == true &&
+                StreamJson.StopReasonOf(m, current.CancelRequested) == StopReason.EndTurn)
+            {
+                promptObservation = new PromptObservation(Id, exact, current.Uuid, live.BackgroundStreamId, observationIngress);
+            }
             UpdateIdle();
         }
         foreach (var receipt in observedReceipts) QueueObservedReceipt(receipt);
@@ -1489,7 +1661,7 @@ internal sealed class HeadlessSession : IClaudeSession
                 .Select(s => s.Uuid).ToList();
             foreach (var uuid in removed)
             {
-                steers.Remove(uuid);
+                if (steers.Remove(uuid, out var lost) && lost.Owner is { } lostOwner) lostOwner.SteerLost = true;
                 pending.Remove(uuid);
             }
             if (removed.Count > 0) UpdateIdle();
@@ -1650,6 +1822,7 @@ internal sealed class HeadlessSession : IClaudeSession
 
     public async ValueTask DisposeAsync()
     {
+        lock (stateGate) { observationClosing = true; promptObservation = null; observationIngress++; }
         // No launch may start after this; one under way finishes first.
         var gated = await launchGate.WaitAsync(TimeSpan.FromSeconds(30));
         try
@@ -1706,6 +1879,10 @@ internal sealed class HeadlessSession : IClaudeSession
     {
         readonly TaskCompletionSource<StopReason> done = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public string Uuid { get; } = uuid;
+        public string? PromptId { get; init; }
+        public long ArrivalSequence { get; init; }
+        public bool Echoed { get; set; }
+        public bool SteerLost { get; set; }
         public bool Written { get; set; }
 
         /// <summary>The prompt's input write is done (or failed): a steer behind it may go in.</summary>

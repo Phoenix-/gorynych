@@ -44,6 +44,7 @@ public sealed class HostLink
 
     public int ProcessId { get; init; }
     public string? ProcessStart { get; init; }
+    internal string? CompletionProcessStart { get; init; }
 
     internal readonly HashSet<string> Sessions = new(StringComparer.Ordinal); // under the AgentHost's linksGate
     internal int Opening; // opens on their way to it; under linksGate
@@ -150,7 +151,9 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         },
         ClientInfo = new Implementation { Name = "gorynych", Title = "Gorynych", Version = Version },
         Meta = Name is "codex" or "claude" ? new JsonObject { [GorynychProtocol.MetaSubagentLiveState] = true,
-            [GorynychProtocol.CapHostCodexProvisionalIdle] = Name == "codex" && Hosts is not null } : null,
+            [GorynychProtocol.CapHostCodexProvisionalIdle] = Name == "codex" && Hosts is not null,
+            [GorynychProtocol.CapHostClaudePromptObservation] = Name == "claude" && Hosts is not null,
+            [GorynychProtocol.CapHostCompletionGuarded] = Name == "claude" && Hosts is not null } : null,
     };
 
     /// <summary>The adapter-wide connection, for a list or what no session has open: started, or waited for.</summary>
@@ -503,6 +506,7 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         {
             HostId = hello.HostId, Slot = hello.Slot, Generation = hello.Generation, ProcessId = hello.ProcessId,
             ProcessStart = ProcessStartedAt(hello.ProcessId),
+            CompletionProcessStart = ProcessIncarnation.Read(hello.ProcessId),
             Current = expected is null || expected.Same(hello.Generation),
             ForSession = hello.Slot.Contains('.'),
         };

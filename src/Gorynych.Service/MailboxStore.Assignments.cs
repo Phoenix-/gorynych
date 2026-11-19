@@ -16,7 +16,8 @@ internal sealed partial class MailboxStore
         while (copy.Count >= assignmentCapacity)
         {
             var victim = copy.Where(p => (string?)p.Value?["status"] is "completed" or "cancelled" or "failed" &&
-                    (string?)p.Value?["delivery"] is "delivered" or "failed" or "suppressed")
+                    (string?)p.Value?["delivery"] is "delivered" or "failed" or "suppressed" &&
+                    CompletionAllowsAssignmentEviction(p.Key, p.Value!.AsObject()))
                 .OrderBy(p => (long)p.Value!["sequence"]!).ThenBy(p => p.Key, StringComparer.Ordinal)
                 .Select(p => p.Key).FirstOrDefault();
             if (victim is null) throw new InvalidOperationException("Assignment storage is full of active or unresolved assignments");
@@ -49,7 +50,7 @@ internal sealed partial class MailboxStore
     static JsonObject AssignmentView(string id, JsonObject item)
     {
         var view = item.DeepClone().AsObject();
-        view.Remove("fingerprint"); view.Remove("operations"); view["assignmentId"] = id;
+        view.Remove("fingerprint"); view.Remove("operations"); view.Remove("completionReminder"); view["assignmentId"] = id;
         return view;
     }
 

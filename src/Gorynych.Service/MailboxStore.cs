@@ -1,4 +1,6 @@
 using System.Text.Json.Nodes;
+using System.Security.Cryptography;
+using System.Text;
 using Gorynych.Acp.Hosting;
 
 namespace Gorynych.Service;
@@ -15,26 +17,49 @@ internal sealed partial class MailboxStore
     internal int CapacityForTests { set { if (value <= 0) throw new ArgumentOutOfRangeException(nameof(value)); lock (gate) capacity = value; } }
     readonly TimeProvider clock;
     readonly Lock gate = new();
+    bool publicationUncertain;
+    byte[]? committedDigest, recoveryBefore, recoveryAfter;
+    string? recoveryClaimId;
+    bool recoveryClaimStarted;
     JsonArray entries;
     long next;
     long trimmedThrough;
+    string? completionStream;
+    long completionNext;
     internal Action<string, string> WriteFile { get; set; } = static (path, json) => AtomicFile.WriteAllText(path, json);
 
-    internal MailboxStore(string path, int capacity = 5000, int waitCapacity = 1000, TimeProvider? clock = null, int assignmentCapacity = 1000)
+    internal MailboxStore(string path, int capacity = 5000, int waitCapacity = 1000, TimeProvider? clock = null, int assignmentCapacity = 1000, int completionClaimCapacity = 64, int completionReceiptCapacity = 64)
     {
         this.path = path;
         this.clock = clock ?? TimeProvider.System;
         this.capacity = capacity > 0 ? capacity : throw new ArgumentOutOfRangeException(nameof(capacity));
         this.waitCapacity = waitCapacity > 0 ? waitCapacity : throw new ArgumentOutOfRangeException(nameof(waitCapacity));
         this.assignmentCapacity = assignmentCapacity > 0 ? assignmentCapacity : throw new ArgumentOutOfRangeException(nameof(assignmentCapacity));
+        this.completionClaimCapacity = completionClaimCapacity > 0 ? completionClaimCapacity : throw new ArgumentOutOfRangeException(nameof(completionClaimCapacity));
+        this.completionReceiptCapacity = completionReceiptCapacity > 0 ? completionReceiptCapacity : throw new ArgumentOutOfRangeException(nameof(completionReceiptCapacity));
         if (File.Exists(path))
         {
-            var root = JsonNode.Parse(File.ReadAllText(path))?.AsObject() ?? throw new InvalidDataException("Invalid mailbox state");
+            var bytes = File.ReadAllBytes(path);
+            committedDigest = SHA256.HashData(bytes);
+            var root = ParseSnapshot(bytes) ?? throw new InvalidDataException("Invalid mailbox state");
             entries = root["entries"]?.AsArray() ?? throw new InvalidDataException("Missing mailbox entries");
             next = (long?)root["next"] ?? throw new InvalidDataException("Missing mailbox sequence");
             trimmedThrough = (long?)root["trimmedThrough"] ?? 0;
             if (root["replyWaits"] is { } retained) replyWaits = retained.AsObject();
             if (root["assignments"] is { } existingAssignments) assignments = existingAssignments.AsObject();
+            if (root["completionReceipts"] is { } receipts) completionReceipts = receipts.AsObject();
+            if (root["completionStream"] is { } streamNode)
+            {
+                completionStream = (string?)streamNode;
+                completionNext = (long?)root["completionNext"] ?? throw new InvalidDataException("Missing completion sequence");
+                if (!Guid.TryParseExact(completionStream, "N", out _) || completionStream != completionStream.ToLowerInvariant() || completionNext < 0)
+                    throw new InvalidDataException("Invalid completion stream");
+            }
+            else if (root["completionNext"] is not null) throw new InvalidDataException("Missing completion stream");
+            // A prior process may have handed input off after recording started. Never replay it.
+            foreach (var assignment in assignments.Select(p => p.Value).OfType<JsonObject>())
+                if ((string?)assignment["completionReminder"]?["disposition"] == "handoff_started")
+                    assignment["completionReminder"]!["disposition"] = "uncertain";
         }
         else entries = [];
     }
@@ -265,16 +290,110 @@ internal sealed partial class MailboxStore
         }
     }
 
-    void Save(JsonArray replacement, long sequence, long? trimmed = null, JsonObject? waits = null, JsonObject? assigned = null)
+    void Save(JsonArray replacement, long sequence, long? trimmed = null, JsonObject? waits = null, JsonObject? assigned = null,
+        string? completionClaimId = null, bool completionClaimStarted = false, JsonObject? receipts = null,
+        string? newCompletionStream = null, long? newCompletionNext = null)
     {
+        if (publicationUncertain) throw new InvalidOperationException("Mailbox publication is uncertain; reconcile before writing");
         var root = new JsonObject { ["next"] = sequence, ["entries"] = replacement, ["trimmedThrough"] = trimmed ?? trimmedThrough };
         if (waits is not null || replyWaits.Count > 0) root["replyWaits"] = waits ?? replyWaits.DeepClone();
         if (assigned is not null || assignments.Count > 0) root["assignments"] = assigned ?? assignments.DeepClone();
-        WriteFile(path, root.ToJsonString());
+        if (receipts is not null || completionReceipts.Count > 0) root["completionReceipts"] = receipts ?? completionReceipts.DeepClone();
+        var stream = newCompletionStream ?? completionStream;
+        if (stream is not null) { root["completionStream"] = stream; root["completionNext"] = newCompletionNext ?? completionNext; }
+        // AtomicFile.WriteAllText uses UTF-8 without a BOM. Hash the exact encoded bytes
+        // incrementally to avoid another mailbox-sized byte array or a persistent DOM clone.
+        var json = root.ToJsonString(); var candidateDigest = Utf8Digest(json);
+        try { WriteFile(path, json); }
+        catch when (completionClaimId is not null)
+        {
+            publicationUncertain = true;
+            recoveryBefore = committedDigest; recoveryAfter = candidateDigest;
+            recoveryClaimId = completionClaimId; recoveryClaimStarted = completionClaimStarted;
+            ReconcileCompletionPublicationLocked();
+            throw;
+        }
+        committedDigest = candidateDigest;
         entries = root["entries"]!.AsArray();
         if (waits is not null) replyWaits = waits;
         if (assigned is not null) assignments = assigned;
+        if (receipts is not null) completionReceipts = receipts;
+        completionStream = stream; completionNext = newCompletionNext ?? completionNext;
         next = sequence;
         trimmedThrough = trimmed ?? trimmedThrough;
+    }
+
+    static byte[] Utf8Digest(string text)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var encoder = Encoding.UTF8.GetEncoder(); var remaining = text.AsSpan();
+        Span<byte> buffer = stackalloc byte[4096];
+        while (!remaining.IsEmpty)
+        {
+            encoder.Convert(remaining, buffer, true, out var chars, out var bytes, out _);
+            hash.AppendData(buffer[..bytes]); remaining = remaining[chars..];
+        }
+        return hash.GetHashAndReset();
+    }
+
+    static JsonObject? ParseSnapshot(byte[] bytes)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        using var reader = new StreamReader(stream, detectEncodingFromByteOrderMarks: true);
+        return JsonNode.Parse(reader.ReadToEnd())?.AsObject();
+    }
+
+    // Force object materialization at every depth, rejecting duplicate property names.
+    static void ValidateSnapshot(JsonNode? node)
+    {
+        if (node is JsonObject obj) foreach (var item in obj) ValidateSnapshot(item.Value);
+        else if (node is JsonArray arr) foreach (var item in arr) ValidateSnapshot(item);
+    }
+
+    // Explicit retry is available when the canonical file was temporarily unreadable.
+    internal bool ReconcileCompletionPublication()
+    {
+        lock (gate) return ReconcileCompletionPublicationLocked();
+    }
+
+    bool ReconcileCompletionPublicationLocked()
+    {
+        if (!publicationUncertain) return true;
+        try
+        {
+            // Read once: the bytes that are hashed are exactly those that are parsed/adopted.
+            var bytes = File.ReadAllBytes(path); var digest = SHA256.HashData(bytes);
+            var before = recoveryBefore is not null && CryptographicOperations.FixedTimeEquals(digest, recoveryBefore);
+            var after = recoveryAfter is not null && CryptographicOperations.FixedTimeEquals(digest, recoveryAfter);
+            if (!before && !after) return false;
+            var disk = ParseSnapshot(bytes);
+            if (disk is null) return false;
+            ValidateSnapshot(disk);
+            if (before)
+            {
+                // The live in-memory state was never changed; do not replace its recovered facts.
+            }
+            else if (after)
+            {
+                committedDigest = digest;
+                entries = disk["entries"]!.AsArray(); next = (long)disk["next"]!;
+                trimmedThrough = (long?)disk["trimmedThrough"] ?? 0;
+                replyWaits = disk["replyWaits"]?.AsObject() ?? new JsonObject();
+                assignments = disk["assignments"]?.AsObject() ?? new JsonObject();
+                completionReceipts = disk["completionReceipts"]?.AsObject() ?? new JsonObject();
+                completionStream = (string?)disk["completionStream"];
+                completionNext = (long?)disk["completionNext"] ?? 0;
+                if (completionStream is not null && (!Guid.TryParseExact(completionStream, "N", out _) || completionNext < 0))
+                    throw new InvalidDataException("Invalid completion stream");
+                // An error after the claim write cannot grant a dispatch, and its delivery is unknown.
+                if (recoveryClaimStarted && assignments[recoveryClaimId!]?["completionReminder"] is JsonObject claim &&
+                    (string?)claim["disposition"] == "handoff_started") claim["disposition"] = "uncertain";
+            }
+            else return false;
+            publicationUncertain = false; recoveryBefore = null; recoveryAfter = null; recoveryClaimId = null;
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException or InvalidOperationException or ArgumentException)
+        { return false; }
     }
 }

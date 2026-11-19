@@ -288,6 +288,39 @@ public sealed partial class Conductor
     JsonObject? AssignmentFor(string source, string id, string actor) => source == "spawn"
         ? store.FindSpawnAssignment(id, actor) : mailbox.FindAssignment(id, actor);
 
+    internal JsonObject ListCompletionNotices(JsonRpcRequest request)
+    {
+        var owner = MailboxPeer(request);
+        var args = AssignmentParams(request, "cursor", "limit");
+        var limit = 32;
+        if (args.TryGetPropertyValue("limit", out var n) && (n is not JsonValue v || !v.TryGetValue<int>(out limit) || limit is < 1 or > 100))
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "limit must be 1..100");
+        string? cursor = null;
+        if (args.TryGetPropertyValue("cursor", out var raw) && (raw is not JsonValue cv || !cv.TryGetValue<string>(out cursor) || cursor.Length > 65))
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "Invalid notice cursor");
+        try { return mailbox.ListCompletionUnknownReceipts(owner, cursor, limit); }
+        catch (InvalidOperationException) { throw new JsonRpcException(JsonRpcException.InvalidRequest, "Completion notices temporarily unavailable"); }
+    }
+
+    internal JsonObject AckCompletionNotice(JsonRpcRequest request)
+    {
+        var owner = MailboxPeer(request);
+        var args = AssignmentParams(request, "assignmentId", "assignee", "generation", "revision", "attemptId");
+        var id = RequiredMailboxText(args, "assignmentId"); var assignee = RequiredMailboxText(args, "assignee");
+        var generation = RequiredMailboxText(args, "generation"); var attempt = RequiredMailboxText(args, "attemptId");
+        if (id.Length > 256 || assignee.Length > 512 || !Guid.TryParseExact(generation, "N", out _) ||
+            !Guid.TryParseExact(attempt, "N", out _) || args["revision"] is not JsonValue v ||
+            !v.TryGetValue<long>(out var revision) || revision < 1)
+            throw new JsonRpcException(JsonRpcException.InvalidParams, "Invalid notice identity");
+        try
+        {
+            if (!mailbox.AckCompletionUnknownReceipt(owner, id, assignee, generation, revision, attempt))
+                throw new JsonRpcException(JsonRpcException.InvalidParams, "Notice unavailable or not accessible");
+            return new JsonObject { ["acknowledged"] = true };
+        }
+        catch (InvalidOperationException) { throw new JsonRpcException(JsonRpcException.InvalidRequest, "Completion notices temporarily unavailable"); }
+    }
+
     internal JsonObject ReadAssignment(JsonRpcRequest request)
     {
         var actor = MailboxPeer(request); var args = AssignmentParams(request, "source", "assignmentId");

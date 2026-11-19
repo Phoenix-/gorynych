@@ -149,6 +149,9 @@ await using var conductor = new Conductor(new ConductorOptions
     DataDirectory = dataDirectory,
     ServiceId = state.ServiceId,
     DefaultAgent = line.Value("--default-agent"),
+    CompletionConfiguration = line.Value("--completion-project") is { } completionProject &&
+        line.Value("--completion-group") is { } completionGroup && line.Value("--completion-instance") is { } completionInstance
+        ? (completionProject, completionGroup, completionInstance) : null,
     SessionDefaults = sessionDefaults,
     UnloadAfter = UnloadAfter(line.Value("--unload-after")),
     PeerServerCommand = line.Flag("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
@@ -229,6 +232,8 @@ static List<IAgentAdapter> Adapters(CommandLine line, string dataDirectory, bool
         ChannelServerCommand = line.Flag("--no-channel") ? null : [Environment.ProcessPath!, "peers"],
         Channels = Channels(line.Value("--claude-channels")),
         AutoTitle = true,
+        HostedPromptObservation = hosted,
+        HostedCompletionGuarded = hosted,
         Log = ServiceLog.Info,
     }),
     new KimiAdapter(new KimiAdapterOptions { Log = ServiceLog.Info }),
@@ -309,7 +314,8 @@ static async Task<int> HostCommand(CommandLine line)
             ?? throw new IOException("no conductor on the host pipe");
         return (stream, stream);
     }, new Gorynych.Service.Hosts.AdapterHostOptions { Adapter = adapterName, Token = token, Slot = slot, Generation = generation, Log = ServiceLog.Info,
-        ReportStore = new ReportStore(Path.Combine(data, "reports")) });
+        ReportStore = new ReportStore(Path.Combine(data, "reports")),
+        CompletionHostLedger = adapterName == "claude" ? new Gorynych.Service.Hosts.CompletionHostLedger(Path.Combine(data, "completion-host-ledger.json")) : null });
     ServiceLog.Info($"host {adapterName} {host.HostId} starting, pid {Environment.ProcessId}, pipe {pipe}, data {data}, slot {(slot.Length == 0 ? "(none)" : slot)}, " +
         $"build {build} (read in {buildTook.TotalMilliseconds:0} ms)");
     var code = await host.RunAsync();

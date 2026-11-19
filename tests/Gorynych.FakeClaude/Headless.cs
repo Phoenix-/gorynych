@@ -108,10 +108,16 @@ static partial class FakeHeadless
 
         while (await Inbox.Reader.WaitToReadAsync())
         {
+            while (File.Exists(Path.Combine(cwd, "hold-guard-dequeue")) && !File.Exists(Path.Combine(cwd, "release-guard-dequeue"))) await Task.Delay(20);
             if (!Inbox.Reader.TryRead(out var first)) continue;
             await TurnAsync(first, sessionId, http, replyUrl);
         }
         await reading;
+        if (File.Exists(Path.Combine(cwd, "hold-exit-after-eof")))
+        {
+            File.WriteAllText(Path.Combine(cwd, "observed-input-eof"), "");
+            while (!File.Exists(Path.Combine(cwd, "release-exit-after-eof"))) await Task.Delay(20);
+        }
         return 0;
     }
 
@@ -216,7 +222,8 @@ static partial class FakeHeadless
                     _ = Task.Run(async () =>
                     {
                         while (!File.Exists(Path.Combine(cwd, "release-contradiction-response"))) await Task.Delay(20);
-                        await RespondAsync(id, new JsonObject { ["still_queued"] = new JsonArray(), ["cancelled"] = cancelled });
+                        if (File.Exists(Path.Combine(cwd, "delayed-malformed-interrupt"))) await RespondAsync(id, new JsonObject());
+                        else await RespondAsync(id, new JsonObject { ["still_queued"] = new JsonArray(), ["cancelled"] = cancelled });
                     });
                 }
                 else await RespondAsync(id, new JsonObject { ["still_queued"] = new JsonArray(), ["cancelled"] = cancelled });
@@ -268,6 +275,10 @@ static partial class FakeHeadless
         if (prompt.Contains("receipt-exit-after-echo", StringComparison.Ordinal)) Environment.Exit(42);
         if (prompt.Contains("receipt-hold-after-echo", StringComparison.Ordinal))
             while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-report-result"))) await Task.Delay(20);
+        if ((prompt.StartsWith("Please review this assignment and explicitly record its outcome", StringComparison.Ordinal) ||
+             prompt.StartsWith("Please record an explicit outcome or continuation.", StringComparison.Ordinal)) &&
+            File.Exists(Path.Combine(Environment.CurrentDirectory, "hold-completion-result")))
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-completion-result"))) await Task.Delay(20);
         if (prompt.Contains("receipt-fail-after-echo", StringComparison.Ordinal))
         {
             await WriteAsync(new JsonObject { ["type"] = "result", ["subtype"] = "error_during_execution", ["is_error"] = true,
@@ -465,7 +476,50 @@ static partial class FakeHeadless
             return;
         }
         await AnswerAsync(sessionId, answer, prompt.Contains("think", StringComparison.OrdinalIgnoreCase));
+        if (prompt.Contains("observation-state-before-result", StringComparison.Ordinal))
+            await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "session_state_changed", ["state"] = "idle", ["uuid"] = Guid.NewGuid().ToString(), ["session_id"] = sessionId });
+        if (prompt.Contains("observation-command-before-result", StringComparison.Ordinal))
+            await WriteAsync(new JsonObject { ["type"] = "command_lifecycle", ["state"] = "completed", ["command_uuid"] = (string?)first["uuid"], ["session_id"] = sessionId });
         await ResultAsync(sessionId, answer);
+        if (prompt.Contains("observation-command-after-result", StringComparison.Ordinal))
+        {
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-observation-command"))) await Task.Delay(20);
+            var command = new JsonObject { ["type"] = "command_lifecycle", ["state"] = "completed", ["command_uuid"] = (string?)first["uuid"], ["session_id"] = sessionId };
+            if (prompt.Contains("foreign-uuid", StringComparison.Ordinal)) command["command_uuid"] = Guid.NewGuid().ToString();
+            if (prompt.Contains("foreign-session", StringComparison.Ordinal)) command["session_id"] = Guid.NewGuid().ToString();
+            if (prompt.Contains("missing-uuid", StringComparison.Ordinal)) command.Remove("command_uuid");
+            if (prompt.Contains("malformed-session", StringComparison.Ordinal)) command["session_id"] = 123;
+            if (prompt.Contains("absent-session", StringComparison.Ordinal)) command.Remove("session_id");
+            foreach (var state in new[] { "queued", "started", "cancelled", "discarded", "refused", "unrecognized" })
+                if (prompt.Contains("state-" + state, StringComparison.Ordinal)) command["state"] = state;
+            await WriteAsync(command);
+        }
+        if (prompt.Contains("observation-unknown-after-result", StringComparison.Ordinal))
+        {
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-observation-unknown"))) await Task.Delay(20);
+            await WriteAsync(new JsonObject { ["type"] = "future_protocol_event", ["payload"] = "private-test-payload", ["session_id"] = sessionId });
+        }
+        if (prompt.Contains("observation-rate-after-result", StringComparison.Ordinal))
+        {
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-observation-rate"))) await Task.Delay(20);
+            await WriteAsync(new JsonObject { ["type"] = "rate_limit_event", ["rate_limit_info"] = new JsonObject { ["status"] = "allowed" }, ["uuid"] = Guid.NewGuid().ToString(), ["session_id"] = sessionId });
+        }
+        if (prompt.Contains("observation-state-after-result", StringComparison.Ordinal))
+        {
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-observation-state"))) await Task.Delay(20);
+            await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "session_state_changed", ["state"] = "idle", ["uuid"] = Guid.NewGuid().ToString(), ["session_id"] = sessionId });
+        }
+        if (prompt.Contains("observation-benign-after-result", StringComparison.Ordinal))
+        {
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-observation-benign"))) await Task.Delay(20);
+            await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "status", ["session_id"] = sessionId });
+        }
+        if (prompt.Contains("observation-exit-held", StringComparison.Ordinal))
+        {
+            while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-observation-exit"))) await Task.Delay(20);
+            Environment.Exit(43);
+        }
+        if (prompt.Contains("observation-result-then-exit", StringComparison.Ordinal)) Environment.Exit(43);
         if (backgroundProbe)
         {
             while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-background"))) await Task.Delay(20);

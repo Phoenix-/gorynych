@@ -10,6 +10,14 @@ static class ReportHostProbe
 {
     public static Process Start(params string[] args)
     {
+        var configured = Environment.GetEnvironmentVariable("GORYNYCH_TEST_REPORT_HOST_PROBE");
+        if (configured is { Length: > 0 } && File.Exists(configured))
+        {
+            var isolated = new ProcessStartInfo(configured) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (var arg in args) isolated.ArgumentList.Add(arg);
+            return Process.Start(isolated) ?? throw new InvalidOperationException("Could not start the report host probe");
+        }
         var output = new DirectoryInfo(AppContext.BaseDirectory);
         var root = output.Parent!.Parent!.Parent!.Parent!.FullName;
         var exe = Path.Combine(root, "Gorynych.ReportHostProbe", "bin", output.Parent.Name, output.Name, TestDirs.Exe("Gorynych.ReportHostProbe"));

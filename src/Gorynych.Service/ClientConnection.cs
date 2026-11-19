@@ -130,9 +130,11 @@ internal sealed class ClientConnection
             case GorynychProtocol.MethodSteering:
                 return await conductor.SteeringAsync(this, request, ct);
             case AcpMethods.Agent.SessionClose:
-                return await conductor.CloseAsync(this, RequireSession(request), ct);
+                var closing = RequireSession(request);
+                return await conductor.CompletionParticipantMutationAsync(closing, () => conductor.CloseAsync(this, closing, ct), ct);
             case AcpMethods.Agent.SessionDelete:
-                return await conductor.DeleteAsync(RequireSession(request), ct);
+                var deleting = RequireSession(request);
+                return await conductor.CompletionParticipantMutationAsync(deleting, () => conductor.DeleteAsync(deleting, ct), ct);
             case GorynychProtocol.MethodStatus:
                 // An explicit status check is a bounded recovery opportunity after storage heals.
                 conductor.QueueReportDeliveries();
@@ -145,7 +147,9 @@ internal sealed class ClientConnection
                 return await conductor.UiMetadataAsync(request.Method, request.Params, ct);
             case GorynychProtocol.MethodStop:
                 ServiceLog.Info($"{Rpc.Name}: asked for a management stop");
-                return await conductor.StopAsync(request);
+                var affectsClaude = (bool?)request.Params?["all"] == true ||
+                    request.Params?["agents"] is JsonArray stopped && stopped.Any(a => (string?)a == "claude");
+                return await conductor.CompletionServiceMutationAsync(affectsClaude, () => conductor.StopAsync(request), ct);
             case GorynychProtocol.MethodStart:
                 ServiceLog.Info($"{Rpc.Name}: asked to start adapters");
                 return conductor.Start(request);
@@ -161,6 +165,18 @@ internal sealed class ClientConnection
             case GorynychProtocol.MethodHostReportNoteReceipt:
             case GorynychProtocol.MethodCodexProvisionalIdle:
             case GorynychProtocol.MethodHostCodexProvisionalIdle:
+            case GorynychProtocol.MethodCompletionGuardedSubmit:
+            case GorynychProtocol.MethodCompletionGuardedStatus:
+            case GorynychProtocol.MethodCompletionGuardedAck:
+            case GorynychProtocol.MethodCompletionGuardedRetire:
+            case GorynychProtocol.MethodCompletionGuardedAbort:
+            case GorynychProtocol.MethodHostCompletionGuardedSubmit:
+            case GorynychProtocol.MethodHostCompletionGuardedStatus:
+            case GorynychProtocol.MethodHostCompletionGuardedAck:
+            case GorynychProtocol.MethodHostCompletionGuardedRetire:
+            case GorynychProtocol.MethodHostCompletionGuardedAbort:
+            case GorynychProtocol.MethodClaudePromptObservation:
+            case GorynychProtocol.MethodHostClaudePromptObservation:
                 throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {request.Method}");
             case GorynychProtocol.MethodOpinion:
                 return await conductor.OpinionAsync(request, ct, linkGone: () => Rpc.IsClosed);
@@ -174,14 +190,22 @@ internal sealed class ClientConnection
                 return await conductor.SendMessageAsync(request, reply: false, ct);
             case GorynychProtocol.MethodRequestReply:
                 return await conductor.SendMessageAsync(request, reply: false, ct, expectReply: true);
+            case GorynychProtocol.MethodRecoverCompletionReminder:
+                return await conductor.RecoverCompletionOwnerAsync(request, ct);
+            case GorynychProtocol.MethodRequestCompletionReminder:
+                return await conductor.SubmitCompletionOwnerAsync(request, ct);
+            case GorynychProtocol.MethodListCompletionNotices:
+                return conductor.ListCompletionNotices(request);
+            case GorynychProtocol.MethodAckCompletionNotice:
+                return conductor.AckCompletionNotice(request);
             case GorynychProtocol.MethodListAssignments:
                 return conductor.ListAssignments(request);
             case GorynychProtocol.MethodReadAssignment:
                 return conductor.ReadAssignment(request);
             case GorynychProtocol.MethodUpdateAssignment:
-                return conductor.UpdateAssignment(request);
+                return await conductor.CompletionAssignmentMutationAsync(request, false, ct);
             case GorynychProtocol.MethodUpdateContinuation:
-                return conductor.UpdateContinuation(request);
+                return await conductor.CompletionAssignmentMutationAsync(request, true, ct);
             case GorynychProtocol.MethodListBackgroundTasks:
                 return conductor.ListBackgroundTasks(request);
             case GorynychProtocol.MethodListReplyWaits:
@@ -204,11 +228,14 @@ internal sealed class ClientConnection
                 return await conductor.Outside.HandleAsync(this, request, ct);
             case GorynychProtocol.MethodShutdown:
                 ServiceLog.Info($"{Rpc.Name}: asked the service to exit");
-                _ = Task.Delay(200).ContinueWith(_ => conductor.RequestShutdown(), TaskScheduler.Default);
-                return new JsonObject();
+                return await conductor.CompletionServiceMutationAsync(true, () =>
+                {
+                    _ = Task.Delay(200).ContinueWith(_ => conductor.RequestShutdown(), TaskScheduler.Default);
+                    return Task.FromResult<JsonNode?>(new JsonObject());
+                }, ct);
             case GorynychProtocol.MethodRestart:
                 ServiceLog.Info($"{Rpc.Name}: asked the service to restart");
-                return await conductor.RestartAsync(request);
+                return await conductor.CompletionServiceMutationAsync(true, () => conductor.RestartAsync(request), ct);
             default:
                 // Anything else about a session (modes, config options) goes to its agent.
                 if ((string?)request.Params?["sessionId"] is { } sid)
@@ -221,11 +248,18 @@ internal sealed class ClientConnection
     {
         if (method is GorynychProtocol.MethodHostState or GorynychProtocol.MethodReportNote or GorynychProtocol.MethodReportNoteStatus or GorynychProtocol.MethodReportNoteAck or
             GorynychProtocol.MethodHostReportNote or GorynychProtocol.MethodHostReportNoteStatus or GorynychProtocol.MethodHostReportNoteAck or GorynychProtocol.MethodHostReportNoteReceipt or
-            GorynychProtocol.MethodCodexProvisionalIdle or GorynychProtocol.MethodHostCodexProvisionalIdle) return;
+            GorynychProtocol.MethodCodexProvisionalIdle or GorynychProtocol.MethodHostCodexProvisionalIdle or
+            GorynychProtocol.MethodClaudePromptObservation or GorynychProtocol.MethodHostClaudePromptObservation or
+            GorynychProtocol.MethodCompletionGuardedSubmit or GorynychProtocol.MethodCompletionGuardedStatus or GorynychProtocol.MethodCompletionGuardedAck or GorynychProtocol.MethodCompletionGuardedRetire or GorynychProtocol.MethodCompletionGuardedAbort or
+            GorynychProtocol.MethodHostCompletionGuardedSubmit or GorynychProtocol.MethodHostCompletionGuardedStatus or GorynychProtocol.MethodHostCompletionGuardedAck or GorynychProtocol.MethodHostCompletionGuardedRetire or GorynychProtocol.MethodHostCompletionGuardedAbort) return;
         if ((string?)@params?["sessionId"] is not { } sid) return;
         if (conductor.RootOfSubagent(sid) is not null) return;
         if (method == AcpMethods.Agent.SessionCancel) cancelledAt[sid] = Rpc.NotificationSequence;
-        try { await conductor.ForwardNotificationAsync(method, @params, sid); }
+        try
+        {
+            if (method == AcpMethods.Agent.SessionCancel) await conductor.CompletionUserCancelAsync(sid, @params);
+            else await conductor.ForwardNotificationAsync(method, @params, sid);
+        }
             catch (Exception e) when (e is IOException or JsonRpcException) { ServiceLog.Warn($"{method} for {sid}: {e.Message}"); }
     }
 
@@ -257,7 +291,7 @@ internal sealed class ClientConnection
     };
 
     /// <summary>The service's extension flags, advertised in <c>agentCapabilities._meta</c>.</summary>
-    static JsonObject Extensions()
+    JsonObject Extensions()
     {
         var flags = DeprecatedFlags();
         flags[GorynychProtocol.CapSessionAttributes] = true;
@@ -266,6 +300,9 @@ internal sealed class ClientConnection
         flags[GorynychProtocol.CapReportRetrieval] = true;
         flags[GorynychProtocol.CapReplyWaits] = true;
         flags[GorynychProtocol.CapAssignments] = true;
+        flags[GorynychProtocol.CapCompletionNotices] = true;
+        flags[GorynychProtocol.CapCompletionOwnerTrigger] = conductor.CompletionOwnerTriggerAvailable;
+        flags[GorynychProtocol.CapCompletionOwnerRecovery] = true;
         flags[GorynychProtocol.CapAssignmentContinuations] = true;
         flags[GorynychProtocol.CapAssignmentDiagnostics] = true;
         flags[GorynychProtocol.CapAssignmentBackgroundContinuations] = true;

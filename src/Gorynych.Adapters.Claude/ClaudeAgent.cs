@@ -73,7 +73,14 @@ public sealed class ClaudeAdapterOptions
     // Per-session process-local report receipt bound; tests can exercise backpressure.
     internal int ReportNoteLedgerLimit { get; init; } = 256;
     internal int ReportNoteGlobalLimit { get; init; } = 4096;
+    internal int GuardedReceiptLimitForTests { get; init; } = 64;
+    internal Func<Task>? BeforeGuardedWriteForTests { get; init; }
     internal Func<Task>? AfterReportNoteWrite { get; init; }
+    /// <summary>Allow the enclosing host to negotiate private read-only prompt observations.</summary>
+    public bool HostedPromptObservation { get; init; }
+    public bool HostedCompletionGuarded { get; init; }
+    internal bool DisableForceKillForTests { get; init; }
+    internal Action<ClaudeProcess>? NativeProcessStartedForTests { get; init; }
 
     /// <summary>Headless, for tests: awaited before a cancel's interrupt takes the input.</summary>
     public Func<Task>? BeforeInterrupt { get; init; }
@@ -241,16 +248,18 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         rpc.Log = Log;
     }
 
-    sealed record Arrival(HeadlessSession Session, long Sequence);
+    sealed record Arrival(HeadlessSession Session, long Sequence, bool Ordered);
     readonly System.Runtime.CompilerServices.ConditionalWeakTable<JsonRpcRequest, Arrival> arrivals = new();
 
     /// <summary>The stream's order of a prompt or steer is registered before its handler runs, so a steer behind a prompt waits for it and a cancel behind both waits for them.</summary>
     void OnRequestArrived(JsonRpcRequest request)
     {
-        if (request.Method is not (AcpMethods.Agent.SessionPrompt or GorynychProtocol.MethodSteering)) return;
+        var ordered = request.Method is AcpMethods.Agent.SessionPrompt or GorynychProtocol.MethodSteering;
+        if (!ordered && request.Method is not (GorynychProtocol.MethodNote or GorynychProtocol.MethodOpinion or GorynychProtocol.MethodReportNote)) return;
         if ((string?)request.Params?["sessionId"] is not { } id || !sessions.TryGetValue(id, out var session) || session is not HeadlessSession headless) return;
-        headless.NoteArrival(request.Sequence);
-        arrivals.AddOrUpdate(request, new Arrival(headless, request.Sequence));
+        headless.ObserveInputArrival();
+        if (ordered) headless.NoteArrival(request.Sequence);
+        arrivals.AddOrUpdate(request, new Arrival(headless, request.Sequence, ordered));
     }
 
     void OnRequestDone(JsonRpcRequest request)
@@ -258,13 +267,37 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         if (arrivals.TryGetValue(request, out var arrival))
         {
             arrivals.Remove(request);
-            arrival.Session.AdmitArrival(arrival.Sequence);
+            if (arrival.Ordered) arrival.Session.AdmitArrival(arrival.Sequence);
+            arrival.Session.ObserveInputDone();
         }
     }
 
     public ChannelHost? Channel { get; }
 
     bool Headless => options.Transport == ClaudeTransport.Headless;
+    bool negotiatedPromptObservation;
+    bool negotiatedCompletionGuarded;
+    readonly Lock guardedReceiptGate = new();
+    readonly Dictionary<string, string> guardedReceiptOwners = new(StringComparer.Ordinal);
+    internal bool TryReserveGuardedReceipt(string attempt, string session)
+    {
+        lock (guardedReceiptGate)
+        {
+            if (guardedReceiptOwners.Count >= 1024 || guardedReceiptOwners.ContainsKey(attempt)) return false;
+            guardedReceiptOwners.Add(attempt, session); return true;
+        }
+    }
+
+    internal bool GuardedReservationAbsent(string attempt)
+    {
+        lock (guardedReceiptGate) return !guardedReceiptOwners.ContainsKey(attempt);
+    }
+
+    internal void ReleaseGuardedReservation(string attempt, string session)
+    {
+        lock (guardedReceiptGate)
+            if (guardedReceiptOwners.TryGetValue(attempt, out var owner) && owner == session) guardedReceiptOwners.Remove(attempt);
+    }
 
     /// <summary>
     /// Claude's model catalog: kept from an earlier run (<c>catalog.json</c>), fetched at start, or from
@@ -295,10 +328,15 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         switch (request.Method)
         {
             case AcpMethods.Agent.Initialize:
+            {
+                negotiatedPromptObservation = Headless && options.HostedPromptObservation &&
+                    request.Params?["_meta"]?[GorynychProtocol.CapClaudeObservationReceiver] is JsonValue observation && observation.TryGetValue<bool>(out var accepted) && accepted;
+                negotiatedCompletionGuarded = Headless && options.HostedCompletionGuarded &&
+                    request.Params?["_meta"]?[GorynychProtocol.CapCompletionGuardedReceiver] is JsonValue guard && guard.TryGetValue<bool>(out var guarded) && guarded;
                 ClientHasForms = request.ParamsAs<InitializeRequest>().ClientCapabilities?.Elicitation?.Form is not null;
                 ClientHasSubagents = Headless && request.ParamsAs<InitializeRequest>().ClientCapabilities?.Subagents is not null;
                 ClientMarksSubagentLive = request.Params?["_meta"]?[GorynychProtocol.MetaSubagentLiveState] is JsonValue flag && flag.TryGetValue<bool>(out var enabled) && enabled;
-                return AcpJson.ToNode(new InitializeResponse
+                var initialization = AcpJson.ToNode(new InitializeResponse
                 {
                     ProtocolVersion = AcpMethods.ProtocolVersion,
                     AgentInfo = new Implementation
@@ -337,8 +375,88 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                         [GorynychProtocol.MetaSteering] = new JsonObject { ["supported"] = Headless },
                         [GorynychProtocol.CapReportNote] = Headless && Channel is not null,
                         [GorynychProtocol.CapReportNoteAck] = Headless && Channel is not null,
+                        [GorynychProtocol.CapClaudePromptObservation] = negotiatedPromptObservation,
                     },
-                });
+                })!;
+                if (negotiatedCompletionGuarded) initialization["_meta"]![GorynychProtocol.CapCompletionGuardedAdapter] = true;
+                return initialization;
+            }
+            case GorynychProtocol.MethodCompletionGuardedSubmit:
+            case GorynychProtocol.MethodCompletionGuardedStatus:
+            case GorynychProtocol.MethodCompletionGuardedAck:
+            case GorynychProtocol.MethodCompletionGuardedAbort:
+            case GorynychProtocol.MethodCompletionGuardedRetire:
+            {
+                if (!negotiatedCompletionGuarded || request.Params?["_meta"] is not JsonObject meta ||
+                    meta["sessionId"] is not JsonValue sessionNode || !sessionNode.TryGetValue<string>(out var guardedSession) ||
+                    meta["attemptId"] is not JsonValue attemptNode || !attemptNode.TryGetValue<string>(out var guardedAttempt) ||
+                    !sessions.TryGetValue(guardedSession, out var target) || target is not HeadlessSession guardedHeadless)
+                    throw new JsonRpcException(JsonRpcException.InvalidRequest, "Guarded bridge unavailable");
+                var prompt = (string?)meta["promptId"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "Missing prompt");
+                var uuid = (string?)meta["nativeUuid"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "Missing UUID");
+                var stream = (string?)meta["stream"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "Missing stream");
+                var revision = (long?)meta["observationRevision"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "Missing revision");
+                var digest = (string?)meta["digest"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "Missing digest");
+                var witness = new HeadlessSession.PromptObservation(guardedSession, prompt, uuid, stream, revision);
+                if (request.Method == GorynychProtocol.MethodCompletionGuardedSubmit)
+                {
+                    var text = (string?)meta["text"] ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "Missing text");
+                    var actualDigest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)));
+                    if (actualDigest != digest) throw new JsonRpcException(JsonRpcException.InvalidRequest, "Digest mismatch");
+                    await guardedHeadless.SubmitGuardedReceiptAsync(witness, guardedAttempt, text, TimeSpan.FromSeconds(10), ct);
+                }
+                if (request.Method == GorynychProtocol.MethodCompletionGuardedAbort)
+                {
+                    var verdict = guardedHeadless.AbortGuardedForBridge(guardedAttempt, witness, digest);
+                    return new JsonObject { ["_meta"] = new JsonObject { ["state"] = verdict.State, ["revision"] = verdict.Revision, ["attemptId"] = guardedAttempt,
+                        ["sessionId"] = witness.SessionId, ["promptId"] = witness.PromptId, ["witnessUuid"] = witness.NativeUuid,
+                        ["stream"] = witness.Stream, ["observationRevision"] = witness.IngressRevision, ["digest"] = digest } };
+                }
+                if (request.Method == GorynychProtocol.MethodCompletionGuardedRetire)
+                {
+                    if (meta["receiptRevision"] is not JsonValue retireValue || !retireValue.TryGetValue<long>(out var retireRevision) || retireRevision < 0 ||
+                        !guardedHeadless.RetireGuardedReceiptForBridge(guardedAttempt, witness, digest, retireRevision))
+                        return new JsonObject { ["_meta"] = new JsonObject { ["state"] = "unknown" } };
+                    return new JsonObject { ["_meta"] = new JsonObject { ["state"] = "retired", ["attemptId"] = guardedAttempt,
+                        ["revision"] = retireRevision, ["sessionId"] = witness.SessionId, ["promptId"] = witness.PromptId,
+                        ["witnessUuid"] = witness.NativeUuid, ["stream"] = witness.Stream, ["observationRevision"] = witness.IngressRevision, ["digest"] = digest } };
+                }
+                if (request.Method == GorynychProtocol.MethodCompletionGuardedAck)
+                {
+                    if (meta["receiptRevision"] is not JsonValue ackValue || !ackValue.TryGetValue<long>(out var ackRevision) || ackRevision < 0 ||
+                        !guardedHeadless.ReleaseGuardedReceiptForBridge(guardedAttempt, witness, digest, ackRevision))
+                        return new JsonObject { ["_meta"] = new JsonObject { ["state"] = "unknown" } };
+                    return new JsonObject { ["_meta"] = new JsonObject { ["state"] = "acknowledged", ["attemptId"] = guardedAttempt,
+                        ["nativeUuid"] = Guid.ParseExact(guardedAttempt, "N").ToString("D"), ["revision"] = ackRevision,
+                        ["sessionId"] = witness.SessionId, ["promptId"] = witness.PromptId, ["witnessUuid"] = witness.NativeUuid,
+                        ["stream"] = witness.Stream, ["observationRevision"] = witness.IngressRevision, ["digest"] = digest } };
+                }
+                var matched = guardedHeadless.GuardedReceiptForBridge(guardedAttempt, witness, digest);
+                var receipt = matched?.Snapshot;
+                return new JsonObject { ["_meta"] = receipt is null ? new JsonObject { ["state"] = "unknown" } : new JsonObject {
+                    ["state"] = "receipt", ["attemptId"] = receipt.AttemptId, ["nativeUuid"] = receipt.NativeUuid,
+                    ["sessionId"] = matched!.Value.Witness.SessionId, ["promptId"] = matched.Value.Witness.PromptId,
+                    ["witnessUuid"] = matched.Value.Witness.NativeUuid, ["stream"] = matched.Value.Witness.Stream,
+                    ["observationRevision"] = matched.Value.Witness.IngressRevision, ["digest"] = matched.Value.Digest,
+                    ["revision"] = receipt.Revision, ["committed"] = receipt.Committed, ["noInput"] = receipt.NoInput,
+                    ["writeCompleted"] = receipt.WriteCompleted, ["taken"] = receipt.Taken, ["cycleResult"] = receipt.CycleResult,
+                    ["nativeCancelled"] = receipt.NativeCancelled, ["cancelRequested"] = receipt.CancelRequested,
+                    ["uncertain"] = receipt.Uncertain, ["contradiction"] = receipt.Contradiction,
+                    ["nativeStop"] = receipt.NativeStop, ["nativeSubtype"] = receipt.NativeSubtype, ["nativeTerminal"] = receipt.NativeTerminal,
+                    ["cancelObservers"] = receipt.CancelObservers, ["cancelUnresolved"] = receipt.CancelUnresolved } };
+            }
+            case GorynychProtocol.MethodClaudePromptObservation:
+            {
+                if (!negotiatedPromptObservation || request.Params is not JsonObject args || args.Count != 1 ||
+                    args["_meta"] is not JsonObject observationArgs || observationArgs.Count != 2 ||
+                    observationArgs["sessionId"] is not JsonValue sessionValue || !sessionValue.TryGetValue<string>(out var sessionId) || sessionId.Length is < 1 or > 256 ||
+                    observationArgs["promptId"] is not JsonValue promptValue || !promptValue.TryGetValue<string>(out var promptId) || promptId.Length is < 1 or > 256)
+                    throw new JsonRpcException(JsonRpcException.MethodNotFound, "Prompt observation unavailable");
+                var witness = sessions.TryGetValue(sessionId, out var existing) && existing is HeadlessSession headless ? headless.ReadPromptObservation(promptId) : null;
+                return new JsonObject { ["_meta"] = witness is null ? new JsonObject { ["state"] = "unknown" } : new JsonObject
+                    { ["state"] = "observed", ["sessionId"] = witness.SessionId, ["promptId"] = witness.PromptId,
+                      ["nativeUuid"] = witness.NativeUuid, ["stream"] = witness.Stream, ["revision"] = witness.IngressRevision } };
+            }
             case AcpMethods.Agent.SessionNew:
             {
                 var p = request.ParamsAs<NewSessionRequest>();
@@ -400,9 +518,13 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 if (reminder is not null && (session is not HeadlessSession || string.IsNullOrWhiteSpace(stream)))
                     throw new JsonRpcException(JsonRpcException.InvalidRequest, "A reminder requires a confirmed live headless Claude process.");
                 Func<bool> cancelled = () => cancelledAt.TryGetValue(session.Id, out var at) && at > sequence;
+                var observedPromptId = p.Meta?[GorynychProtocol.MetaPromptId] is JsonValue promptValue && promptValue.TryGetValue<string>(out var promptText)
+                    ? promptText : null;
                 var stop = reminder is not null
                     ? await ((HeadlessSession)session).ReminderPromptAsync(p.Prompt, cancelled, ct, request.Sequence, stream!)
-                    : await session.PromptAsync(p.Prompt, cancelled, ct, request.Sequence);
+                    : session is HeadlessSession observed
+                        ? await observed.ObservedPromptAsync(p.Prompt, cancelled, ct, request.Sequence, observedPromptId)
+                        : await session.PromptAsync(p.Prompt, cancelled, ct, request.Sequence);
                 state.Update(session.Id, session.Cwd, r => r.UpdatedAt = DateTimeOffset.UtcNow);
                 return AcpJson.ToNode(new PromptResponse { StopReason = stop, Meta = await MarkMetaAsync(session) });
             }

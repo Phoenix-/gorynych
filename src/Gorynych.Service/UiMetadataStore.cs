@@ -118,7 +118,14 @@ internal sealed class UiMetadataStore
         {
             var result = new JsonArray();
             if (Projects(state)[project] is JsonObject groups)
-                foreach (var (id, name) in groups) result.Add((JsonNode)new JsonObject { ["groupId"] = id, ["name"] = name!.DeepClone() });
+                foreach (var (id, name) in groups)
+                {
+                    var item = new JsonObject { ["groupId"] = id, ["name"] = name!.DeepClone() };
+                    if (state["groupInstances"] is JsonObject allInstances && allInstances[project] is JsonObject projectInstances &&
+                        projectInstances[id] is JsonValue instance && instance.TryGetValue<string>(out var token) &&
+                        Guid.TryParseExact(token, "N", out _) && token == token.ToLowerInvariant()) item["instanceId"] = token;
+                    result.Add((JsonNode)item);
+                }
             return result;
         }
     }
@@ -132,11 +139,57 @@ internal sealed class UiMetadataStore
             var projects = Projects(next);
             if (projects[project] is not JsonObject) projects[project] = new JsonObject();
             var groups = projects[project]!.AsObject();
-            if ((string?)groups[id] == name) return false;
+            var sameName = (string?)groups[id] == name;
+            next["groupInstances"] ??= new JsonObject();
+            if (next["groupInstances"] is JsonObject projectsWithInstances)
+            {
+                projectsWithInstances[project] ??= new JsonObject();
+                if (projectsWithInstances[project] is JsonObject instances)
+                {
+                    if (sameName && instances[id] is not null) return false;
+                    if (instances[id] is null) instances[id] = Guid.NewGuid().ToString("N");
+                }
+                else if (sameName) return false;
+            }
+            else if (sameName) return false;
             groups[id] = name;
             Commit(next);
             return true;
         }
+    }
+
+    // A consent binding names this instance, not only its reusable public group key.
+    // Creating the token and deleting the group use the same COW document.
+    internal string? EnsureGroupInstance(string project, string id)
+    {
+        Field(JsonValue.Create(project), "projectKey"); Field(JsonValue.Create(id), "groupId");
+        lock (gate)
+        {
+            if (Projects(state)[project] is not JsonObject groups || !groups.ContainsKey(id)) return null;
+            var existing = state["groupInstances"]?[project]?[id];
+            if (existing is not null)
+            {
+                if (existing is not JsonValue value || !value.TryGetValue<string>(out var instance) ||
+                    !Guid.TryParseExact(instance, "N", out _) || instance != instance.ToLowerInvariant())
+                    throw new InvalidDataException("Invalid group instance");
+                return instance;
+            }
+            var next = state.DeepClone().AsObject();
+            next["groupInstances"] ??= new JsonObject();
+            var projects = next["groupInstances"]!.AsObject();
+            projects[project] ??= new JsonObject();
+            var token = Guid.NewGuid().ToString("N");
+            projects[project]![id] = token;
+            Commit(next);
+            return token;
+        }
+    }
+
+    internal bool IsCurrentGroupInstance(string project, string id, string instance)
+    {
+        lock (gate) return Projects(state)[project] is JsonObject groups && groups.ContainsKey(id) &&
+            state["groupInstances"] is JsonObject all && all[project] is JsonObject instances &&
+            instances[id] is JsonValue v && v.TryGetValue<string>(out var token) && token == instance;
     }
 
     internal List<string> Delete(string project, string id, out bool changed)
@@ -148,6 +201,11 @@ internal sealed class UiMetadataStore
             changed = Projects(next)[project] is JsonObject groups && groups.Remove(id);
             var affected = new List<string>();
             if (!changed) return affected;
+            if (next["groupInstances"] is JsonObject allInstances && allInstances[project] is JsonObject instances)
+            {
+                instances.Remove(id);
+                if (instances.Count == 0) allInstances.Remove(project);
+            }
             foreach (var (sid, value) in Sessions(next))
                 if (value is JsonObject attrs && attrs[Group] is JsonObject group && (string?)group["projectKey"] == project && (string?)group["groupId"] == id)
                 { attrs.Remove(Group); affected.Add(sid); }

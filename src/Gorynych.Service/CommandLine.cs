@@ -66,6 +66,8 @@ internal sealed class CommandLine
                                                 off by default
           --hosts on|off                        run each adapter in a host of its own, which a restart leaves
                                                 running (default on Windows and Linux; off on macOS, where it is untried)
+          --completion-project <key> --completion-group <id> --completion-instance <uuid>
+                                                one explicit manual completion reminder scope; all three required
           --no-channel  --no-peers
           --console                             also log to the console (not for acp and task install)
 
@@ -75,7 +77,7 @@ internal sealed class CommandLine
         """;
 
     static readonly string[] ServiceValues =
-        ["--pipe", "--data", "--default-agent", "--claude-model", "--unload-after", "--claude-transport", "--claude-channels", "--hosts", "--ahp"];
+        ["--pipe", "--data", "--default-agent", "--claude-model", "--unload-after", "--claude-transport", "--claude-channels", "--hosts", "--ahp", "--completion-project", "--completion-group", "--completion-instance"];
 
     /// <summary>The options an adapter host takes: those of the adapters, and where the service is.</summary>
     static readonly string[] HostValues = ["--adapter", "--slot", "--pipe", "--data", "--claude-model", "--claude-transport", "--claude-channels"];

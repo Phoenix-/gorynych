@@ -135,6 +135,13 @@ public static class GorynychProtocol
     /// <summary>Durably enqueue an inter-session message without waiting for a reply.</summary>
     public const string MethodSendMessage = "_gorynych/send_message";
     public const string MethodRequestReply = "_gorynych/request_reply";
+    public const string CapCompletionOwnerTrigger = "gorynych/completionOwnerTrigger";
+    public const string CapCompletionOwnerRecovery = "gorynych/completionOwnerRecovery";
+    public const string MethodRecoverCompletionReminder = "_gorynych/recover_completion_reminder";
+    public const string MethodRequestCompletionReminder = "_gorynych/request_completion_reminder";
+    public const string MethodListCompletionNotices = "_gorynych/list_completion_notices";
+    public const string MethodAckCompletionNotice = "_gorynych/ack_completion_notice";
+    public const string CapCompletionNotices = "gorynych/completionNotices";
     public const string MethodListAssignments = "_gorynych/list_assignments";
     public const string MethodReadAssignment = "_gorynych/read_assignment";
     public const string MethodUpdateAssignment = "_gorynych/update_assignment";
@@ -254,6 +261,24 @@ public static class GorynychProtocol
     public const string MethodCodexProvisionalIdle = "_gorynych/codex_provisional_idle";
     public const string MethodHostCodexProvisionalIdle = "_gorynych/host_codex_provisional_idle";
     public const string CapHostCodexProvisionalIdle = "gorynych/hostCodexProvisionalIdle";
+    public const string MethodCompletionGuardedSubmit = "_gorynych/completion_guarded_submit";
+    public const string MethodCompletionGuardedStatus = "_gorynych/completion_guarded_status";
+    public const string MethodCompletionGuardedAck = "_gorynych/completion_guarded_ack";
+    public const string MethodCompletionGuardedRetire = "_gorynych/completion_guarded_retire";
+    public const string MethodCompletionGuardedAbort = "_gorynych/completion_guarded_abort";
+    public const string MethodHostCompletionGuardedSubmit = "_gorynych/host_completion_guarded_submit";
+    public const string MethodHostCompletionGuardedStatus = "_gorynych/host_completion_guarded_status";
+    public const string MethodHostCompletionGuardedAck = "_gorynych/host_completion_guarded_ack";
+    public const string MethodHostCompletionGuardedRetire = "_gorynych/host_completion_guarded_retire";
+    public const string MethodHostCompletionGuardedAbort = "_gorynych/host_completion_guarded_abort";
+    public const string CapCompletionGuardedReceiver = "gorynych/completionGuardedReceiver";
+    public const string CapCompletionGuardedAdapter = "gorynych/completionGuardedAdapter";
+    public const string CapHostCompletionGuarded = "gorynych/hostCompletionGuarded";
+    public const string MethodClaudePromptObservation = "_gorynych/claude_prompt_observation";
+    public const string MethodHostClaudePromptObservation = "_gorynych/host_claude_prompt_observation";
+    public const string CapClaudeObservationReceiver = "gorynych/claudeObservationReceiver";
+    public const string CapClaudePromptObservation = "gorynych/claudePromptObservation";
+    public const string CapHostClaudePromptObservation = "gorynych/hostClaudePromptObservation";
     public const string CapCodexIdleHostReceiver = "gorynych/codexIdleHostReceiver";
     public const string CapCodexIdleAdapter = "gorynych/codexIdleAdapter";
     /// <summary>Trusted adapter confirms a full background change stream for its current process.</summary>
@@ -478,7 +503,7 @@ public static class GorynychProtocol
         "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent",
         "mcp__gorynych__send_message", "mcp__gorynych__reply_message",
         "mcp__gorynych__request_reply", "mcp__gorynych__list_reply_waits", "mcp__gorynych__cancel_reply_wait",
-        "mcp__gorynych__list_assignments", "mcp__gorynych__read_assignment", "mcp__gorynych__update_assignment", "mcp__gorynych__update_continuation", "mcp__gorynych__list_background_tasks",
+        "mcp__gorynych__recover_completion_reminder", "mcp__gorynych__request_completion_reminder", "mcp__gorynych__list_completion_notices", "mcp__gorynych__ack_completion_notice", "mcp__gorynych__list_assignments", "mcp__gorynych__read_assignment", "mcp__gorynych__update_assignment", "mcp__gorynych__update_continuation", "mcp__gorynych__list_background_tasks",
         "mcp__gorynych__read_report", "mcp__gorynych__list_reports",
         "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", SpawnTool,
     ];

@@ -255,7 +255,7 @@ public sealed class PeersTests
             Assert.IsNotNull(init!["capabilities"]!["tools"]);
             StringAssert.Contains((string?)init["instructions"], "Use delegate_task to continue already user-authorized work with your immediate child");
             var tools = await mcp.SendRequestAsync("tools/list", new JsonObject());
-            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports", "request_reply", "list_reply_waits", "cancel_reply_wait", "list_assignments", "read_assignment", "update_assignment", "update_continuation", "list_background_tasks" },
+            CollectionAssert.AreEqual(new[] { "list_agents", "send_message", "delegate_task", "spawn_session", "archive_session", "restore_session", "reply_message", "read_report", "list_reports", "request_reply", "list_reply_waits", "cancel_reply_wait", "recover_completion_reminder", "request_completion_reminder", "list_completion_notices", "ack_completion_notice", "list_assignments", "read_assignment", "update_assignment", "update_continuation", "list_background_tasks" },
                 tools!["tools"]!.AsArray().Select(t => (string)t!["name"]!).ToArray());
 
             StringAssert.Contains((string?)init["instructions"], "list_assignments");
@@ -292,6 +292,21 @@ public sealed class PeersTests
             var spoof = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "read_assignment", ["arguments"] = new JsonObject
             { ["source"] = "delegation", ["assignment_id"] = "mcp-assignment", ["actor"] = "answering" } });
             Assert.AreEqual(true, (bool?)spoof!["isError"]);
+
+            conductor.ReplyMailbox.Accept("mcp-notice", "asking", "answering", "work", delegation: true);
+            conductor.ReplyMailbox.MarkStarted("mcp-notice", "answering");
+            conductor.ReplyMailbox.MarkDelivered("mcp-notice", "answering");
+            var noticeGeneration = (string)conductor.ReplyMailbox.FindAssignment("mcp-notice", "asking")!["generation"]!;
+            var noticeAttempt = Guid.NewGuid().ToString("N");
+            Assert.IsTrue(conductor.ReplyMailbox.ClaimCompletionReminder("delegation", "mcp-notice", "asking", "answering", noticeGeneration, 1, noticeAttempt, new CompletionReminderBinding("project", "group", Guid.NewGuid().ToString("N"), "prompt", Guid.NewGuid().ToString("D"), Guid.NewGuid().ToString("N"), 1, new string('A', 64), "host", "generation", null, null)).Acquired);
+            Assert.IsTrue(conductor.ReplyMailbox.CloseCompletionReminderUnknown("delegation", "mcp-notice", "asking", "answering", noticeGeneration, 1, noticeAttempt));
+            var noticeList = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_completion_notices", ["arguments"] = new JsonObject() });
+            Assert.AreEqual(1, JsonNode.Parse((string)noticeList!["content"]![0]!["text"]!)!["items"]!.AsArray().Count);
+            var noticeAck = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "ack_completion_notice", ["arguments"] = new JsonObject
+            { ["assignment_id"] = "mcp-notice", ["assignee"] = "answering", ["generation"] = noticeGeneration, ["revision"] = 1, ["attempt_id"] = noticeAttempt } });
+            Assert.AreEqual(true, (bool?)JsonNode.Parse((string)noticeAck!["content"]![0]!["text"]!)!["acknowledged"]);
+            var badNotice = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_completion_notices", ["arguments"] = new JsonArray() });
+            Assert.AreEqual(true, (bool?)badNotice!["isError"]);
 
             var malformedWait = await mcp.SendRequestAsync("tools/call", new JsonObject { ["name"] = "list_reply_waits", ["arguments"] = new JsonArray() });
             Assert.AreEqual(true, (bool?)malformedWait!["isError"]);

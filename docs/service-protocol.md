@@ -2352,7 +2352,7 @@ object, null removes a key, objects merge recursively, and scalars and arrays re
 it is persisted before the answer and is not sent to the adapter. Attributes are service
 metadata, survive archive and restart, and can be edited without loading a native session.
 
-`_gorynych/groups/list {projectKey}` returns `{groups: [{groupId, name}]}`;
+`_gorynych/groups/list {projectKey}` returns `{groups: [{groupId, name, instanceId}]}` for provisioned instances;
 `_gorynych/groups/set {projectKey, groupId, name}` creates or renames and returns
 `{group: {groupId, name}}`; `_gorynych/groups/delete {projectKey, groupId}` returns `{}`.
 IDs are client-chosen, scoped to the opaque project key, and can be reused in other projects.
@@ -2680,3 +2680,77 @@ Before returning `open_without_recorded_continuation`, the service re-reads the 
 A matching native Codex idle received before `turn/completed` may be retained as an ephemeral observation. The hosted adapter and the host negotiate private support during initialization; each authenticated conductor connection separately advertises and receives host support. Direct adapters and older peers leave it disabled. The adapter's `_gorynych/codex_provisional_idle` confirmation commits under the JSON-RPC write gate after synchronous witness validation; later invalidating ingress queues matching revocation on the same stream. The host validates the exact successful prompt and native history mark and forwards only to the admitted supporting conductor, without buffering or replay. The conductor requires exact delivered, journaled successful delegation terminal and the same route/activity fence. Matching revocation is honored even during history import; confirmation during import is ignored. Reattachment, route change, native EOF and later activity discard the proof. This is an observation at an ordered commit point, not a guarantee about future activity or authority to wake.
 
 Early-idle confirmation is passive evidence as of its ordered guarded publication point. A matching revocation received before or after terminal publication prevents that evidence from being used; the consumer does not infer a result from the private frame alone. This checkpoint uses internal test opt-ins only and is not production negotiation.
+
+
+### Completion reminder notices
+
+The service advertises `gorynych/completionNotices` in ACP capabilities. A managed
+session may call `_gorynych/list_completion_notices` with an optional `cursor` and
+`limit` (1–100), and `_gorynych/ack_completion_notice` with the exact `assignmentId`,
+`assignee`, `generation`, original `revision`, and `attemptId` from a notice. Both
+require the existing peer token; the owner is resolved by the service and caller-supplied
+identity fields are rejected. The MCP tools `list_completion_notices` and
+`ack_completion_notice` provide the same owner-scoped operations. A notice says that
+the handoff was unknown when closed, not that no input was sent. Acknowledging it does
+not complete the assignment or grant another attempt.
+
+Peer tokens establish session identity within the service, not human identity or OS
+isolation from other processes running as the same user.
+
+The manual completion reminder is off by default. A service launch may select exactly
+one group instance with all three options `--completion-project <key> --completion-group
+<id> --completion-instance <uuid>`. Creating a group provisions its immutable `instanceId`;
+setting an existing legacy group provisions one. Read the ID from `_gorynych/groups/list`
+and copy it into the launch options. The ID is not a credential. Omitted, incomplete,
+invalid, deleted or stale scope leaves reminder dispatch disabled. Deleting and recreating
+a group changes the instance and does not transfer consent. The service persists the
+explicit launch arguments for the existing restart/start mechanism.
+
+For a hosted service on the same machine, first obtain the exact `instanceId` using the
+existing groups list, then request a graceful `Gorynych.Service.exe restart --pipe <pipe>`.
+After the old service has exited, launch the same build with the same data directory and
+pipe, `--hosts on`, and all three completion options. Hosted turns remain in their hosts
+across a compatible service restart. To disable, repeat the graceful restart and launch
+without the three options. Ensure no other bridge or launcher races that explicit launch
+with older arguments, and check `agentCapabilities._meta["gorynych/completionOwnerTrigger"]`
+afterward. These commands do not install or update the service.
+
+`request_completion_reminder` accepts `assignment_id` and exact `generation`; the service
+derives the caller from its peer token and requires the durable assignment owner and
+current group membership. A confirmed pre-commit abort records `not_sent`; an already
+committed handoff establishes order without changing the assignment outcome. An unresolved
+abort blocks the affected mutation with a retryable error. Pending attempts remain fenced
+by their saved binding even when the launch scope changes or is omitted. An uncertain
+response does not authorize another input.
+
+After an exact durable host ACK or adapter-origin pre-commit abort, a separate private
+retire releases the adapter receipt and its indexes. The host retains the row until it
+durably records retire; a repeated retire whose receipt is absent establishes only capacity
+release, never no-input or permission to resend. The adapter invalidates the matching
+witness under its state lock before retiring an aborted attempt. The host admission
+watermark rejects delayed submits after compaction; restoring an old data-directory backup
+is outside that guarantee. `recover_completion_reminder` is owner-scoped and available
+without opt-in. On the exact current original producer route it pulls status and can record
+an exact ACK, retire the adapter receipt and settle the durable handoff. An unresolved
+result with `nativeTaken: true` means the native process echoed the input; it does not mean
+the assignment was completed or the terminal result is known. After exact original producer
+exit is proved, recovery instead rereads the ledger and settles an exact ACK or abort, or
+closes uncertain evidence with an owner notice. Disconnect is not exit proof. Recovery never
+sends input or completes the assignment. An exact pending attempt can use its authenticated
+original host route for status, ACK and retire even when that host has an older build. This
+does not authorize submit on the stale host. Automatic migration and idle unload first try
+bounded status-only reconciliation and retain that exact route while its receipt is unresolved;
+other sessions may still move. Explicit cancellation, close and maintenance retain their
+normal policy fences.
+
+For a Linux completion handoff the private durable producer identity uses the kernel
+boot ID and the process start ticks from `/proc/<pid>/stat`, scoped to the process ID.
+Both the conductor and host must be able to read the same procfs identity. If either
+cannot, or the identities differ, the guarded path is unavailable. Windows continues
+to use the process creation time. A wall-clock timestamp from an older Linux build is
+not comparable to a kernel identity: a live PID with such a legacy record cannot be
+declared exited merely from a different clock-derived timestamp. An authenticated admitted session route with the same host ID and generation is conservatively
+held against automatic cleanup while such a legacy claim is pending. This veto is not proof
+of producer identity and cannot authorize status, abort, settlement or a resend; a live
+legacy producer remains unresolved without exact evidence.
+This does not alter the public process-start timestamp or authorize a retry.
