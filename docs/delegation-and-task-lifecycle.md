@@ -36,15 +36,17 @@ that an agent's solution is correct or force an agent to complete arbitrary work
 - [Safety and liveness properties](#safety-and-liveness-properties)
 - [Scenarios and acceptance criteria](#scenarios-and-acceptance-criteria)
 - [Implementation sequence and open decisions](#implementation-sequence-and-open-decisions)
+- [Coordinator report inbox](#coordinator-report-inbox)
 - [References](#references)
 
 ## Decisions and rationale
 
 The following are the agreed direction:
 
-1. **Keep automatic child reports.** Prefer an extra report to losing a needed
-   result and leaving the team asleep. A peer- or user-initiated turn is not, by
-   itself, a reason to suppress a report that would otherwise be generated.
+1. **Keep automatic child reports.** Publish every eligible result. A peer- or
+   user-initiated turn keeps the same eligibility. After completion supervision,
+   the [report inbox](#coordinator-report-inbox) can reduce how often publication
+   starts a coordinator turn.
 2. **Distinguish delegation from conversation.** Add explicit delegation to an
    immediate child, checked against the service's stored relationship. An ordinary
    `send_message` is not delegation and does not grant user authority.
@@ -220,11 +222,11 @@ An automatic report means "this turn ended with this outcome". It is distinct fr
 the explicit claim "assignment X is complete". Both error/cancellation reports and
 turns with no final text matter to the parent.
 
-Keep report delivery independent of whether the turn began with delegation, peer
-conversation, a direct user prompt or a later reminder, subject to existing report
-opt-outs and recursion safeguards. Mark the cause and assignment correlation;
-uncertain relevance favors delivery. There is no mandatory duplicate `send_message`
-for an ordinary child result.
+Keep automatic report publication independent of whether the turn began with
+delegation, peer conversation, a direct user prompt or a later reminder, subject
+to existing report opt-outs and recursion safeguards. Mark the cause and assignment
+correlation. The current policy delivers each report to the parent. There is no
+mandatory duplicate `send_message` for an ordinary child result.
 
 Preserve the full result before acknowledging its publication. A preview must say
 that it is truncated and link to that exact immutable result, not "the child's
@@ -354,8 +356,9 @@ this discussion. Let `pending(w)` mean an unresolved registered wait and
   a lost response is not proof that no dispatch occurred.
 - A terminal assignment cannot be reopened by a stale event. Results and notices
   remain available under their explicit retention policy.
-- Every eligible automatic report is delivered or has a visible pending/failure
-  disposition; initiator-based relevance guesses do not discard it.
+- Every eligible automatic report reaches its recipient through the active
+  delivery policy or has a visible pending/failure disposition. Inbox publication
+  preserves the report's identity and availability even if its notification fails.
 
 **Liveness and visibility, assuming a running service, fair event/timer processing
 and usable persistence:**
@@ -403,7 +406,8 @@ host and restart boundaries; reducer tests alone do not prove native recovery.
 
 ## Implementation sequence and open decisions
 
-The user approved six independently reviewable rollout iterations:
+The rollout uses independently reviewable iterations. Track status and related
+pull requests in the [GitHub roadmap](https://github.com/Phoenix-/gorynych/issues/10).
 
 | Iteration | Deliverable | Acceptance boundary |
 | --- | --- | --- |
@@ -413,6 +417,7 @@ The user approved six independently reviewable rollout iterations:
 | 4. Targeted reply reminders (**under review**) | Fresh activity checks, bounded recipient reminders and owner escalation | Reply/deadline races, cancellation, maintenance and uncertain handoff; enable first on an opted-in test group; disabling reminders preserves messaging and wait records |
 | 5. Assignment outcomes and other waits (**5a participant API; user control pending**) | Explicit completed/blocked/cancelled outcomes and background/child/user-action continuations | Partial final text does not complete work; unrelated native work grants no blanket exemption; initially observe without the general completion watchdog |
 | 6. General completion supervision | Detect an open admitted assignment left without execution, valid waiting or an exposed obstacle | Seven-agent team scenario, native background work, mutual waiting, user intervention and restart; only now enable completion reminders |
+| 7. Coordinator report inbox | Keep eligible reports available for retrieval and coalesce routine coordinator wake-ups, after completion supervision is verified | Two reviewers can settle a discussion without a coordinator turn for each exchange. A missed notification still leaves actionable work visible and eligible for overdue escalation |
 
 Each iteration must be usable and reviewable without deploying the next one. The
 first two are standalone improvements. Preserve running hosts and native threads
@@ -423,8 +428,9 @@ ship on the service/MCP side; a dependency-graph GUI is a later presentation cho
 Specify exact tool/wire contracts and capability compatibility for each iteration
 before implementing it. Use deterministic tests and scoped runtime checks, then
 review the change independently. Enable scheduling only after its passive state
-and cancellation/recovery behavior have been observed. Measure real team workflows
-before considering coalescing or other noise policy.
+and cancellation/recovery behavior have been observed. Use the seven-agent team
+workflow from iteration 6 as the baseline for measuring coordinator wake-ups in
+iteration 7.
 
 Open decisions include exact tools/wire and capability negotiation; completion and
 reply-expectation registration; assignment cardinality; review intervals and reminder
@@ -434,8 +440,29 @@ late-result acceptance and explicit reopening; and any future managed-message
 steering. None is settled by choosing a tool name in this document.
 
 General cycle detection, automatic summary-based filtering, and rate limits are
-not prerequisites. Any later noise reduction must preserve the no-silent-loss
-properties and remain separately reviewable.
+not prerequisites.
+
+## Coordinator report inbox
+
+Zerus [Agent Teams doorbells](https://github.com/ufna/zerus/blob/main/docs/agent-teams.md#doorbells-and-timers)
+inspire a separate delivery mode after iterations 5 and 6. Keep the full report
+under its existing retention policy and use `list_reports` and `read_report` for
+discovery and retrieval. The service can notify an eligible idle coordinator once
+for several new reports. Work that calls for a coordinator decision, an explicit
+assignment outcome, or an exposed blocker remains visible individually and follows
+the appropriate notification and escalation policy. Use recorded events for these
+decisions and preserve reports when their relevance is uncertain.
+
+Report publication, notification delivery, and resolution of an obligation remain
+separate. A delivered notification or a report read leaves the underlying
+obligation open until its correlated event or explicit disposition. If a
+notification gets lost, goes unconfirmed, or receives no action, its reports remain
+retrievable and unresolved actionable work still reaches its overdue review.
+
+Start with an opted-in team. Verify that a busy coordinator receives a single
+notification for accumulated routine reports once eligible. Test an unanswered
+decision request across restart with a lost notification, and verify that all report
+IDs remain retrievable and the outstanding decision becomes visibly overdue.
 
 ## References
 
