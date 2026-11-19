@@ -47,7 +47,7 @@ internal static class AssignmentContinuations
         }
         else throw new ArgumentException("Unknown continuation action");
         state["revision"] = revision + 1;
-        var result = state.DeepClone().AsObject(); result.Remove("operations"); result.Remove("fingerprint");
+        var result = state.DeepClone().AsObject(); result.Remove("operations"); result.Remove("fingerprint"); result.Remove("completionReminder");
         while (ops.Count >= 64)
             ops.Remove(ops.OrderBy(p => (long)p.Value!["expectedRevision"]!).ThenBy(p => p.Key, StringComparer.Ordinal).First().Key);
         ops[operation] = new JsonObject { ["kind"] = "continuation", ["actor"] = actor, ["expectedRevision"] = revision,

@@ -2680,3 +2680,22 @@ Before returning `open_without_recorded_continuation`, the service re-reads the 
 A matching native Codex idle received before `turn/completed` may be retained as an ephemeral observation. The hosted adapter and the host negotiate private support during initialization; each authenticated conductor connection separately advertises and receives host support. Direct adapters and older peers leave it disabled. The adapter's `_gorynych/codex_provisional_idle` confirmation commits under the JSON-RPC write gate after synchronous witness validation; later invalidating ingress queues matching revocation on the same stream. The host validates the exact successful prompt and native history mark and forwards only to the admitted supporting conductor, without buffering or replay. The conductor requires exact delivered, journaled successful delegation terminal and the same route/activity fence. Matching revocation is honored even during history import; confirmation during import is ignored. Reattachment, route change, native EOF and later activity discard the proof. This is an observation at an ordered commit point, not a guarantee about future activity or authority to wake.
 
 Early-idle confirmation is passive evidence as of its ordered guarded publication point. A matching revocation received before or after terminal publication prevents that evidence from being used; the consumer does not infer a result from the private frame alone. This checkpoint uses internal test opt-ins only and is not production negotiation.
+
+
+### Completion reminder notices
+
+The service advertises `gorynych/completionNotices` in ACP capabilities. A managed
+session may call `_gorynych/list_completion_notices` with an optional `cursor` and
+`limit` (1–100), and `_gorynych/ack_completion_notice` with the exact `assignmentId`,
+`assignee`, `generation`, original `revision`, and `attemptId` from a notice. Both
+require the existing peer token; the owner is resolved by the service and caller-supplied
+identity fields are rejected. The MCP tools `list_completion_notices` and
+`ack_completion_notice` provide the same owner-scoped operations. A notice says that
+the handoff was unknown when closed, not that no input was sent. Acknowledging it does
+not complete the assignment or grant another attempt.
+
+This storage and notice interface does not enable or dispatch completion reminders.
+A future manual trigger requires separately configured operator opt-in, exact group
+instance identity, policy and live-route guards, and durable host/adapter recovery.
+Peer tokens establish a session identity within the service, not human identity or OS
+isolation from other processes running as the same user.

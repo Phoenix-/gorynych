@@ -135,6 +135,9 @@ public static class GorynychProtocol
     /// <summary>Durably enqueue an inter-session message without waiting for a reply.</summary>
     public const string MethodSendMessage = "_gorynych/send_message";
     public const string MethodRequestReply = "_gorynych/request_reply";
+    public const string MethodListCompletionNotices = "_gorynych/list_completion_notices";
+    public const string MethodAckCompletionNotice = "_gorynych/ack_completion_notice";
+    public const string CapCompletionNotices = "gorynych/completionNotices";
     public const string MethodListAssignments = "_gorynych/list_assignments";
     public const string MethodReadAssignment = "_gorynych/read_assignment";
     public const string MethodUpdateAssignment = "_gorynych/update_assignment";
@@ -478,7 +481,7 @@ public static class GorynychProtocol
         "mcp__gorynych__list_agents", "mcp__gorynych__reply", "mcp__gorynych__ask_agent",
         "mcp__gorynych__send_message", "mcp__gorynych__reply_message",
         "mcp__gorynych__request_reply", "mcp__gorynych__list_reply_waits", "mcp__gorynych__cancel_reply_wait",
-        "mcp__gorynych__list_assignments", "mcp__gorynych__read_assignment", "mcp__gorynych__update_assignment", "mcp__gorynych__update_continuation", "mcp__gorynych__list_background_tasks",
+        "mcp__gorynych__list_completion_notices", "mcp__gorynych__ack_completion_notice", "mcp__gorynych__list_assignments", "mcp__gorynych__read_assignment", "mcp__gorynych__update_assignment", "mcp__gorynych__update_continuation", "mcp__gorynych__list_background_tasks",
         "mcp__gorynych__read_report", "mcp__gorynych__list_reports",
         "mcp__gorynych__archive_session", "mcp__gorynych__restore_session", SpawnTool,
     ];

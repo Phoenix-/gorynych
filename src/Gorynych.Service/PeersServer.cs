@@ -80,7 +80,7 @@ public static class PeersServer
                 requested is "read_report" or "list_reports" && req.Params?["arguments"] is not null && req.Params?["arguments"] is not JsonObject
                 => Text("Report arguments must be an object", error: true),
             "tools/call" when req.Params?["name"] is JsonValue assignmentName && assignmentName.TryGetValue<string>(out var assignmentTool) &&
-                assignmentTool is "list_assignments" or "read_assignment" or "update_assignment" or "update_continuation" or "list_background_tasks" &&
+                assignmentTool is "list_completion_notices" or "ack_completion_notice" or "list_assignments" or "read_assignment" or "update_assignment" or "update_continuation" or "list_background_tasks" &&
                 req.Params?["arguments"] is not null && req.Params?["arguments"] is not JsonObject
                 => Text("Assignment arguments must be an object", error: true),
             "tools/call" when req.Params?["name"] is JsonValue waitName && waitName.TryGetValue<string>(out var waitTool) &&
@@ -287,6 +287,22 @@ public static class PeersServer
                     if (args.TryGetPropertyValue("cursor", out var cursor)) query["cursor"] = cursor?.DeepClone();
                     if (args.TryGetPropertyValue("limit", out var limit)) query["limit"] = limit?.DeepClone();
                     var result = await RequestAsync(route!, read ? GorynychProtocol.MethodReadReport : GorynychProtocol.MethodListReports, query, ct);
+                    return Text(result?.ToJsonString(AcpJson.TextOptions) ?? "null");
+                }
+                case "list_completion_notices" or "ack_completion_notice" when pipe is not null && token is not null:
+                {
+                    args ??= new JsonObject();
+                    var list = tool == "list_completion_notices";
+                    foreach (var property in args)
+                        if (!(list ? property.Key is "cursor" or "limit" : property.Key is "assignment_id" or "assignee" or "generation" or "revision" or "attempt_id"))
+                            return Text("Unknown completion notice argument: " + property.Key, error: true);
+                    var query = new JsonObject { ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token } };
+                    foreach (var property in args)
+                    {
+                        var key = property.Key switch { "assignment_id" => "assignmentId", "attempt_id" => "attemptId", _ => property.Key };
+                        query[key] = property.Value?.DeepClone();
+                    }
+                    var result = await RequestAsync(route!, list ? GorynychProtocol.MethodListCompletionNotices : GorynychProtocol.MethodAckCompletionNotice, query, ct, retryLost: !list);
                     return Text(result?.ToJsonString(AcpJson.TextOptions) ?? "null");
                 }
                 case "list_assignments" or "read_assignment" or "update_assignment" or "update_continuation" or "list_background_tasks" when pipe is not null && token is not null:
@@ -818,6 +834,12 @@ public static class PeersServer
             ["inputSchema"] = new JsonObject { ["type"] = "object", ["additionalProperties"] = false,
                 ["properties"] = properties, ["required"] = required },
         };
+        var listCompletionNotices = AssignmentTool("list_completion_notices", "List your unacknowledged completion reminder notices. An unknown handoff is not proof that input was absent.",
+            new JsonObject { ["cursor"] = new JsonObject { ["type"] = "string" }, ["limit"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1, ["maximum"] = 100 } }, new JsonArray());
+        var ackCompletionNotice = AssignmentTool("ack_completion_notice", "Acknowledge your exact retained completion reminder notice without changing the assignment outcome.",
+            new JsonObject { ["assignment_id"] = new JsonObject { ["type"] = "string" }, ["assignee"] = new JsonObject { ["type"] = "string" },
+                ["generation"] = new JsonObject { ["type"] = "string" }, ["revision"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1 },
+                ["attempt_id"] = new JsonObject { ["type"] = "string" } }, new JsonArray("assignment_id", "assignee", "generation", "revision", "attempt_id"));
         var listAssignments = AssignmentTool("list_assignments", "List bounded assignment records and passive diagnostics where you are parent or child. Follow nextCursor.",
             new JsonObject { ["cursor"] = new JsonObject { ["type"] = "string" }, ["limit"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1, ["maximum"] = 100 } }, new JsonArray());
         JsonObject IdentityProperties() => new() { ["source"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("spawn", "delegation") },
@@ -847,7 +869,7 @@ public static class PeersServer
         var updateContinuation = AssignmentTool("update_continuation", "Register your retained reply wait, immediate child assignment or observed background task, or withdraw the current continuation. This does not start a turn or change the assignment outcome.",
             continuationProperties, new JsonArray("source", "assignment_id", "generation", "expected_revision", "operation_id", "action"));
         return [list, send, delegateTask, spawn, archive, restore, replyMessage, readReport, listReports, requestReply, listWaits, cancelWait,
-            listAssignments, readAssignment, updateAssignment, updateContinuation, backgroundTasks];
+            listCompletionNotices, ackCompletionNotice, listAssignments, readAssignment, updateAssignment, updateContinuation, backgroundTasks];
     }
 }
 
