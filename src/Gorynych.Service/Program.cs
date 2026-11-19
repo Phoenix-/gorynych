@@ -152,6 +152,7 @@ await using var conductor = new Conductor(new ConductorOptions
     CompletionObservationConfiguration = line.Value("--completion-observe-project") is { } observeProject &&
         line.Value("--completion-observe-group") is { } observeGroup && line.Value("--completion-observe-instance") is { } observeInstance
         ? (observeProject, observeGroup, observeInstance) : null,
+    CompletionAuto = line.Flag("--completion-auto"),
     CompletionConfiguration = line.Value("--completion-project") is { } completionProject &&
         line.Value("--completion-group") is { } completionGroup && line.Value("--completion-instance") is { } completionInstance
         ? (completionProject, completionGroup, completionInstance) : null,

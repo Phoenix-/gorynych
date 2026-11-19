@@ -2804,3 +2804,29 @@ evidence are rechecked after the host pull; a concurrent change can still occur 
 the last check. Restart or stream replacement can discard ephemeral evidence and turn a
 candidate into a defer. The pass reports only current coordinator-visible assignments;
 paging is ordered by source and assignment ID and is not a transactional snapshot.
+
+### Automatic completion pilot
+
+The automatic completion pilot is off by default and is separate from observation.
+An operator may opt in with `--completion-auto` together with all three existing
+`--completion-project`, `--completion-group` and `--completion-instance` service
+launch options. They select one current immutable group instance; an absent, invalid,
+deleted or recreated scope does not enable a different group. Launch without
+`--completion-auto` to disable automatic attempts. The existing service restart
+persists service arguments; disabling requires a launch without this flag.
+
+A non-overlapping sweep uses the service clock every 15 seconds. It examines a bounded
+page of retained open, delivered delegation assignments, advancing a cursor across
+pages. At most one admitted or uncertain handoff is attempted per sweep. Both owner
+and assignee must be current active members of the selected group. At least 60 seconds
+must have elapsed since the assignee's last observed activity, and the existing live
+hosted Claude observation, mode, route, input, background, continuation and authority
+guards must all pass. The selected generation and revision are rechecked before the
+durable claim. The attempt shares the same claim, guarded dispatch and settlement as
+the authenticated manual request; it neither completes the assignment nor opens a
+session to obtain evidence.
+
+An unresolved earlier handoff defers automatic attempts, including after restart.
+The pilot never resends an uncertain attempt. The existing owner-only
+`recover_completion_reminder` operation remains the recovery path, including when
+automatic mode is later disabled. No new retry or settlement policy is implied.

@@ -384,19 +384,27 @@ public sealed partial class Conductor
     const string CompletionPilotText = "Please record an explicit outcome or continuation.";
     internal async Task<JsonObject> SubmitCompletionOwnerAsync(JsonRpcRequest request, CancellationToken ct)
     {
-        JsonObject Defer(string reason) => new() { ["state"] = "deferred", ["reason"] = reason };
         var owner = MailboxPeer(request);
         var args = AssignmentParams(request, "assignmentId", "generation");
         var id = RequiredMailboxText(args, "assignmentId");
         var requestedGeneration = RequiredMailboxText(args, "generation");
         if (id.Length > 256 || !Guid.TryParseExact(requestedGeneration, "N", out _))
             throw new JsonRpcException(JsonRpcException.InvalidParams, "Invalid assignment identity");
+        return await SubmitCompletionAsync(owner, id, requestedGeneration, null, TimeSpan.FromSeconds(1), ct);
+    }
+
+    // Trusted internal caller supplies an owner selected from durable state; no peer token
+    // is synthesized. The final admission below is shared by manual and automatic paths.
+    async Task<JsonObject> SubmitCompletionAsync(string owner, string id, string requestedGeneration,
+        long? observedRevision, TimeSpan quiet, CancellationToken ct)
+    {
+        JsonObject Defer(string reason) => new() { ["state"] = "deferred", ["reason"] = reason };
         if (completionScope is not { } scope || !CompletionScopeIsCurrent) return Defer("disabled");
         var ledger = new CompletionHostLedger(options.TestCompletionLedgerPath ?? Path.Combine(options.DataDirectory, "completion-host-ledger.json"));
-        var quiet = TimeSpan.FromSeconds(1);
         var row = AssignmentFor("delegation", id, owner);
         if (row is null || (string?)row["parent"] != owner || (string?)row["child"] is not { } child ||
             (string?)row["generation"] is not { } generation || generation != requestedGeneration || (long?)row["revision"] is not { } revision ||
+            observedRevision is { } requiredRevision && revision != requiredRevision ||
             (string?)row["status"] != "open" || (string?)row["delivery"] != "delivered" || row["continuation"] is not null) return Defer("assignment");
         if (store.Get(owner) is not { Deleted: false, Archived: false } || store.Get(child) is not { Deleted: false, Archived: false, Agent: "claude" } session ||
             Draining || IsStopping(session.Agent) || !agents.TryGetValue("claude", out var host) || host.RouteOf(child) is not { Current: true } route ||
@@ -435,10 +443,12 @@ public sealed partial class Conductor
             var activity = feed.Activity.Snapshot();
             if (!CompletionScopeIsCurrent || !Member(owner) || !Member(child) ||
                 store.Get(owner) is not { Deleted: false, Archived: false } || store.Get(child) is not { Deleted: false, Archived: false } ||
+                observedRevision is not null && (store.Get(owner) is not { Draft: false } || store.Get(child) is not { Draft: false }) ||
                 Draining || IsStopping(session.Agent) || feed.Retired || feed.ReadOnly is not null || feed.OpenedReadOnly ||
                 feed.ReminderModeUncertain || !ReminderModeKnown(feed.State()) || InFullAccess(child) ||
                 feed.LastActivity == DateTimeOffset.MinValue || options.Time.GetUtcNow() - feed.LastActivity < quiet ||
                 feed.Users != 0 || feed.HasSteeringInFlight || feed.HasBackgroundWork || feed.Asking != 0 || feed.PendingRequests != 0 ||
+                observedRevision is not null && (feed.TurnRunning || feed.AgentTurnRunning) ||
                 (string?)activity["state"] != "idle" || mailbox.Read(child, 0, 1, true).Count != 0 ||
                 route.Info.Meta?[GorynychProtocol.CapHostCompletionGuarded] is not JsonValue guardedFinal ||
                 !guardedFinal.TryGetValue<bool>(out var guardedStillSupported) || !guardedStillSupported ||

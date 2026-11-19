@@ -17,6 +17,8 @@ public sealed class ConductorOptions
     public required string ServiceId { get; init; }
     public string? DefaultAgent { get; init; }
     internal (string Project, string Group, string Instance)? CompletionConfiguration { get; init; }
+    internal bool CompletionAuto { get; init; }
+    internal TimeSpan CompletionAutoSweepInterval { get; init; } = TimeSpan.FromSeconds(15);
     internal (string Project, string Group, string Instance)? CompletionObservationConfiguration { get; init; }
     internal string? TestCompletionLedgerPath { get; init; }
     internal TimeSpan? TestCompletionObservationTimeout { get; init; }
@@ -253,6 +255,7 @@ public sealed partial class Conductor : IAsyncDisposable
         reports = new ReportStore(Path.Combine(options.DataDirectory, "reports"));
         InitializeMailbox();
         StartReminderSweep();
+        StartCompletionAutoSweep();
         Track(Task.Run(() => { QueueReportDeliveries(); return ReconcileReportInventoryAsync(); }));
     }
 
@@ -6145,6 +6148,7 @@ public sealed partial class Conductor : IAsyncDisposable
         lock (restartGate) cleanupStop.Cancel();
         Volatile.Read(ref reclaimSweep)?.Dispose();
         reminderTimer?.Dispose();
+        completionAutoTimer?.Dispose();
         try { await Task.WhenAll(autoTitleTasks.Keys).WaitAsync(TimeSpan.FromSeconds(2)); }
         catch (Exception e) { ServiceLog.Warn($"generated titles at exit: {e.Message}"); }
         try { await Task.WhenAll(cleanups.Keys).WaitAsync(TimeSpan.FromSeconds(5)); }
