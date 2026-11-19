@@ -24,6 +24,8 @@ internal sealed partial class MailboxStore
     JsonArray entries;
     long next;
     long trimmedThrough;
+    string? completionStream;
+    long completionNext;
     internal Action<string, string> WriteFile { get; set; } = static (path, json) => AtomicFile.WriteAllText(path, json);
 
     internal MailboxStore(string path, int capacity = 5000, int waitCapacity = 1000, TimeProvider? clock = null, int assignmentCapacity = 1000, int completionClaimCapacity = 64, int completionReceiptCapacity = 64)
@@ -46,6 +48,14 @@ internal sealed partial class MailboxStore
             if (root["replyWaits"] is { } retained) replyWaits = retained.AsObject();
             if (root["assignments"] is { } existingAssignments) assignments = existingAssignments.AsObject();
             if (root["completionReceipts"] is { } receipts) completionReceipts = receipts.AsObject();
+            if (root["completionStream"] is { } streamNode)
+            {
+                completionStream = (string?)streamNode;
+                completionNext = (long?)root["completionNext"] ?? throw new InvalidDataException("Missing completion sequence");
+                if (!Guid.TryParseExact(completionStream, "N", out _) || completionStream != completionStream.ToLowerInvariant() || completionNext < 0)
+                    throw new InvalidDataException("Invalid completion stream");
+            }
+            else if (root["completionNext"] is not null) throw new InvalidDataException("Missing completion stream");
             // A prior process may have handed input off after recording started. Never replay it.
             foreach (var assignment in assignments.Select(p => p.Value).OfType<JsonObject>())
                 if ((string?)assignment["completionReminder"]?["disposition"] == "handoff_started")
@@ -281,13 +291,16 @@ internal sealed partial class MailboxStore
     }
 
     void Save(JsonArray replacement, long sequence, long? trimmed = null, JsonObject? waits = null, JsonObject? assigned = null,
-        string? completionClaimId = null, bool completionClaimStarted = false, JsonObject? receipts = null)
+        string? completionClaimId = null, bool completionClaimStarted = false, JsonObject? receipts = null,
+        string? newCompletionStream = null, long? newCompletionNext = null)
     {
         if (publicationUncertain) throw new InvalidOperationException("Mailbox publication is uncertain; reconcile before writing");
         var root = new JsonObject { ["next"] = sequence, ["entries"] = replacement, ["trimmedThrough"] = trimmed ?? trimmedThrough };
         if (waits is not null || replyWaits.Count > 0) root["replyWaits"] = waits ?? replyWaits.DeepClone();
         if (assigned is not null || assignments.Count > 0) root["assignments"] = assigned ?? assignments.DeepClone();
         if (receipts is not null || completionReceipts.Count > 0) root["completionReceipts"] = receipts ?? completionReceipts.DeepClone();
+        var stream = newCompletionStream ?? completionStream;
+        if (stream is not null) { root["completionStream"] = stream; root["completionNext"] = newCompletionNext ?? completionNext; }
         // AtomicFile.WriteAllText uses UTF-8 without a BOM. Hash the exact encoded bytes
         // incrementally to avoid another mailbox-sized byte array or a persistent DOM clone.
         var json = root.ToJsonString(); var candidateDigest = Utf8Digest(json);
@@ -305,6 +318,7 @@ internal sealed partial class MailboxStore
         if (waits is not null) replyWaits = waits;
         if (assigned is not null) assignments = assigned;
         if (receipts is not null) completionReceipts = receipts;
+        completionStream = stream; completionNext = newCompletionNext ?? completionNext;
         next = sequence;
         trimmedThrough = trimmed ?? trimmedThrough;
     }
@@ -367,6 +381,10 @@ internal sealed partial class MailboxStore
                 replyWaits = disk["replyWaits"]?.AsObject() ?? new JsonObject();
                 assignments = disk["assignments"]?.AsObject() ?? new JsonObject();
                 completionReceipts = disk["completionReceipts"]?.AsObject() ?? new JsonObject();
+                completionStream = (string?)disk["completionStream"];
+                completionNext = (long?)disk["completionNext"] ?? 0;
+                if (completionStream is not null && (!Guid.TryParseExact(completionStream, "N", out _) || completionNext < 0))
+                    throw new InvalidDataException("Invalid completion stream");
                 // An error after the claim write cannot grant a dispatch, and its delivery is unknown.
                 if (recoveryClaimStarted && assignments[recoveryClaimId!]?["completionReminder"] is JsonObject claim &&
                     (string?)claim["disposition"] == "handoff_started") claim["disposition"] = "uncertain";

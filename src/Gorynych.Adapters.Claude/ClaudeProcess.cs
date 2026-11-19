@@ -15,6 +15,7 @@ namespace Gorynych.Adapters.Claude;
 internal sealed class ClaudeProcess : IAsyncDisposable
 {
     readonly Process process;
+    readonly bool allowForceKill;
     readonly Stream stdin;
     readonly SemaphoreSlim writeGate = new(1, 1);
     readonly ConcurrentDictionary<string, TaskCompletionSource<JsonObject>> pending = new(StringComparer.Ordinal);
@@ -26,15 +27,17 @@ internal sealed class ClaudeProcess : IAsyncDisposable
     readonly string? stderrLog;
     long counter;
     bool inputClosed;
+    bool inputTainted;
+    internal bool InputTainted => Volatile.Read(ref inputTainted);
 
     const int StderrTailChars = 2000;
     const long StderrLogLimit = 1024 * 1024;
 
     readonly TaskCompletionSource begin = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    ClaudeProcess(Process process, Func<JsonObject, Task> onMessage, Action<string> log, string? stderrLog)
+    ClaudeProcess(Process process, Func<JsonObject, Task> onMessage, Action<string> log, string? stderrLog, bool allowForceKill)
     {
-        this.process = process;
+        this.process = process; this.allowForceKill = allowForceKill;
         this.onMessage = onMessage;
         this.log = log;
         this.stderrLog = stderrLog;
@@ -44,7 +47,7 @@ internal sealed class ClaudeProcess : IAsyncDisposable
     /// <summary>Starts <paramref name="exe"/> with <paramref name="args"/> in <paramref name="cwd"/>, with exactly <paramref name="environment"/>.</summary>
     /// <param name="stderrLog">A file for Claude's stderr (kept up to 1 MB), or null.</param>
     public static ClaudeProcess Start(string exe, IEnumerable<string> args, string cwd, IReadOnlyDictionary<string, string> environment,
-        string? stderrLog, Func<JsonObject, Task> onMessage, Action<string> log)
+        string? stderrLog, Func<JsonObject, Task> onMessage, Action<string> log, bool allowForceKill = true)
     {
         var info = new ProcessStartInfo(exe)
         {
@@ -65,7 +68,7 @@ internal sealed class ClaudeProcess : IAsyncDisposable
             try { File.WriteAllText(stderrLog, ""); }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { stderrLog = null; }
         var process = Process.Start(info) ?? throw new InvalidOperationException($"{exe} did not start");
-        var claude = new ClaudeProcess(process, onMessage, log, stderrLog);
+        var claude = new ClaudeProcess(process, onMessage, log, stderrLog, allowForceKill);
         // Blocking reads for the life of the process, on threads of their own (as the ConPTY host
         // does), so sessions never starve the pool. Stdout is read only after BeginReading, so the
         // session can register the process before its first line is handled.
@@ -81,6 +84,9 @@ internal sealed class ClaudeProcess : IAsyncDisposable
     public int Id => process.Id;
     // Stable only for this native process; never accepted from a user prompt.
     public string BackgroundStreamId { get; } = Guid.NewGuid().ToString("N");
+
+    // Exited includes output drain; a snapshot must not trust a physically dead process during that interval.
+    internal bool PhysicallyExited { get { try { return process.HasExited; } catch (InvalidOperationException) { return true; } } }
 
     /// <summary>Completes with the exit code once the process has exited and its output is read.</summary>
     public Task<int> Exited => exited.Task;
@@ -175,7 +181,7 @@ internal sealed class ClaudeProcess : IAsyncDisposable
         await writeGate.WaitAsync(ct);
         try
         {
-            if (inputClosed) throw new IOException("Claude's input is closed");
+            if (inputClosed || inputTainted) throw new IOException("Claude's input is closed or uncertain");
             await stdin.WriteAsync(bytes, ct);
             await stdin.FlushAsync(ct);
         }
@@ -183,18 +189,77 @@ internal sealed class ClaudeProcess : IAsyncDisposable
         finally { writeGate.Release(); }
     }
 
+    internal enum GuardedWriteOutcome { NoInput, WriteCompleted, Uncertain }
+
+    // The caller's synchronous guard commits under its state lock after writeGate is held.
+    // Once committed, cancellation or write/flush failure cannot prove that no bytes were sent.
+    internal async Task<GuardedWriteOutcome> WriteGuardedAsync(JsonObject message, Func<bool> commit,
+        CancellationToken ct)
+    {
+        var bytes = Encoding.UTF8.GetBytes(message.ToJsonString() + "\n");
+        try
+        {
+            await writeGate.WaitAsync(ct);
+        }
+        catch (OperationCanceledException) { return GuardedWriteOutcome.NoInput; }
+        try
+        {
+            if (inputClosed || inputTainted || ct.IsCancellationRequested || !commit()) return GuardedWriteOutcome.NoInput;
+            try
+            {
+                await stdin.WriteAsync(bytes, ct);
+                await stdin.FlushAsync(ct);
+                return ct.IsCancellationRequested ? GuardedWriteOutcome.Uncertain : GuardedWriteOutcome.WriteCompleted;
+            }
+            catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException or InvalidOperationException)
+            {
+                // A partial JSON line may be present. Never append another frame to it.
+                Volatile.Write(ref inputTainted, true);
+                // Close stdin gracefully: never append to a potentially partial JSON line.
+                // A replacement is only allowed after this process has actually exited.
+                try { stdin.Close(); inputClosed = true; }
+                catch (Exception closeError) when (closeError is IOException or ObjectDisposedException) { }
+                return GuardedWriteOutcome.Uncertain;
+            }
+        }
+        finally { writeGate.Release(); }
+    }
+
     /// <summary>
     /// Sends a control request (<c>{type: "control_request", request_id, request}</c>) and returns the
     /// <c>response</c> of its success; an error response throws <see cref="ClaudeControlException"/>.
     /// </summary>
-    public async Task<JsonObject> ControlAsync(JsonObject request, TimeSpan timeout, CancellationToken ct = default)
+    public async Task<JsonObject> ControlAsync(JsonObject request, TimeSpan timeout, CancellationToken ct = default) =>
+        (await ControlCoreAsync(request, timeout, null, ct))!;
+
+    // A guarded-only interrupt must still address the exact cycle at the stdin writer.
+    // The synchronous predicate commits directly before the first write; no state lock crosses I/O.
+    internal Task<JsonObject?> ControlGuardedAsync(JsonObject request, TimeSpan timeout, Func<bool> guard,
+        CancellationToken ct = default) => ControlCoreAsync(request, timeout, guard, ct);
+
+    async Task<JsonObject?> ControlCoreAsync(JsonObject request, TimeSpan timeout, Func<bool>? guard, CancellationToken ct)
     {
         var id = "g" + Interlocked.Increment(ref counter);
         var waiting = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
         pending[id] = waiting;
         try
         {
-            await WriteAsync(new JsonObject { ["type"] = "control_request", ["request_id"] = id, ["request"] = request }, ct);
+            var frame = new JsonObject { ["type"] = "control_request", ["request_id"] = id, ["request"] = request };
+            if (guard is null) await WriteAsync(frame, ct);
+            else
+            {
+                var bytes = Encoding.UTF8.GetBytes(frame.ToJsonString() + "\n");
+                await writeGate.WaitAsync(ct);
+                try
+                {
+                    if (inputClosed || inputTainted) throw new IOException("Claude's input is closed or uncertain");
+                    if (!guard()) return null;
+                    await stdin.WriteAsync(bytes, ct);
+                    await stdin.FlushAsync(ct);
+                }
+                catch (ObjectDisposedException e) { throw new IOException("Claude's input is closed", e); }
+                finally { writeGate.Release(); }
+            }
             // An exit after the sweep of pending requests would otherwise leave this to its timeout.
             if (await Task.WhenAny(waiting.Task, exited.Task).WaitAsync(timeout, ct) != waiting.Task && !waiting.Task.IsCompleted)
                 throw new IOException($"Claude exited with code {exited.Task.Result}");
@@ -239,6 +304,7 @@ internal sealed class ClaudeProcess : IAsyncDisposable
 
     public void Kill()
     {
+        if (!allowForceKill) { log("claude: forced termination disabled for this test process"); return; }
         try { process.Kill(entireProcessTree: true); }
         catch (InvalidOperationException) { }
         catch (System.ComponentModel.Win32Exception) { }

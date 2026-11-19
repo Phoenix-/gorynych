@@ -16,6 +16,9 @@ public sealed class ConductorOptions
     public required string DataDirectory { get; init; }
     public required string ServiceId { get; init; }
     public string? DefaultAgent { get; init; }
+    internal (string Project, string Group, string Instance)? CompletionConfiguration { get; init; }
+    internal string? TestCompletionLedgerPath { get; init; }
+    internal TimeSpan? TestCompletionObservationTimeout { get; init; }
 
     /// <summary>
     /// Per-agent choices for new sessions, from <c>session-defaults.json</c> in the data folder.
@@ -144,6 +147,16 @@ public sealed partial class Conductor : IAsyncDisposable
     readonly Dictionary<string, AgentHost> agents = new(StringComparer.Ordinal);
     readonly SessionStore store;
     readonly UiMetadataStore uiMetadata;
+    readonly (string Project, string Group, string Instance)? completionScope;
+    internal bool CompletionScopeIsCurrent
+    {
+        get
+        {
+            if (completionScope is not { } scope) return false;
+            try { return uiMetadata.IsCurrentGroupInstance(scope.Project, scope.Group, scope.Instance); }
+            catch (Exception e) when (e is InvalidOperationException or ArgumentException or System.Text.Json.JsonException) { return false; }
+        }
+    }
     internal UiMetadataStore UiMetadata => uiMetadata;
     readonly SemaphoreSlim uiMetadataGate = new(1, 1);
     const string AttributesKey = GorynychProtocol.MetaAttributes;
@@ -207,6 +220,13 @@ public sealed partial class Conductor : IAsyncDisposable
         store = new SessionStore(Path.Combine(options.DataDirectory, "sessions.json"));
         store.ReconcileSpawnAssignments();
         uiMetadata = new UiMetadataStore(Path.Combine(options.DataDirectory, "ui-metadata.json"));
+        if (options.CompletionConfiguration is { } configured &&
+            !string.IsNullOrWhiteSpace(configured.Project) && configured.Project.Length <= 512 &&
+            !string.IsNullOrWhiteSpace(configured.Group) && configured.Group.Length <= 256 &&
+            Guid.TryParseExact(configured.Instance, "N", out _) && configured.Instance == configured.Instance.ToLowerInvariant())
+            completionScope = configured;
+        if (options.CompletionConfiguration is not null && !CompletionScopeIsCurrent)
+            ServiceLog.Warn("completion reminder: configured group instance is unavailable; disabled");
         reminderPolicy = ReplyReminderPolicy.Load(Path.Combine(options.DataDirectory, "reply-reminders.json"), out reminderPolicyStatus);
         startupDrafts = store.All().Where(r => r.Draft).Select(r => r.SessionId).ToList();
         foreach (var a in adapters) agents[a.Name] = new AgentHost(a, this);
@@ -547,6 +567,7 @@ public sealed partial class Conductor : IAsyncDisposable
         if (removed.ContainsKey(sessionId) || store.Get(sessionId) is not { Deleted: false } record
             || !agents.TryGetValue(record.Agent, out var host)) return Move.Stay;
         if (host.RouteOf(sessionId) is not { Current: false } stale) return Move.Done;
+        if (await HoldCompletionForCleanupAsync(sessionId, ct)) return Move.Stay;
         var feed = Feed(sessionId);
         if (!OpensElsewhere(stale, feed)) return Move.Stay;
         if (!stale.CanClose) return await TryStopWholeAsync(host, stale, holdingTurn ? sessionId : null);
@@ -603,6 +624,9 @@ public sealed partial class Conductor : IAsyncDisposable
     /// <param name="turnHeldFor">The session whose turn the caller holds, for a prompt in it.</param>
     internal async Task<Move> TryStopWholeAsync(AgentHost host, HostLink link, string? turnHeldFor)
     {
+        // Check all sessions before marking the host stopping; no session gate is held across status RPC.
+        foreach (var session in host.SessionsOf(link))
+            if (await HoldCompletionForCleanupAsync(session, cleanupStop.Token)) return Move.Stay;
         // Another stop of it is on its way, or it is gone: the session stays where it is open now.
         if (!host.BeginStop(link)) return turnHeldFor is not null && host.RouteOf(turnHeldFor) != link ? Move.Done : Move.Stay;
         var held = new List<(SessionFeed Feed, bool Turn)>();
@@ -2260,9 +2284,21 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         static string Required(JsonNode? p, string key) => p?[key] is JsonValue v && v.TryGetValue<string>(out var s) && !string.IsNullOrEmpty(s)
             ? s : throw new JsonRpcException(JsonRpcException.InvalidParams, $"{key} is required");
-        await uiMetadataGate.WaitAsync(ct);
+        var held = false; var fenced = false; var applied = false;
+        await uiMetadataGate.WaitAsync(ct); held = true;
         try
         {
+            var pending = BeginCompletionMembershipMutation(method, parameters, out fenced);
+            string? verdict = null;
+            if (fenced && pending is not null)
+            {
+                uiMetadataGate.Release(); held = false;
+                if (BeforeCompletionPolicyAbortForTests is { } barrier) await barrier().WaitAsync(ct);
+                verdict = await AbortCompletionPolicyAsync(pending.Owner, pending.AssignmentId, pending.Assignee,
+                    pending.Generation, pending.AttemptId, ct);
+                await uiMetadataGate.WaitAsync(ct); held = true;
+            }
+            if (fenced) ConfirmCompletionMembershipMutation(pending, verdict);
             switch (method)
             {
                 case GorynychProtocol.MethodAttributesGet:
@@ -2275,7 +2311,7 @@ public sealed partial class Conductor : IAsyncDisposable
                     var patch = parameters?["patch"] as JsonObject ?? throw new JsonRpcException(JsonRpcException.InvalidParams, "patch must be an object");
                     var attributes = uiMetadata.Patch(id, patch);
                     await PublishAttributesAsync(record, attributes);
-                    return new JsonObject { ["attributes"] = attributes };
+                    applied = true; return new JsonObject { ["attributes"] = attributes };
                 }
                 case GorynychProtocol.MethodGroupsList:
                     return new JsonObject { ["groups"] = uiMetadata.List(Required(parameters, "projectKey")) };
@@ -2294,13 +2330,13 @@ public sealed partial class Conductor : IAsyncDisposable
                     foreach (var id in affected)
                         if (store.Get(id) is { Deleted: false } record) await PublishAttributesAsync(record, uiMetadata.Get(id));
                     if (changed) NotifyGroups(project);
-                    return new JsonObject();
+                    applied = true; return new JsonObject();
                 }
                 default: throw new JsonRpcException(JsonRpcException.MethodNotFound, method);
             }
         }
         catch (ArgumentException e) { throw new JsonRpcException(JsonRpcException.InvalidParams, e.Message); }
-        finally { uiMetadataGate.Release(); }
+        finally { if (held) uiMetadataGate.Release(); if (fenced) EndCompletionMembershipMutation(applied); }
     }
 
     void NotifyGroups(string project)
@@ -3477,12 +3513,17 @@ public sealed partial class Conductor : IAsyncDisposable
 
     async Task<JsonNode?> ForwardCoreAsync(JsonRpcRequest request, string sessionId, CancellationToken ct)
     {
+        var modeChange = request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode;
+        var pilot = modeChange ? await BeginCompletionParticipantPolicyAsync(sessionId, ct) : default;
+        var pilotApplied = false;
+        try
+        {
         using var use = await UseAsync(sessionId, ct);
         var (rpc, _) = await EnsureLiveAsync(use.Record, ct);
-        var modeChange = request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode;
         if (modeChange) await use.Feed.ReminderModeGate.WaitAsync(ct);
         try
         {
+            if (pilot.Fenced) ConfirmCompletionMembershipMutation(pilot.Saved, pilot.Verdict);
             // A change of a session its agent opened for reading only: opened again first, which takes it
             // if it is free now, and refused in the same words as a prompt while it is still read-only.
             if (use.Feed.OpenedReadOnly && request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode or "session/set_model")
@@ -3526,9 +3567,11 @@ public sealed partial class Conductor : IAsyncDisposable
                     use.Feed.SetCurrent("models", "currentModelId", request.Params?["modelId"]);
                     break;
             }
-            return response;
+            pilotApplied = true; return response;
         }
         finally { if (modeChange) use.Feed.ReminderModeGate.Release(); }
+        }
+        finally { if (pilot.Fenced) EndCompletionMembershipMutation(pilotApplied); }
     }
 
     internal async Task ForwardNotificationAsync(string method, JsonNode? @params, string sessionId)
@@ -4731,6 +4774,7 @@ public sealed partial class Conductor : IAsyncDisposable
     async Task UnloadIfIdleAsync(SessionFeed feed, long timer)
     {
         var sessionId = feed.SessionId;
+        if (await HoldCompletionForCleanupAsync(sessionId, cleanupStop.Token)) return;
         await feed.LifeGate.WaitAsync(cleanupStop.Token);
         try
         {
@@ -4759,6 +4803,7 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         try
         {
+            if (await HoldCompletionForCleanupAsync(feed.SessionId, cleanupStop.Token)) return;
             await feed.LifeGate.WaitAsync(cleanupStop.Token);
             try
             {
@@ -4782,8 +4827,16 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         if (store.Get(sessionId) is not { } record || !agents.TryGetValue(record.Agent, out var host)) return;
         if (host.RouteOf(sessionId) is not { CanClose: true } on) return;
-        await CloseInAgentAsync(host, on.Rpc, sessionId, cleanupStop.Token);
-        ServiceLog.Info($"{record.Agent} {sessionId}: unloaded from its agent, {why(host)}");
+        lock (completionPilotGate)
+        {
+            if (CompletionPendingOnRoute(sessionId, on, out _) || !completionAutoClosing.Add(sessionId)) return;
+        }
+        try
+        {
+            await CloseInAgentAsync(host, on.Rpc, sessionId, cleanupStop.Token);
+            ServiceLog.Info($"{record.Agent} {sessionId}: unloaded from its agent, {why(host)}");
+        }
+        finally { lock (completionPilotGate) completionAutoClosing.Remove(sessionId); }
     }
 
     /// <summary>
@@ -4820,6 +4873,10 @@ public sealed partial class Conductor : IAsyncDisposable
         string? from = null;
         if ((string?)request.Params?["_meta"]?[GorynychProtocol.MetaPeerToken] is { } token)
             from = peerTokens.TryGetValue(token, out var sid) ? sid : throw new JsonRpcException(JsonRpcException.InvalidRequest, "Unknown peer token");
+        var pilot = await BeginCompletionParticipantPolicyAsync(target, ct);
+        var pilotApplied = false;
+        try
+        {
         SessionUse use;
         try
         {
@@ -4838,6 +4895,7 @@ public sealed partial class Conductor : IAsyncDisposable
             await archiveGate.WaitAsync(ct);
             try
             {
+                if (pilot.Fenced) ConfirmCompletionMembershipMutation(pilot.Saved, pilot.Verdict);
                 record = store.Get(target) is { Deleted: false } now ? now : throw NotFound(target);
                 changed = record.Archived != archived;
                 if (changed)
@@ -4861,8 +4919,10 @@ public sealed partial class Conductor : IAsyncDisposable
             if (changed && !archived) QueueReportDeliveries(target);
             var result = new JsonObject();
             if (from is not null) result["text"] = ArchiveText(record, archived, changed, self: from == target);
-            return result;
+            pilotApplied = true; return result;
         }
+        }
+        finally { if (pilot.Fenced) EndCompletionMembershipMutation(pilotApplied); }
     }
 
     /// <summary>What <c>archive_session</c> and <c>restore_session</c> tell the agent: which session, and what it means now.</summary>

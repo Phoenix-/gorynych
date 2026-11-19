@@ -88,7 +88,14 @@ public sealed class CompletionReminderClaimTests
         Assert.ThrowsExactly<IOException>(() => store.ClaimCompletionReminder("delegation", "task", "parent", "child", generation, 1, attempt, binding));
         var recovered = new MailboxStore(path).ReadCompletionRecovery("task", "parent", "child", generation, attempt);
         Assert.AreEqual(afterWrite, recovered is not null);
-        if (recovered is not null) { Assert.AreEqual(binding, recovered.Binding); Assert.AreEqual("uncertain", recovered.Disposition); }
+        if (recovered is not null) { Assert.AreEqual(binding, recovered.Binding); Assert.AreEqual("uncertain", recovered.Disposition); Assert.AreEqual(1L, recovered.Number); }
+        var reopened = new MailboxStore(path);
+        reopened.Accept("next-task", "parent", "child", "work", delegation: true);
+        reopened.MarkStarted("next-task", "child"); reopened.MarkDelivered("next-task", "child");
+        var nextGeneration = (string)reopened.FindAssignment("next-task", "parent")!["generation"]!;
+        var next = reopened.ClaimCompletionReminder("delegation", "next-task", "parent", "child", nextGeneration, 1, Attempt(), binding);
+        Assert.IsTrue(next.Acquired); Assert.AreEqual(afterWrite ? 2L : 1L, next.Claim!.Number);
+        if (recovered is not null) Assert.AreEqual(recovered.Stream, next.Claim.Stream);
     }
 
     [TestMethod]

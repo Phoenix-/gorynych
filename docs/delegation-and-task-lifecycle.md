@@ -524,3 +524,30 @@ the group preserves it; deleting the group removes it atomically, so recreation 
 same public key gets another token. The future configuration must retain and compare
 the originally approved token, including across restart, and must not silently bind a
 replacement group. Allocation of this token does not grant opt-in or send anything.
+
+The in-progress completion handoff storage uses a durable mailbox stream incarnation
+and monotonic claim number. A bounded host ledger retains a watermark while compacting
+only a proven pre-commit abort or an exact released receipt after durable consumer
+settlement. A missing row below that watermark is stale/unknown, not proof of no input.
+The ledger has a separate incarnation anchor; initial creation requires a durable
+mailbox stream with no prior claims. These primitives are not wired into dispatch or
+recovery yet. They do not promise safety if a person manually rolls the canonical data
+directory back to an older backup.
+
+If initialization was interrupted after writing the ledger anchor, a missing ledger can
+be repaired only when the exact mailbox stream is still durably pristine. A previously
+used or mismatched stream remains unknown. After independently proving exit of the
+exact original producer, an admitted row may be compacted only after the matching
+mailbox transaction durably records `unknown_closed` and its owner notice. This is
+independent of adapter ACK and never establishes that input was absent. These internal
+operations still require the production authenticated host/adapter integration.
+
+A hosted headless Claude adapter and its authenticated current AdapterHost connection can
+negotiate a private guarded handoff and prompt-observation capability. The host accepts
+a submit only for an already published exact mailbox-derived ledger row and matching
+current host, session, prompt, stream, sequence and digest. The durable `BeginForward`
+marker is committed immediately before the adapter writer; missing or stale admission
+is not a no-input proof. Adapter receipt revisions and ACK are retained by the host
+before consumer settlement. External ACP requests and notifications cannot invoke
+these private methods. The current driver is internal; the owner trigger, policy fence,
+and automatic recovery integration are not yet connected.

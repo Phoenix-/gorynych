@@ -38,19 +38,35 @@ public sealed class PrivateReportNoteBoundaryTests
         var updated = service.Store.Get(session)!.UpdatedAt; var users = service.Feed(session).Users;
         var prompts = agent.Prompts.Count;
         await Refused();
+        var guarded = new[] { GorynychProtocol.MethodCompletionGuardedSubmit, GorynychProtocol.MethodCompletionGuardedStatus,
+            GorynychProtocol.MethodCompletionGuardedAck, GorynychProtocol.MethodCompletionGuardedRetire, GorynychProtocol.MethodCompletionGuardedAbort,
+            GorynychProtocol.MethodHostCompletionGuardedSubmit, GorynychProtocol.MethodHostCompletionGuardedStatus,
+            GorynychProtocol.MethodHostCompletionGuardedAck, GorynychProtocol.MethodHostCompletionGuardedRetire, GorynychProtocol.MethodHostCompletionGuardedAbort,
+            GorynychProtocol.MethodClaudePromptObservation, GorynychProtocol.MethodHostClaudePromptObservation };
+        foreach (var method in guarded)
+        {
+            var error = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => client.Rpc.SendRequestAsync(method, Args()));
+            Assert.AreEqual(JsonRpcException.MethodNotFound, error.Code);
+            await client.Rpc.SendNotificationAsync(method, Args());
+        }
         await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodCodexProvisionalIdle, Args());
         await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodHostCodexProvisionalIdle, Args());
         await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodHostReportNoteReceipt, Args());
         await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodHostReportNoteAck, Args());
+        await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodCompletionGuardedRetire, Args());
+        await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodHostCompletionGuardedRetire, Args());
         await client.Rpc.SendNotificationAsync(GorynychProtocol.MethodReportNoteAck, Args());
         await client.Rpc.SendRequestAsync(GorynychProtocol.MethodStatus, new JsonObject());
         Assert.AreEqual(0, NativeCalls(), "private requests and notification never reached the native adapter");
+        lock (agent.Adapter.Methods) Assert.IsFalse(agent.Adapter.Methods.Any(m => guarded.Contains(m)), "guarded methods never reached the adapter");
         Assert.AreEqual(prompts, agent.Prompts.Count); Assert.AreEqual(users, service.Feed(session).Users);
         Assert.AreEqual(updated, service.Store.Get(session)!.UpdatedAt);
 
         // The guarded methods are still routable over the trusted host RPC. This fake does not
         // implement them; its method log proves they crossed that boundary and stopped there.
         var route = service.Agents["kimi"].RouteOf(session)!;
+        await Assert.ThrowsExactlyAsync<JsonRpcException>(() => route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedStatus, Args()));
+        lock (agent.Adapter.Methods) Assert.IsFalse(agent.Adapter.Methods.Any(m => guarded.Contains(m)), "unsupported host must not forward guarded RPC");
         var direct = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => route.Rpc.SendRequestAsync(GorynychProtocol.MethodReportNoteStatus, Args()));
         Assert.AreEqual(JsonRpcException.MethodNotFound, direct.Code); Assert.AreEqual(1, NativeCalls());
 

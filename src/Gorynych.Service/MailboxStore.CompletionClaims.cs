@@ -6,7 +6,7 @@ namespace Gorynych.Service;
 // and is never called by a scheduler or exposed through a client protocol.
 internal enum CompletionReminderSettlement { NativeEnded, NativeFailed, NativeCancelled, ProvenNotSent }
 
-internal sealed record CompletionReminderClaim(string AttemptId, long AssignmentRevision, string Disposition);
+internal sealed record CompletionReminderClaim(string AttemptId, long AssignmentRevision, string Disposition, string? Stream = null, long Number = 0);
 internal sealed record CompletionReminderAdmission(bool Acquired, CompletionReminderClaim? Claim);
 
 // Service-owned immutable facts captured before the final handoff claim. Missing producer
@@ -42,7 +42,7 @@ internal sealed record CompletionReminderBinding(string ProjectKey, string Group
     }
 }
 internal sealed record CompletionReminderRecovery(string Source, string AssignmentId, string Owner, string Assignee,
-    string Generation, long OriginalRevision, string AttemptId, string Disposition, CompletionReminderBinding Binding);
+    string Generation, long OriginalRevision, string AttemptId, string Disposition, CompletionReminderBinding Binding, string Stream, long Number);
 
 internal sealed partial class MailboxStore
 {
@@ -50,6 +50,27 @@ internal sealed partial class MailboxStore
     readonly int completionReceiptCapacity;
     JsonObject completionReceipts = new();
     static string CompletionReceiptKey(string generation, string attemptId) => generation + ":" + attemptId;
+    // Prepare before the first claim. An uncertain publication never grants a stream.
+    internal string PrepareCompletionStream()
+    {
+        lock (gate)
+        {
+            if (publicationUncertain) throw new InvalidOperationException("Mailbox publication is uncertain");
+            if (completionStream is not null) return completionStream;
+            if (assignments.Any(p => p.Value?["completionReminder"] is not null))
+                throw new InvalidOperationException("Legacy completion claim prevents stream initialization");
+            var stream = Guid.NewGuid().ToString("N");
+            Save(entries.DeepClone().AsArray(), next, completionClaimId: "__completion_stream__",
+                newCompletionStream: stream, newCompletionNext: 0);
+            return stream;
+        }
+    }
+    internal bool CompletionStreamIsPristine(string stream)
+    {
+        lock (gate) return !publicationUncertain && completionStream == stream && completionNext == 0 &&
+            !assignments.Any(p => p.Value?["completionReminder"] is not null);
+    }
+
     bool HasOwnerReceipt(string id, JsonObject item, JsonObject claim)
     {
         if ((bool?)claim["ownerReceiptAcked"] == true) return true;
@@ -90,7 +111,8 @@ internal sealed partial class MailboxStore
             {
                 if ((string?)prior["attemptId"] != attemptId || (long?)prior["assignmentRevision"] != revision ||
                     !JsonNode.DeepEquals(prior["binding"], binding?.ToJson())) return new(false, null);
-                return new(false, new(attemptId, revision, (string)prior["disposition"]!));
+                if ((string?)prior["stream"] != completionStream || (long?)prior["number"] is not { } priorNumber || priorNumber < 1 || priorNumber > completionNext) return new(false, null);
+                return new(false, new(attemptId, revision, (string)prior["disposition"]!, completionStream, priorNumber));
             }
             if ((long?)current["revision"] != revision || (string?)current["status"] != "open" ||
                 (string?)current["delivery"] != "delivered" || current["continuation"] is not null)
@@ -109,12 +131,15 @@ internal sealed partial class MailboxStore
             }
             reserved[key] = new JsonObject { ["source"] = source, ["assignmentId"] = id, ["owner"] = owner,
                 ["assignee"] = assignee, ["generation"] = generation, ["revision"] = revision, ["attemptId"] = attemptId, ["state"] = "reserved" };
+            if (completionNext == long.MaxValue) return new(false, null);
+            var stream = completionStream ?? Guid.NewGuid().ToString("N"); var number = completionNext + 1;
             var copy = assignments.DeepClone().AsObject();
             copy[id]!["completionReminder"] = new System.Text.Json.Nodes.JsonObject
                 { ["attemptId"] = attemptId, ["assignmentRevision"] = revision, ["disposition"] = "handoff_started",
-                    ["binding"] = binding?.ToJson() };
-            Save(entries.DeepClone().AsArray(), next, assigned: copy, completionClaimId: id, completionClaimStarted: true, receipts: reserved);
-            return new(true, new(attemptId, revision, "handoff_started"));
+                    ["binding"] = binding.ToJson(), ["stream"] = stream, ["number"] = number };
+            Save(entries.DeepClone().AsArray(), next, assigned: copy, completionClaimId: id, completionClaimStarted: true, receipts: reserved,
+                newCompletionStream: stream, newCompletionNext: number);
+            return new(true, new(attemptId, revision, "handoff_started", stream, number));
         }
     }
 
@@ -129,8 +154,10 @@ internal sealed partial class MailboxStore
                 (string?)item["parent"] != owner || (string?)item["child"] != assignee || (string?)item["generation"] != generation ||
                 item["completionReminder"] is not JsonObject claim || (string?)claim["attemptId"] != attemptId ||
                 (long?)claim["assignmentRevision"] is not { } revision || (string?)claim["disposition"] is not { } disposition ||
-                CompletionReminderBinding.Parse(claim["binding"] as JsonObject) is not { } binding) return null;
-            return new("delegation", id, owner, assignee, generation, revision, attemptId, disposition, binding);
+                CompletionReminderBinding.Parse(claim["binding"] as JsonObject) is not { } binding ||
+                (string?)claim["stream"] is not { } stream || stream != completionStream ||
+                (long?)claim["number"] is not { } number || number < 1 || number > completionNext) return null;
+            return new("delegation", id, owner, assignee, generation, revision, attemptId, disposition, binding, stream, number);
         }
     }
 
@@ -161,7 +188,7 @@ internal sealed partial class MailboxStore
         }
     }
 
-    internal (IReadOnlyList<CompletionReminderRecovery> Items, bool Unknown) CompletionReminderPending(string project, string group, string? participant)
+    internal (IReadOnlyList<CompletionReminderRecovery> Items, bool Unknown) CompletionReminderPending(string? project, string? group, string? participant)
     {
         lock (gate)
         {
@@ -175,7 +202,7 @@ internal sealed partial class MailboxStore
                 if (participant is not null && participant != owner && participant != child) continue;
                 var binding = CompletionReminderBinding.Parse(claim["binding"] as JsonObject);
                 if (binding is null) { unknown = true; continue; }
-                if (binding.ProjectKey != project || binding.GroupId != group) continue;
+                if (project is not null && binding.ProjectKey != project || group is not null && binding.GroupId != group) continue;
                 if (owner is null || child is null || (string?)item["generation"] is not { } generation ||
                     (string?)claim["attemptId"] is not { } attempt || ReadCompletionRecovery(id, owner, child, generation, attempt) is not { } recovery)
                 { unknown = true; continue; }

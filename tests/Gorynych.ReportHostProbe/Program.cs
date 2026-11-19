@@ -5,6 +5,75 @@ using Gorynych.Acp.JsonRpc;
 using Gorynych.Service;
 using Gorynych.Service.Hosts;
 
+if (args is [var hostMode, var pipe, var cwd, var executable, var ledgerPath, var slot] && hostMode is "completion-host")
+{
+    // Isolated fixture: an actual AdapterHost and headless adapter in this OS process.
+    var nativePilot = false;
+    var processes = new List<Gorynych.Adapters.Claude.ClaudeProcess>(); var processGate = new object();
+    var adapter = new Gorynych.Adapters.Claude.ClaudeAdapter(new Gorynych.Adapters.Claude.ClaudeAdapterOptions
+    {
+        DataDirectory = Path.Combine(cwd, "claude-host"), Executable = executable, FetchCatalog = false,
+        ProjectsDirectory = nativePilot ? null : Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", "projects"),
+        ClaudeStatePath = nativePilot ? null : Path.Combine(cwd, "no-claude-state.json"), HostedPromptObservation = true,
+        HostedCompletionGuarded = true, DisableForceKillForTests = true,
+        GuardedReceiptLimitForTests = File.Exists(Path.Combine(cwd, "small-guarded-cap")) ? 2 : 64,
+        BeforeGuardedWriteForTests = async () =>
+        {
+            if (!File.Exists(Path.Combine(cwd, "hold-guarded-write"))) return;
+            File.WriteAllText(Path.Combine(cwd, "guarded-write-entered"), "");
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            while (!File.Exists(Path.Combine(cwd, "release-guarded-write"))) await Task.Delay(20, timeout.Token);
+        },
+        NativeProcessStartedForTests = p => { lock (processGate) processes.Add(p); },
+        ChannelServerCommand = nativePilot ? null : ["gorynych-peers-not-started"], StartupTimeoutSeconds = 20, StallMs = nativePilot ? int.MaxValue : 1500,
+        CloseTimeoutMs = 3000, InterruptGraceMs = 3000,
+    });
+    var processAgent = await adapter.StartAsync(CancellationToken.None);
+    async Task<(Stream Input, Stream Output)> Connect(CancellationToken ct)
+    {
+        var client = new System.IO.Pipes.NamedPipeClientStream(".", pipe, System.IO.Pipes.PipeDirection.InOut, System.IO.Pipes.PipeOptions.Asynchronous);
+        try { await client.ConnectAsync(ct); return (client, client); }
+        catch { await client.DisposeAsync(); throw; }
+    }
+    void FailOnce(string name)
+    {
+        var marker = Path.Combine(cwd, name);
+        if (!File.Exists(marker)) return;
+        File.Delete(marker);
+        throw new IOException("Injected test-only host ledger fault");
+    }
+    var processHost = new AdapterHost(processAgent, Connect, new AdapterHostOptions
+    {
+        Adapter = "claude", Token = "0123456789abcdef0123456789abcdef-test", Slot = slot,
+        Generation = new HostGeneration("build-1", []), CompletionHostLedger = new CompletionHostLedger(ledgerPath),
+        BeforeCompletionAckRecordForTests = () => FailOnce("fail-completion-ack-record"),
+        BeforeCompletionRetireRecordForTests = () => FailOnce("fail-completion-retire-record"),
+        RetryDelays = [TimeSpan.FromMilliseconds(50)],
+    });
+    Console.WriteLine("HOST_STARTED");
+    _ = Task.Run(async () =>
+    {
+        while (await Console.In.ReadLineAsync() is { } command)
+        {
+            if (command != "CLOSE_NATIVE") continue;
+            Gorynych.Adapters.Claude.ClaudeProcess[] owned; lock (processGate) owned = processes.ToArray();
+            var ok = true;
+            foreach (var process in owned)
+            {
+                try { if (!process.Exited.IsCompleted && !await process.CloseInputAsync(TimeSpan.FromSeconds(5))) { ok = false; continue; }
+                    await process.Exited.WaitAsync(TimeSpan.FromSeconds(15)); }
+                catch (Exception e) when (e is TimeoutException or ObjectDisposedException or InvalidOperationException) { ok = false; }
+            }
+            Console.WriteLine(ok ? "NATIVE_EXITED" : "NATIVE_STILL_RUNNING");
+        }
+    });
+    var result = await processHost.RunAsync();
+    await processAgent.DisposeAsync();
+    Console.WriteLine("HOST_EXITED");
+    Environment.ExitCode = result;
+    return;
+}
+
 if (args is ["wait-for-exit"])
 {
     await Console.In.ReadLineAsync();

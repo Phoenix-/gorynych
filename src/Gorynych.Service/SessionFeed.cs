@@ -122,6 +122,21 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             return (terminal, idle);
         }
     }
+    internal ClaudeObservationFence? ClaudeObservationFor(HostLink route, string id, string generation)
+    {
+        lock (nativeActivityGate)
+        {
+            if (route.Rpc.IsClosed || route.HostId is null || route.Info.Meta?[GorynychProtocol.CapHostClaudePromptObservation] is not JsonValue capability ||
+                !capability.TryGetValue<bool>(out var supported) || !supported ||
+                route.Info.Meta?[GorynychProtocol.CapHostBackgroundEvidence] is not JsonValue bgCapability || !bgCapability.TryGetValue<bool>(out var bgSupported) || !bgSupported ||
+                !ReferenceEquals(route.Rpc, backgroundEvidenceRoute) || backgroundEvidence is not { Items.Length: 0 } bg || bg.HostId != route.HostId ||
+                !ReferenceEquals(completeBackgroundRoute, route.Rpc) || completeBackgroundStream != bg.Stream || backgroundUse || knownBackgroundUse ||
+                initialAssignmentTurn is not { } fact || fact.Route != route.Rpc || fact.Id != id || fact.Generation != generation || !strictIdleEligible ||
+                TurnGate.CurrentCount != 1 || evidencePrompts != 0 || AgentTurnRunning || Asking != 0 || PendingRequests != 0) return null;
+            return new ClaudeObservationFence(route.Rpc, route.HostId, fact.Prompt, assignmentEvidenceEpoch, assignmentActivityFence, bg.Stream, bg.Revision);
+        }
+    }
+
     int nativeActivity;
     bool backgroundUse;
     bool knownBackgroundUse;
@@ -1567,3 +1582,5 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         return new() { ["sessionId"] = target, ["update"] = update };
     }
 }
+
+internal sealed record ClaudeObservationFence(JsonRpcConnection Route, string Host, string Prompt, long Epoch, long ActivityFence, string BackgroundStream, long BackgroundRevision);
