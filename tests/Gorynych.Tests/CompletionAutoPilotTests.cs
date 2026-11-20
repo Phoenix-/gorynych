@@ -1,8 +1,10 @@
 using System.Text.Json.Nodes;
 using Gorynych.Acp;
 using Gorynych.Acp.Hosting;
+using Gorynych.Acp.JsonRpc;
 using Gorynych.Adapters.Claude;
 using Gorynych.Service;
+using Gorynych.Service.Hosts;
 
 namespace Gorynych.Tests;
 
@@ -17,7 +19,10 @@ public sealed partial class ClaudeHeadlessTests
     [DataRow("timer")]
     [DataRow("quiet")]
     [DataRow("race")]
+    [DataRow("late")]
     [DataRow("lost")]
+    [DataRow("foreign_scope")]
+    [DataRow("wrong_producer")]
     [DataRow("mutual")]
     [Timeout(120000, CooperativeCancellation = true)]
     public async Task CompletionAutoUsesHostedGuardWithoutReplay(string scenario)
@@ -28,16 +33,18 @@ public sealed partial class ClaudeHeadlessTests
         var metadata = new UiMetadataStore(Path.Combine(data, "ui-metadata.json"));
         metadata.Set("project", "group", "Group"); metadata.Set("project", "other", "Other");
         var instance = metadata.EnsureGroupInstance("project", "group")!;
+        var otherInstance = metadata.EnsureGroupInstance("project", "other")!;
         var ledger = Path.Combine(dir, "auto-ledger.json"); var clock = new ManualTime();
         await using var launcher = new CompletionProcessHost(dir, ledger, FakeClaude());
         var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true));
-        Conductor Create() => new(new ConductorOptions { DataDirectory = data, ServiceId = "auto-test", Time = clock,
+        Conductor Create(bool otherScope = false) => new(new ConductorOptions { DataDirectory = data, ServiceId = "auto-test", Time = clock,
             Hosts = launcher, HostToken = InProcessHosts.Token,
-            CompletionConfiguration = scenario == "no_scope" ? null : ("project", "group", instance),
+            CompletionConfiguration = scenario == "no_scope" ? null : otherScope ? ("project", "other", otherInstance) : ("project", "group", instance),
             CompletionAuto = scenario != "disabled", CompletionAutoSweepInterval = scenario == "timer" ? TimeSpan.FromSeconds(15) : TimeSpan.FromHours(1),
             TestCompletionLedgerPath = ledger, TestCompletionObservationTimeout = TimeSpan.FromMilliseconds(400) }, [adapter]);
         var service = Create(); launcher.Service = service; var client = await TestClient.ConnectAsync(service);
         var release = Path.Combine(dir, "release-completion-result");
+        var holdsResult = scenario is "late" or "lost" or "foreign_scope" or "wrong_producer";
         try
         {
             async Task<string> New() => (string)(await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew,
@@ -110,7 +117,7 @@ public sealed partial class ClaudeHeadlessTests
             Assert.IsNull(service.ReplyMailbox.ReadCompletionReminder("auto-assignment", owner, child, generation));
             clock.Advance(TimeSpan.FromSeconds(1));
 
-            if (scenario == "lost") File.WriteAllText(Path.Combine(dir, "hold-completion-result"), "");
+            if (holdsResult) File.WriteAllText(Path.Combine(dir, "hold-completion-result"), "");
             if (scenario == "race")
             {
                 var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -157,20 +164,81 @@ public sealed partial class ClaudeHeadlessTests
                 }
                 return;
             }
+            await LinkHarness.Until(() => Inputs() == 2, "guarded reminder reached the native process").WaitAsync(TimeSpan.FromSeconds(20));
             var claim = service.ReplyMailbox.ReadCompletionReminder("auto-assignment", owner, child, generation);
             Assert.IsNotNull(claim); Assert.AreEqual(2, Inputs(), "one original prompt and one guarded reminder");
             Assert.AreEqual("open", (string?)service.ReplyMailbox.FindAssignment("auto-assignment", owner)!["status"]);
 
-            if (scenario == "lost")
+            if (holdsResult)
             {
                 Assert.IsTrue(claim.Disposition is "handoff_started" or "uncertain", claim.Disposition);
-                await client.DisposeAsync(); await service.DisposeAsync();
-                service = Create(); launcher.Service = service; client = await TestClient.ConnectAsync(service);
-                await LinkHarness.Until(() => service.Agents["claude"].RouteOf(child) is { Current: true }, "host reattached").WaitAsync(TimeSpan.FromSeconds(20));
+                var saved = service.ReplyMailbox.ReadCompletionRecovery("auto-assignment", owner, child, generation, claim.AttemptId);
+                Assert.IsNotNull(saved);
+                if (scenario != "late")
+                {
+                    launcher.Service = null; launcher.BreakConnection();
+                    await LinkHarness.Until(() => route.Rpc.IsClosed, "host disconnected").WaitAsync(TimeSpan.FromSeconds(15));
+                    await service.SweepCompletionAutoAsync();
+                    Assert.AreEqual(claim, service.ReplyMailbox.ReadCompletionReminder("auto-assignment", owner, child, generation),
+                        "a lost route cannot settle the attempt");
+                    await client.DisposeAsync(); await service.DisposeAsync();
+                    if (scenario == "wrong_producer")
+                    {
+                        // Inject a different producer binding into the persisted claim while the service is closed.
+                        var mailboxPath = Path.Combine(data, "mailbox.json");
+                        var mailbox = JsonNode.Parse(File.ReadAllText(mailboxPath))!;
+                        mailbox["assignments"]!["auto-assignment"]!["completionReminder"]!["binding"]!["producerPid"] = launcher.Pid + 1;
+                        File.WriteAllText(mailboxPath, mailbox.ToJsonString());
+                    }
+                    service = Create(otherScope: scenario == "foreign_scope");
+                    launcher.Service = service; client = await TestClient.ConnectAsync(service);
+                    await LinkHarness.Until(() => service.Agents["claude"].RouteOf(child) is { Current: true }, "host reattached").WaitAsync(TimeSpan.FromSeconds(20));
+                }
+                else
+                {
+                    await client.Rpc.SendRequestAsync(GorynychProtocol.MethodUpdateAssignment, new JsonObject {
+                        ["source"] = "delegation", ["assignmentId"] = "auto-assignment", ["generation"] = generation,
+                        ["expectedRevision"] = 1, ["operationId"] = "auto-late-completed", ["outcome"] = "completed",
+                        ["summary"] = "assignment completed before the native terminal arrived",
+                        ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = service.Store.Get(child)!.PeerToken } });
+                }
                 await service.SweepCompletionAutoAsync();
                 var retained = service.ReplyMailbox.ReadCompletionReminder("auto-assignment", owner, child, generation);
-                Assert.IsNotNull(retained); Assert.AreEqual(claim.AttemptId, retained.AttemptId); Assert.AreEqual(2, Inputs());
+                Assert.IsNotNull(retained);
+                Assert.AreEqual(claim.AttemptId, retained.AttemptId);
+                Assert.IsTrue(retained.Disposition is "handoff_started" or "uncertain");
                 File.WriteAllText(release, "");
+                route = service.Agents["claude"].RouteOf(child)!;
+                Assert.AreEqual(launcher.Pid, route.ProcessId);
+                var shouldSettle = scenario is "late" or "lost";
+                if (shouldSettle)
+                {
+                    // Only sweeps may retrieve and settle the late receipt in the positive cases.
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                    while (true)
+                    {
+                        await service.SweepCompletionAutoAsync(timeout.Token);
+                        if (service.ReplyMailbox.ReadCompletionReminder("auto-assignment", owner, child, generation)?.Disposition == "native_ended") break;
+                        await Task.Delay(50, timeout.Token);
+                    }
+                }
+                else
+                {
+                    var identity = CompletionHostLedger.Identity(saved.Source, saved.AssignmentId, saved.Owner, saved.Assignee,
+                        saved.Generation, saved.OriginalRevision, saved.AttemptId, saved.Binding, saved.Stream, saved.Number);
+                    await WaitForAutoTestTerminalAsync(route, identity);
+                    await service.SweepCompletionAutoAsync();
+                }
+                await service.SweepCompletionAutoAsync();
+                var after = service.ReplyMailbox.ReadCompletionReminder("auto-assignment", owner, child, generation);
+                Assert.IsNotNull(after);
+                Assert.AreEqual(claim.AttemptId, after.AttemptId);
+                if (shouldSettle) Assert.AreEqual("native_ended", after.Disposition);
+                else Assert.AreEqual(retained.Disposition, after.Disposition, "a foreign scope or producer mismatch keeps recovery pending");
+                Assert.AreEqual(scenario == "late" ? "completed" : "open",
+                    (string?)service.ReplyMailbox.FindAssignment("auto-assignment", owner)!["status"]);
+                Assert.AreEqual(2, Inputs(), "every recovery pass must leave the native input count alone");
+                Assert.AreEqual(1, InputCount(child, Guid.ParseExact(claim.AttemptId, "N").ToString("D")));
             }
             else
             {
@@ -182,6 +250,23 @@ public sealed partial class ClaudeHeadlessTests
         {
             File.WriteAllText(release, "");
             await client.DisposeAsync(); await service.DisposeAsync(); await launcher.CloseNativeGracefully();
+        }
+    }
+
+    static async Task WaitForAutoTestTerminalAsync(HostLink route, JsonObject identity)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        while (true)
+        {
+            try
+            {
+                var status = await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedStatus,
+                    new JsonObject { ["_meta"] = identity.DeepClone() }, timeout.Token);
+                Assert.IsTrue(JsonNode.DeepEquals(status?["_meta"]?["identity"], identity));
+                if ((string?)status?["_meta"]?["receipt"]?["cycleResult"] == "ended") return;
+            }
+            catch (JsonRpcException e) when (e.Message == "Guarded bridge busy") { }
+            await Task.Delay(50, timeout.Token);
         }
     }
 

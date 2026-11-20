@@ -24,8 +24,7 @@ public sealed partial class Conductor
         }, null, options.CompletionAutoSweepInterval, options.CompletionAutoSweepInterval);
     }
 
-    // One bounded page, with a stable cursor. No parallel sweeps or automatic
-    // recovery: an unresolved previous handoff defers the entire group.
+    // One bounded page or one status-only recovery, with no parallel sweeps.
     internal async Task SweepCompletionAutoAsync(CancellationToken ct = default)
     {
         if (!options.CompletionAuto || Interlocked.Exchange(ref completionAutoRunning, 1) != 0) return;
@@ -33,7 +32,19 @@ public sealed partial class Conductor
         {
             if (Draining || completionScope is not { } scope || !CompletionScopeIsCurrent) return;
             var pending = mailbox.CompletionReminderPending(null, null, null);
-            if (pending.Unknown || pending.Items.Count != 0) return;
+            if (pending.Unknown) return;
+            if (pending.Items.Count != 0)
+            {
+                if (pending.Items is [var saved] && saved.Binding.ProjectKey == scope.Project &&
+                    saved.Binding.GroupId == scope.Group && saved.Binding.GroupInstance == scope.Instance)
+                {
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    timeout.CancelAfter(TimeSpan.FromSeconds(3));
+                    await ReconcileCompletionLiveAsync(saved, timeout.Token);
+                }
+                // A recovery pass never dispatches, even when settlement succeeds.
+                return;
+            }
             var candidates = mailbox.CompletionAutoCandidates(completionAutoCursor, 16);
             if (candidates.Length == 0 && completionAutoCursor is not null)
             {

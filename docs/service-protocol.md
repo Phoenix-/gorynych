@@ -2826,7 +2826,12 @@ durable claim. The attempt shares the same claim, guarded dispatch and settlemen
 the authenticated manual request; it neither completes the assignment nor opens a
 session to obtain evidence.
 
-An unresolved earlier handoff defers automatic attempts, including after restart.
-The pilot never resends an uncertain attempt. The existing owner-only
-`recover_completion_reminder` operation remains the recovery path, including when
-automatic mode is later disabled. No new retry or settlement policy is implied.
+An unresolved earlier handoff defers automatic dispatch, including after restart.
+When exactly one known pending handoff belongs to the selected group instance, a
+sweep reconciles it with its original authenticated host route using a
+three-second RPC budget. The sweep checks the existing receipt, acknowledges and
+retires it when confirmed, and records settlement. It sends no new input. New
+attempts are considered on later ticks. A missing route, a different producer, an
+unconfirmed receipt or a pending handoff from a different group keeps dispatch
+deferred. The owner-only `recover_completion_reminder` operation remains
+available when automatic mode is disabled and for confirmed producer loss.
