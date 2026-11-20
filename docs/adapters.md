@@ -997,7 +997,7 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 | --- | --- |
 | `item/agentMessage/delta` | `agent_message_chunk`, `messageId` = the item ID (`msg_…`); the completed item's text only when no delta came |
 | `item/reasoning/summaryTextDelta`, `textDelta`, `summaryPartAdded` | `agent_thought_chunk`, `messageId` = the item ID (`rs_…`); a new summary part starts a paragraph |
-| `commandExecution` | `tool_call` titled from `commandActions` (`Read <file>`, `Search …`, else the command without Codex's shell wrapper), kind `read`, `search` or `execute`; on completion its output as text and `rawOutput {exitCode, output}` |
+| `commandExecution` | `tool_call` titled from `commandActions` (`Read <file>`, `Search …`, else the command without Codex's shell wrapper), kind `read`, `search` or `execute`, with `rawInput {command, cwd}`; on completion its output as text and `rawOutput {exitCode, output}` |
 | `fileChange` | `tool_call` kind `edit` (`Create`, `Delete` or `Edit <file>`), locations, each file's diff as text |
 | `mcpToolCall` | `tool_call` titled `<tool> (<server>)`, `rawInput` = its arguments, the result's text |
 | `webSearch`, `imageView`, `dynamicToolCall`, `collabAgentToolCall`, `imageGeneration` | `tool_call` kinds `fetch`, `read`, `other` |
@@ -1005,6 +1005,10 @@ over app-server's JSON-RPC. The design and the probes behind it are in
 | `thread/tokenUsage/updated` | `usage_update {used: the last request's input + output tokens, size: the model's context window}` |
 | `thread/name/updated` | `session_info_update {title}` |
 | `thread/settings/updated` | `config_option_update` |
+
+Command calls and command approvals report the working directory in `rawInput.cwd`.
+When replaying a Codex journal, the service drops the legacy singleton file location that
+matches the command's working directory. The replay preserves file locations and journal positions.
 
 ### Approvals and forms
 

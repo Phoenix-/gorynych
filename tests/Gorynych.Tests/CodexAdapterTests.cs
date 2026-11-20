@@ -737,13 +737,65 @@ public sealed class CodexAdapterTests
             "the exec-policy amendment Codex offers is left out: it writes ~/.codex/rules");
         CollectionAssert.AreEqual(new[] { "allow_once", "allow_always", "reject_once", "reject_once" }, asked.Options.Select(o => o.Kind.Value).ToArray());
         Assert.AreEqual(("cmd /c echo hi", "execute"), (asked.ToolCall.Title, asked.ToolCall.Kind?.Value));
+        Assert.AreEqual(Cwd, (string?)asked.ToolCall.RawInput!["cwd"]);
+        Assert.IsNull(asked.ToolCall.Locations);
         Assert.AreEqual("acceptForSession", (string?)fake.Answers.Single().Answer!["decision"]);
         var call = Of(zed, "tool_call").Single();
         Assert.AreEqual(("cmd /c echo hi", "execute", "in_progress"), ((string?)call["title"], (string?)call["kind"], (string?)call["status"]));
         Assert.AreEqual(Cwd, (string?)call["rawInput"]!["cwd"]);
+        Assert.IsFalse(call.ContainsKey("locations"));
         var end = Of(zed, "tool_call_update").Last();
         Assert.AreEqual(("completed", "hi\n"), ((string?)end["status"], (string?)end["content"]![0]!["content"]!["text"]));
         Assert.AreEqual(0, (int?)end["rawOutput"]!["exitCode"]);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task ReplayingAnOldCodexJournal_HidesTheCommandWorkingDirectoryAsAFile(bool resume)
+    {
+        var fake = new FakeAppServer();
+        await using var conductor = Conductor(fake);
+        await using var first = await ZedAsync(conductor);
+        var id = await NewAsync(first);
+        await PromptAsync(first, id, "hello");
+
+        var journal = conductor.Feed(id).Journal;
+        var before = journal.LastPosition;
+        var file = Path.Combine(Cwd, "note.txt");
+        var oldCommand = new JsonObject
+        {
+            ["sessionUpdate"] = "tool_call",
+            ["toolCallId"] = "old-command",
+            ["title"] = "Search notes",
+            ["kind"] = "search",
+            ["status"] = "completed",
+            ["rawInput"] = new JsonObject { ["command"] = "rg notes", ["cwd"] = Cwd },
+            ["locations"] = new JsonArray(new JsonObject { ["path"] = Cwd }),
+        };
+        var fileCall = (JsonObject)oldCommand.DeepClone();
+        fileCall["toolCallId"] = "file-location";
+        fileCall["locations"] = new JsonArray(new JsonObject { ["path"] = file, ["line"] = 3 });
+        journal.AppendMany([oldCommand, fileCall]);
+
+        await using var next = await ZedAsync(conductor);
+        var request = new JsonObject { ["sessionId"] = id, ["cwd"] = Cwd };
+        if (resume)
+            request["_meta"] = new JsonObject
+            {
+                [GorynychProtocol.MetaReplayFrom] = new JsonObject
+                {
+                    ["type"] = GorynychProtocol.ReplayAfterMark,
+                    ["mark"] = SessionJournal.FormatPosition(before),
+                },
+            };
+        await next.Rpc.SendRequestAsync(resume ? AcpMethods.Agent.SessionResume : AcpMethods.Agent.SessionLoad, request).WaitAsync(Wait);
+        var calls = Of(next, "tool_call").Where(u => SessionJournal.PositionOf(u) > before).ToArray();
+        CollectionAssert.AreEqual(new[] { before + 1, before + 2 }, calls.Select(SessionJournal.PositionOf).ToArray());
+        Assert.AreEqual(("old-command", Cwd), ((string?)calls[0]["toolCallId"], (string?)calls[0]["rawInput"]!["cwd"]));
+        Assert.IsFalse(calls[0].ContainsKey("locations"));
+        Assert.AreEqual((file, 3), ((string?)calls[1]["locations"]![0]!["path"], (int?)calls[1]["locations"]![0]!["line"]));
+        Assert.AreEqual(Cwd, (string?)journal.ReadAfter(before)[0]["locations"]![0]!["path"]);
     }
 
     [TestMethod]
@@ -763,6 +815,7 @@ public sealed class CodexAdapterTests
         Assert.AreEqual(Path.Combine(Cwd, "note.txt"), asked.ToolCall.Locations![0].Path);
         Assert.AreEqual("decline", (string?)fake.Answers.Single().Answer!["decision"]);
         var call = Of(zed, "tool_call").Single();
+        Assert.AreEqual(Path.Combine(Cwd, "note.txt"), (string?)call["locations"]![0]!["path"]);
         StringAssert.Contains((string?)call["content"]![0]!["content"]!["text"], "```diff\nhi\n```");
         Assert.AreEqual("failed", (string?)Of(zed, "tool_call_update").Last()["status"]);
     }

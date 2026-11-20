@@ -33,7 +33,6 @@ static class CodexMap
                 Kind = CommandKind(c),
                 Status = done ? StatusOf(c.Status.Value) : ToolCallStatus.InProgress,
                 RawInput = new JsonObject { ["command"] = c.Command, ["cwd"] = c.Cwd },
-                Locations = [new ToolCallLocation { Path = c.Cwd }],
             },
             FileChangeThreadItem f => new ToolCall
             {

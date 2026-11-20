@@ -1224,7 +1224,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// agent has sent none since the service started.
     /// </summary>
     /// <returns>The position the client is at: what it gets next follows it.</returns>
-    public async Task<long> ReplayAndAttachAsync(ClientConnection client)
+    public async Task<long> ReplayAndAttachAsync(ClientConnection client, bool codex)
     {
         await gate.WaitAsync();
         try
@@ -1235,6 +1235,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
             foreach (var update in Journal.ReadAll())
             {
                 if (SessionJournal.IsCommands(update) && !SubagentRouting.IsPreview(update)) { journaled = update; continue; }
+                if (codex) RemoveLegacyCodexCommandLocation(update);
                 if (!await SendUpdateAsync(client, update)) return position;
             }
             if ((commands?.DeepClone() ?? journaled) is { } list && !await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(list))) return position;
@@ -1254,7 +1255,7 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
     /// attaches it, without losing updates in between.
     /// </summary>
     /// <returns>The position the client is at: what it gets next follows it.</returns>
-    public async Task<long> ResumeAndAttachAsync(ClientConnection client, long? after = null)
+    public async Task<long> ResumeAndAttachAsync(ClientConnection client, long? after, bool codex)
     {
         await gate.WaitAsync();
         try
@@ -1273,7 +1274,10 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
                 }
             if (after is { } from)
                 foreach (var update in Journal.ReadAfter(from))
+                {
+                    if (codex) RemoveLegacyCodexCommandLocation(update);
                     if (!await SendUpdateAsync(client, update)) return position;
+                }
             if (commands?.DeepClone() is { } list && !await SendAsync(client, AcpMethods.Client.SessionUpdate, Notification(list))) return position;
             Attach(client);
             return position;
@@ -1282,6 +1286,19 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         {
             gate.Release();
         }
+    }
+
+    /// <summary>Older Codex adapters used a command's working directory as its sole file location.
+    /// Remove that shape from the parsed journal entry to keep clients from trying to open the directory.</summary>
+    static void RemoveLegacyCodexCommandLocation(JsonNode update)
+    {
+        if (update is JsonObject call
+            && call["sessionUpdate"] is JsonValue kind && kind.TryGetValue<string>(out var type) && type is "tool_call" or "tool_call_update"
+            && call["rawInput"] is JsonObject input && input["command"] is JsonValue command && command.TryGetValue<string>(out _)
+            && input["cwd"] is JsonValue directory && directory.TryGetValue<string>(out var cwd) && cwd is { Length: > 0 }
+            && call["locations"] is JsonArray { Count: 1 } locations && locations[0] is JsonObject { Count: 1 } location
+            && location["path"] is JsonValue path && path.TryGetValue<string>(out var file) && file == cwd)
+            call.Remove("locations");
     }
 
     readonly Dictionary<long, (string? PromptId, bool Handed)> prompts = []; // under clientsGate: the client prompts in progress, by a number of the feed's own

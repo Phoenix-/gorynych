@@ -2842,7 +2842,7 @@ public sealed partial class Conductor : IAsyncDisposable
             ServiceLog.Warn($"{host.Name}: cannot reopen {record.SessionId}: {e.Message}");
             response = [];
         }
-        var position = await feed.ReplayAndAttachAsync(client);
+        var position = await feed.ReplayAndAttachAsync(client, codex: host.Name == "codex");
         await NoticeOnOpenAsync(feed, client);
         return WithLinkState(response, feed, position, host.Steers);
     }
@@ -2863,7 +2863,7 @@ public sealed partial class Conductor : IAsyncDisposable
         var host = HostOf(use.Record);
         if (IsStopping(host.Name)) throw Unavailable(host.Name);
         var (rpc, opened) = await EnsureLiveAsync(use.Record, ct);
-        var position = await use.Feed.ResumeAndAttachAsync(client, after);
+        var position = await use.Feed.ResumeAndAttachAsync(client, after, codex: host.Name == "codex");
         if (client.TakesSubagents && host.Name is "codex" or "claude")
             afterAnswer(() => RefreshSubagentStatesAsync(host, rpc, client, request.SessionId));
         await NoticeOnOpenAsync(use.Feed, client);

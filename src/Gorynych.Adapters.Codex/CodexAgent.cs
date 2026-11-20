@@ -2386,7 +2386,6 @@ sealed partial class CodexAgent : IAsyncDisposable
             Kind = CommandKind(actions),
             Status = ToolCallStatus.Pending,
             RawInput = new JsonObject { ["command"] = command, ["cwd"] = p.Cwd, ["reason"] = p.Reason },
-            Locations = p.Cwd is { Length: > 0 } cwd ? [new ToolCallLocation { Path = cwd }] : null,
         }, options, ct);
         return new JsonObject { ["decision"] = chosen ?? (options.Any(o => o.OptionId == "cancel") ? "cancel" : "decline") };
     }
