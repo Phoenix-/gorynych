@@ -249,7 +249,13 @@ public sealed partial class ClaudeHeadlessTests
         finally
         {
             File.WriteAllText(release, "");
-            await client.DisposeAsync(); await service.DisposeAsync(); await launcher.CloseNativeGracefully();
+            // Conductor disposal stops AdapterHost, which owns the fixture's native stdin.
+            try { await launcher.CloseNativeGracefully(); }
+            finally
+            {
+                await client.DisposeAsync();
+                await service.DisposeAsync();
+            }
         }
     }
 
