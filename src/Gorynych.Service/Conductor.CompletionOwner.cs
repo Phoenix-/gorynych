@@ -297,6 +297,7 @@ public sealed partial class Conductor
                     saved.Assignee, saved.Generation, saved.OriginalRevision, saved.AttemptId, known);
             });
             if (!settled) return Unknown(taken);
+            QueueMailbox(saved.Owner);
             return new JsonObject { ["state"] = "settled", ["attemptId"] = saved.AttemptId,
                 ["disposition"] = mailbox.ReadCompletionReminder(saved.AssignmentId, saved.Owner, saved.Assignee, saved.Generation)?.Disposition };
         }
@@ -374,7 +375,9 @@ public sealed partial class Conductor
                 !CompletionReminderBinding.CanonicalProducerStart(start) || !ProcessIncarnation.DefinitelyExited(pid, start))
                 return alreadySettled ? new JsonObject { ["state"] = saved.Disposition } : live;
             var ledger = new CompletionHostLedger(options.TestCompletionLedgerPath ?? Path.Combine(options.DataDirectory, "completion-host-ledger.json"));
-            return new JsonObject { ["state"] = ledger.RecoverAfterProducerExit(saved, mailbox) };
+            var recovered = ledger.RecoverAfterProducerExit(saved, mailbox);
+            QueueMailbox(saved.Owner);
+            return new JsonObject { ["state"] = recovered };
         }
         catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException or ArgumentException or System.Text.Json.JsonException)
         { return new JsonObject { ["state"] = "unresolved" }; }
@@ -469,7 +472,7 @@ public sealed partial class Conductor
                 var acquired = host.OnCurrentRoute(child, route.Rpc, link => link.Current &&
                     link.Info.Meta?[GorynychProtocol.CapHostCompletionGuarded] is JsonValue cap && cap.TryGetValue<bool>(out var supported) && supported &&
                     feed.ClaudeObservationFor(link, id, generation) == first &&
-                    ledger.ClaimFromMailbox(mailbox, "delegation", id, owner, child, generation, revision, attempt, binding).Acquired, false);
+                    ledger.ClaimFromMailbox(mailbox, "delegation", id, owner, child, generation, revision, attempt, binding, automatic: observedRevision is not null).Acquired, false);
                 if (!acquired) return Defer("claim");
                 claimed = mailbox.ReadCompletionRecovery(id, owner, child, generation, attempt);
                 }

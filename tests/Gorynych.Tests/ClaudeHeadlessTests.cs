@@ -27,8 +27,10 @@ public sealed partial class ClaudeHeadlessTests
 
     static ClaudeAdapterOptions Options(string dir, List<string>? log = null, bool liveNotes = false, Func<Task>? beforeInterrupt = null,
         bool fetchCatalog = true, string permissionMode = "default", int stallMs = 1500,
-        Func<Task>? beforeStartup = null, bool autoTitle = false, int reportNoteLimit = 256, Func<Task>? afterReportNoteWrite = null, int reportNoteGlobalLimit = 4096) => new()
+        Func<Task>? beforeStartup = null, bool autoTitle = false, int reportNoteLimit = 256, Func<Task>? afterReportNoteWrite = null, int reportNoteGlobalLimit = 4096, bool completionGuard = false) => new()
     {
+        HostedPromptObservation = completionGuard, HostedCompletionGuarded = completionGuard,
+        DisableForceKillForTests = completionGuard,
         ReportNoteLedgerLimit = reportNoteLimit,
         ReportNoteGlobalLimit = reportNoteGlobalLimit,
         AfterReportNoteWrite = afterReportNoteWrite,

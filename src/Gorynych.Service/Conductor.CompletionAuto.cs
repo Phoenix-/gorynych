@@ -30,7 +30,9 @@ public sealed partial class Conductor
         if (!options.CompletionAuto || Interlocked.Exchange(ref completionAutoRunning, 1) != 0) return;
         try
         {
-            if (Draining || completionScope is not { } scope || !CompletionScopeIsCurrent) return;
+            if (Draining) return;
+            ReevaluateCoordinatorSupervision();
+            if (completionScope is not { } scope || !CompletionScopeIsCurrent) return;
             var pending = mailbox.CompletionReminderPending(null, null, null);
             if (pending.Unknown) return;
             if (pending.Items.Count != 0)

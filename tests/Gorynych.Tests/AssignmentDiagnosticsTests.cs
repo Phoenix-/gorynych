@@ -598,7 +598,7 @@ public sealed class AssignmentDiagnosticsTests
                 if (id == child && method == "thread/status/changed" && !held.Task.IsCompleted)
                 { held.TrySetResult(); await released.Task.WaitAsync(Wait); }
             },
-            ProvisionalIdleConfirmedForTests = _ => confirmed.TrySetResult() });
+            ProvisionalIdleConfirmedForTests = witness => { if (witness.SessionId == child) confirmed.TrySetResult(); } });
         var hosts = new InProcessHosts(_ => adapter); var service = hosts.Conductor(TestDirs.New(), adapter); hosts.Service = service;
         await using (service)
         await using (var client = await TestClient.ConnectAsync(service))
@@ -626,10 +626,10 @@ public sealed class AssignmentDiagnosticsTests
     [Timeout(60000, CooperativeCancellation = true)]
     public async Task NativeEarlyIdleIsNotYetPromotedWithoutCrossStreamProof()
     {
-        var named = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var named = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         var fake = new FakeAppServer { IdleBeforeTurnCompleted = true, BeforeEarlyIdle = () => named.Task.WaitAsync(Wait) };
         var confirmed = new TaskCompletionSource<CodexProvisionalIdleWitness>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var adapter = new CodexAdapter(new CodexAdapterOptions { Launch = fake.StartAsync, ClientVersion = "test", NativeTurnNamedForTests = (_, _) => named.TrySetResult(),
+        var adapter = new CodexAdapter(new CodexAdapterOptions { Launch = fake.StartAsync, ClientVersion = "test", NativeTurnNamedForTests = (_, turn) => named.TrySetResult(turn),
             FindHolders = _ => new Dictionary<string, string>(), LocksDirectory = Path.Combine(TestDirs.New(), "no-native-locks"),
             ProvisionalIdleConfirmedForTests = witness => confirmed.TrySetResult(witness) });
         var hosts = new InProcessHosts(_ => adapter); var service = hosts.Conductor(TestDirs.New(), adapter); hosts.Service = service;
@@ -646,7 +646,7 @@ public sealed class AssignmentDiagnosticsTests
             var read = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodReadAssignment, new JsonObject { ["source"] = "delegation", ["assignmentId"] = "early-idle",
                 ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token } }).WaitAsync(Wait);
             var witness = await confirmed.Task.WaitAsync(Wait);
-            Assert.AreEqual(child, witness.SessionId); Assert.AreEqual(fake.LastTurnId, witness.NativeTurnId);
+            Assert.AreEqual(child, witness.SessionId); Assert.AreEqual(await named.Task.WaitAsync(Wait), witness.NativeTurnId);
             Assert.IsFalse(string.IsNullOrWhiteSpace(witness.PromptId));
             Assert.AreEqual("terminal_observed", (string?)read!["diagnostic"]!["initialTurn"]);
             Assert.AreEqual("unknown", (string?)read["diagnostic"]!["foregroundIdle"], "provisional native ordering is not yet cross-stream proof");

@@ -10,14 +10,16 @@ internal sealed partial class MailboxStore
     JsonObject assignments = new();
     const int AssignmentOperationLimit = 64;
 
-    JsonObject AdmitAssignment(string id, string parent, string child, string text, string generation)
+    JsonObject AdmitAssignment(string id, string parent, string child, string text, string generation, bool coordinatorLifecycle)
     {
         var copy = assignments.DeepClone().AsObject();
         while (copy.Count >= assignmentCapacity)
         {
             var victim = copy.Where(p => (string?)p.Value?["status"] is "completed" or "cancelled" or "failed" &&
                     (string?)p.Value?["delivery"] is "delivered" or "failed" or "suppressed" &&
-                    CompletionAllowsAssignmentEviction(p.Key, p.Value!.AsObject()))
+                    CompletionAllowsAssignmentEviction(p.Key, p.Value!.AsObject()) &&
+                    (p.Value["coordinatorNotice"] is not JsonObject notice || !IsPending(notice)) &&
+                    (p.Value["coordinatorPreviousNotice"] is not JsonObject previous || !IsPending(previous)))
                 .OrderBy(p => (long)p.Value!["sequence"]!).ThenBy(p => p.Key, StringComparer.Ordinal)
                 .Select(p => p.Key).FirstOrDefault();
             if (victim is null) throw new InvalidOperationException("Assignment storage is full of active or unresolved assignments");
@@ -26,6 +28,7 @@ internal sealed partial class MailboxStore
         copy[id] = new JsonObject { ["parent"] = parent, ["child"] = child, ["source"] = "delegation",
             ["generation"] = generation, ["sequence"] = next + 1, ["fingerprint"] = WaitFingerprint(text), ["status"] = "open", ["revision"] = 1L,
             ["delivery"] = "queued", ["operations"] = new JsonObject() };
+        if (coordinatorLifecycle) copy[id]!["coordinatorLifecycle"] = true;
         return copy;
     }
 
@@ -89,6 +92,11 @@ internal sealed partial class MailboxStore
             item["status"] = outcome; item["summary"] = summary; item["revision"] = expectedRevision + 1;
             if (outcome is "completed" or "failed" or "cancelled") item.Remove("continuation");
             if (outcomeReportId is not null) item["outcomeReportId"] = outcomeReportId;
+            var sequence = next;
+            if ((bool?)item["coordinatorLifecycle"] == true && outcome is ("completed" or "failed"))
+                SetCoordinatorNotice(id, item, ++sequence, "outcome");
+            else
+                RemoveUnstartedCoordinatorEscalation(item);
             var entriesCopy = entries.DeepClone().AsArray();
             if (outcome == "cancelled" && (string?)item["delivery"] == "queued")
             {
@@ -105,7 +113,7 @@ internal sealed partial class MailboxStore
             }
             updatedOps[operationId] = new JsonObject { ["actor"] = actor, ["outcome"] = outcome,
                 ["summaryFingerprint"] = WaitFingerprint(summary), ["outcomeReportId"] = outcomeReportId, ["expectedRevision"] = expectedRevision, ["result"] = result.DeepClone() };
-            Save(entriesCopy, next, assigned: copy);
+            Save(entriesCopy, sequence, assigned: copy);
             return result;
         }
     }
@@ -127,7 +135,11 @@ internal sealed partial class MailboxStore
             }
             var (changed, result) = AssignmentContinuations.Update(copy[id]!.AsObject(), actor, generation, revision, operation, action, target);
             result["assignmentId"] = id;
-            if (changed) Save(entries.DeepClone().AsArray(), next, assigned: copy);
+            if (changed)
+            {
+                if (action == "register") RemoveUnstartedCoordinatorEscalation(copy[id]!.AsObject());
+                Save(entries.DeepClone().AsArray(), next, assigned: copy);
+            }
             return result;
         }
     }
@@ -140,7 +152,8 @@ internal sealed partial class MailboxStore
             return assignments.Where(p => (after is null || string.CompareOrdinal(p.Key, after) > 0) &&
                     p.Value is JsonObject a && (string?)a["source"] == "delegation" &&
                     (string?)a["status"] == "open" && (string?)a["delivery"] == "delivered" &&
-                    a["continuation"] is null && a["completionReminder"] is null)
+                    a["continuation"] is null && a["completionReminder"] is null &&
+                    (bool?)a["coordinatorFallbackIssued"] != true)
                 .OrderBy(p => p.Key, StringComparer.Ordinal).Take(limit)
                 .Select(p => new JsonObject { ["assignmentId"] = p.Key, ["parent"] = p.Value!["parent"]!.DeepClone(),
                     ["child"] = p.Value!["child"]!.DeepClone(), ["generation"] = p.Value!["generation"]!.DeepClone(),

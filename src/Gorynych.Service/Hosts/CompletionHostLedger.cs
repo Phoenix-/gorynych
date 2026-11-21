@@ -75,7 +75,7 @@ internal sealed class CompletionHostLedger(string path, int capacity = 64)
     // Lock order is shared ledger then mailbox. This publishes a claim only after
     // the exact stream's ledger exists; no network operation is held under either lock.
     internal CompletionReminderAdmission ClaimFromMailbox(MailboxStore mailbox, string source, string id, string owner,
-        string assignee, string generation, long revision, string attempt, CompletionReminderBinding binding)
+        string assignee, string generation, long revision, string attempt, CompletionReminderBinding binding, bool automatic = false)
     {
         using var held = SharedFileLock.Acquire(path);
         var stream = mailbox.PrepareCompletionStream();
@@ -88,7 +88,7 @@ internal sealed class CompletionHostLedger(string path, int capacity = 64)
                 return new(false, new CompletionReminderClaim(attempt, revision, prior.Disposition, prior.Stream, prior.Number));
             return new(false, null);
         }
-        var claim = mailbox.ClaimCompletionReminder(source, id, owner, assignee, generation, revision, attempt, binding);
+        var claim = mailbox.ClaimCompletionReminder(source, id, owner, assignee, generation, revision, attempt, binding, automatic);
         if (!claim.Acquired || claim.Claim is not { } created) return claim;
         var identity = Identity(source, id, owner, assignee, generation, revision, attempt, binding, created.Stream!, created.Number);
         if (AdmitLocked(root, created.Stream!, created.Number, attempt, identity) != Admission.Added)

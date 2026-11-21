@@ -10,7 +10,8 @@ internal enum ReportCause { Unknown, Spawn, User, Delegation, Peer, Reply, Nativ
 internal sealed record ReportIdentity(string TurnKey, string Child, string Parent, ReportCause Cause,
     string? PromptId = null, string? AssignmentId = null, string? MessageId = null,
     string? HostId = null, string? HostGeneration = null, int? HostProcessId = null, string? HostProcessStart = null,
-    bool LegacyCapture = false, string? AssignmentGeneration = null);
+    bool LegacyCapture = false, string? AssignmentGeneration = null,
+    string? ReplyWaitId = null, long? ReplyWaitSequence = null, long? ReplyMessageSequence = null);
 internal sealed record ReportDeliveryClaim(string AttemptId, string Parent, string MessageId, string PromptId,
     string Route, string? HostId, string? HostGeneration, bool DispatchStarted = false,
     bool? ReceiptAckPending = null, bool? ReceiptConflict = null, int? HostProcessId = null, string? HostProcessStart = null,
@@ -77,7 +78,7 @@ internal sealed partial class ReportStore
         manifest = Path.Combine(this.directory, "reports.json");
     }
 
-    static bool Pinned(JsonObject item) => (string?)item["status"] is not ("completed" or "failed") || (bool?)item["producerAck"] != true ||
+    static bool Pinned(JsonObject item) => (string?)item["status"] is not ("completed" or "failed" or "retained") || (bool?)item["producerAck"] != true ||
         ((string?)item["delivery"]?["route"] == "note" && item["delivery"]?["settledReceiptRevision"] is not null &&
          (((long?)item["delivery"]?["acknowledgedReceiptRevision"] != (long?)item["delivery"]?["settledReceiptRevision"] &&
            (long?)item["delivery"]?["hostExitReleasedRevision"] != (long?)item["delivery"]?["settledReceiptRevision"] &&
@@ -89,7 +90,12 @@ internal sealed partial class ReportStore
         ArgumentException.ThrowIfNullOrWhiteSpace(i.Child);
         ArgumentException.ThrowIfNullOrWhiteSpace(i.Parent);
         if (!Enum.IsDefined(i.Cause)) throw new ArgumentException("Invalid report cause");
-        if (new[] { i.TurnKey, i.Child, i.Parent, i.PromptId, i.AssignmentId, i.MessageId, i.HostId, i.HostGeneration, i.HostProcessStart, i.AssignmentGeneration }.Any(s => s?.Length > 512))
+        if ((i.ReplyWaitId is not null || i.ReplyWaitSequence is not null || i.ReplyMessageSequence is not null) &&
+            (i.Cause != ReportCause.Reply || string.IsNullOrWhiteSpace(i.AssignmentId) ||
+             string.IsNullOrWhiteSpace(i.AssignmentGeneration) || string.IsNullOrWhiteSpace(i.MessageId) ||
+             string.IsNullOrWhiteSpace(i.ReplyWaitId) || i.ReplyWaitSequence is not > 0 || i.ReplyMessageSequence is not > 0))
+            throw new ArgumentException("Invalid correlated reply report identity");
+        if (new[] { i.TurnKey, i.Child, i.Parent, i.PromptId, i.AssignmentId, i.MessageId, i.HostId, i.HostGeneration, i.HostProcessStart, i.AssignmentGeneration, i.ReplyWaitId }.Any(s => s?.Length > 512))
             throw new ArgumentException("Report identity field exceeds 512 characters");
     }
     static JsonObject Identity(ReportIdentity i)
@@ -104,6 +110,9 @@ internal sealed partial class ReportStore
         if (i.HostProcessStart is not null) value["hostProcessStart"] = i.HostProcessStart;
         if (i.LegacyCapture) value["legacyCapture"] = true;
         if (i.AssignmentGeneration is not null) value["assignmentGeneration"] = i.AssignmentGeneration;
+        if (i.ReplyWaitId is not null) value["replyWaitId"] = i.ReplyWaitId;
+        if (i.ReplyWaitSequence is not null) value["replyWaitSequence"] = i.ReplyWaitSequence;
+        if (i.ReplyMessageSequence is not null) value["replyMessageSequence"] = i.ReplyMessageSequence;
         return value;
     }
     static ReportIdentity IdentityFrom(JsonNode? n)
@@ -112,7 +121,8 @@ internal sealed partial class ReportStore
             throw new InvalidDataException("Invalid persisted report cause");
         return new((string)n!["turnKey"]!, (string)n["child"]!, (string)n["parent"]!, cause,
             (string?)n["promptId"], (string?)n["assignmentId"], (string?)n["messageId"],
-            (string?)n["hostId"], (string?)n["hostGeneration"], (int?)n["hostProcessId"], (string?)n["hostProcessStart"], (bool?)n["legacyCapture"] == true, (string?)n["assignmentGeneration"]);
+            (string?)n["hostId"], (string?)n["hostGeneration"], (int?)n["hostProcessId"], (string?)n["hostProcessStart"], (bool?)n["legacyCapture"] == true, (string?)n["assignmentGeneration"],
+            (string?)n["replyWaitId"], (long?)n["replyWaitSequence"], (long?)n["replyMessageSequence"]);
     }
     static ReportInfo Info(JsonObject item) => new((string)item["id"]!, IdentityFrom(item["identity"]),
         (string)item["status"]!, (string?)item["reason"], (bool?)item["producerAck"] == true,
@@ -218,6 +228,22 @@ internal sealed partial class ReportStore
             var id = name[..^suffix.Length];
             if (Guid.TryParseExact(id, "N", out _) && (suffix == ".body.tmp" || !known.TryGetValue(id, out var acknowledged) || (suffix is ".capture" or ".capture.compact" && acknowledged))) File.Delete(file);
         }
+    }
+
+    // Report IDs encode this store's durable incarnation and monotonic allocation
+    // sequence. IDs from different incarnations cannot be ordered safely.
+    internal static bool TryCompareReportOrder(string left, string right, out int order)
+    {
+        order = 0;
+        static bool Valid(string value, out long sequence)
+        {
+            sequence = 0;
+            return value.Length == 32 && value == value.ToLowerInvariant() && Guid.TryParseExact(value, "N", out _) &&
+                long.TryParse(value.AsSpan(16), System.Globalization.NumberStyles.HexNumber,
+                    System.Globalization.CultureInfo.InvariantCulture, out sequence) && sequence > 0;
+        }
+        if (!Valid(left, out var a) || !Valid(right, out var b) || !left.AsSpan(0, 16).SequenceEqual(right.AsSpan(0, 16))) return false;
+        order = a.CompareTo(b); return true;
     }
 
     // Persist allocation before making the reservation visible. Skipped numbers are harmless;
@@ -611,7 +637,7 @@ internal sealed partial class ReportStore
 
     internal void SetDisposition(string id, string status, string? reason = null)
     {
-        if (status is not ("pending" or "claimed" or "accepted" or "uncertain" or "completed" or "failed")) throw new ArgumentException("Invalid report status");
+        if (status is not ("pending" or "claimed" or "accepted" or "uncertain" or "completed" or "failed" or "retained")) throw new ArgumentException("Invalid report status");
         if (status is "uncertain" or "failed" && string.IsNullOrWhiteSpace(reason)) throw new ArgumentException("Failure and uncertainty require a reason");
         lock (gate) using (SharedFileLock.Acquire(manifest))
         {
@@ -621,17 +647,17 @@ internal sealed partial class ReportStore
             if (reason is not null && Utf8.GetByteCount(reason) > ReportCapture.ReasonBytes) throw new ArgumentException("Disposition reason is too long");
             var allowed = previous == status || (previous, status) switch
             {
-                ("pending", "claimed" or "failed") => true,
+                ("pending", "claimed" or "failed" or "retained") => true,
                 ("claimed", "accepted" or "uncertain" or "failed") => true,
                 ("accepted", "completed" or "uncertain" or "failed") => true,
                 ("uncertain", "completed" or "failed") => true,
                 _ => false,
             };
             if (!allowed) throw new InvalidOperationException("Invalid report disposition transition");
-            if (previous == status && status is "completed" or "failed" && (string?)item["reason"] != reason) throw new InvalidOperationException("A terminal disposition is immutable");
+            if (previous == status && status is "completed" or "failed" or "retained" && (string?)item["reason"] != reason) throw new InvalidOperationException("A terminal disposition is immutable");
             if (previous == "uncertain" && status != previous && string.IsNullOrWhiteSpace(reason)) throw new ArgumentException("Resolving uncertainty requires evidence");
             item["status"] = status; item["reason"] = reason;
-            if (status is "completed" or "failed" && previous != status) item["terminalAt"] = Now().ToUnixTimeMilliseconds();
+            if (status is "completed" or "failed" or "retained" && previous != status) item["terminalAt"] = Now().ToUnixTimeMilliseconds();
             Save(entries);
         }
     }

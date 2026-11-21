@@ -56,6 +56,7 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
     public bool CaptureReports { get; set; } = true;
     // Host protocol tests can drive the receipt store without the conductor scheduling delivery.
     public ReportStore? HostReportStore { get; set; }
+    public CompletionHostLedger? HostCompletionLedger { get; set; }
     public Action<ReportCapture>? CaptureOpened { get; set; }
     public Action? BeforeProducerEvidence { get; set; }
     public bool FilterCodexIdleForTests { get; set; }
@@ -105,7 +106,7 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
             Adapter = adapter, Token = Token, RetryDelays = [TimeSpan.FromMilliseconds(50)], Slot = slot,
             Generation = new HostGeneration(Build, Options(adapter)),
             OrphanIdle = OrphanIdle, OrphanBusy = OrphanBusy, CancelGrace = CancelGrace, BufferBytes = BufferBytes,
-            ReportStore = CaptureReports ? HostReportStore ?? Service?.ReportStorage : null, CaptureOpened = CaptureOpened,
+            ReportStore = CaptureReports ? HostReportStore ?? Service?.ReportStorage : null, CompletionHostLedger = HostCompletionLedger, CaptureOpened = CaptureOpened,
             BeforeProducerEvidence = BeforeProducerEvidence,
             FilterCodexIdleForTests = FilterCodexIdleForTests, IdleFrameProcessedForTests = IdleFrameProcessedForTests,
             Log = m => { lock (Said) Said.Add(m); },
