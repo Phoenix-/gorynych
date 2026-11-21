@@ -30,7 +30,8 @@ public sealed class AssignmentTeamDiagnosticsTests
             var reviewer1 = members[0]; var reviewer2 = members[1];
             var worker1 = members[2]; var worker2 = members[3]; var worker3 = members[4]; var worker4 = members[5];
             foreach (var id in members) service.Store.Update(id, "codex", r => { r.Draft = false; r.ParentSessionId = coordinator; r.ReportToParent = false; }, durable: true);
-            service.Store.Update(coordinator, "codex", r => r.Draft = false, durable: true);
+            // Keep lifecycle notices pending while measuring diagnostic-only input.
+            service.Store.Update(coordinator, "codex", r => { r.Draft = false; r.Archived = true; }, durable: true);
             string Token(string id) => service.Store.Get(id)!.PeerToken ?? throw new InvalidOperationException("Peer token unavailable");
             JsonObject Meta(string id) => new() { [GorynychProtocol.MetaPeerToken] = Token(id) };
             async Task<JsonNode?> Call(string method, JsonObject args) => await client.Rpc.SendRequestAsync(method, args).WaitAsync(Wait);

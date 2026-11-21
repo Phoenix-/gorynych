@@ -12,13 +12,42 @@ public sealed partial class Conductor
     internal MailboxStore ReplyMailbox => mailbox;
     internal Action? BeforeMailboxMarkStarted { get; set; }
     internal Func<Task>? AfterMailboxResponseForTests { get; set; }
+    internal Func<Task>? BeforeCoordinatorModeWaitForTests { get; set; }
+    internal Action? BeforeCoordinatorArchiveWaitForTests { get; set; }
     readonly Lock mailboxGate = new();
     readonly Dictionary<string, Task> mailboxWorkers = new(StringComparer.Ordinal);
 
     void InitializeMailbox()
     {
         mailbox = new MailboxStore(Path.Combine(options.DataDirectory, "mailbox.json"), clock: options.Time);
+        ReevaluateCoordinatorSupervision(afterRestart: true);
         foreach (var recipient in mailbox.PendingRecipients()) QueueMailbox(recipient);
+    }
+
+    void ReevaluateCoordinatorSupervision(bool afterRestart = false)
+    {
+        foreach (var item in mailbox.CoordinatorSupervisionInventory(includeReportOnly: true))
+        {
+            var id = (string)item["assignmentId"]!; var parent = (string)item["parent"]!;
+            var child = (string)item["child"]!; var generation = (string)item["generation"]!;
+            if ((bool?)item["coordinatorInitialTurnSettled"] != true)
+            {
+                // While the originating prompt still owns TurnGate its exact terminal
+                // publication may follow the report ACK. Once that owner is gone, or
+                // on restart, recover the retained report conservatively.
+                if ((afterRestart || !feeds.TryGetValue(child, out var turnFeed) || turnFeed.TurnGate.CurrentCount != 0) &&
+                    mailbox.RecoverCoordinatorReportWithoutBoundary(id, generation, child, parent)) QueueMailbox(parent);
+                continue;
+            }
+            var originalHost = (string?)item["coordinatorHostId"];
+            var originalGeneration = (string?)item["coordinatorHostGeneration"];
+            var originalEpoch = (long?)item["coordinatorRouteEpoch"];
+            if ((originalHost is null || originalGeneration is null || originalEpoch is null ||
+                !feeds.TryGetValue(child, out var savedFeed) || savedFeed.AssignmentEvidenceEpoch != originalEpoch ||
+                !CanAutoSuperviseCoordinator(parent, child, originalHost, originalGeneration)) &&
+                mailbox.RecordCoordinatorInitialTurn(id, generation, child, parent, supervision: false))
+                QueueMailbox(parent);
+        }
     }
 
     static string RequiredMailboxText(JsonNode? node, string field) =>
@@ -102,7 +131,8 @@ public sealed partial class Conductor
         try
         {
             var schedule = expectReply ? ReminderScheduleFor(sender, target) : null;
-            mailbox.Accept(requestId, sender, target, text, reply ? targetOrMessage : null, approved, delegation, expectReply, schedule);
+            mailbox.Accept(requestId, sender, target, text, reply ? targetOrMessage : null, approved, delegation, expectReply, schedule,
+                coordinatorLifecycle: delegation);
         }
         catch (Exception e) when (e is ArgumentException or InvalidOperationException) { throw MailboxInputError(e); }
         finally { if (expectReply) uiMetadataGate.Release(); }
@@ -168,7 +198,7 @@ public sealed partial class Conductor
         }
     }
 
-    void QueueMailbox(string recipient)
+    internal void QueueMailbox(string recipient)
     {
         if (recipient.StartsWith("outside:", StringComparison.Ordinal)) return;
         lock (mailboxGate)
@@ -178,13 +208,16 @@ public sealed partial class Conductor
         }
     }
 
+    IReadOnlyList<JsonObject> ReadManagedQueue(string recipient, int limit) =>
+        mailbox.ReadManagedQueue(recipient, limit, includeNotices: store.Get(recipient)?.Archived != true);
+
     async Task PumpMailboxAsync(string recipient)
     {
         try
         {
             while (!cleanupStop.IsCancellationRequested && !Draining)
             {
-                var item = mailbox.Read(recipient, 0, 1, pendingOnly: true).FirstOrDefault();
+                var item = ReadManagedQueue(recipient, 1).FirstOrDefault();
                 if (item is null) break;
                 try
                 {
@@ -213,7 +246,7 @@ public sealed partial class Conductor
                 mailboxWorkers.Remove(recipient);
                 // Acceptance and worker removal share this lock, so a message arriving at the
                 // end of a pump always gets a worker even when the previous read was empty.
-                if (!cleanupStop.IsCancellationRequested && !Draining && mailbox.Read(recipient, 0, 1, true).Count > 0)
+                if (!cleanupStop.IsCancellationRequested && !Draining && ReadManagedQueue(recipient, 1).Count > 0)
                     QueueMailbox(recipient);
             }
         }
@@ -221,6 +254,11 @@ public sealed partial class Conductor
 
     void FailMailbox(JsonObject item, string reason, bool uncertain)
     {
+        if (MailboxStore.IsCoordinatorNotice(item))
+        {
+            mailbox.FailCoordinatorNotice(item, reason, uncertain);
+            return;
+        }
         var id = (string)item["id"]!;
         var recipient = (string)item["recipient"]!;
         var sender = (string)item["sender"]!;
@@ -248,6 +286,10 @@ public sealed partial class Conductor
         long? assignmentRouteEpoch = null;
         long responseActivityFence = -1;
         ReportAdmission? report = null;
+        IReadOnlyList<JsonObject> batch = [item];
+        var archiveHeld = false;
+        var noticeModeHeld = false;
+        var headConsent = false;
         try
         {
             if (Draining) return; // still queued; the next service resumes it
@@ -260,42 +302,72 @@ public sealed partial class Conductor
                 feed.TurnGate.Release();
                 try { await ConfirmAskIntoFullAccessAsync(sender, use.Record, (string)item["text"]!, ct); }
                 finally { await feed.TurnGate.WaitAsync(CancellationToken.None); }
+                headConsent = true;
                 if (Draining) return;
             }
             if (feed.Retired || store.Get(recipient) is not { Deleted: false }) throw NotFound(recipient);
             if (!suppliedGates) rpc = await RpcForTurnAsync(use.Record, rpc, ct, forAgent: true);
             else if (HostOf(use.Record).RouteOf(recipient)?.Rpc != rpc) throw new IOException("Reminder route changed after handoff claim");
-            var block = new TextContent { Text = MailboxPrompt(item) };
+            if (!suppliedGates && MailboxStore.IsCoordinatorItem(item))
+            {
+                // Mode changes serialize on this gate. Build the entire FIFO prefix only
+                // after acquiring it, so every secondary item has current authority.
+                if (BeforeCoordinatorModeWaitForTests is { } modeBarrier) await modeBarrier();
+                await feed.ReminderModeGate.WaitAsync(ct); noticeModeHeld = true;
+                var current = ReadManagedQueue(recipient, 8);
+                if (current.Count == 0 || (long?)current[0]["sequence"] != (long?)item["sequence"]) return;
+                if (!MailboxStore.IsCoordinatorNotice(item) && sender != "service" &&
+                    !sender.StartsWith("outside:", StringComparison.Ordinal) && InFullAccess(recipient) &&
+                    !InFullAccess(sender) && (bool?)item["approvedFullAccess"] != true && !headConsent) return;
+                batch = CoordinatorBatch(current, recipient);
+                item = batch[0];
+            }
+            var resume = use.Record.ParentSessionId is { } reportParent ? mailbox.ResolveCoordinatorReply(batch, reportParent) : null;
+            var batchCommit = batch.Count > 1 || MailboxStore.IsCoordinatorNotice(item) || resume is not null;
+            var text = batch.Count == 1 ? InboxPrompt(item, recipient) :
+                "[Coordinator inbox]\n\n" + string.Join("\n\n", batch.Select(entry => InboxPrompt(entry, recipient)));
+            var block = new TextContent { Text = text };
             var assignmentGeneration = (bool?)item["delegation"] == true ? (string?)item["assignmentGeneration"] : null;
             // Request IDs are arbitrary bounded strings: a separate prefix prevents an
             // ordinary/legacy mailbox ID from spelling a generated delegation key.
-            var messageId = assignmentGeneration is null ? "mailbox-" + id : "delegation-" + assignmentGeneration + "-" + id;
+            var messageId = batchCommit ? "inbox-" + (long)item["sequence"]! :
+                assignmentGeneration is null ? "mailbox-" + id : "delegation-" + assignmentGeneration + "-" + id;
             promptId = ServicePromptId(messageId);
             var isDelegation = (bool?)item["delegation"] == true;
-            if (!isDelegation) key = feed.BeginPrompt(promptId);
-            var shownSender = sender.StartsWith("outside:", StringComparison.Ordinal) ? "outside_agent" : sender;
+            if (!isDelegation && !batchCommit) key = feed.BeginPrompt(promptId);
+            var shownSender = batch.Count > 1 ? "service" : sender.StartsWith("outside:", StringComparison.Ordinal) ? "outside_agent" : sender;
             var meta = new JsonObject { [GorynychProtocol.MetaOrigin] = "peer", [GorynychProtocol.MetaSender] = shownSender,
                 [GorynychProtocol.MetaMailboxMessage] = id, [GorynychProtocol.MetaPromptId] = promptId };
             if ((bool?)item["delegation"] == true) meta[GorynychProtocol.MetaAssignmentId] = (string?)item["assignmentId"];
             if ((bool?)item["expectReply"] == true) meta[GorynychProtocol.MetaExpectsReply] = true;
             if ((string?)item["reminderFor"] is { } reminderFor)
                 meta[GorynychProtocol.MetaReplyReminder] = new JsonObject { ["messageId"] = reminderFor, ["kind"] = (string?)item["reminderKind"], ["backgroundStream"] = (string?)item["reminderStream"] };
-            if (sender != "service" && !sender.StartsWith("outside:", StringComparison.Ordinal)) meta[GorynychProtocol.MetaFromSessionId] = sender;
+            if (batch.Count == 1 && sender != "service" && !sender.StartsWith("outside:", StringComparison.Ordinal))
+                meta[GorynychProtocol.MetaFromSessionId] = sender;
             async Task PublishMessageAsync() => await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
             { Content = block, MessageId = messageId, Meta = meta.DeepClone().AsObject() })!.AsObject(), except: null, () => store.Touch(recipient));
-            if (!isDelegation) await PublishMessageAsync();
+            if (!isDelegation && !batchCommit) await PublishMessageAsync();
             if (use.Record.ParentSessionId is not null) feed.BeginTurnText(ReportLimit + 1);
             Task<JsonNode?> response;
             var startAttempted = false;
+            // Reports take archiveGate before ForwardGate. Never invert that order.
+            if (!suppliedGates && batch.Any(MailboxStore.IsCoordinatorNotice))
+            {
+                BeforeCoordinatorArchiveWaitForTests?.Invoke();
+                await archiveGate.WaitAsync(ct); archiveHeld = true;
+                if (store.Get(recipient)?.Archived == true) return;
+            }
             if (!forwardHeld) { await feed.ForwardGate.WaitAsync(ct); forwardHeld = true; }
             try
             {
                 if (feed.Retired || store.Get(recipient) is not { Deleted: false }) throw NotFound(recipient);
                 var cause = (bool?)item["delegation"] == true ? ReportCause.Delegation :
                     item["replyTo"] is not null ? ReportCause.Reply : ReportCause.Peer;
-                var turnKey = assignmentGeneration is null ? "mailbox:" + id : "delegation:" + assignmentGeneration + ":" + id;
+                var turnKey = batchCommit ? "mailbox-batch:" + (long)item["sequence"]! :
+                    assignmentGeneration is null ? "mailbox:" + id : "delegation:" + assignmentGeneration + ":" + id;
                 report = AdmitReport(use.Record, rpc, promptId, turnKey, cause,
-                    cause == ReportCause.Delegation ? (string?)item["assignmentId"] : null, id, assignmentGeneration);
+                    cause == ReportCause.Delegation ? (string?)item["assignmentId"] : resume?.AssignmentId, id,
+                    cause == ReportCause.Delegation ? assignmentGeneration : resume?.Generation, resume);
                 BeforeMailboxMarkStarted?.Invoke();
                 if (suppliedGates && ((string?)item["reminderSource"] is not { } authoritySource ||
                     Draining || IsStopping(use.Record.Agent) || feed.ReadOnly is not null || feed.OpenedReadOnly ||
@@ -307,8 +379,8 @@ public sealed partial class Conductor
                 if (isDelegation && assignmentGeneration is not null)
                     assignmentRouteEpoch = HostOf(use.Record).OnCurrentRoute<long?>(recipient, rpc,
                         link => link.HostId is not null ? feed.AssignmentEvidenceEpoch : null, null);
-                if (!mailbox.TryMarkStarted(id, recipient, (long)item["sequence"]!)) return;
-                if (isDelegation)
+                if (!(batchCommit ? mailbox.TryStartCoordinatorBatch(batch, resume, use.Record.ParentSessionId) : mailbox.TryMarkStarted(id, recipient, (long)item["sequence"]!))) return;
+                if (isDelegation || batchCommit)
                 {
                     key = feed.BeginPrompt(promptId);
                     if (assignmentRouteEpoch is { } earlyEpoch && assignmentGeneration is not null)
@@ -333,7 +405,12 @@ public sealed partial class Conductor
             finally
             {
                 try { if (!startAttempted) AbandonUnstarted(report); }
-                finally { authorityGate?.Release(); authorityGate = null; feed.ForwardGate.Release(); forwardHeld = false; }
+                finally
+                {
+                    if (archiveHeld) { archiveGate.Release(); archiveHeld = false; }
+                    if (noticeModeHeld) { feed.ReminderModeGate.Release(); noticeModeHeld = false; }
+                    authorityGate?.Release(); authorityGate = null; feed.ForwardGate.Release(); forwardHeld = false;
+                }
             }
             JsonNode? result;
             try { result = await response; if (AfterMailboxResponseForTests is { } barrier) await barrier(); }
@@ -343,7 +420,8 @@ public sealed partial class Conductor
             feed.ConfirmIdle(rpc);
             // Writing bytes is not an acknowledgement. Retain the uncertain started claim
             // until the adapter has actually answered; a restart must never hide that gap.
-            mailbox.MarkDelivered(id, recipient);
+            if (batchCommit) mailbox.CompleteCoordinatorBatch(batch);
+            else mailbox.MarkDelivered(id, recipient);
             KeepMark(feed, result);
             await MarkPromptEndAsync(feed, promptId, result, null);
             if (assignmentRouteEpoch is { } epoch && assignmentGeneration is not null &&
@@ -356,10 +434,28 @@ public sealed partial class Conductor
                         TextOf(result?["_meta"]?[GorynychProtocol.MetaHistoryMark]));
                     return true;
                 }, false);
+            if (isDelegation && assignmentGeneration is not null &&
+                (string?)result?["stopReason"] == "end_turn" && mailbox.FindAssignment(id, recipient) is { } openAssignment &&
+                (string?)openAssignment["parent"] is { } assignmentOwner)
+            {
+                var initial = HostOf(use.Record).OnCurrentRoute<(string? Host, string? Generation, long? Epoch)>(recipient, rpc,
+                    link => (link.HostId, link.Generation?.Key, feed.AssignmentEvidenceEpoch), (null, null, null));
+                var supervised = initial.Host is not null && initial.Generation is not null &&
+                    CanAutoSuperviseCoordinator(assignmentOwner, recipient, initial.Host, initial.Generation);
+                // report:false opts out of an implicit notice for an unsupervised
+                // initial turn. Explicit outcomes and actual reminder settlements
+                // have independent durable notice paths.
+                if ((use.Record.ReportToParent || supervised) &&
+                    mailbox.RecordCoordinatorInitialTurn(id, assignmentGeneration, recipient, assignmentOwner,
+                        supervised, initial.Host, initial.Generation, supervised ? initial.Epoch : null,
+                        fallbackAllowed: use.Record.ReportToParent)) QueueMailbox(assignmentOwner);
+            }
             ReportTurnEnd(recipient, Outcome(result), feed.EndTurnText());
         }
         catch (Exception e)
         {
+            if (!Draining && !cleanupStop.IsCancellationRequested)
+                foreach (var extra in batch.Skip(1)) FailMailbox(extra, e.Message, uncertain: e is not JsonRpcException);
             if (e is ReportPersistenceException persistence) await ReportPersistenceNoticeAsync(feed, persistence);
             if (e is not ReportPersistenceException && promptId is not null && !(handed && LivesOnInHost(e))) await MarkPromptEndAsync(feed, promptId, null, e);
             if (e is not ReportPersistenceException && promptId is not null && !LivesOnInHost(e))
@@ -368,6 +464,8 @@ public sealed partial class Conductor
         }
         finally
         {
+            if (archiveHeld) archiveGate.Release();
+            if (noticeModeHeld) feed.ReminderModeGate.Release();
             authorityGate?.Release();
             if (forwardHeld) feed.ForwardGate.Release();
             ForgetAdmission(report);
@@ -376,6 +474,43 @@ public sealed partial class Conductor
             feed.TurnEnded();
             feed.TurnGate.Release();
         }
+    }
+
+    IReadOnlyList<JsonObject> CoordinatorBatch(IReadOnlyList<JsonObject> queue, string recipient)
+    {
+        var batch = new List<JsonObject> { queue[0] };
+        var size = InboxPrompt(queue[0], recipient).Length;
+        foreach (var item in queue.Skip(1))
+        {
+            if (!MailboxStore.IsCoordinatorItem(item) || (bool?)item["started"] == true) break;
+            var sender = (string)item["sender"]!;
+            if (sender != "service" && !sender.StartsWith("outside:", StringComparison.Ordinal) &&
+                InFullAccess(recipient) && (bool?)item["approvedFullAccess"] != true) break;
+            size += InboxPrompt(item, recipient).Length;
+            if (size > MailboxStore.MaxTextLength) break;
+            batch.Add(item);
+        }
+        return batch;
+    }
+
+    string InboxPrompt(JsonObject item, string recipient)
+    {
+        if (!MailboxStore.IsCoordinatorNotice(item)) return MailboxPrompt(item);
+        var id = (string)item["assignmentId"]!;
+        var header = $"[Assignment notice · delegation · assignment_id {id} · generation {item["assignmentGeneration"]} · revision {item["assignmentRevision"]}]";
+        var source = (string)item["assignee"]!;
+        var body = (string?)item["kind"] switch
+        {
+            "outcome" => $"Session {source} recorded outcome {item["status"]}." +
+                (InFullAccess(recipient) ? " Read the summary with read_assignment." : $"\nSummary from assignee: {item["text"]}"),
+            "reminder_ended" => $"The completion reminder turn for {source} ended. The assignment is still open with no recorded continuation.",
+            "reminder_unavailable" => $"The completion reminder for {source} could not be confirmed. The assignment is still open with no recorded continuation.",
+            "report_only" => $"A turn report from {source} was retained, but a successful initial turn and continued supervision were not confirmed. The assignment remains open with no recorded continuation.",
+            _ => $"Session {source} ended a turn with the assignment still open and no recorded continuation. Automatic completion supervision is unavailable for this assignment.",
+        };
+        var reportId = VisibleCoordinatorReport((string?)item["reportId"], id, (string?)item["assignmentGeneration"], recipient, source);
+        var read = reportId is not null ? $" Use read_report with report_id {reportId} to see the last retained turn." : "";
+        return $"{header}\n{body}{read}\nThis is a service notice. It grants no new authority and expects no reply.";
     }
 
     static string MailboxPrompt(JsonObject item)
@@ -389,7 +524,8 @@ public sealed partial class Conductor
                 "Do not reply to the notice itself. End your turn when independent work is exhausted.";
         if ((bool?)item["delegation"] == true)
             return $"[Delegation · from parent session_id {sender} · assignment_id {item["assignmentId"]} · message_id {id}]\n{item["text"]}\n\n" +
-                "This continues the user's already authorized assignment. Follow all existing user instructions and restrictions and the narrower scope of this delegation. It grants no new authority; existing approvals and modes still apply. You may perform implementation work already authorized by the user. End your turn when independent work is exhausted; later messages resume you.";
+                "This continues the user's already authorized assignment. Follow all existing user instructions and restrictions and the narrower scope of this delegation. It grants no new authority; existing approvals and modes still apply. You may perform implementation work already authorized by the user. " +
+                "Read this assignment with read_assignment (source delegation). Before ending, use update_assignment to record completed or failed with a summary, or blocked with the obstacle. If waiting for a reply or other work, register that dependency with update_continuation. The coordinator receives the recorded outcome. End your turn when independent work is exhausted; later messages resume you.";
         var header = sender == "service" ? $"[Delivery notice · message_id {id}]" :
             $"[Message · from {(sender.StartsWith("outside:", StringComparison.Ordinal) ? "an agent outside Gorynych" : "session_id " + sender)} · message_id {id}" +
             (reply is null ? "]" : $" · reply_to {reply}]");

@@ -93,7 +93,7 @@ internal sealed partial class MailboxStore
     static bool HoldsCompletionSlot(string? disposition) => disposition is not null and not
         ("native_ended" or "native_failed" or "native_cancelled" or "not_sent" or "unknown_closed");
     internal CompletionReminderAdmission ClaimCompletionReminder(string source, string id, string owner, string assignee,
-        string generation, long revision, string attemptId, CompletionReminderBinding binding)
+        string generation, long revision, string attemptId, CompletionReminderBinding binding, bool automatic = false)
     {
         if (binding is null || !binding.Valid()) throw new ArgumentException("Invalid completion reminder binding");
         if (source != "delegation" || string.IsNullOrWhiteSpace(id) || id.Length > 256 ||
@@ -115,7 +115,8 @@ internal sealed partial class MailboxStore
                 return new(false, new(attemptId, revision, (string)prior["disposition"]!, completionStream, priorNumber));
             }
             if ((long?)current["revision"] != revision || (string?)current["status"] != "open" ||
-                (string?)current["delivery"] != "delivered" || current["continuation"] is not null)
+                (string?)current["delivery"] != "delivered" || current["continuation"] is not null ||
+                automatic && (bool?)current["coordinatorFallbackIssued"] == true)
                 return new(false, null);
             if (assignments.Count(p => HoldsCompletionSlot((string?)p.Value?["completionReminder"]?["disposition"])) >= completionClaimCapacity)
                 return new(false, null);
@@ -234,10 +235,15 @@ internal sealed partial class MailboxStore
             if (prior == disposition) return true;
             if (prior is not ("handoff_started" or "uncertain" or "unknown_closed")) return false;
             if (prior == "unknown_closed" && !HasOwnerReceipt(id, item, claim)) return false;
-            var copy = assignments.DeepClone().AsObject(); copy[id]!["completionReminder"]!["disposition"] = disposition;
+            var copy = assignments.DeepClone().AsObject(); var updated = copy[id]!.AsObject();
+            updated["completionReminder"]!["disposition"] = disposition;
+            var sequence = next;
+            if (prior != "unknown_closed" && settlement == CompletionReminderSettlement.NativeEnded && (bool?)updated["coordinatorLifecycle"] == true &&
+                (bool?)updated["coordinatorFallbackIssued"] != true && StillNeedsOutcome(updated))
+                SetCoordinatorNotice(id, updated, ++sequence, "reminder_ended");
             var receipts = completionReceipts.DeepClone().AsObject(); var key = CompletionReceiptKey(generation, attemptId);
             if ((string?)receipts[key]?["state"] == "reserved") receipts.Remove(key);
-            Save(entries.DeepClone().AsArray(), next, assigned: copy, completionClaimId: id, receipts: receipts);
+            Save(entries.DeepClone().AsArray(), sequence, assigned: copy, completionClaimId: id, receipts: receipts);
             return true;
         }
     }
@@ -260,10 +266,14 @@ internal sealed partial class MailboxStore
             var key = CompletionReceiptKey(generation, attemptId);
             if (!ReceiptMatches(completionReceipts[key] as JsonObject, source, id, owner, assignee, generation, originalRevision, attemptId) ||
                 (string?)completionReceipts[key]?["state"] != "reserved") return false;
-            var copy = assignments.DeepClone().AsObject(); copy[id]!["completionReminder"]!["disposition"] = "unknown_closed";
+            var copy = assignments.DeepClone().AsObject(); var updated = copy[id]!.AsObject();
+            updated["completionReminder"]!["disposition"] = "unknown_closed";
+            var sequence = next;
+            if ((bool?)updated["coordinatorLifecycle"] == true && (bool?)updated["coordinatorFallbackIssued"] != true && StillNeedsOutcome(updated))
+                SetCoordinatorNotice(id, updated, ++sequence, "reminder_unavailable");
             var receipts = completionReceipts.DeepClone().AsObject(); receipts[key]!["state"] = "unacked";
             receipts[key]!["event"] = "handoff_unknown_at_closure";
-            Save(entries.DeepClone().AsArray(), next, assigned: copy, completionClaimId: id, receipts: receipts);
+            Save(entries.DeepClone().AsArray(), sequence, assigned: copy, completionClaimId: id, receipts: receipts);
             return true;
         }
     }

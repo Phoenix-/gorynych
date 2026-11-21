@@ -302,6 +302,38 @@ public sealed partial class Conductor
         }
     }
 
+    bool CanAutoSuperviseCoordinator(string parent, string child, string? originalHost = null, string? originalGeneration = null)
+    {
+        return options.CompletionAuto && CompletionScopeIsCurrent && completionScope is { } scope &&
+            (string?)uiMetadata.Get(parent)[GorynychProtocol.MetaGroup]?["projectKey"] == scope.Project &&
+            (string?)uiMetadata.Get(parent)[GorynychProtocol.MetaGroup]?["groupId"] == scope.Group &&
+            (string?)uiMetadata.Get(child)[GorynychProtocol.MetaGroup]?["projectKey"] == scope.Project &&
+            (string?)uiMetadata.Get(child)[GorynychProtocol.MetaGroup]?["groupId"] == scope.Group &&
+            store.Get(child) is { Deleted: false, Archived: false, Agent: "claude" } &&
+            agents.TryGetValue("claude", out var host) && host.RouteOf(child) is { Current: true, HostId: not null, Generation.Key: not null } route && !route.Rpc.IsClosed &&
+            (originalHost is null || route.HostId == originalHost && route.Generation.Key == originalGeneration) &&
+            route.Info.Meta?[GorynychProtocol.CapHostCompletionGuarded] is JsonValue value &&
+            value.TryGetValue<bool>(out var supported) && supported;
+    }
+
+    // Only exact, acknowledged lifecycle delegation captures replace a report wake.
+    // Recording the assignment reference first makes a crash before report disposition retryable.
+    bool RetainCoordinatorReport(ReportInfo info)
+    {
+        var identity = info.Identity;
+        var resume = identity.Cause == ReportCause.Reply && identity.ReplyWaitId is not null &&
+            identity.ReplyWaitSequence is > 0 && identity.ReplyMessageSequence is > 0;
+        if (identity.Cause != ReportCause.Delegation && !resume || identity.LegacyCapture ||
+            identity.AssignmentId is not { } id || identity.AssignmentGeneration is not { } generation)
+            return false;
+        var notEnded = info.Outcome is "failed" or "cancelled" or "not_started" || info.Outcome?.StartsWith("stopped:", StringComparison.Ordinal) == true;
+        if (!mailbox.RecordCoordinatorReport(id, generation, identity.Child, identity.Parent, info.ReportId, terminalNotEnded: notEnded, resume: resume)) return false;
+        reports.SetDisposition(info.ReportId, "retained", "Available through assignment history; lifecycle notice handles owner wake");
+        ReevaluateCoordinatorSupervision();
+        QueueMailbox(identity.Parent);
+        return true;
+    }
+
     async Task DeliverReportAsync(string id, CancellationToken ct)
     {
         var info = reports.GetReport(id);
@@ -322,6 +354,7 @@ public sealed partial class Conductor
             info = reports.GetReport(id);
         }
         if (info.Status != "pending" || !info.ProducerAck) return;
+        if (RetainCoordinatorReport(info)) return;
         var parentId = info.Identity.Parent;
         var parent = store.Get(parentId);
         if (parent is null) { reports.PendingDeliveryReason(id, "Intended parent is unavailable"); return; }

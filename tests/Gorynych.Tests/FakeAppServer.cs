@@ -496,6 +496,14 @@ sealed class FakeAppServer
     {
         var shown = string.Join("\n\n", (p["input"] as JsonArray ?? []).Select(i => (string?)i?["text"]));
         var text = (string?)(p["input"] as JsonArray)?[0]?["text"] ?? ""; // the script is in the first input only: a spawn's second one says where it came from
+        // Script commands belong to the delegated body, not the service's lifecycle guidance.
+        // Keep the original input in the synthetic native history above.
+        if (text.StartsWith("[Delegation · ", StringComparison.Ordinal) &&
+            text.IndexOf("\n\nThis continues the user's already authorized assignment.", StringComparison.Ordinal) is var guidance && guidance >= 0)
+        {
+            var body = text.IndexOf('\n');
+            if (body >= 0 && body < guidance) text = text[(body + 1)..guidance];
+        }
         var status = "completed";
         JsonObject? error = null;
         await Notify("turn/started", new JsonObject { ["threadId"] = t.Id, ["turn"] = new JsonObject { ["id"] = turnId, ["items"] = new JsonArray(), ["status"] = "inProgress" } });

@@ -224,8 +224,14 @@ public sealed partial class ClaudeHeadlessTests
                 ["assignmentId"] = "waiting", ["generation"] = generation, ["expectedRevision"] = 1,
                 ["operationId"] = "wait", ["action"] = "register", ["messageId"] = "reply",
                 ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = service.Store.Get(other)!.PeerToken } });
+            // report:false is an explicit opt-out from a wake solely for the
+            // unsupervised initial turn. Observation may not publish a notice.
+            Assert.IsNull(service.ReplyMailbox.FindAssignment("original", parent)?["coordinatorNotice"]);
             var saved = service.ReplyMailbox.AssignmentViews(parent).Select(x => x.ToJsonString()).Order().ToArray();
             var inputPath = Path.Combine(FakeRoot, child + ".inputs.jsonl"); var count = File.ReadAllLines(inputPath).Length;
+            var ownerInputPath = Path.Combine(FakeRoot, parent + ".inputs.jsonl");
+            var ownerCount = File.Exists(ownerInputPath) ? File.ReadAllLines(ownerInputPath).Length : 0;
+            Assert.AreEqual(0, ownerCount, "report:false must not wake the coordinator");
             var oldRoute = service.Agents["claude"].RouteOf(child)!; var oldPid = launcher.Pid;
             await HostTests.RestartAsync(service);
             launcher.Service = null; launcher.BreakConnection();
@@ -241,6 +247,8 @@ public sealed partial class ClaudeHeadlessTests
             Assert.AreEqual("defer", (string?)items.Single(x => (string?)x?["assignmentId"] == "original")!["decision"]);
             CollectionAssert.AreEqual(saved, service.ReplyMailbox.AssignmentViews(parent).Select(x => x.ToJsonString()).Order().ToArray());
             Assert.AreEqual(count, File.ReadAllLines(inputPath).Length);
+            Assert.AreEqual(ownerCount, File.Exists(ownerInputPath) ? File.ReadAllLines(ownerInputPath).Length : 0,
+                "observation does not send to the coordinator");
         }
         finally { await client.DisposeAsync(); await service.DisposeAsync(); await launcher.CloseNativeGracefully(); }
     }

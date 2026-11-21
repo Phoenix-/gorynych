@@ -161,10 +161,32 @@ public sealed class MailboxHostedRestartTests
                     ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = service.Store.Get(from)!.PeerToken } }).WaitAsync(Wait);
                 Assert.AreEqual("cancelled", (string?)late!["status"], "late turn/report cannot reopen the assignment");
             }
-            // BackgroundTurnsIdleAsync also tracks the host's perpetual stale-generation sweep.
-            // Await the reports' actual turn completions instead of waiting for that loop to exit.
-            await LinkHarness.Until(() => HostTests.EndMarks(service, from) == (inFlight ? 5 : 4),
-                "all three child reports (and any recovery notice) completed in the parent");
+            // Lifecycle-correlated delegation reports are retained instead of sending a
+            // separate [Report] prompt. Other turns still deliver ordinary reports.
+            if (delegation)
+            {
+                var initial = service.ReplyMailbox.FindAssignment(messageId, from)!;
+                var exactGeneration = (string)initial["generation"]!;
+                await LinkHarness.Until(() =>
+                {
+                    var reports = service.ReportStorage.List(to).Items;
+                    return reports.Count(r => r.ProducerAck && r.Status is "completed" or "retained") >= 3 &&
+                        reports.Any(r => r.Identity.AssignmentId == messageId && r.Identity.AssignmentGeneration == exactGeneration &&
+                            r.ProducerAck && r.Status == "retained");
+                }, "three retained or delivered child reports").WaitAsync(Wait);
+                var exactReport = service.ReportStorage.List(to).Items.Single(r => r.Identity.AssignmentId == messageId &&
+                    r.Identity.AssignmentGeneration == exactGeneration);
+                Assert.AreEqual("retained", exactReport.Status);
+                Assert.IsNotNull(service.ReportStorage.Read(exactReport.ReportId, from).Text);
+                if (!inFlight)
+                    await LinkHarness.Until(() => { lock (sender.Prompts) return sender.Prompts.Count(p => p.SessionId == from &&
+                        p.Text.Contains($"assignment_id {messageId}", StringComparison.Ordinal)) == 1; }, "one factual lifecycle notice").WaitAsync(Wait);
+                else
+                    Assert.AreEqual("cancelled", (string?)service.ReplyMailbox.FindAssignment(messageId, from)!["status"]);
+            }
+            // Await native end marks, not the host's perpetual stale-generation sweep.
+            await LinkHarness.Until(() => HostTests.EndMarks(service, from) == (inFlight && !delegation ? 5 : 4),
+                "ordinary reports and lifecycle or recovery notice completed in the parent");
             lock (recipient.Prompts)
             {
                 Assert.AreEqual(1, recipient.Prompts.Count(p => p.SessionId == to && p.Text.Contains(marker, StringComparison.Ordinal)),
@@ -175,8 +197,14 @@ public sealed class MailboxHostedRestartTests
             }
             Assert.AreEqual(4, HostTests.EndMarks(service, to), "each native turn ends exactly once across adoption");
             lock (sender.Prompts)
-                Assert.AreEqual(3, sender.Prompts.Count(p => p.SessionId == from && p.Text.StartsWith("[Report", StringComparison.Ordinal)),
-                    "each completed child turn reports once; the initial history predates its parent relation");
+            {
+                Assert.AreEqual(delegation ? 2 : 3, sender.Prompts.Count(p => p.SessionId == from && p.Text.StartsWith("[Report", StringComparison.Ordinal)),
+                    "ordinary child turns report once; the exact delegation report is retained");
+                if (delegation)
+                    Assert.AreEqual(inFlight ? 0 : 1, sender.Prompts.Count(p => p.SessionId == from &&
+                        p.Text.Contains($"assignment_id {messageId}", StringComparison.Ordinal)),
+                        "cancelled delegation has no stale lifecycle notice; open delegation has one");
+            }
             Assert.AreEqual(2, hosts.Launches, "both adapter hosts survived; this was not a cold-start-only recovery test");
         }
         finally

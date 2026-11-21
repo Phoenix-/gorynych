@@ -70,26 +70,30 @@ internal sealed partial class MailboxStore
 
     JsonObject? WithWaitDelivery(JsonObject item, string delivery)
     {
+        var copy = replyWaits.DeepClone().AsObject();
+        return ApplyWaitDelivery(copy, item, delivery) ? copy : null;
+    }
+
+    bool ApplyWaitDelivery(JsonObject waits, JsonObject item, string delivery)
+    {
         var id = (string)item["id"]!;
         if ((string?)item["reminderFor"] is { } original && (string?)item["reminderKind"] is { } kind &&
-            replyWaits[original]?["reminders"] is JsonObject reminders && (string?)reminders[kind + "MessageId"] == id)
+            waits[original]?["reminders"] is JsonObject reminders && (string?)reminders[kind + "MessageId"] == id)
         {
-            var copy = replyWaits.DeepClone().AsObject();
-            copy[original]!["reminders"]![kind] = delivery;
-            return copy;
+            reminders[kind] = delivery;
+            return true;
         }
-        if ((bool?)item["expectReply"] == true && replyWaits[id] is not null)
+        if ((bool?)item["expectReply"] == true && waits[id] is JsonObject requested)
         {
-            var copy = replyWaits.DeepClone().AsObject();
-            copy[id]!["requestDelivery"] = delivery;
-            if (delivery == "delivered" && copy[id]!["reminders"] is JsonObject reminder && reminder["reviewAt"] is null)
+            requested["requestDelivery"] = delivery;
+            if (delivery == "delivered" && requested["reminders"] is JsonObject reminder && reminder["reviewAt"] is null)
                 reminder["reviewAt"] = clock.GetUtcNow().AddTicks((long)reminder["delayTicks"]!).ToString("O");
-            return copy;
+            return true;
         }
-        if ((string?)item["replyTo"] is not { } replyTo || (string?)replyWaits[replyTo]?["replyId"] != id) return null;
-        var updated = replyWaits.DeepClone().AsObject();
-        updated[replyTo]!["replyDelivery"] = delivery;
-        return updated;
+        if ((string?)item["replyTo"] is not { } replyTo || waits[replyTo] is not JsonObject wait ||
+            (string?)wait["replyId"] != id) return false;
+        wait["replyDelivery"] = delivery;
+        return true;
     }
 
     internal JsonObject CancelReplyWait(string id, string peer)

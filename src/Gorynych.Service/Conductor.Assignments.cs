@@ -20,8 +20,33 @@ public sealed partial class Conductor
             ["delivery"] = state["delivery"]?.DeepClone(), ["summary"] = state["summary"]?.DeepClone(),
             ["outcomeReportId"] = state["outcomeReportId"]?.DeepClone(), ["continuation"] = continuation,
         };
-        if (includeDiagnostic) result["diagnostic"] = AssignmentDiagnostic(state, continuation);
+        if (includeDiagnostic)
+        {
+            result["diagnostic"] = AssignmentDiagnostic(state, continuation);
+            result["latestReportId"] = VisibleCoordinatorReport((string?)state["latestReportId"], (string?)state["assignmentId"],
+                (string?)state["generation"], (string?)state["parent"], (string?)state["child"]);
+            if (state["coordinatorNotice"] is JsonObject notice)
+                result["outcomeNotification"] = new JsonObject {
+                    ["kind"] = notice["kind"]?.DeepClone(),
+                    ["delivery"] = notice["delivery"]?.DeepClone() ?? JsonValue.Create(
+                        (bool?)notice["delivered"] == true ? "delivered" : (bool?)notice["started"] == true ? "uncertain" : "queued") };
+        }
         return result;
+    }
+
+    string? VisibleCoordinatorReport(string? reportId, string? assignment, string? generation, string? parent, string? child)
+    {
+        if (reportId is null || assignment is null || generation is null || parent is null || child is null) return null;
+        try
+        {
+            var report = reports.GetReport(reportId); var identity = report.Identity;
+            return report.ProducerAck && (identity.Cause == ReportCause.Delegation || identity.Cause == ReportCause.Reply &&
+                identity.ReplyWaitId is not null && identity.ReplyWaitSequence is > 0 && identity.ReplyMessageSequence is > 0) && !identity.LegacyCapture &&
+                identity.AssignmentId == assignment && identity.AssignmentGeneration == generation &&
+                identity.Parent == parent && identity.Child == child ? reportId : null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or
+            ArgumentException or KeyNotFoundException or System.Text.Json.JsonException) { return null; }
     }
 
     internal Action? AfterDiagnosticProofForTests { get; set; }
@@ -393,11 +418,16 @@ public sealed partial class Conductor
             var parent = (string)item["parent"]!; var child = (string)item["child"]!;
             JsonObject? retry = source == "spawn" ? store.RetrySpawnTransition(child, id, actor, revision, operation, outcome, summary, reportId, generation)
                 : mailbox.RetryAssignmentTransition(id, actor, revision, operation, outcome, summary, reportId, generation);
-            if (retry is not null) return PublicAssignment(retry);
+            if (retry is not null)
+            {
+                if (source == "delegation") Track(Task.Run(() => QueueMailbox(parent)));
+                return PublicAssignment(retry);
+            }
             JsonObject Commit() => source == "spawn" ? store.TransitionSpawnAssignment(child, id, actor, revision, operation, outcome, summary, reportId, generation)
                 : mailbox.TransitionAssignment(id, actor, revision, operation, outcome, summary, reportId, generation);
             var result = reportId is null ? Commit() : reports.WithAssignmentReport(reportId, actor, parent, child, id,
                 generation, source == "spawn" ? ReportCause.Spawn : ReportCause.Delegation, Commit);
+            if (source == "delegation") Track(Task.Run(() => QueueMailbox(parent)));
             return PublicAssignment(result);
         }
         catch (Exception e) when (e is InvalidOperationException or ArgumentException or IOException or UnauthorizedAccessException or KeyNotFoundException)
@@ -413,7 +443,11 @@ public sealed partial class Conductor
                     {
                         var retry = source == "spawn" ? store.RetrySpawnTransition((string)current["child"]!, id, actor, revision, operation, outcome, summary, reportId, generation)
                             : mailbox.RetryAssignmentTransition(id, actor, revision, operation, outcome, summary, reportId, generation);
-                        if (retry is not null) return PublicAssignment(retry);
+                        if (retry is not null)
+                        {
+                            if (source == "delegation") Track(Task.Run(() => QueueMailbox((string)current["parent"]!)));
+                            return PublicAssignment(retry);
+                        }
                     }
                 }
                 catch (InvalidOperationException) { }

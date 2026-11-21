@@ -178,7 +178,7 @@ public sealed partial class ClaudeHeadlessTests
         await using var launcher = new CompletionProcessHost(dir, ledgerPath, FakeClaude());
         var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true));
         await using var service = new Conductor(new ConductorOptions { DataDirectory = data, ServiceId = "owner-host", Time = clock,
-            Hosts = launcher, HostToken = InProcessHosts.Token, CompletionConfiguration = ("project", "group", instance),
+            Hosts = launcher, HostToken = InProcessHosts.Token, CompletionConfiguration = ("project", "group", instance), CompletionAuto = true,
             TestCompletionLedgerPath = ledgerPath,
             PeerServerCommand = [serviceExe, "peers", "--pipe", pipe] }, [adapter]);
         launcher.Service = service;
@@ -289,6 +289,11 @@ public sealed partial class ClaudeHeadlessTests
             var retryBody = JsonNode.Parse((string)retry!["content"]![0]!["text"]!)!;
             Assert.AreEqual("deferred", (string?)retryBody["state"], retryBody.ToJsonString());
             Assert.AreEqual(2, File.ReadAllLines(Path.Combine(FakeRoot, child + ".inputs.jsonl")).Length);
+            var ownerInput = Path.Combine(FakeRoot, parent + ".inputs.jsonl");
+            await LinkHarness.Until(() => File.Exists(ownerInput) && File.ReadAllLines(ownerInput).Length == 1 &&
+                service.ReplyMailbox.ReadManagedQueue(parent, 8).Count == 0, "one completion escalation delivered").WaitAsync(TimeSpan.FromSeconds(20));
+            StringAssert.Contains(File.ReadAllText(ownerInput), "The completion reminder turn");
+            Assert.AreEqual(1, File.ReadAllLines(ownerInput).Length, "one owner notice");
             Assert.AreEqual("open", (string?)service.ReplyMailbox.FindAssignment("owner-assignment", parent)!["status"]);
         }
         finally
@@ -298,6 +303,149 @@ public sealed partial class ClaudeHeadlessTests
             stop.Cancel(); try { await listener; } catch (OperationCanceledException) { }
             await launcher.CloseNativeGracefully();
         }
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    [Timeout(120000, CooperativeCancellation = true)]
+    public async Task LiveRouteEpochInvalidationTriggersFallbackWithoutAutomaticReminder(bool reportEnabled)
+    {
+        var dir = TestDirs.New(); var data = TestDirs.New(); File.WriteAllText(Path.Combine(dir, "background-supported"), "");
+        var metadata = new UiMetadataStore(Path.Combine(data, "ui-metadata.json")); metadata.Set("project", "group", "Group");
+        var instance = metadata.EnsureGroupInstance("project", "group")!;
+        var ledger = Path.Combine(dir, "ledger.json"); var clock = new ManualTime();
+        var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true, completionGuard: true));
+        var hosts = new InProcessHosts(_ => adapter) { HostCompletionLedger = new CompletionHostLedger(ledger) };
+        await using var service = new Conductor(new ConductorOptions { DataDirectory = data, ServiceId = "route-loss", Time = clock,
+            Hosts = hosts, HostToken = InProcessHosts.Token, CompletionConfiguration = ("project", "group", instance),
+            CompletionAuto = true, TestCompletionLedgerPath = ledger }, [adapter]);
+        hosts.Service = service; await using var client = await TestClient.ConnectAsync(service);
+        try
+        {
+            async Task<string> New() => (string)(await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew,
+                new JsonObject { ["cwd"] = dir, ["mcpServers"] = new JsonArray() }))!["sessionId"]!;
+            var parent = await New(); var child = await New();
+            service.Store.Update(parent, "claude", r => r.Draft = false, durable: true);
+            service.Store.Update(child, "claude", r => { r.Draft = false; r.ParentSessionId = parent; r.ReportToParent = reportEnabled; }, durable: true);
+            foreach (var sid in new[] { parent, child }) await client.Rpc.SendRequestAsync(GorynychProtocol.MethodAttributesPatch,
+                new JsonObject { ["sessionId"] = sid, ["patch"] = new JsonObject { [GorynychProtocol.MetaGroup] = new JsonObject { ["projectKey"] = "project", ["groupId"] = "group" } } });
+            await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject { ["sessionId"] = child, ["text"] = "initial delegation",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = service.Store.Get(parent)!.PeerToken, [GorynychProtocol.MetaMessageRequestId] = "route-task" } });
+            await LinkHarness.Until(() => service.ReplyMailbox.FindAssignment("route-task", parent)?["coordinatorRouteEpoch"] is not null,
+                "initial route evidence").WaitAsync(TimeSpan.FromSeconds(20));
+            var saved = service.ReplyMailbox.FindAssignment("route-task", parent)!;
+            var generation = (string)saved["generation"]!; var old = service.Agents["claude"].RouteOf(child)!;
+            var oldEpoch = (long)saved["coordinatorRouteEpoch"]!;
+            Assert.AreEqual(old.HostId, (string?)saved["coordinatorHostId"]);
+            service.Store.Update(parent, "claude", r => r.Archived = true, durable: true);
+            // Simulate the exact source discontinuity on the live route. The same
+            // host ID and generation remain in place; only its epoch is invalidated.
+            service.Feed(child).InvalidateAssignmentEvidence(old.Rpc);
+            var current = service.Agents["claude"].RouteOf(child)!;
+            Assert.AreEqual(old.HostId, current.HostId); Assert.AreEqual(old.Generation!.Key, current.Generation!.Key);
+            Assert.AreNotEqual(oldEpoch, service.Feed(child).AssignmentEvidenceEpoch);
+            clock.Advance(TimeSpan.FromSeconds(61)); await service.SweepCompletionAutoAsync();
+            var notices = service.ReplyMailbox.ReadManagedQueue(parent, 8);
+            Assert.AreEqual(reportEnabled ? 1 : 0, notices.Count);
+            if (reportEnabled) Assert.AreEqual("unsupervised", (string?)notices.Single()["kind"]);
+            Assert.IsNull(service.ReplyMailbox.ReadCompletionReminder("route-task", parent, child, generation));
+            Assert.AreEqual(1, File.ReadAllLines(Path.Combine(FakeRoot, child + ".inputs.jsonl")).Length);
+        }
+        finally { hosts.Service = null; }
+    }
+
+    [TestMethod]
+    [Timeout(120000, CooperativeCancellation = true)]
+    public async Task SameOriginalHostReattachesOnNewRouteAndRecoversFallback()
+    {
+        var dir = TestDirs.New(); var data = TestDirs.New(); File.WriteAllText(Path.Combine(dir, "background-supported"), "");
+        var metadata = new UiMetadataStore(Path.Combine(data, "ui-metadata.json")); metadata.Set("project", "group", "Group");
+        var instance = metadata.EnsureGroupInstance("project", "group")!; var ledger = Path.Combine(dir, "ledger.json"); var clock = new ManualTime();
+        await using var launcher = new CompletionProcessHost(dir, ledger, FakeClaude());
+        var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true));
+        Conductor Create() => new(new ConductorOptions { DataDirectory = data, ServiceId = "fallback-reattach", Time = clock,
+            Hosts = launcher, HostToken = InProcessHosts.Token, CompletionConfiguration = ("project", "group", instance),
+            CompletionAuto = true, TestCompletionLedgerPath = ledger }, [adapter]);
+        var service = Create(); launcher.Service = service; var client = await TestClient.ConnectAsync(service);
+        try
+        {
+            async Task<string> New() => (string)(await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew,
+                new JsonObject { ["cwd"] = dir, ["mcpServers"] = new JsonArray() }))!["sessionId"]!;
+            var parent = await New(); var child = await New();
+            service.Store.Update(parent, "claude", r => r.Draft = false, durable: true);
+            service.Store.Update(child, "claude", r => { r.Draft = false; r.ParentSessionId = parent; r.ReportToParent = true; }, durable: true);
+            foreach (var sid in new[] { parent, child }) await client.Rpc.SendRequestAsync(GorynychProtocol.MethodAttributesPatch,
+                new JsonObject { ["sessionId"] = sid, ["patch"] = new JsonObject { [GorynychProtocol.MetaGroup] = new JsonObject { ["projectKey"] = "project", ["groupId"] = "group" } } });
+            await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject { ["sessionId"] = child, ["text"] = "initial delegation",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = service.Store.Get(parent)!.PeerToken, [GorynychProtocol.MetaMessageRequestId] = "reattach-task" } });
+            await LinkHarness.Until(() => service.ReplyMailbox.FindAssignment("reattach-task", parent)?["coordinatorRouteEpoch"] is not null &&
+                service.Feed(child).TurnGate.CurrentCount == 1, "initial supervised terminal").WaitAsync(TimeSpan.FromSeconds(20));
+            var saved = service.ReplyMailbox.FindAssignment("reattach-task", parent)!; var generation = (string)saved["generation"]!;
+            var old = service.Agents["claude"].RouteOf(child)!; var pid = launcher.Pid;
+            Assert.AreEqual(0, service.ReplyMailbox.ReadManagedQueue(parent, 8).Count);
+            service.Store.Update(parent, "claude", r => r.Archived = true, durable: true);
+            await HostTests.RestartAsync(service); launcher.Service = null; launcher.BreakConnection();
+            await client.DisposeAsync(); await service.DisposeAsync();
+            service = Create(); launcher.Service = service; client = await TestClient.ConnectAsync(service);
+            await LinkHarness.Until(() => service.Agents["claude"].RouteOf(child) is { Current: true }, "original host reattached").WaitAsync(TimeSpan.FromSeconds(20));
+            var current = service.Agents["claude"].RouteOf(child)!;
+            Assert.AreNotSame(old.Rpc, current.Rpc); Assert.AreEqual(pid, launcher.Pid);
+            Assert.AreEqual(old.HostId, current.HostId); Assert.AreEqual(old.Generation!.Key, current.Generation!.Key);
+            var notice = service.ReplyMailbox.ReadManagedQueue(parent, 8).Single(); Assert.AreEqual("unsupervised", (string?)notice["kind"]);
+            clock.Advance(TimeSpan.FromSeconds(61)); await service.SweepCompletionAutoAsync();
+            Assert.IsNull(service.ReplyMailbox.ReadCompletionReminder("reattach-task", parent, child, generation));
+            Assert.AreEqual(1, File.ReadAllLines(Path.Combine(FakeRoot, child + ".inputs.jsonl")).Length);
+        }
+        finally { await client.DisposeAsync(); await service.DisposeAsync(); await launcher.CloseNativeGracefully(); }
+    }
+
+    [TestMethod]
+    [Timeout(120000, CooperativeCancellation = true)]
+    public async Task ReportAckBeforeTerminalBoundaryDoesNotInventRouteEpoch()
+    {
+        var dir = TestDirs.New(); var data = TestDirs.New(); File.WriteAllText(Path.Combine(dir, "background-supported"), "");
+        var metadata = new UiMetadataStore(Path.Combine(data, "ui-metadata.json")); metadata.Set("project", "group", "Group");
+        var instance = metadata.EnsureGroupInstance("project", "group")!; var ledger = Path.Combine(dir, "ledger.json");
+        var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true, completionGuard: true));
+        var hosts = new InProcessHosts(_ => adapter) { HostCompletionLedger = new CompletionHostLedger(ledger) };
+        await using var service = new Conductor(new ConductorOptions { DataDirectory = data, ServiceId = "ack-before-boundary",
+            Hosts = hosts, HostToken = InProcessHosts.Token, CompletionConfiguration = ("project", "group", instance),
+            CompletionAuto = true, TestCompletionLedgerPath = ledger }, [adapter]);
+        hosts.Service = service; await using var client = await TestClient.ConnectAsync(service);
+        var arrived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        service.AfterMailboxResponseForTests = async () => { arrived.TrySetResult(); await release.Task.WaitAsync(TimeSpan.FromSeconds(20)); };
+        try
+        {
+            async Task<string> New() => (string)(await client.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew,
+                new JsonObject { ["cwd"] = dir, ["mcpServers"] = new JsonArray() }))!["sessionId"]!;
+            var parent = await New(); var child = await New();
+            service.Store.Update(parent, "claude", r => r.Draft = false, durable: true);
+            service.Store.Update(child, "claude", r => { r.Draft = false; r.ParentSessionId = parent; r.ReportToParent = true; }, durable: true);
+            foreach (var sid in new[] { parent, child }) await client.Rpc.SendRequestAsync(GorynychProtocol.MethodAttributesPatch,
+                new JsonObject { ["sessionId"] = sid, ["patch"] = new JsonObject { [GorynychProtocol.MetaGroup] = new JsonObject { ["projectKey"] = "project", ["groupId"] = "group" } } });
+            await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject { ["sessionId"] = child, ["text"] = "initial delegation",
+                ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = service.Store.Get(parent)!.PeerToken, [GorynychProtocol.MetaMessageRequestId] = "ack-task" } });
+            await arrived.Task.WaitAsync(TimeSpan.FromSeconds(20));
+            await LinkHarness.Until(() => service.ReportStorage.List(child).Items.Any(r => r.Identity.AssignmentId == "ack-task" && r.ProducerAck && r.Status == "retained"),
+                "producer acknowledgement retained").WaitAsync(TimeSpan.FromSeconds(20));
+            var pre = service.ReplyMailbox.FindAssignment("ack-task", parent)!;
+            Assert.IsNotNull(pre["latestReportId"]); Assert.IsNull(pre["coordinatorInitialTurnSettled"]); Assert.IsNull(pre["coordinatorRouteEpoch"]);
+            await service.SweepCompletionAutoAsync();
+            Assert.AreEqual(0, service.ReplyMailbox.ReadManagedQueue(parent, 8).Count);
+            Assert.IsNull(service.ReplyMailbox.FindAssignment("ack-task", parent)!["completionReminder"]);
+            release.TrySetResult();
+            await LinkHarness.Until(() => service.ReplyMailbox.FindAssignment("ack-task", parent)?["coordinatorRouteEpoch"] is not null,
+                "exact boundary published").WaitAsync(TimeSpan.FromSeconds(20));
+            await service.SweepCompletionAutoAsync();
+            Assert.AreEqual(0, service.ReplyMailbox.ReadManagedQueue(parent, 8).Count);
+            var row = service.ReplyMailbox.FindAssignment("ack-task", parent)!;
+            Assert.AreEqual(service.Feed(child).AssignmentEvidenceEpoch, (long?)row["coordinatorRouteEpoch"]);
+            Assert.IsNull(row["completionReminder"]);
+            Assert.AreEqual(1, File.ReadAllLines(Path.Combine(FakeRoot, child + ".inputs.jsonl")).Length);
+        }
+        finally { release.TrySetResult(); hosts.Service = null; }
     }
 
     [TestMethod]

@@ -1077,6 +1077,39 @@ public sealed partial class ClaudeHeadlessTests
 
     [TestMethod]
     [Timeout(120_000, CooperativeCancellation = true)]
+    public async Task LiveReportAndCoordinatorBatchUseSameArchiveForwardOrder()
+    {
+        var dir = TestDirs.New(); var adapter = new ClaudeAdapter(Options(dir, liveNotes: true, fetchCatalog: false));
+        var hosts = new InProcessHosts(_ => adapter); await using var service = hosts.Conductor(dir, adapter); hosts.Service = service;
+        await using var client = await TestClient.ConnectAsync(service); var parent = await NewAsync(client, dir); await PromptAsync(client, parent, "warmup");
+        var child = await NewAsync(client, dir); var box = service.ReplyMailbox;
+        box.Accept("batch-task", parent, child, "work", delegation: true, coordinatorLifecycle: true);
+        box.MarkStarted("batch-task", child); box.MarkDelivered("batch-task", child);
+        var generation = (string)box.FindAssignment("batch-task", parent)!["generation"]!;
+        box.TransitionAssignment("batch-task", child, 1, "done", "completed", "result", generation: generation);
+        box.Accept("question", parent, child, "question", expectReply: true); box.MarkStarted("question", child); box.MarkDelivered("question", child);
+        box.Accept("reply", child, parent, "answer", replyTo: "question");
+        var store = service.ReportStorage; var id = store.Reserve(new ReportIdentity("live-order", child, parent, ReportCause.User, "source")).ReportId;
+        using (var capture = store.OpenCapture(id)) { capture.Append("report"); capture.Seal("ended"); store.Commit(id, capture); }
+        store.AcknowledgeProducer(id);
+        var feed = service.Feed(parent); await feed.ForwardGate.WaitAsync().WaitAsync(TimeSpan.FromSeconds(15)); var held = true;
+        var reportWait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var inboxWait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        service.BeforeLiveReportForwardWait = () => reportWait.TrySetResult();
+        service.BeforeCoordinatorArchiveWaitForTests = () => inboxWait.TrySetResult();
+        try
+        {
+            service.QueueReportDeliveries(parent); await reportWait.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            service.QueueMailbox(parent); await inboxWait.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            feed.ForwardGate.Release(); held = false;
+            await LinkHarness.Until(() => store.GetReport(id).Status == "completed", "report completed").WaitAsync(TimeSpan.FromSeconds(15));
+            await LinkHarness.Until(() => box.ReadManagedQueue(parent, 8).Count == 0, "inbox batch completed").WaitAsync(TimeSpan.FromSeconds(15));
+        }
+        finally { if (held) feed.ForwardGate.Release(); }
+    }
+
+    [TestMethod]
+    [Timeout(120_000, CooperativeCancellation = true)]
     public async Task LiveDeliveryRechecksReadOnlyAfterForwardGateWait()
     {
         var dir = TestDirs.New(); var adapter = new ClaudeAdapter(Options(dir, liveNotes: true, fetchCatalog: false));

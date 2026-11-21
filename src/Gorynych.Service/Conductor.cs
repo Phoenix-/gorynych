@@ -4926,7 +4926,7 @@ public sealed partial class Conductor : IAsyncDisposable
                 archiveGate.Release();
             }
             if (changed) ServiceLog.Info($"{record.Agent} {target}: {(archived ? "archived" : "restored")}{(from is null ? "" : $" by {from}")}");
-            if (changed && !archived) QueueReportDeliveries(target);
+            if (changed && !archived) { QueueReportDeliveries(target); QueueMailbox(target); }
             var result = new JsonObject();
             if (from is not null) result["text"] = ArchiveText(record, archived, changed, self: from == target);
             pilotApplied = true; return result;

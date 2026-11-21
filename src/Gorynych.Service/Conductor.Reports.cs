@@ -29,7 +29,8 @@ public sealed partial class Conductor
     }
 
     ReportAdmission? AdmitReport(SessionRecord record, JsonRpcConnection rpc, string promptId, string turnKey,
-        ReportCause cause, string? assignment, string? message, string? assignmentGeneration = null)
+        ReportCause cause, string? assignment, string? message, string? assignmentGeneration = null,
+        MailboxStore.CoordinatorReplyResume? resume = null)
     {
         if (!record.ReportToParent || record.ParentSessionId is not { } parent) return null;
         var link = HostOf(record).RouteOf(record.SessionId);
@@ -39,7 +40,8 @@ public sealed partial class Conductor
         {
             var identity = new ReportIdentity(turnKey, record.SessionId, parent, cause, promptId, assignment, message,
                 link.HostId, link.Generation?.Key, link.HostId is null ? Environment.ProcessId : link.ProcessId > 0 ? link.ProcessId : null,
-                link.HostId is null ? AgentHost.ProcessStartedAt(Environment.ProcessId) : link.ProcessStart, legacy, assignmentGeneration);
+                link.HostId is null ? AgentHost.ProcessStartedAt(Environment.ProcessId) : link.ProcessStart, legacy, assignmentGeneration,
+                resume?.WaitId, resume?.WaitSequence, resume?.ReplySequence);
             var receipt = reports.Reserve(identity);
             var id = receipt.ReportId;
             var admission = new ReportAdmission(id, identity, receipt.Created);

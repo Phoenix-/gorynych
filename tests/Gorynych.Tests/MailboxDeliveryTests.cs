@@ -193,6 +193,14 @@ public sealed class MailboxDeliveryTests
         var oldReport = service.ReportStorage.List(child.Id).Items.Single(r => r.Identity.MessageId == "same");
         Assert.AreEqual(oldGeneration, oldReport.Identity.AssignmentGeneration);
         service.ReplyMailbox.TransitionAssignment("same", parent.Id, 1, "cancel-old", "cancelled", "done", generation: oldGeneration);
+        // An already started coordinator notice pins its exact assignment until the
+        // handoff settles; cancellation only removes a notice that has not started.
+        await LinkHarness.Until(() =>
+        {
+            var row = service.ReplyMailbox.FindAssignment("same", parent.Id);
+            return (row?["coordinatorNotice"] is not JsonObject notice || (bool?)notice["delivered"] == true) &&
+                (row?["coordinatorPreviousNotice"] is not JsonObject previous || (bool?)previous["delivered"] == true);
+        }, "previous notice settled before eviction").WaitAsync(Wait);
         service.ReplyMailbox.Accept("filler", parent.Id, child.Id, "filler", delegation: true);
         service.ReplyMailbox.TransitionAssignment("filler", parent.Id, 1, "cancel-filler", "cancelled", "stop", generation: (string)service.ReplyMailbox.FindAssignment("filler", parent.Id)!["generation"]!);
         await Delegate("second incarnation").WaitAsync(Wait);
