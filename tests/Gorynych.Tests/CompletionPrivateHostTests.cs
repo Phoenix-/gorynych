@@ -1036,15 +1036,31 @@ public sealed partial class ClaudeHeadlessTests
                 ["assignmentId"] = "late-assignment", ["generation"] = generation, ["expectedRevision"] = 1, ["operationId"] = "late-complete",
                 ["outcome"] = "completed", ["summary"] = "completed before native terminal",
                 ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = childToken } });
+            var ownerInputPath = Path.Combine(FakeRoot, parent + ".inputs.jsonl");
+            await LinkHarness.Until(() =>
+            {
+                var notice = service.ReplyMailbox.FindAssignment("late-assignment", parent)?["coordinatorNotice"];
+                var feed = service.Feed(parent);
+                return (string?)notice?["delivery"] == "delivered" && feed.TurnGate.CurrentCount == 1 &&
+                    !feed.AgentTurnRunning && feed.Asking == 0 && File.Exists(ownerInputPath);
+            }, "the exact owner outcome notice completed before reconnect").WaitAsync(TimeSpan.FromSeconds(20));
+            var ownerInputs = File.ReadAllLines(ownerInputPath);
+            Assert.AreEqual(1, ownerInputs.Length, "exactly one owner notice was sent");
+            StringAssert.Contains(ownerInputs[0], "late-assignment");
+            StringAssert.Contains(ownerInputs[0], "completed before native terminal");
             launcher.Service = null; launcher.BreakConnection();
             await LinkHarness.Until(() => oldRoute.Rpc.IsClosed, "old recovery route disconnected").WaitAsync(TimeSpan.FromSeconds(15));
             await client.DisposeAsync(); await service.DisposeAsync();
             var reopened = new Conductor(new ConductorOptions { DataDirectory = data, ServiceId = "live-recovery", Time = clock,
                 Hosts = launcher, HostToken = InProcessHosts.Token, TestCompletionLedgerPath = ledgerPath,
                 HostGeneration = staleBuild ? _ => new HostGeneration("build-2", []) : null }, [adapter]);
-            launcher.Service = reopened; var after = await TestClient.ConnectAsync(reopened);
+            // Make the transient Wait path deterministic: the stale route may
+            // reattach while an owner turn still has its gate.
+            var parentGateHeld = false; TestClient? after = null;
             try
             {
+                if (staleBuild) { await reopened.Feed(parent).TurnGate.WaitAsync(); parentGateHeld = true; }
+                launcher.Service = reopened; after = await TestClient.ConnectAsync(reopened);
                 await LinkHarness.Until(() => reopened.Agents["claude"].RouteOf(child) is not null, "original host reattached").WaitAsync(TimeSpan.FromSeconds(20));
                 var reattached = reopened.Agents["claude"].RouteOf(child)!;
                 Assert.AreEqual(oldRoute.HostId, reattached.HostId); Assert.AreEqual(oldRoute.ProcessId, reattached.ProcessId);
@@ -1055,8 +1071,28 @@ public sealed partial class ClaudeHeadlessTests
                     Assert.AreEqual(Conductor.Move.Stay, await reopened.TryMoveAsync(child, false, CancellationToken.None),
                         "unresolved exact producer must not be migrated");
                     Assert.AreEqual(oldRoute.HostId, reopened.Agents["claude"].RouteOf(child)?.HostId);
-                    Assert.AreEqual(Conductor.Move.Done, await reopened.TryMoveAsync(parent, false, CancellationToken.None),
-                        "an unrelated session on the same stale host may still move");
+                    Assert.AreEqual(Conductor.Move.Wait, await reopened.TryMoveAsync(parent, false, CancellationToken.None),
+                        "a held owner turn is a transient wait, not a successful move");
+                    Assert.AreSame(reattached, reopened.Agents["claude"].RouteOf(parent), "the waiting owner remains on the original route");
+                    reopened.Feed(parent).TurnGate.Release(); parentGateHeld = false;
+                    // A concurrent inbox or stale-migration worker can transiently hold
+                    // the owner's turn gate. Wait for that exact gate and native turn;
+                    // Wait itself is never accepted as successful migration.
+                    using var parentMoveTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+                    var parentFeed = reopened.Feed(parent);
+                    while (true)
+                    {
+                        var moved = await reopened.TryMoveAsync(parent, false, parentMoveTimeout.Token);
+                        if (moved == Conductor.Move.Done) break;
+                        Assert.AreEqual(Conductor.Move.Wait, moved, "the settled owner must not be pinned");
+                        await parentFeed.TurnGate.WaitAsync(parentMoveTimeout.Token); parentFeed.TurnGate.Release();
+                        await LinkHarness.Until(() => !parentFeed.AgentTurnRunning && parentFeed.Asking == 0,
+                            "owner native turn is idle").WaitAsync(parentMoveTimeout.Token);
+                        await Task.Yield();
+                    }
+                    Assert.IsFalse(ReferenceEquals(reattached, reopened.Agents["claude"].RouteOf(parent)),
+                        "the unrelated owner must leave the original stale route");
+                    Assert.AreEqual(1, File.ReadAllLines(ownerInputPath).Length, "owner notice is not replayed during migration");
                 }
                 File.WriteAllText(Path.Combine(dir, "fail-completion-ack-record"), "");
                 File.WriteAllText(Path.Combine(dir, "fail-completion-retire-record"), "");
@@ -1093,6 +1129,7 @@ public sealed partial class ClaudeHeadlessTests
                 Assert.AreEqual("native_ended", reopened.ReplyMailbox.ReadCompletionReminder("late-assignment", parent, child, generation)?.Disposition);
                 Assert.AreEqual(1, InputCount(child, Guid.ParseExact(attempt, "N").ToString("D")));
                 Assert.AreEqual(2, File.ReadAllLines(Path.Combine(FakeRoot, child + ".inputs.jsonl")).Length);
+                Assert.AreEqual(1, File.ReadAllLines(ownerInputPath).Length, "recovery must not replay the owner notice");
                 if (staleBuild)
                 {
                     Assert.AreEqual(Conductor.Move.Done, await reopened.TryMoveAsync(child, false, CancellationToken.None),
@@ -1107,7 +1144,8 @@ public sealed partial class ClaudeHeadlessTests
             catch (Exception e) { originalFailure = e; throw; }
             finally
             {
-                await Cleanup(async () => await after.DisposeAsync());
+                if (parentGateHeld) reopened.Feed(parent).TurnGate.Release();
+                if (after is not null) await Cleanup(async () => await after.DisposeAsync());
                 await Cleanup(async () => await reopened.DisposeAsync());
             }
         }
