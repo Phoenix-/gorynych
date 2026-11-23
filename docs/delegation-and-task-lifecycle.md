@@ -251,8 +251,9 @@ This decision describes a follow-up to the deployed
 - A turn started by an ordinary direct `send_message` returns its final answer to
   the sender by default. This rule applies to any relationship between the two
   sessions. A `reply_message` from that turn to the exact triggering message
-  supplies the answer and suppresses the automatic one. A plain `send_message`
-  leaves the automatic answer eligible, even when it goes to the same sender.
+  suppresses the automatic answer once the mailbox durably accepts the reply.
+  A plain `send_message` leaves the automatic answer eligible, even when it goes
+  to the same sender.
 - The recipient's parent can use `list_reports` and `read_report` to inspect the
   retained report. When another agent starts the turn, the report is available
   for inspection without waking the parent. A reply explicitly addressed to the
@@ -262,10 +263,14 @@ This decision describes a follow-up to the deployed
   has started the current turn. The explicit reply carries the verdict to the
   coordinator. The peer's triggering message still determines where this turn's
   default answer goes and which explicit reply can suppress it.
-- Track reply acceptance and delivery separately. Report failure and cancellation
-  as turn outcomes independently of successful-answer suppression. An automatic
-  answer closes the automatic response path so delivering it cannot start a
-  chain of automatic answers.
+- Use the same mailbox lock for reply acceptance and the decision to enqueue the
+  automatic answer at turn completion. A reply refused before acceptance leaves
+  the automatic answer eligible. Track delivery separately from acceptance and
+  surface a later delivery failure through the normal failure notice. The captured
+  report remains available in history.
+- Report failure and cancellation as turn outcomes independently of successful-answer
+  suppression. An automatic answer closes the automatic response path so delivering
+  it cannot start a chain of automatic answers.
 
 Explicit reply waits and assignment outcomes follow their respective lifecycle
 rules. An ordinary turn result carries no assignment completion claim.
