@@ -278,6 +278,11 @@ public static class GorynychProtocol
     public const string CapHostCompletionGuarded = "gorynych/hostCompletionGuarded";
     public const string MethodClaudePromptObservation = "_gorynych/claude_prompt_observation";
     public const string MethodHostClaudePromptObservation = "_gorynych/host_claude_prompt_observation";
+    // Private hosted test negotiation; never a public caller authority.
+    public const string CapPeerTerminalReceiver = "gorynych/peerTerminalReceiver";
+    public const string CapPeerTerminalAdapter = "gorynych/peerTerminalAdapter";
+    public const string CapHostPeerTerminal = "gorynych/hostPeerTerminal";
+    public const string MetaPeerTerminal = "gorynych/peerTerminal";
     public const string CapClaudeObservationReceiver = "gorynych/claudeObservationReceiver";
     public const string CapClaudePromptObservation = "gorynych/claudePromptObservation";
     public const string CapHostClaudePromptObservation = "gorynych/hostClaudePromptObservation";

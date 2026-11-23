@@ -15,6 +15,82 @@ public sealed class ReportStoreTests
     }
 
     [TestMethod]
+    public void SenderOnlyPeerCaptureHasExactIndependentAclAndAdmissionSequence()
+    {
+        var directory = TestDirs.New(); var store = new ReportStore(directory, bodyLimit: 1024, totalLimit: 1024 * 1024);
+        var route = new PeerTurnIdentity("message", 17, "sender", "worker", "service-peer-17-message");
+        var identity = new ReportIdentity("peer:17:message", "worker", null, ReportCause.Peer,
+            PromptId: route.PromptId, MessageId: route.MessageId, PeerRoute: route);
+        var id = store.Reserve(identity).ReportId;
+        Assert.ThrowsExactly<ArgumentException>(() => store.Reserve(identity with { PeerRoute = route with { Sequence = 18 } }));
+        using (var capture = Sealed(store, id, "peer result")) store.Commit(id, capture);
+        store = new ReportStore(directory, bodyLimit: 1024, totalLimit: 1024 * 1024);
+        Assert.AreEqual(route, store.GetReport(id).Identity.PeerRoute); Assert.IsNull(store.GetReport(id).Identity.Parent);
+        Assert.AreEqual("peer result", store.Read(id, "sender").Text); Assert.AreEqual("peer result", store.Read(id, "worker").Text);
+        Assert.ThrowsExactly<UnauthorizedAccessException>(() => store.Read(id, "unrelated"));
+        Assert.AreEqual(1, store.List("sender").Items.Count); Assert.AreEqual(0, store.List("unrelated").Items.Count);
+    }
+
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public void PeerCaptureParentVisibilityIsIndependentFromSender(bool parentVisible)
+    {
+        var directory = TestDirs.New(); var store = new ReportStore(directory, bodyLimit: 1024, totalLimit: 1024 * 1024);
+        var route = new PeerTurnIdentity("message", 17, "sender", "worker", "service-peer-17-message");
+        var identity = new ReportIdentity("peer:17:message", "worker", parentVisible ? "parent" : null, ReportCause.Peer,
+            PromptId: route.PromptId, MessageId: route.MessageId, PeerRoute: route);
+        var id = store.Reserve(identity).ReportId;
+        using (var capture = Sealed(store, id, "body")) store.Commit(id, capture);
+        Assert.AreEqual("body", store.Read(id, "sender").Text);
+        Assert.AreEqual("body", store.Read(id, "worker").Text);
+        if (parentVisible) Assert.AreEqual("body", store.Read(id, "parent").Text);
+        else Assert.ThrowsExactly<UnauthorizedAccessException>(() => store.Read(id, "parent"));
+        Assert.ThrowsExactly<UnauthorizedAccessException>(() => store.Read(id, "other"));
+    }
+
+    [TestMethod]
+    public void RetainedPeerReportStaysPinnedUntilMailboxAcknowledgement()
+    {
+        var directory = TestDirs.New(); var store = new ReportStore(directory, bodyLimit: 1024, totalLimit: 1024 * 1024, recordLimit: 1, pinnedLimit: 1);
+        var route = new PeerTurnIdentity("message", 17, "sender", "worker", "service-peer-17-message");
+        var identity = new ReportIdentity("peer:17:message", "worker", null, ReportCause.Peer, PromptId: route.PromptId,
+            MessageId: route.MessageId, HostId: "host", HostGeneration: "generation", PeerRoute: route);
+        var id = store.Reserve(identity).ReportId;
+        using (var capture = Sealed(store, id, "result")) { store.RecordProducerEvidence(id, "host", "ended", null, null); store.Commit(id, capture); }
+        store.AcknowledgeProducer(id); store.SetDisposition(id, "retained", "settled");
+        store = new ReportStore(directory, bodyLimit: 1024, totalLimit: 1024 * 1024, recordLimit: 1, pinnedLimit: 1);
+        Assert.ThrowsExactly<InvalidOperationException>(() => store.Reserve(Identity("another")));
+        Assert.AreEqual("result", store.Read(id, "sender").Text);
+    }
+
+    [TestMethod]
+    public void PeerProducerEvidenceAndTerminalAreAtomicImmutableAndSurviveReopen()
+    {
+        var directory = TestDirs.New(); var store = new ReportStore(directory, bodyLimit: 1024, totalLimit: 1024 * 1024);
+        var route = new PeerTurnIdentity("message", 17, "sender", "worker", "service-peer-17-message");
+        var identity = new ReportIdentity("peer:17:message", "worker", null, ReportCause.Peer, PromptId: route.PromptId,
+            MessageId: route.MessageId, HostId: "original-host", HostGeneration: "generation", PeerRoute: route);
+        var id = store.Reserve(identity).ReportId;
+        var proof = new PeerProducerEvidence(route.PromptId, "01234567-89ab-cdef-0123-456789abcdef", "stream", "0123456789abcdef0123456789abcdef");
+        Assert.ThrowsExactly<InvalidOperationException>(() => store.RecordProducerEvidence(id, "foreign-host", "ended", null, null, proof));
+        Assert.ThrowsExactly<InvalidOperationException>(() => store.RecordProducerEvidence(id, "original-host", "ended", null, null, proof with { PromptId = "foreign" }));
+        Assert.ThrowsExactly<InvalidOperationException>(() => store.RecordProducerEvidence(id, "original-host", "ended", "contradiction", null, proof));
+        var write = store.WriteManifest;
+        store.WriteManifest = (_, _) => throw new IOException("injected before replace");
+        Assert.ThrowsExactly<IOException>(() => store.RecordProducerEvidence(id, "original-host", "ended", null, null, proof));
+        store.WriteManifest = write;
+        Assert.IsNull(new ReportStore(directory, bodyLimit: 1024, totalLimit: 1024 * 1024).GetReport(id).PeerEvidence);
+        store.RecordProducerEvidence(id, "original-host", "ended", null, null, proof);
+        store = new ReportStore(directory, bodyLimit: 1024, totalLimit: 1024 * 1024);
+        Assert.AreEqual(proof, store.GetReport(id).PeerEvidence);
+        store.RecordProducerEvidence(id, "original-host", "ended", null, null, proof);
+        Assert.ThrowsExactly<InvalidOperationException>(() => store.RecordProducerEvidence(id, "original-host", "ended", null, null, null));
+        using (var capture = Sealed(store, id, "result")) store.Commit(id, capture);
+        Assert.AreEqual(proof, new ReportStore(directory, bodyLimit: 1024, totalLimit: 1024 * 1024).GetReport(id).PeerEvidence);
+    }
+
+    [TestMethod]
     public void AtomicPublicationFailureAndIdempotentRecovery()
     {
         var directory = TestDirs.New();

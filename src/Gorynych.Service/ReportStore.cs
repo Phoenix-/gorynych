@@ -7,15 +7,18 @@ namespace Gorynych.Service;
 
 // Only service/host code constructs this value. It must not be built from untrusted client metadata.
 internal enum ReportCause { Unknown, Spawn, User, Delegation, Peer, Reply, Native }
-internal sealed record ReportIdentity(string TurnKey, string Child, string Parent, ReportCause Cause,
+internal sealed record ReportIdentity(string TurnKey, string Child, string? Parent, ReportCause Cause,
     string? PromptId = null, string? AssignmentId = null, string? MessageId = null,
     string? HostId = null, string? HostGeneration = null, int? HostProcessId = null, string? HostProcessStart = null,
     bool LegacyCapture = false, string? AssignmentGeneration = null,
-    string? ReplyWaitId = null, long? ReplyWaitSequence = null, long? ReplyMessageSequence = null);
+    string? ReplyWaitId = null, long? ReplyWaitSequence = null, long? ReplyMessageSequence = null,
+    PeerTurnIdentity? PeerRoute = null);
 internal sealed record ReportDeliveryClaim(string AttemptId, string Parent, string MessageId, string PromptId,
     string Route, string? HostId, string? HostGeneration, bool DispatchStarted = false,
     bool? ReceiptAckPending = null, bool? ReceiptConflict = null, int? HostProcessId = null, string? HostProcessStart = null,
     string? ReceiptReleaseReason = null);
+// Created only by a negotiated trusted producing host; null means unknown, never no-reply.
+internal sealed record PeerProducerEvidence(string PromptId, string NativeUuid, string Stream, string? AcceptedMessageId);
 internal sealed record ReportReceipt(string ReportId, string Status, bool Created = false);
 internal sealed record ReportPage(string ReportId, ReportIdentity Identity, string Text, string? NextCursor, string Status,
     string? DispositionReason, string Outcome, string? Error, bool HasText, string? IncompleteReason, long TotalBytes,
@@ -24,7 +27,8 @@ internal sealed record ReportInfo(string ReportId, ReportIdentity Identity, stri
     string? ProducerEvidence = null, string? ProducerFailure = null, string? ProducerOutcome = null, string? ProducerError = null,
     bool EndJournaled = false, string? Outcome = null, string? Error = null, bool? HasText = null,
     string? IncompleteReason = null, string? CaptureConfidenceReason = null, long? TotalBytes = null,
-    ReportDeliveryClaim? Delivery = null);
+    ReportDeliveryClaim? Delivery = null, PeerProducerEvidence? PeerEvidence = null,
+    string? PeerMailboxIncarnation = null, bool PeerMailboxAck = false, bool ExactProducerExit = false);
 internal sealed record ReportListPage(IReadOnlyList<ReportInfo> Items, string? NextCursor);
 internal sealed record ReportPreview(string Text, bool Truncated, bool HasText, string? IncompleteReason);
 
@@ -79,6 +83,7 @@ internal sealed partial class ReportStore
     }
 
     static bool Pinned(JsonObject item) => (string?)item["status"] is not ("completed" or "failed" or "retained") || (bool?)item["producerAck"] != true ||
+        (item["identity"]?["peerRoute"] is not null && (bool?)item["peerMailboxAck"] != true) ||
         ((string?)item["delivery"]?["route"] == "note" && item["delivery"]?["settledReceiptRevision"] is not null &&
          (((long?)item["delivery"]?["acknowledgedReceiptRevision"] != (long?)item["delivery"]?["settledReceiptRevision"] &&
            (long?)item["delivery"]?["hostExitReleasedRevision"] != (long?)item["delivery"]?["settledReceiptRevision"] &&
@@ -88,7 +93,15 @@ internal sealed partial class ReportStore
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(i.TurnKey);
         ArgumentException.ThrowIfNullOrWhiteSpace(i.Child);
-        ArgumentException.ThrowIfNullOrWhiteSpace(i.Parent);
+        if (i.Parent is null && i.PeerRoute is null) throw new ArgumentException("Report requires a parent or exact peer route");
+        if (i.Parent is not null) ArgumentException.ThrowIfNullOrWhiteSpace(i.Parent);
+        if (i.PeerRoute is { } peer && (i.Cause != ReportCause.Peer || i.LegacyCapture || peer.Sequence <= 0 ||
+            peer.Sender == peer.Recipient || peer.Recipient != i.Child || peer.PromptId != i.PromptId || peer.MessageId != i.MessageId ||
+            string.IsNullOrWhiteSpace(peer.Sender) || string.IsNullOrWhiteSpace(peer.Recipient) || string.IsNullOrWhiteSpace(peer.MessageId) ||
+            peer.Sender.StartsWith("outside:", StringComparison.Ordinal) || peer.Recipient.StartsWith("outside:", StringComparison.Ordinal) ||
+            peer.Sender == "service" || peer.MessageId.Length > 256 || peer.Sender.Length > 512 || peer.Recipient.Length > 512 ||
+            i.TurnKey != $"peer:{peer.Sequence}:{peer.MessageId}" || i.PromptId != $"service-peer-{peer.Sequence}-{peer.MessageId}"))
+            throw new ArgumentException("Invalid exact peer report route");
         if (!Enum.IsDefined(i.Cause)) throw new ArgumentException("Invalid report cause");
         if ((i.ReplyWaitId is not null || i.ReplyWaitSequence is not null || i.ReplyMessageSequence is not null) &&
             (i.Cause != ReportCause.Reply || string.IsNullOrWhiteSpace(i.AssignmentId) ||
@@ -113,24 +126,52 @@ internal sealed partial class ReportStore
         if (i.ReplyWaitId is not null) value["replyWaitId"] = i.ReplyWaitId;
         if (i.ReplyWaitSequence is not null) value["replyWaitSequence"] = i.ReplyWaitSequence;
         if (i.ReplyMessageSequence is not null) value["replyMessageSequence"] = i.ReplyMessageSequence;
+        if (i.PeerRoute is { } p) value["peerRoute"] = new JsonObject { ["messageId"] = p.MessageId, ["sequence"] = p.Sequence,
+            ["sender"] = p.Sender, ["recipient"] = p.Recipient, ["promptId"] = p.PromptId };
         return value;
     }
     static ReportIdentity IdentityFrom(JsonNode? n)
     {
         if (!Enum.TryParse<ReportCause>((string?)n?["cause"], true, out var cause) || !Enum.IsDefined(cause))
             throw new InvalidDataException("Invalid persisted report cause");
-        return new((string)n!["turnKey"]!, (string)n["child"]!, (string)n["parent"]!, cause,
+        var route = n?["peerRoute"] is JsonObject p ? new PeerTurnIdentity((string)p["messageId"]!, (long)p["sequence"]!,
+            (string)p["sender"]!, (string)p["recipient"]!, (string)p["promptId"]!) : null;
+        var identity = new ReportIdentity((string)n!["turnKey"]!, (string)n["child"]!, (string?)n["parent"], cause,
             (string?)n["promptId"], (string?)n["assignmentId"], (string?)n["messageId"],
             (string?)n["hostId"], (string?)n["hostGeneration"], (int?)n["hostProcessId"], (string?)n["hostProcessStart"], (bool?)n["legacyCapture"] == true, (string?)n["assignmentGeneration"],
-            (string?)n["replyWaitId"], (long?)n["replyWaitSequence"], (long?)n["replyMessageSequence"]);
+            (string?)n["replyWaitId"], (long?)n["replyWaitSequence"], (long?)n["replyMessageSequence"], route);
+        ValidateIdentity(identity);
+        return identity;
     }
     static ReportInfo Info(JsonObject item) => new((string)item["id"]!, IdentityFrom(item["identity"]),
         (string)item["status"]!, (string?)item["reason"], (bool?)item["producerAck"] == true,
         (string?)item["producerEvidence"], (string?)item["producerFailure"], (string?)item["producerOutcome"], (string?)item["producerError"],
         (bool?)item["endJournaled"] == true, (string?)item["outcome"], (string?)item["error"], (bool?)item["hasText"],
-        (string?)item["incompleteReason"], (string?)item["captureConfidenceReason"], (long?)item["bodyBytes"], DeliveryFrom(item["delivery"], (string)item["identity"]!["parent"]!));
-    static ReportDeliveryClaim? DeliveryFrom(JsonNode? value, string parent) => value is null ? null : new(
-        (string)value["attemptId"]!, parent, (string)value["messageId"]!, (string)value["promptId"]!,
+        (string?)item["incompleteReason"], (string?)item["captureConfidenceReason"], (long?)item["bodyBytes"], DeliveryFrom(item["delivery"], (string?)item["identity"]?["parent"]), PeerEvidenceFrom(item["producerPeerEvidence"]),
+        (string?)item["peerMailboxIncarnation"], (bool?)item["peerMailboxAck"] == true, (bool?)item["exactProducerExit"] == true);
+    static PeerProducerEvidence? PeerEvidenceFrom(JsonNode? node)
+    {
+        if (node is null) return null;
+        if (node is not JsonObject value || value.Count != 5 || (int?)value["version"] != 1 ||
+            value["promptId"] is not JsonValue p || !p.TryGetValue<string>(out var prompt) || string.IsNullOrWhiteSpace(prompt) || prompt.Length > 512 ||
+            value["nativeUuid"] is not JsonValue u || !u.TryGetValue<string>(out var uuid) || !Guid.TryParseExact(uuid, "D", out _) || uuid != uuid.ToLowerInvariant() ||
+            value["stream"] is not JsonValue st || !st.TryGetValue<string>(out var stream) || string.IsNullOrWhiteSpace(stream) || stream.Length > 256 ||
+            !value.ContainsKey("acceptedMessageId")) throw new InvalidDataException("Invalid peer producer evidence");
+        string? accepted = null;
+        if (value["acceptedMessageId"] is { } id && (id is not JsonValue v || !v.TryGetValue<string>(out accepted) ||
+            !Guid.TryParseExact(accepted, "N", out _) || accepted != accepted.ToLowerInvariant())) throw new InvalidDataException("Invalid accepted peer ID");
+        return new(prompt, uuid, stream, accepted);
+    }
+    internal static bool IsValidPeerEvidence(PeerProducerEvidence evidence)
+    {
+        try { return PeerEvidenceFrom(PeerEvidenceNode(evidence)) is not null; }
+        catch (Exception e) when (e is InvalidDataException or InvalidOperationException or ArgumentException) { return false; }
+    }
+    static JsonObject PeerEvidenceNode(PeerProducerEvidence evidence) => new() { ["version"] = 1, ["promptId"] = evidence.PromptId,
+        ["nativeUuid"] = evidence.NativeUuid, ["stream"] = evidence.Stream, ["acceptedMessageId"] = evidence.AcceptedMessageId };
+
+    static ReportDeliveryClaim? DeliveryFrom(JsonNode? value, string? parent) => value is null ? null : new(
+        (string)value["attemptId"]!, parent ?? throw new InvalidDataException("A parent delivery requires its original parent"), (string)value["messageId"]!, (string)value["promptId"]!,
         (string)value["route"]!, (string?)value["hostId"], (string?)value["hostGeneration"], (bool?)value["dispatchStarted"] == true,
         (string?)value["route"] == "note" && value["settledReceiptRevision"] is not null ?
             ((long?)value["settledReceiptRevision"] != (long?)value["acknowledgedReceiptRevision"] &&
@@ -381,7 +422,8 @@ internal sealed partial class ReportStore
     }
     // Written by the producing host only after its capture lease is released. A missing
     // confirmation remains unknown on recovery, even if the spool looks complete.
-    internal void RecordProducerEvidence(string id, string hostId, string outcome, string? error, string? failure)
+    internal void RecordProducerEvidence(string id, string hostId, string outcome, string? error, string? failure,
+        PeerProducerEvidence? peerEvidence = null)
     {
         ValidateId(id); ArgumentException.ThrowIfNullOrWhiteSpace(hostId); ArgumentException.ThrowIfNullOrWhiteSpace(outcome);
         if (Utf8.GetByteCount(outcome) > ReportCapture.OutcomeBytes || (error is not null && Utf8.GetByteCount(error) > ReportCapture.ErrorBytes))
@@ -394,6 +436,10 @@ internal sealed partial class ReportStore
             var identity = IdentityFrom(item["identity"]);
             if (identity.HostId is not null && identity.HostId != hostId)
                 throw new InvalidOperationException("Producer host identity does not match reservation");
+            var peerNode = peerEvidence is null ? null : PeerEvidenceNode(peerEvidence);
+            if (peerNode is not null && (identity.PeerRoute is null || identity.HostId is null || failure is not null || error is not null || outcome != "ended" ||
+                PeerEvidenceFrom(peerNode)?.PromptId != identity.PeerRoute.PromptId || Utf8.GetByteCount(peerNode.ToJsonString()) > 2048))
+                throw new InvalidOperationException("Peer evidence does not match the original successful producer");
             var evidence = failure is null ? "sealed" : "failed";
             var failureHash = failure is null ? null : Convert.ToHexString(SHA256.HashData(Utf8.GetBytes(failure)));
             var prior = (string?)item["producerEvidence"];
@@ -401,13 +447,15 @@ internal sealed partial class ReportStore
             {
                 var priorOutcome = (string?)item["producerOutcome"] ?? (string?)item["outcome"];
                 var priorError = item.ContainsKey("producerError") ? (string?)item["producerError"] : (string?)item["error"];
-                if (prior != evidence || (string?)item["producerFailureHash"] != failureHash || priorOutcome != outcome || priorError != error)
+                if (prior != evidence || (string?)item["producerFailureHash"] != failureHash || priorOutcome != outcome || priorError != error ||
+                    !JsonNode.DeepEquals(item["producerPeerEvidence"], peerNode))
                     throw new InvalidOperationException("Producer evidence is immutable");
                 return;
             }
             if ((string?)item["status"] != "reserved") throw new InvalidOperationException("Result is already published");
             item["producerEvidence"] = evidence; item["producerFailure"] = failure; item["producerFailureHash"] = failureHash;
             item["producerOutcome"] = outcome; item["producerError"] = error;
+            if (peerNode is not null) item["producerPeerEvidence"] = peerNode;
             Save(entries);
         }
     }
@@ -446,11 +494,11 @@ internal sealed partial class ReportStore
         return new ReportCapture(path, bodyLimit, owned);
     }
     internal const string MissingProducerEvidence = "Producer exited after seal before durable capture evidence";
-    internal ReportReceipt Commit(string id, ReportCapture capture) => CommitCore(id, capture, null);
+    internal ReportReceipt Commit(string id, ReportCapture capture) => CommitCore(id, capture, null, false);
     // The caller must first establish producer exit and hold the producer lease. The valid
     // sealed text/outcome are retained while completeness is explicitly downgraded.
-    internal ReportReceipt CommitUnconfirmed(string id, ReportCapture capture) => CommitCore(id, capture, MissingProducerEvidence);
-    ReportReceipt CommitCore(string id, ReportCapture capture, string? confidenceReason)
+    internal ReportReceipt CommitUnconfirmed(string id, ReportCapture capture, bool exactProducerExit = false) => CommitCore(id, capture, MissingProducerEvidence, exactProducerExit);
+    ReportReceipt CommitCore(string id, ReportCapture capture, string? confidenceReason, bool exactProducerExit)
     {
         ValidateId(id);
         if (!string.Equals(capture.Path, Path.GetFullPath(CapturePath(id)), OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
@@ -487,7 +535,8 @@ internal sealed partial class ReportStore
                     {
                         if ((string?)item["digest"] != digest || (string?)item["outcome"] != outcome ||
                             (bool?)item["hasText"] != snapshot.HasText || (string?)item["incompleteReason"] != incompleteReason ||
-                            (string?)item["captureConfidenceReason"] != confidenceReason || (string?)item["error"] != snapshot.Error)
+                            (string?)item["captureConfidenceReason"] != confidenceReason || (string?)item["error"] != snapshot.Error ||
+                            ((bool?)item["exactProducerExit"] == true) != exactProducerExit)
                             throw new InvalidOperationException("Report ID is already committed with different content");
                         return new(id, (string)item["status"]!);
                     }
@@ -496,6 +545,7 @@ internal sealed partial class ReportStore
                     item["digest"] = digest; item["bodyBytes"] = bytes.Length; item["outcome"] = outcome;
                     item["hasText"] = snapshot.HasText; item["incompleteReason"] = incompleteReason; item["error"] = snapshot.Error;
                     if (confidenceReason is not null) item["captureConfidenceReason"] = confidenceReason;
+                    if (exactProducerExit) item["exactProducerExit"] = true;
                     item["status"] = "pending";
                     item.Remove("producerOutcome"); item.Remove("producerError"); item.Remove("producerFailure");
                     Save(entries);
@@ -507,7 +557,7 @@ internal sealed partial class ReportStore
     }
     // Reconcile an unreadable, missing or otherwise unavailable producer spool without claiming
     // any text was captured. This still publishes the result and pending intent together.
-    internal ReportReceipt CommitCaptureFailure(string id, string outcome, string reason, string? error = null)
+    internal ReportReceipt CommitCaptureFailure(string id, string outcome, string reason, string? error = null, bool exactProducerExit = false)
     {
         ValidateId(id); ArgumentException.ThrowIfNullOrWhiteSpace(outcome); ArgumentException.ThrowIfNullOrWhiteSpace(reason);
         if (Utf8.GetByteCount(outcome) > ReportCapture.OutcomeBytes) throw new ArgumentException("Report outcome is too long");
@@ -520,13 +570,15 @@ internal sealed partial class ReportStore
             if ((string?)item["status"] != "reserved")
             {
                 if ((string?)item["digest"] != digest || (string?)item["outcome"] != outcome ||
-                    (bool?)item["hasText"] != false || (string?)item["incompleteReason"] != reason || (string?)item["error"] != error)
+                    (bool?)item["hasText"] != false || (string?)item["incompleteReason"] != reason || (string?)item["error"] != error ||
+                    ((bool?)item["exactProducerExit"] == true) != exactProducerExit)
                     throw new InvalidOperationException("Report ID is already committed with different content");
                 return new(id, (string)item["status"]!);
             }
             AtomicFile.WriteAllText(BodyPath(id), "", Utf8);
             item["digest"] = digest; item["bodyBytes"] = 0; item["outcome"] = outcome;
             item["hasText"] = false; item["incompleteReason"] = reason; item["error"] = error; item["status"] = "pending";
+            if (exactProducerExit) item["exactProducerExit"] = true;
             item.Remove("producerOutcome"); item.Remove("producerError"); item.Remove("producerFailure");
             Save(entries);
             return new(id, "pending");
@@ -635,6 +687,46 @@ internal sealed partial class ReportStore
         }
     }
 
+    // Called only after the exact mailbox settlement COW. The original route is never
+    // reconstructed from the current host or from the destination session.
+    internal void RetainPeerReport(string id, PeerTurnIdentity route, string incarnation)
+    {
+        ValidateId(id);
+        if (!Guid.TryParseExact(incarnation, "N", out _) || incarnation != incarnation.ToLowerInvariant())
+            throw new ArgumentException("Invalid mailbox incarnation");
+        lock (gate) using (SharedFileLock.Acquire(manifest))
+        {
+            var entries = Load(); var item = Find(entries, id); var identity = IdentityFrom(item["identity"]);
+            if (identity.PeerRoute != route || (bool?)item["producerAck"] != true)
+                throw new InvalidOperationException("Peer retained identity is not authoritative");
+            var status = (string?)item["status"];
+            if (status == "retained")
+            {
+                if ((string?)item["peerMailboxIncarnation"] != incarnation) throw new InvalidOperationException("Peer retained incarnation conflicts");
+                return;
+            }
+            if (status != "pending") throw new InvalidOperationException("Peer report is not pending");
+            item["peerMailboxIncarnation"] = incarnation; item["status"] = "retained";
+            item["reason"] = "Peer terminal disposition recorded"; item["terminalAt"] = Now().ToUnixTimeMilliseconds();
+            Save(entries);
+        }
+    }
+
+    // Mailbox ACK must already have durably released or proven eviction of the exact pin.
+    internal void AcknowledgePeerMailbox(string id, PeerTurnIdentity route, string incarnation)
+    {
+        ValidateId(id);
+        lock (gate) using (SharedFileLock.Acquire(manifest))
+        {
+            var entries = Load(); var item = Find(entries, id);
+            if (IdentityFrom(item["identity"]).PeerRoute != route || (string?)item["status"] != "retained" ||
+                (string?)item["peerMailboxIncarnation"] != incarnation || (bool?)item["producerAck"] != true)
+                throw new InvalidOperationException("Peer mailbox ACK does not match retained report");
+            if ((bool?)item["peerMailboxAck"] == true) return;
+            item["peerMailboxAck"] = true; Save(entries);
+        }
+    }
+
     internal void SetDisposition(string id, string status, string? reason = null)
     {
         if (status is not ("pending" or "claimed" or "accepted" or "uncertain" or "completed" or "failed" or "retained")) throw new ArgumentException("Invalid report status");
@@ -670,7 +762,7 @@ internal sealed partial class ReportStore
         var scope = "l" + Convert.ToHexString(SHA256.HashData(Utf8.GetBytes(caller))).ToLowerInvariant();
         lock (gate) using (SharedFileLock.Acquire(manifest))
             return Page(Load().OfType<JsonObject>().Where(e => (string?)e["identity"]?["child"] == caller ||
-                (string?)e["identity"]?["parent"] == caller).ToArray(), cursor, limit, scope);
+                (string?)e["identity"]?["parent"] == caller || (string?)e["identity"]?["peerRoute"]?["sender"] == caller).ToArray(), cursor, limit, scope);
     }
     internal ReportInfo[] FindDeliveryByPrompt(string parent, string promptId)
     {
@@ -712,10 +804,17 @@ internal sealed partial class ReportStore
     }    internal ReportPreview Preview(string id, string caller)
     {
         var page = Read(id, caller, limit: 16384);
-        var end = Math.Min(page.Text.Length, 2000);
-        if (end > 0 && end < page.Text.Length && char.IsHighSurrogate(page.Text[end - 1]) && char.IsLowSurrogate(page.Text[end])) end--;
-        return new(page.Text[..end], end < page.Text.Length || page.NextCursor is not null, page.HasText, page.IncompleteReason);
+        var (text, truncated) = LimitPreview(page.Text);
+        return new(text, truncated || page.NextCursor is not null, page.HasText, page.IncompleteReason);
     }
+    // Shared by report delivery and peer-turn result delivery; never split a surrogate pair.
+    internal static (string Text, bool Truncated) LimitPreview(string text)
+    {
+        var end = Math.Min(text.Length, 2000);
+        if (end > 0 && end < text.Length && char.IsHighSurrogate(text[end - 1]) && char.IsLowSurrogate(text[end])) end--;
+        return (text[..end], end < text.Length);
+    }
+
     internal ReportPage Read(string id, string caller, string? cursor = null, int limit = 4096)
     {
         ValidateId(id); ArgumentException.ThrowIfNullOrWhiteSpace(caller);
@@ -725,7 +824,8 @@ internal sealed partial class ReportStore
         lock (gate) using (SharedFileLock.Acquire(manifest))
         {
             item = Find(Load(), id);
-            if ((string?)item["identity"]?["child"] != caller && (string?)item["identity"]?["parent"] != caller)
+            var identity = IdentityFrom(item["identity"]);
+            if (identity.Child != caller && identity.Parent != caller && identity.PeerRoute?.Sender != caller)
                 throw new UnauthorizedAccessException("Report is not available to this session");
             if ((string?)item["status"] == "reserved") throw new InvalidOperationException("Report is not published");
             // Open the immutable body while the reference is valid. Delete sharing lets eviction

@@ -26,6 +26,7 @@ internal sealed partial class MailboxStore
     long trimmedThrough;
     string? completionStream;
     long completionNext;
+    string? peerMailboxIncarnation;
     internal Action<string, string> WriteFile { get; set; } = static (path, json) => AtomicFile.WriteAllText(path, json);
 
     internal MailboxStore(string path, int capacity = 5000, int waitCapacity = 1000, TimeProvider? clock = null, int assignmentCapacity = 1000, int completionClaimCapacity = 64, int completionReceiptCapacity = 64)
@@ -45,6 +46,9 @@ internal sealed partial class MailboxStore
             entries = root["entries"]?.AsArray() ?? throw new InvalidDataException("Missing mailbox entries");
             next = (long?)root["next"] ?? throw new InvalidDataException("Missing mailbox sequence");
             trimmedThrough = (long?)root["trimmedThrough"] ?? 0;
+            peerMailboxIncarnation = (string?)root["peerMailboxIncarnation"];
+            if (peerMailboxIncarnation is not null && (!Guid.TryParseExact(peerMailboxIncarnation, "N", out _) || peerMailboxIncarnation != peerMailboxIncarnation.ToLowerInvariant()))
+                throw new InvalidDataException("Invalid peer mailbox incarnation");
             if (root["replyWaits"] is { } retained) replyWaits = retained.AsObject();
             if (root["assignments"] is { } existingAssignments) assignments = existingAssignments.AsObject();
             if (root["completionReceipts"] is { } receipts) completionReceipts = receipts.AsObject();
@@ -96,7 +100,7 @@ internal sealed partial class MailboxStore
             var trimmed = trimmedThrough;
             while (replacement.Count >= capacity)
             {
-                var evict = replacement.OfType<JsonObject>().FirstOrDefault(e => (bool?)e["delivered"] == true);
+                var evict = replacement.OfType<JsonObject>().FirstOrDefault(PeerTurnEvictable);
                 if (evict is null) throw new InvalidOperationException("Mailbox storage is full of pending messages");
                 trimmed = Math.Max(trimmed, (long)evict["sequence"]!);
                 replacement.Remove(evict);
@@ -107,10 +111,12 @@ internal sealed partial class MailboxStore
             if (delegation) { item["delegation"] = true; item["assignmentId"] = requestId; item["assignmentGeneration"] = Guid.NewGuid().ToString("N"); }
             if (expectReply) item["expectReply"] = true;
             replacement.Add((JsonNode)item);
+            var peerAcceptance = RecordPeerAcceptance(replacement, requestId, sender, recipient, replyTo, next + 1);
             var waits = AdmitOrResolveWait(requestId, sender, recipient, text, replyTo, expectReply, schedule);
             if (replyTo is not null && (string?)waits?[replyTo]?["replyId"] == requestId) item["coordinatorReply"] = true;
             var admitted = delegation ? AdmitAssignment(requestId, sender, recipient, text, (string)item["assignmentGeneration"]!, coordinatorLifecycle) : null;
-            Save(replacement, next + 1, trimmed, waits, admitted);
+            Save(replacement, next + 1, trimmed, waits, admitted,
+                completionClaimId: peerAcceptance ? "peer-accept:" + requestId : null);
             return item.DeepClone().AsObject();
         }
     }
@@ -219,7 +225,7 @@ internal sealed partial class MailboxStore
         if (!TryMarkStarted(id, recipient)) throw new InvalidOperationException("Assignment was cancelled before dispatch");
     }
 
-    internal bool TryMarkStarted(string id, string recipient, long? expectedSequence = null)
+    internal bool TryMarkStarted(string id, string recipient, long? expectedSequence = null, PeerTurnIdentity? peerTurn = null)
     {
         lock (gate)
         {
@@ -229,10 +235,12 @@ internal sealed partial class MailboxStore
             var item = copy.OfType<JsonObject>().FirstOrDefault(e => (string?)e["id"] == id && (string?)e["recipient"] == recipient);
             if (expectedSequence is not null && (long?)item?["sequence"] != expectedSequence) return false;
             if (item is null) throw new InvalidOperationException("Unknown message for recipient");
-            if ((bool?)item["started"] == true) return true;
+            if ((bool?)item["started"] == true) return peerTurn is null || PeerTurnMatches(item, peerTurn);
+            if (peerTurn is not null && !InitializePeerTurn(item, peerTurn)) return false;
             item["started"] = true;
             var updated = WithAssignmentDelivery(id, "started");
-            Save(copy, next, waits: WithWaitDelivery(item, "handoff_started"), assigned: updated);
+            Save(copy, next, waits: WithWaitDelivery(item, "handoff_started"), assigned: updated,
+                completionClaimId: peerTurn is null ? null : "peer-turn:" + id);
             return true;
         }
     }
@@ -264,7 +272,8 @@ internal sealed partial class MailboxStore
                     // At capacity the failed entry itself may be the oldest evictable history.
                     while (copy.Count >= capacity)
                     {
-                        var evict = copy.OfType<JsonObject>().First(e => (bool?)e["delivered"] == true);
+                        var evict = copy.OfType<JsonObject>().FirstOrDefault(PeerTurnEvictable) ??
+                            throw new InvalidOperationException("Mailbox storage is full of pending messages and unresolved turns");
                         trimmed = Math.Max(trimmed, (long)evict["sequence"]!);
                         copy.Remove(evict);
                     }
@@ -294,13 +303,15 @@ internal sealed partial class MailboxStore
 
     void Save(JsonArray replacement, long sequence, long? trimmed = null, JsonObject? waits = null, JsonObject? assigned = null,
         string? completionClaimId = null, bool completionClaimStarted = false, JsonObject? receipts = null,
-        string? newCompletionStream = null, long? newCompletionNext = null)
+        string? newCompletionStream = null, long? newCompletionNext = null, string? newPeerMailboxIncarnation = null)
     {
         if (publicationUncertain) throw new InvalidOperationException("Mailbox publication is uncertain; reconcile before writing");
         var root = new JsonObject { ["next"] = sequence, ["entries"] = replacement, ["trimmedThrough"] = trimmed ?? trimmedThrough };
         if (waits is not null || replyWaits.Count > 0) root["replyWaits"] = waits ?? replyWaits.DeepClone();
         if (assigned is not null || assignments.Count > 0) root["assignments"] = assigned ?? assignments.DeepClone();
         if (receipts is not null || completionReceipts.Count > 0) root["completionReceipts"] = receipts ?? completionReceipts.DeepClone();
+        var peerIncarnation = newPeerMailboxIncarnation ?? peerMailboxIncarnation;
+        if (peerIncarnation is not null) root["peerMailboxIncarnation"] = peerIncarnation;
         var stream = newCompletionStream ?? completionStream;
         if (stream is not null) { root["completionStream"] = stream; root["completionNext"] = newCompletionNext ?? completionNext; }
         // AtomicFile.WriteAllText uses UTF-8 without a BOM. Hash the exact encoded bytes
@@ -321,6 +332,7 @@ internal sealed partial class MailboxStore
         if (assigned is not null) assignments = assigned;
         if (receipts is not null) completionReceipts = receipts;
         completionStream = stream; completionNext = newCompletionNext ?? completionNext;
+        peerMailboxIncarnation = peerIncarnation;
         next = sequence;
         trimmedThrough = trimmed ?? trimmedThrough;
     }
@@ -383,6 +395,9 @@ internal sealed partial class MailboxStore
                 replyWaits = disk["replyWaits"]?.AsObject() ?? new JsonObject();
                 assignments = disk["assignments"]?.AsObject() ?? new JsonObject();
                 completionReceipts = disk["completionReceipts"]?.AsObject() ?? new JsonObject();
+                peerMailboxIncarnation = (string?)disk["peerMailboxIncarnation"];
+                if (peerMailboxIncarnation is not null && (!Guid.TryParseExact(peerMailboxIncarnation, "N", out _) || peerMailboxIncarnation != peerMailboxIncarnation.ToLowerInvariant()))
+                    throw new InvalidDataException("Invalid peer mailbox incarnation");
                 completionStream = (string?)disk["completionStream"];
                 completionNext = (long?)disk["completionNext"] ?? 0;
                 if (completionStream is not null && (!Guid.TryParseExact(completionStream, "N", out _) || completionNext < 0))

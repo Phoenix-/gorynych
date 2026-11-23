@@ -94,7 +94,7 @@ internal sealed partial class MailboxStore
             var replacement = entries.DeepClone().AsArray(); var trimmed = trimmedThrough;
             while (replacement.Count >= capacity)
             {
-                var evict = replacement.OfType<JsonObject>().FirstOrDefault(e => (bool?)e["delivered"] == true);
+                var evict = replacement.OfType<JsonObject>().FirstOrDefault(PeerTurnEvictable);
                 if (evict is null) throw new InvalidOperationException("Mailbox storage is full of pending messages");
                 trimmed = Math.Max(trimmed, (long)evict["sequence"]!); replacement.Remove(evict);
             }

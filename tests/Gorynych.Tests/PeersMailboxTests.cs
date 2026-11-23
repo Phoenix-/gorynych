@@ -10,6 +10,27 @@ namespace Gorynych.Tests;
 public sealed class PeersMailboxTests
 {
     [TestMethod]
+    public async Task PeerRefusalProofIsOptInAndPreDispatch()
+    {
+        using var http = new HttpClient(); var called = false;
+        var route = new PeersServer.ServiceRoute(_ => { called = true; throw new InvalidOperationException("must not dispatch"); }, "test");
+        var args = new JsonObject { ["message_id"] = Guid.NewGuid().ToString("N"), ["text"] = "" };
+        var legacy = await PeersServer.CallAsync(http, route, "token", null, "reply_message", args, CancellationToken.None);
+        Assert.AreEqual("message_id and text are required", (string?)legacy["content"]?[0]?["text"]);
+        Assert.IsNull(legacy["structuredContent"]);
+        var enabled = await PeersServer.CallAsync(http, route, "token", null, "reply_message", args, CancellationToken.None, peerTurnReplies: true);
+        Assert.IsTrue((bool?)enabled["isError"] == true);
+        Assert.IsTrue(JsonNode.DeepEquals(enabled["structuredContent"], JsonNode.Parse((string)enabled["content"]![0]!["text"]!)));
+        Assert.IsFalse(called);
+        var parsed = CommandLine.Parse(["serve", "--peer-turn-replies"]);
+        Assert.IsTrue(parsed.Flag("--peer-turn-replies"));
+        CollectionAssert.Contains(parsed.PersistentServiceArguments(), "--peer-turn-replies");
+        Assert.IsFalse(CommandLine.Parse(["serve"]).Flag("--peer-turn-replies"));
+        Assert.IsTrue(CommandLine.Parse(["host", "--adapter", "claude", "--peer-turn-replies"]).Flag("--peer-turn-replies"));
+        Assert.IsTrue(CommandLine.Parse(["peers", "--peer-turn-replies"]).Flag("--peer-turn-replies"));
+    }
+
+    [TestMethod]
     public void DiscoveryHasOnlyTheNewManagedMessagingTools()
     {
         var tools = PeersServer.Tools(true).ToDictionary(t => (string)t["name"]!);

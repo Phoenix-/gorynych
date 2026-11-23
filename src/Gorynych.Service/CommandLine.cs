@@ -71,6 +71,7 @@ internal sealed class CommandLine
           --completion-project <key> --completion-group <id> --completion-instance <uuid>
                                                 one explicit manual completion reminder scope; all three required
           --completion-auto                    opt in to automatic completion reminders for the selected group
+          --peer-turn-replies                  opt in to sender-addressed peer turn results for hosted headless Claude
           --no-channel  --no-peers
           --console                             also log to the console (not for acp and task install)
 
@@ -87,7 +88,7 @@ internal sealed class CommandLine
 
     /// <summary>The adapters a host runs, as the service names them.</summary>
     public static readonly string[] AdapterNames = ["claude", "kimi", "codex", "dsh"];
-    static readonly string[] ServiceFlags = ["--no-channel", "--no-peers", "--completion-auto"];
+    static readonly string[] ServiceFlags = ["--no-channel", "--no-peers", "--completion-auto", "--peer-turn-replies"];
 
     readonly List<(string Name, string? Value)> options = [];
 
@@ -180,10 +181,10 @@ internal sealed class CommandLine
                 known = (["--pipe", "--timeout"], ["--no-wait", "--force"]);
                 break;
             case "host":
-                known = (HostValues, ["--no-channel", "--no-peers", "--console"]);
+                known = (HostValues, ["--no-channel", "--no-peers", "--console", "--peer-turn-replies"]);
                 break;
             case "peers":
-                known = (["--pipe", "--token", "--channel-url", "--reply-url"], []);
+                known = (["--pipe", "--token", "--channel-url", "--reply-url"], ["--peer-turn-replies"]);
                 break;
             case "ahp":
                 action = args.Length > 1 ? args[1] : null;

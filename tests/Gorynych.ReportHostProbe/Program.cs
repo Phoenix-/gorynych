@@ -5,7 +5,7 @@ using Gorynych.Acp.JsonRpc;
 using Gorynych.Service;
 using Gorynych.Service.Hosts;
 
-if (args is [var hostMode, var pipe, var cwd, var executable, var ledgerPath, var slot] && hostMode is "completion-host")
+if (args is [var hostMode, var pipe, var cwd, var executable, var ledgerPath, var slot] && hostMode is "completion-host" or "peer-host")
 {
     // Isolated fixture: an actual AdapterHost and headless adapter in this OS process.
     var nativePilot = false;
@@ -15,7 +15,9 @@ if (args is [var hostMode, var pipe, var cwd, var executable, var ledgerPath, va
         DataDirectory = Path.Combine(cwd, "claude-host"), Executable = executable, FetchCatalog = false,
         ProjectsDirectory = nativePilot ? null : Path.Combine(Path.GetTempPath(), "gorynych-fake-claude", "projects"),
         ClaudeStatePath = nativePilot ? null : Path.Combine(cwd, "no-claude-state.json"), HostedPromptObservation = true,
-        HostedCompletionGuarded = true, DisableForceKillForTests = true,
+        HostedCompletionGuarded = true, HostedPeerTerminal = hostMode == "peer-host" && !File.Exists(Path.Combine(cwd, "disable-peer-cap")), DisableForceKillForTests = true,
+        PeerTerminalWireOverrideForTests = hostMode == "peer-host" && File.Exists(Path.Combine(cwd, "malformed-peer-wire"))
+            ? marker => { marker["nativeUuid"] = "invalid"; return marker; } : null,
         GuardedReceiptLimitForTests = File.Exists(Path.Combine(cwd, "small-guarded-cap")) ? 2 : 64,
         BeforeGuardedWriteForTests = async () =>
         {
@@ -45,7 +47,20 @@ if (args is [var hostMode, var pipe, var cwd, var executable, var ledgerPath, va
     var processHost = new AdapterHost(processAgent, Connect, new AdapterHostOptions
     {
         Adapter = "claude", Token = "0123456789abcdef0123456789abcdef-test", Slot = slot,
-        Generation = new HostGeneration("build-1", []), CompletionHostLedger = new CompletionHostLedger(ledgerPath),
+        Generation = new HostGeneration("build-1", []),
+        CompletionHostLedger = hostMode == "completion-host" ? new CompletionHostLedger(ledgerPath) : null,
+        ReportStore = hostMode == "peer-host" ? new ReportStore(Path.Combine(ledgerPath, "reports")) : null,
+        PeerTerminal = hostMode == "peer-host" && !File.Exists(Path.Combine(cwd, "disable-peer-cap")),
+        CaptureOpened = hostMode == "peer-host" && File.Exists(Path.Combine(cwd, "fail-peer-capture")) ? capture =>
+        {
+            var write = capture.WriteFrame;
+            capture.WriteFrame = frame => { if (frame[0] == 3) throw new IOException("Injected peer capture seal failure"); write(frame); };
+        } : null,
+        BeforeProducerEvidence = hostMode == "peer-host" && File.Exists(Path.Combine(cwd, "fail-peer-evidence")) ? () =>
+        {
+            File.WriteAllText(Path.Combine(cwd, "peer-evidence-failed"), "");
+            throw new IOException("Injected peer producer evidence failure");
+        } : null,
         BeforeCompletionAckRecordForTests = () => FailOnce("fail-completion-ack-record"),
         BeforeCompletionRetireRecordForTests = () => FailOnce("fail-completion-retire-record"),
         RetryDelays = [TimeSpan.FromMilliseconds(50)],
@@ -55,6 +70,12 @@ if (args is [var hostMode, var pipe, var cwd, var executable, var ledgerPath, va
     {
         while (await Console.In.ReadLineAsync() is { } command)
         {
+            if (command == "STOP_HOST" && hostMode == "peer-host")
+            {
+                Console.WriteLine("HOST_STOPPING");
+                processHost.StopForTests();
+                return;
+            }
             if (command != "CLOSE_NATIVE") continue;
             Gorynych.Adapters.Claude.ClaudeProcess[] owned; lock (processGate) owned = processes.ToArray();
             var ok = true;

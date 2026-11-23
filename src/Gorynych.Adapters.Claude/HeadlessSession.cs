@@ -23,6 +23,11 @@ namespace Gorynych.Adapters.Claude;
 /// client's prompt ends with the result of the turn that replayed its <c>uuid</c>, never with
 /// another's.
 /// </remarks>
+internal sealed record ClaudePeerReplyWitness(string SessionId, string PromptId, string NativeUuid, string Stream, long Cycle,
+    string ToolCallId, string TriggerMessageId, string AcceptedMessageId);
+internal sealed record ClaudePeerTerminalEvidence(string SessionId, string PromptId, string NativeUuid, string Stream,
+    IReadOnlyList<ClaudePeerReplyWitness> Replies);
+
 internal sealed partial class HeadlessSession : IClaudeSession
 {
     readonly ClaudeAgent agent;
@@ -192,7 +197,8 @@ internal sealed partial class HeadlessSession : IClaudeSession
         PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null, requiredStream: null);
 
     internal Task<StopReason> ObservedPromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct,
-        long arrivalSequence, string? promptId) => PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null, requiredStream: null, promptId);
+        long arrivalSequence, string? promptId, Action<ClaudePeerTerminalEvidence>? peerTerminal = null) =>
+        PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null, requiredStream: null, promptId, peerTerminal);
 
     internal Task<StopReason> ReminderPromptAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct,
         long arrivalSequence, string requiredStream) => PromptCoreAsync(prompt, cancelled, ct, arrivalSequence, started: null, requiredStream);
@@ -216,12 +222,13 @@ internal sealed partial class HeadlessSession : IClaudeSession
     }
 
     async Task<StopReason> PromptCoreAsync(IReadOnlyList<ContentBlock> prompt, Func<bool> cancelled, CancellationToken ct,
-        long arrivalSequence, TaskCompletionSource? started, string? requiredStream, string? promptId = null)
+        long arrivalSequence, TaskCompletionSource? started, string? requiredStream, string? promptId = null,
+        Action<ClaudePeerTerminalEvidence>? peerTerminal = null)
     {
         if (requiredStream is null) await promptGate.WaitAsync(ct);
         else if (!await promptGate.WaitAsync(0, ct))
             throw new JsonRpcException(JsonRpcException.InvalidRequest, "Claude is busy; the reminder was not sent.");
-        var current = new Turn(Guid.NewGuid().ToString()) { PromptId = promptId is { Length: > 0 and <= 256 } ? promptId : null, ArrivalSequence = arrivalSequence };
+        var current = new Turn(Guid.NewGuid().ToString()) { PromptId = promptId is { Length: > 0 and <= 256 } ? promptId : null, ArrivalSequence = arrivalSequence, CapturePeerTerminal = peerTerminal is not null };
         lock (stateGate) incoming = current;
         AdmitArrival(arrivalSequence); // a steer behind it waits for its input write, not for this admission
         try
@@ -311,7 +318,9 @@ internal sealed partial class HeadlessSession : IClaudeSession
                     throw new JsonRpcException(JsonRpcException.InternalError,
                         $"Claude exited with code {claude.Exited.Result} before the turn ended. {StderrNote(claude)}");
             }
-            return await current.Task;
+            var completion = await current.Task;
+            if (completion.Evidence is { } terminal) { peerTerminal?.Invoke(terminal); options.PeerTerminalForTests?.Invoke(terminal); }
+            return completion.Reason;
         }
         finally
         {
@@ -1309,6 +1318,85 @@ internal sealed partial class HeadlessSession : IClaudeSession
             (!m.ContainsKey("session_id") || Text(m["session_id"]) == session);
     }
 
+    // Test-only live native evidence. Never treats a generic ACP tool update as authority.
+    // A producer/host bridge must persist this before the matching terminal before using it.
+    readonly Dictionary<string, (Turn Turn, ClaudeProcess Owner, long Cycle, string Trigger, bool EmptyText)> peerReplyCalls = new(StringComparer.Ordinal);
+    void ObservePeerReplyEvidence(ClaudeProcess owner, JsonObject frame)
+    {
+        if (options.PeerReplyWitnessForTests is null && options.PeerTerminalForTests is null)
+        { lock (stateGate) if (turn?.CapturePeerTerminal != true) return; }
+        var witnesses = new List<ClaudePeerReplyWitness>();
+        lock (stateGate)
+        {
+            if (!ReferenceEquals(process, owner) || observationClosing || owner.PhysicallyExited || owner.Exited.IsCompleted ||
+                !processUp || !active || activeOwn || turn is not { Echoed: true, CancelRequested: false, PromptId: { } prompt } current ||
+                current.Task.IsCompleted || !taken.Contains(current.Uuid) || StreamJson.IsSubagent(frame) ||
+                frame["session_id"] is not JsonValue session || !session.TryGetValue<string>(out var sid) || sid != Id) return;
+            if (frame.TryGetPropertyValue("isReplay", out var replayNode))
+            {
+                if (replayNode is not JsonValue replay || !replay.TryGetValue<bool>(out var isReplay))
+                { current.PeerEvidenceIncomplete = true; return; }
+                if (isReplay) return;
+            }
+            if (StreamJson.Type(frame) == "assistant")
+            {
+                foreach (var (call, tool, input) in StreamJson.ToolUses(frame))
+                {
+                    if (tool != "mcp__gorynych__reply_message") continue;
+                    if (call.ToolCallId is not { Length: > 0 and <= 256 } id ||
+                        input?["message_id"] is not JsonValue v || !v.TryGetValue<string>(out var trigger) ||
+                        string.IsNullOrWhiteSpace(trigger) || trigger.Length > 256 || peerReplyCalls.Count >= 64 ||
+                        !peerReplyCalls.TryAdd(id, (current, owner, generation, trigger, input?["text"] is JsonValue tv && tv.TryGetValue<string>(out var textValue) && string.IsNullOrWhiteSpace(textValue))))
+                        current.PeerEvidenceIncomplete = true;
+                }
+            }
+            else if (StreamJson.Type(frame) == "user")
+            {
+                foreach (var detail in StreamJson.ToolResultDetails(frame, _ => null))
+                {
+                    if (!peerReplyCalls.Remove(detail.ToolCallId, out var started)) continue;
+                    if (ReferenceEquals(started.Turn, current) && ReferenceEquals(started.Owner, owner) &&
+                        started.Cycle == generation && detail.Failed && started.EmptyText &&
+                        IsExactPreAcceptRefusal(detail, started.Trigger)) continue;
+                    if (!ReferenceEquals(started.Turn, current) || !ReferenceEquals(started.Owner, owner) ||
+                        started.Cycle != generation || detail.Failed || detail.Text is not { Length: > 0 and <= 4096 } text)
+                    { current.PeerEvidenceIncomplete = true; continue; }
+                    try
+                    {
+                        if (JsonNode.Parse(text) is not JsonObject receipt || receipt.Count != 2 ||
+                            receipt["status"] is not JsonValue status || !status.TryGetValue<string>(out var state) || state != "accepted" ||
+                            receipt["messageId"] is not JsonValue id || !id.TryGetValue<string>(out var accepted) ||
+                            !Guid.TryParseExact(accepted, "N", out _) || accepted != accepted.ToLowerInvariant())
+                        { current.PeerEvidenceIncomplete = true; continue; }
+                        var witness = new ClaudePeerReplyWitness(Id, prompt, current.Uuid, owner.BackgroundStreamId, generation, detail.ToolCallId, started.Trigger, accepted);
+                        witnesses.Add(witness);
+                        if (current.PeerReplies.Count < 64) current.PeerReplies.Add(witness);
+                        else current.PeerEvidenceOverflow = true;
+                    }
+                    catch (Exception e) when (e is System.Text.Json.JsonException or InvalidOperationException or ArgumentException)
+                    { current.PeerEvidenceIncomplete = true; }
+                }
+            }
+        }
+        foreach (var witness in witnesses) options.PeerReplyWitnessForTests?.Invoke(witness);
+    }
+
+    internal static bool IsExactPreAcceptRefusal(StreamJson.ToolResultDetail detail, string trigger)
+    {
+        if (!Guid.TryParseExact(trigger, "N", out _) || trigger != trigger.ToLowerInvariant()) return false;
+        static bool Matches(JsonNode? node, string id) => node is JsonObject obj && obj.Count == 5 &&
+            (string?)obj["kind"] == "gorynych.reply.pre_accept_refusal" && (int?)obj["version"] == 1 &&
+            (string?)obj["messageId"] == id && (string?)obj["reason"] == "text_required" &&
+            (string?)obj["error"] == "message_id and text are required";
+        try
+        {
+            if (Matches(detail.Structured, trigger)) return true;
+            return detail.Text is { Length: > 0 and <= 4096 } text && Matches(JsonNode.Parse(text), trigger);
+        }
+        catch (Exception e) when (e is System.Text.Json.JsonException or InvalidOperationException or ArgumentException or FormatException)
+        { return false; }
+    }
+
     async Task OnMessageAsync(ClaudeProcess claude, JsonObject m)
     {
         lock (stateGate)
@@ -1321,6 +1409,7 @@ internal sealed partial class HeadlessSession : IClaudeSession
             else promptObservation = null;
             if (StreamJson.Type(m) == "control_request") observingControls++;
         }
+        ObservePeerReplyEvidence(claude, m);
         if (agent.ClientHasSubagents)
         {
             await nativeSubagentGate.WaitAsync();
@@ -1436,6 +1525,8 @@ internal sealed partial class HeadlessSession : IClaudeSession
         activeMarked = false;
         taken.Clear();
         generation++;
+        foreach (var pendingCall in peerReplyCalls.Values) pendingCall.Turn.PeerEvidenceIncomplete = true;
+        peerReplyCalls.Clear();
         UpdateIdle();
     }
 
@@ -1639,11 +1730,14 @@ internal sealed partial class HeadlessSession : IClaudeSession
             // Whatever the feed did, the prompt ends here, unless it still waits for a later cycle.
             if (current is not null && !deferred)
             {
-                var reason = StreamJson.StopReasonOf(m, current.CancelRequested);
-                current.Deferred = null;
-                if (authError is not null && errorText is not null && !current.CancelRequested)
-                    current.TryFail(new JsonRpcException(JsonRpcException.InternalError, $"Claude authentication or billing error ({authError}): {errorText}"));
-                else current.TryComplete(reason);
+                lock (stateGate)
+                {
+                    var reason = StreamJson.StopReasonOf(m, current.CancelRequested);
+                    current.Deferred = null;
+                    if (authError is not null && errorText is not null && !current.CancelRequested)
+                        current.TryFail(new JsonRpcException(JsonRpcException.InternalError, $"Claude authentication or billing error ({authError}): {errorText}"));
+                    else current.TryComplete(reason, PeerTerminal(current, owner, reason, errorText));
+                }
             }
             if (waiting) ScheduleStallCheck();
         }
@@ -1669,6 +1763,18 @@ internal sealed partial class HeadlessSession : IClaudeSession
         if (removed.Count > 0) agent.Log($"claude {Id}: {removed.Count} accepted steer(s) ended with their turn before Claude took them");
     }
 
+    // Called under stateGate, at the same completion that wins the turn TCS.
+    ClaudePeerTerminalEvidence? PeerTerminal(Turn current, ClaudeProcess owner, StopReason reason, string? error)
+    {
+        if ((options.PeerTerminalForTests is null && !current.CapturePeerTerminal) || reason != StopReason.EndTurn || error is not null ||
+            current.Task.IsCompleted || current.CancelRequested || current.SteerLost || current.PeerEvidenceOverflow || current.PeerEvidenceIncomplete ||
+            peerReplyCalls.Values.Any(call => ReferenceEquals(call.Turn, current)) ||
+            !current.Echoed || current.PromptId is not { } prompt || !ReferenceEquals(process, owner) ||
+            owner.PhysicallyExited || owner.Exited.IsCompleted || observationClosing || !processUp) return null;
+        if (current.PeerReplies.Any(w => w.Stream != owner.BackgroundStreamId || w.NativeUuid != current.Uuid)) return null;
+        return new(Id, prompt, current.Uuid, owner.BackgroundStreamId, current.PeerReplies.ToArray());
+    }
+
     /// <summary>A deferred client turn completes once no accepted steer attached to it is pending.</summary>
     void CompleteDeferredIfSettled()
     {
@@ -1682,8 +1788,8 @@ internal sealed partial class HeadlessSession : IClaudeSession
             current.Deferred = null;
             done = current;
             reason = current.CancelRequested ? StopReason.Cancelled : settled;
+            done.TryComplete(reason, process is { } owner ? PeerTerminal(done, owner, reason, null) : null);
         }
-        done.TryComplete(reason);
     }
 
     async Task MarkOwnTurnAsync(string mark)
@@ -1874,10 +1980,16 @@ internal sealed partial class HeadlessSession : IClaudeSession
         public Turn? Owner { get; } = owner;
     }
 
+    sealed record TurnCompletion(StopReason Reason, ClaudePeerTerminalEvidence? Evidence);
+
     /// <summary>One prompt turn sent by the ACP client.</summary>
     sealed class Turn(string uuid)
     {
-        readonly TaskCompletionSource<StopReason> done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        readonly TaskCompletionSource<TurnCompletion> done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public List<ClaudePeerReplyWitness> PeerReplies { get; } = [];
+        public bool PeerEvidenceOverflow { get; set; }
+        public bool PeerEvidenceIncomplete { get; set; }
+        public bool CapturePeerTerminal { get; init; }
         public string Uuid { get; } = uuid;
         public string? PromptId { get; init; }
         public long ArrivalSequence { get; init; }
@@ -1893,8 +2005,8 @@ internal sealed partial class HeadlessSession : IClaudeSession
         /// <summary>A native result came while accepted steers were still pending; the turn waits for them.</summary>
         public StopReason? Deferred { get; set; }
 
-        public Task<StopReason> Task => done.Task;
-        public void TryComplete(StopReason reason) => done.TrySetResult(reason);
+        public Task<TurnCompletion> Task => done.Task;
+        public void TryComplete(StopReason reason, ClaudePeerTerminalEvidence? evidence = null) => done.TrySetResult(new(reason, evidence));
         public void TryFail(Exception e) => done.TrySetException(e);
     }
 }

@@ -18,6 +18,9 @@ namespace Gorynych.Adapters.Codex;
 /// </summary>
 internal sealed record CodexProvisionalIdleWitness(string SessionId, string PromptId, string NativeTurnId, long TurnEpoch, long IngressRevision);
 internal sealed record CodexProvisionalIdleIngress(string NativeTurnId, long TurnEpoch, long IngressRevision);
+// Adapter-local diagnostic only. It is not authorization and is never sent on ACP.
+internal sealed record CodexPeerReplyWitness(string SessionId, string PromptId, string NativeTurnId, long TurnEpoch,
+    string ToolCallId, string TriggerMessageId, string AcceptedMessageId);
 
 sealed class CodexThread
 {
@@ -39,6 +42,8 @@ sealed class CodexThread
     CodexProvisionalIdleWitness? pendingIdleWitness;
     long turnEpoch;
     long ingressRevision;
+    string? peerPromptId;
+    readonly Dictionary<string, (string TurnId, long Epoch, string Trigger)> peerReplyCalls = new(StringComparer.Ordinal);
     bool stopAsked;
     long cancelledAt;
 
@@ -216,7 +221,7 @@ sealed class CodexThread
     /// null while another runs. A <c>session/cancel</c> received after the prompt but handled before
     /// this (requests run apart from notifications) stops the turn as soon as Codex names it.
     /// </summary>
-    public TaskCompletionSource<Turn>? Begin(long sequence)
+    public TaskCompletionSource<Turn>? Begin(long sequence, string? promptId = null)
     {
         lock (gate)
         {
@@ -225,6 +230,8 @@ sealed class CodexThread
             turn = new TaskCompletionSource<Turn>(TaskCreationOptions.RunContinuationsAsynchronously);
             named = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
             turnId = null;
+            peerPromptId = promptId is { Length: > 0 and <= 256 } ? promptId : null;
+            peerReplyCalls.Clear();
             earlyIdleTurn = null;
             earlyIdleCompleted = null;
             pendingIdleWitness = null;
@@ -257,6 +264,42 @@ sealed class CodexThread
             turnId = id;
             named?.TrySetResult(id);
             return stopAsked;
+        }
+    }
+
+    static string? PeerText(JsonNode? node) => node is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+
+    internal void BeginPeerReplyEvidence(string nativeTurn, McpToolCallThreadItem call)
+    {
+        lock (gate)
+        {
+            if (!Loaded || turn is null || turn.Task.IsCompleted || stopAsked || peerPromptId is null ||
+                turnId != nativeTurn || call.Server != "gorynych" || call.Tool != "reply_message" ||
+                call.Id is not { Length: > 0 and <= 256 } || peerReplyCalls.Count >= 64 ||
+                call.Arguments is not JsonObject args || PeerText(args["message_id"]) is not { } trigger ||
+                string.IsNullOrWhiteSpace(trigger) || trigger.Length > 256) return;
+            peerReplyCalls.TryAdd(call.Id, (nativeTurn, turnEpoch, trigger));
+        }
+    }
+
+    internal CodexPeerReplyWitness? CompletePeerReplyEvidence(string nativeTurn, McpToolCallThreadItem call)
+    {
+        lock (gate)
+        {
+            if (call.Id is not { Length: > 0 and <= 256 } || !peerReplyCalls.Remove(call.Id, out var started) || !Loaded || turn is null || turn.Task.IsCompleted || stopAsked ||
+                peerPromptId is null || turnId != nativeTurn || started.TurnId != nativeTurn || started.Epoch != turnEpoch ||
+                call.Server != "gorynych" || call.Tool != "reply_message" || call.Status.Value != "completed" || call.Error is not null ||
+                call.Arguments is not JsonObject args || PeerText(args["message_id"]) is not { } trigger || trigger != started.Trigger ||
+                call.Result?.Content is not { Count: 1 } contents || contents[0] is not JsonObject content ||
+                PeerText(content["type"]) != "text" || PeerText(content["text"]) is not { } json || json.Length > 4096) return null;
+            try
+            {
+                if (JsonNode.Parse(json) is not JsonObject receipt || receipt.Count != 2 || PeerText(receipt["status"]) != "accepted" ||
+                    PeerText(receipt["messageId"]) is not { } accepted || !Guid.TryParseExact(accepted, "N", out _) ||
+                    accepted != accepted.ToLowerInvariant()) return null;
+                return new(Id, peerPromptId, nativeTurn, turnEpoch, call.Id, trigger, accepted);
+            }
+            catch (Exception e) when (e is System.Text.Json.JsonException or InvalidOperationException or ArgumentException) { return null; }
         }
     }
 
@@ -427,6 +470,7 @@ sealed class CodexThread
             turn = null;
             named = null;
             turnId = null;
+            peerPromptId = null; peerReplyCalls.Clear();
             earlyIdleTurn = null; earlyIdleCompleted = null;
             stopAsked = false;
         }
@@ -1442,7 +1486,7 @@ sealed partial class CodexAgent : IAsyncDisposable
             return await UsageAsync(t, request.Sequence, ct);
         var input = p.Prompt.Select(InputOf).OfType<UserInput>().ToList();
         if (input.Count == 0) throw new JsonRpcException(JsonRpcException.InvalidParams, "The prompt has no text.");
-        var done = t.Begin(request.Sequence) ?? throw new JsonRpcException(JsonRpcException.InvalidRequest, "A turn of this session is still running.");
+        var done = t.Begin(request.Sequence, (string?)p.Meta?[GorynychProtocol.MetaPromptId]) ?? throw new JsonRpcException(JsonRpcException.InvalidRequest, "A turn of this session is still running.");
         t.AdmitArrival(request.Sequence);
         try
         {
@@ -2126,6 +2170,8 @@ sealed partial class CodexAgent : IAsyncDisposable
                 var n = From(p, ctx.ItemStartedNotification);
                 if (n.Item is SubAgentActivityThreadItem activity && activity.Kind.Value == "started")
                     await AnnounceNativeChildAsync(n.ThreadId, activity.AgentThreadId, activity.AgentPath, CancellationToken.None);
+                if (options.PeerReplyWitnessForTests is not null && n.Item is McpToolCallThreadItem peerCall && !nativeChildren.ContainsKey(n.ThreadId))
+                    Thread(n.ThreadId)?.BeginPeerReplyEvidence(n.TurnId, peerCall);
                 if (ToolCallOf(n.Item, done: false) is { } call)
                 {
                     Thread(n.ThreadId)?.Started(n.Item, call.ToolCallId);
@@ -2137,6 +2183,9 @@ sealed partial class CodexAgent : IAsyncDisposable
             {
                 var n = From(p, ctx.ItemCompletedNotification);
                 var t = Thread(n.ThreadId);
+                if (options.PeerReplyWitnessForTests is { } observe && n.Item is McpToolCallThreadItem peerCall &&
+                    !nativeChildren.ContainsKey(n.ThreadId) && t?.CompletePeerReplyEvidence(n.TurnId, peerCall) is { } peerWitness)
+                    observe(peerWitness);
                 if (n.Item is CollabAgentToolCallThreadItem collaboration)
                     await NativeCollaborationAsync(n.ThreadId, collaboration, CancellationToken.None);
                 switch (n.Item)

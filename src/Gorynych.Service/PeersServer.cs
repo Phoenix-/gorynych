@@ -60,7 +60,7 @@ public static class PeersServer
     /// <param name="channelUrl">The TUI's development channel: declared, long-polled, and the first route for <c>reply</c>.</param>
     /// <param name="replyUrl">A headless Claude session's route for <c>reply</c> only: its live notes reach Claude on its
     /// input, so the server declares no channel and polls nothing.</param>
-    public static async Task<int> RunAsync(string? pipe, string? token, string? channelUrl, string? replyUrl = null)
+    public static async Task<int> RunAsync(string? pipe, string? token, string? channelUrl, string? replyUrl = null, bool peerTurnReplies = false)
     {
         var peers = pipe is not null && token is not null;
         var replyRoute = channelUrl ?? replyUrl;
@@ -88,7 +88,7 @@ public static class PeersServer
                 req.Params?["arguments"] is not null && req.Params?["arguments"] is not JsonObject
                 => Text("Reply wait arguments must be an object", error: true),
             "tools/call" => await CallAsync(http, pipe is null ? null : new ServiceRoute(c => ConnectAsync(pipe, c), pipe), token, replyRoute,
-                (string?)req.Params?["name"], req.Params?["arguments"] as JsonObject, ct),
+                (string?)req.Params?["name"], req.Params?["arguments"] as JsonObject, ct, peerTurnReplies),
             _ => throw new JsonRpcException(JsonRpcException.MethodNotFound, $"Method not found: {req.Method}"),
         };
         mcp.Start();
@@ -263,7 +263,7 @@ public static class PeersServer
     static bool IsRestarting(JsonRpcException e) =>
         e.ErrorData?[GorynychProtocol.MetaRestarting] is JsonValue v && v.TryGetValue<bool>(out var restarting) && restarting;
 
-    internal static async Task<JsonNode> CallAsync(HttpClient http, ServiceRoute? route, string? token, string? channelUrl, string? tool, JsonObject? args, CancellationToken ct)
+    internal static async Task<JsonNode> CallAsync(HttpClient http, ServiceRoute? route, string? token, string? channelUrl, string? tool, JsonObject? args, CancellationToken ct, bool peerTurnReplies = false)
     {
         var pipe = route?.Pipe;
         try
@@ -374,6 +374,16 @@ public static class PeersServer
                     var isReply = tool == "reply_message";
                     var destination = args?[isReply ? "message_id" : "session_id"] is JsonValue d && d.TryGetValue<string>(out var id) ? id : null;
                     var text = args?["text"] is JsonValue v && v.TryGetValue<string>(out var value) ? value : null;
+                    if (peerTurnReplies && isReply && Guid.TryParseExact(destination, "N", out _) && destination == destination.ToLowerInvariant() &&
+                        string.IsNullOrWhiteSpace(text))
+                    {
+                        // This validation precedes request ID creation and any service dispatch.
+                        var proof = new JsonObject { ["kind"] = "gorynych.reply.pre_accept_refusal", ["version"] = 1,
+                            ["messageId"] = destination, ["reason"] = "text_required", ["error"] = "message_id and text are required" };
+                        var result = Text(proof.ToJsonString(AcpJson.TextOptions), error: true);
+                        result["structuredContent"] = proof;
+                        return result;
+                    }
                     if (string.IsNullOrWhiteSpace(destination) || string.IsNullOrWhiteSpace(text))
                         return Text($"{(isReply ? "message_id" : "session_id")} and text are required", error: true);
                     var requestId = Guid.NewGuid().ToString("N");

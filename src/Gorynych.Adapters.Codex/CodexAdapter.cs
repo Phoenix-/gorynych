@@ -84,6 +84,7 @@ public sealed class CodexAdapterOptions
     internal Action<string, string?>? NativeIngressForTests { get; init; }
     internal Action<string, string>? NativeTurnNamedForTests { get; init; }
     internal Action<CodexProvisionalIdleWitness>? ProvisionalIdleConfirmedForTests { get; init; }
+    internal Action<CodexPeerReplyWitness>? PeerReplyWitnessForTests { get; init; }
 
     public Action<string>? Log { get; init; }
 }

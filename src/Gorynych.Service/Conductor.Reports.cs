@@ -30,18 +30,20 @@ public sealed partial class Conductor
 
     ReportAdmission? AdmitReport(SessionRecord record, JsonRpcConnection rpc, string promptId, string turnKey,
         ReportCause cause, string? assignment, string? message, string? assignmentGeneration = null,
-        MailboxStore.CoordinatorReplyResume? resume = null)
+        MailboxStore.CoordinatorReplyResume? resume = null, PeerTurnIdentity? peerRoute = null)
     {
-        if (!record.ReportToParent || record.ParentSessionId is not { } parent) return null;
+        var parent = record.ReportToParent ? record.ParentSessionId : null;
+        if (peerRoute is null && parent is null) return null;
         var link = HostOf(record).RouteOf(record.SessionId);
         if (link is null || link.Rpc != rpc || (options.Hosts is not null && link.HostId is null)) return null;
         var legacy = link.HostId is null || (bool?)link.Info.Meta?[GorynychProtocol.MetaReportCapture]?["supported"] != true;
+        if (peerRoute is not null && (legacy || link.Generation?.Key is null)) return null;
         try
         {
             var identity = new ReportIdentity(turnKey, record.SessionId, parent, cause, promptId, assignment, message,
                 link.HostId, link.Generation?.Key, link.HostId is null ? Environment.ProcessId : link.ProcessId > 0 ? link.ProcessId : null,
-                link.HostId is null ? AgentHost.ProcessStartedAt(Environment.ProcessId) : link.ProcessStart, legacy, assignmentGeneration,
-                resume?.WaitId, resume?.WaitSequence, resume?.ReplySequence);
+                link.HostId is null ? AgentHost.ProcessStartedAt(Environment.ProcessId) : peerRoute is not null ? link.CompletionProcessStart : link.ProcessStart, legacy, assignmentGeneration,
+                resume?.WaitId, resume?.WaitSequence, resume?.ReplySequence, peerRoute);
             var receipt = reports.Reserve(identity);
             var id = receipt.ReportId;
             var admission = new ReportAdmission(id, identity, receipt.Created);
@@ -296,7 +298,12 @@ public sealed partial class Conductor
                         {
                             if (item.Status == "reserved" && item.ProducerEvidence is not ("sealed" or "failed"))
                             {
-                                if (!ProducerDefinitelyExited(identity)) continue;
+                                var exactPeerExit = identity.PeerRoute is not null && identity.HostId is { Length: > 0 } &&
+                                    identity.HostGeneration is { Length: > 0 } && identity.HostProcessId is > 0 &&
+                                    identity.HostProcessStart is { } start && CompletionReminderBinding.CanonicalProducerStart(start) &&
+                                    (!OperatingSystem.IsLinux() || ProcessIncarnation.ValidLinux(start)) &&
+                                    ProcessIncarnation.DefinitelyExited(identity.HostProcessId.Value, start);
+                                if (identity.PeerRoute is not null ? !exactPeerExit : !ProducerDefinitelyExited(identity)) continue;
                                 var sealedCandidate = false;
                                 ReportCapture? candidate = null;
                                 try { candidate = reports.OpenCapture(item.ReportId); }
@@ -313,12 +320,12 @@ public sealed partial class Conductor
                                         {
                                             // Publication failures must reach health reporting; only
                                             // an unsuccessful lease/open is treated as producer busy.
-                                            reports.CommitUnconfirmed(item.ReportId, candidate);
+                                            reports.CommitUnconfirmed(item.ReportId, candidate, exactProducerExit: exactPeerExit);
                                             sealedCandidate = true;
                                         }
                                 }
                                 if (!sealedCandidate)
-                                    reports.CommitCaptureFailure(item.ReportId, "unknown", "Producer exited without a valid sealed capture");
+                                    reports.CommitCaptureFailure(item.ReportId, "unknown", "Producer exited without a valid sealed capture", exactProducerExit: exactPeerExit);
                                 reports.AcknowledgeProducer(item.ReportId);
                             }
                             else ImportReport(item.ReportId);

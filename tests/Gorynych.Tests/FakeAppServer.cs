@@ -596,6 +596,17 @@ sealed class FakeAppServer
                 ["threadId"] = t.Id, ["turnId"] = turnId, ["completedAtMs"] = 2, ["item"] = Change(decision is "accept" or "acceptForSession" ? "completed" : "declined"),
             });
         }
+        if (text.Contains("peer-receipt", StringComparison.Ordinal))
+        {
+            var itemId = $"peer-{turnId}";
+            JsonObject Call(string status, JsonObject? result) => new() { ["type"] = "mcpToolCall", ["id"] = itemId,
+                ["server"] = "gorynych", ["tool"] = "reply_message", ["arguments"] = new JsonObject { ["message_id"] = "request", ["text"] = "answer" },
+                ["status"] = status, ["result"] = result };
+            await Notify("item/started", new JsonObject { ["threadId"] = t.Id, ["turnId"] = turnId, ["item"] = Call("inProgress", null), ["startedAtMs"] = 1 });
+            var receipt = new JsonObject { ["messageId"] = "0123456789abcdef0123456789abcdef", ["status"] = "accepted" };
+            await Notify("item/completed", new JsonObject { ["threadId"] = t.Id, ["turnId"] = turnId, ["completedAtMs"] = 2,
+                ["item"] = Call("completed", new JsonObject { ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = receipt.ToJsonString() }) }) });
+        }
         if (text.Contains("mcp"))
         {
             var id = $"mcp-{turnId}";

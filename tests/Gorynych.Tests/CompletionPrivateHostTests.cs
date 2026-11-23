@@ -12,7 +12,7 @@ namespace Gorynych.Tests;
 
 public sealed partial class ClaudeHeadlessTests
 {
-    sealed class CompletionProcessHost(string cwd, string ledger, string fake, bool native = false) : IHostLauncher, IAsyncDisposable
+    sealed class CompletionProcessHost(string cwd, string ledger, string fake, bool native = false, bool peer = false) : IHostLauncher, IAsyncDisposable
     {
         readonly string pipe = "gorynych-completion-" + Guid.NewGuid().ToString("N");
         readonly CancellationTokenSource stop = new();
@@ -25,7 +25,7 @@ public sealed partial class ClaudeHeadlessTests
         {
             if (process is not null) throw new InvalidOperationException("test launches only one host");
             server = Serve();
-            process = ReportHostProbe.Start(native ? "completion-host-native" : "completion-host", pipe, cwd, fake, ledger, slot);
+            process = ReportHostProbe.Start(peer ? "peer-host" : native ? "completion-host-native" : "completion-host", pipe, cwd, fake, ledger, slot);
         }
         async Task Serve()
         {
@@ -58,6 +58,15 @@ public sealed partial class ClaudeHeadlessTests
             Assert.AreEqual("HOST_STARTED", await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(15)));
             await process.StandardInput.WriteLineAsync("CLOSE_NATIVE"); await process.StandardInput.FlushAsync();
             Assert.AreEqual("NATIVE_EXITED", await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(25)), "no forced cleanup");
+            if (!peer) return;
+            if (process.HasExited) { Assert.AreEqual(0, process.ExitCode); return; }
+            try
+            {
+                await process.StandardInput.WriteLineAsync("STOP_HOST"); await process.StandardInput.FlushAsync();
+                Assert.AreEqual("HOST_STOPPING", await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(15)));
+            }
+            catch (IOException) when (process.HasExited && process.ExitCode == 0) { }
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15)); Assert.AreEqual(0, process.ExitCode);
         }
         public async Task WaitExited() { if (process is not null) { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15)); Assert.AreEqual(0, process.ExitCode); } }
         public async ValueTask DisposeAsync()

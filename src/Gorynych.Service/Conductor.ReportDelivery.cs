@@ -28,6 +28,9 @@ public sealed partial class Conductor
     }
     internal Action? BeforeReportDeliveryStart { get; set; }
     internal Action? BeforeLiveReportForwardWait { get; set; }
+    internal Action? AfterPeerMailboxSettlementForTests { get; set; }
+    internal Action? AfterPeerRetainedForTests { get; set; }
+    internal Action? BeforePeerRetentionAckForTests { get; set; }
     internal bool ReportDeliveryRunning(string id) => reportDeliveryWorkers.ContainsKey(id);
 
     readonly ConcurrentDictionary<string, byte> noteHostExitObservers = new(StringComparer.Ordinal);
@@ -65,6 +68,7 @@ public sealed partial class Conductor
                 foreach (var item in page.Items)
                     if ((parent is null || item.Identity.Parent == parent) &&
                         (item.Status is "pending" or "claimed" or "accepted" ||
+                         item.Identity.PeerRoute is not null && item.Status == "retained" && !item.PeerMailboxAck ||
                          item.Delivery?.Route == "note" && (item.Status == "uncertain" ||
                             item.Status is "completed" or "failed" && item.Delivery.ReceiptAckPending == true)))
                         QueueReportDelivery(item.ReportId);
@@ -162,6 +166,7 @@ public sealed partial class Conductor
     async Task ReconcileReportNoteAsync(ReportInfo info, ReportDeliveryClaim claim, CancellationToken ct)
     {
         var id = info.ReportId; var parent = info.Identity.Parent;
+        if (parent is null) return;
         if (claim.HostId is not { } hostId || claim.HostGeneration is not { } generation) return;
         string? proof;
         try { proof = reports.ReadNoteNoInput(id, parent, hostId, generation, claim.AttemptId); }
@@ -231,6 +236,7 @@ public sealed partial class Conductor
     async Task<bool> TryLiveReportNoteAsync(ReportInfo info, SessionUse use, CancellationToken ct)
     {
         var parentId = info.Identity.Parent; var feed = use.Feed;
+        if (parentId is null) return false;
         var link = HostOf(use.Record).RouteOf(parentId);
         if (link?.HostId is not { } hostId || link.Generation?.Key is not { } generation ||
             (bool?)link.Info.Meta?[GorynychProtocol.CapHostReportNote]?["durableRouting"] != true) return false;
@@ -321,6 +327,7 @@ public sealed partial class Conductor
     bool RetainCoordinatorReport(ReportInfo info)
     {
         var identity = info.Identity;
+        if (identity.Parent is null) return false;
         var resume = identity.Cause == ReportCause.Reply && identity.ReplyWaitId is not null &&
             identity.ReplyWaitSequence is > 0 && identity.ReplyMessageSequence is > 0;
         if (identity.Cause != ReportCause.Delegation && !resume || identity.LegacyCapture ||
@@ -337,6 +344,55 @@ public sealed partial class Conductor
     async Task DeliverReportAsync(string id, CancellationToken ct)
     {
         var info = reports.GetReport(id);
+        if (info.Identity.PeerRoute is { } peerIdentity)
+        {
+            if (!info.ProducerAck) return;
+            var recovery = info.ProducerEvidence == "failed" ? "producer_capture_failed" :
+                info.ExactProducerExit ? "producer_exited" : null;
+            if (recovery is null && (info.ProducerEvidence != "sealed" || info.CaptureConfidenceReason is not null)) return;
+            if (info.Status == "retained")
+            {
+                if (!info.PeerMailboxAck && info.PeerMailboxIncarnation is { } incarnation)
+                {
+                    BeforePeerRetentionAckForTests?.Invoke();
+                    if (mailbox.AcknowledgePeerRetained(peerIdentity, id, incarnation))
+                        reports.AcknowledgePeerMailbox(id, peerIdentity, incarnation);
+                }
+                return;
+            }
+            if (info.Status != "pending") return;
+            JsonObject settled;
+            if (recovery is not null && info.Outcome is { } recoveredOutcome)
+                settled = mailbox.SettlePeerTerminalUnknown(peerIdentity, id, recoveredOutcome, recovery);
+            else if (info.Outcome is "failed" or "cancelled" || info.Outcome?.StartsWith("stopped: ", StringComparison.Ordinal) == true)
+                settled = mailbox.SettlePeerTurn(peerIdentity, info.Outcome!, null, reportId: id);
+            else if (info.Outcome != "ended") return;
+            else if (info.Error is not null)
+                settled = mailbox.SettlePeerTerminalUnknown(peerIdentity, id, "ended", "terminal_conflict");
+            else if (info.IncompleteReason is not null)
+                settled = mailbox.SettlePeerTerminalUnknown(peerIdentity, id, "ended", "capture_incomplete", info.PeerEvidence?.AcceptedMessageId);
+            else if (info.PeerEvidence is not { } proof || proof.PromptId != peerIdentity.PromptId)
+                settled = mailbox.SettlePeerTerminalUnknown(peerIdentity, id, "ended", "marker_unknown");
+            else
+            {
+                var preview = reports.Preview(id, peerIdentity.Sender);
+                settled = mailbox.SettlePeerTurn(peerIdentity, "ended", preview.Text, proof.AcceptedMessageId,
+                    preview.Truncated, id, producerEvidenceComplete: true);
+                if ((string?)settled["state"] == "unknown")
+                    settled = mailbox.SettlePeerTerminalUnknown(peerIdentity, id, "ended", "accepted_unconfirmed", proof.AcceptedMessageId);
+            }
+            var settlementState = (string?)settled["state"];
+            if (settlementState is not ("automatic_reply_accepted" or "explicit_reply_accepted" or "ended_without_text" or "outcome_unknown" or "failed" or "cancelled" or "stopped") ||
+                (string?)settled["mailboxIncarnation"] is not { } mailboxIncarnation) return;
+            if (settlementState == "automatic_reply_accepted") QueueMailbox(peerIdentity.Sender);
+            AfterPeerMailboxSettlementForTests?.Invoke();
+            reports.RetainPeerReport(id, peerIdentity, mailboxIncarnation);
+            AfterPeerRetainedForTests?.Invoke();
+            BeforePeerRetentionAckForTests?.Invoke();
+            if (mailbox.AcknowledgePeerRetained(peerIdentity, id, mailboxIncarnation))
+                reports.AcknowledgePeerMailbox(id, peerIdentity, mailboxIncarnation);
+            return;
+        }
         if (info.Delivery is { Route: "note", DispatchStarted: true } note && info.Status is "claimed" or "accepted" or "uncertain" or "completed" or "failed")
         {
             await ReconcileReportNoteAsync(info, note, ct);
@@ -356,6 +412,7 @@ public sealed partial class Conductor
         if (info.Status != "pending" || !info.ProducerAck) return;
         if (RetainCoordinatorReport(info)) return;
         var parentId = info.Identity.Parent;
+        if (parentId is null) return;
         var parent = store.Get(parentId);
         if (parent is null) { reports.PendingDeliveryReason(id, "Intended parent is unavailable"); return; }
         if (parent.Deleted) { reports.SetDisposition(id, "failed", "Intended parent was deleted"); return; }
