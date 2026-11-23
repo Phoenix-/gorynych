@@ -11,6 +11,26 @@ namespace Gorynych.Tests;
 
 public sealed partial class ClaudeHeadlessTests
 {
+    static string PeerServiceExecutable()
+    {
+        if (Environment.GetEnvironmentVariable("GORYNYCH_TEST_SERVICE") is { Length: > 0 } explicitPath)
+            return explicitPath;
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "Gorynych.slnx"))) root = root.Parent;
+        if (root is null) throw new AssertInconclusiveException("Cannot locate the service build root");
+#if DEBUG
+        const string configuration = "Debug";
+#else
+        const string configuration = "Release";
+#endif
+        var executable = TestDirs.Exe("Gorynych.Service");
+        var standard = Path.Combine(root.FullName, "src", "Gorynych.Service", "bin", configuration, "net10.0", executable);
+        var artifacts = Path.Combine(root.FullName, ".artifacts", "bin", "Gorynych.Service", configuration.ToLowerInvariant(), executable);
+        if (File.Exists(standard)) return standard;
+        if (File.Exists(artifacts)) return artifacts;
+        throw new AssertInconclusiveException($"Service executable not found in {configuration} build output");
+    }
+
     static int SafePeerInputCount(string path)
     {
         try { return File.ReadAllLines(path).Length; }
@@ -26,7 +46,7 @@ public sealed partial class ClaudeHeadlessTests
     public async Task PeerOptInRealServiceAndLauncherUseOnlyFakeClaude(bool enabled, bool explicitReply)
     {
         var data = TestDirs.New(); var cwd = TestDirs.New(); var bin = TestDirs.New(); DataFolder.Claim(data);
-        var executable = Environment.GetEnvironmentVariable("GORYNYCH_TEST_SERVICE") ?? throw new AssertInconclusiveException("GORYNYCH_TEST_SERVICE is required");
+        var executable = PeerServiceExecutable();
         var fake = FakeClaude();
         foreach (var path in Directory.EnumerateFiles(Path.GetDirectoryName(fake)!)) File.Copy(path, Path.Combine(bin, Path.GetFileName(path)), true);
         var stub = Path.Combine(bin, TestDirs.Exe("claude")); File.Copy(fake, stub, true);
@@ -113,7 +133,7 @@ public sealed partial class ClaudeHeadlessTests
     public async Task PeerOptInServiceExecutablePersistsLaunchOption(bool enabled)
     {
         var data = TestDirs.New(); DataFolder.Claim(data);
-        var executable = Environment.GetEnvironmentVariable("GORYNYCH_TEST_SERVICE") ?? throw new AssertInconclusiveException("GORYNYCH_TEST_SERVICE is required");
+        var executable = PeerServiceExecutable();
         var pipe = "peer-launch-" + Guid.NewGuid().ToString("N");
         var start = new ProcessStartInfo(executable) { UseShellExecute = false, CreateNoWindow = true };
         foreach (var arg in new[] { "--data", data, "--pipe", pipe, "--hosts", "on", "--no-channel" }) start.ArgumentList.Add(arg);
@@ -141,7 +161,7 @@ public sealed partial class ClaudeHeadlessTests
     {
         var dir = TestDirs.New(); var data = TestDirs.New();
         if (unsupported) File.WriteAllText(Path.Combine(dir, "disable-peer-cap"), "");
-        var serviceExe = Environment.GetEnvironmentVariable("GORYNYCH_TEST_SERVICE") ?? throw new AssertInconclusiveException("GORYNYCH_TEST_SERVICE is required");
+        var serviceExe = PeerServiceExecutable();
         var pipe = "peer-legacy-" + Guid.NewGuid().ToString("N");
         await using var launcher = new CompletionProcessHost(dir, data, FakeClaude(), peer: true);
         var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true));
@@ -280,7 +300,7 @@ public sealed partial class ClaudeHeadlessTests
     {
         var dir = TestDirs.New(); var data = TestDirs.New();
         if (marker == "malformed") File.WriteAllText(Path.Combine(dir, "malformed-peer-wire"), "");
-        var serviceExe = Environment.GetEnvironmentVariable("GORYNYCH_TEST_SERVICE") ?? throw new AssertInconclusiveException("GORYNYCH_TEST_SERVICE is required");
+        var serviceExe = PeerServiceExecutable();
         var pipe = "peer-unknown-" + Guid.NewGuid().ToString("N");
         await using var launcher = new CompletionProcessHost(dir, data, FakeClaude(), peer: true);
         var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true));
@@ -353,7 +373,7 @@ public sealed partial class ClaudeHeadlessTests
     {
         var dir = TestDirs.New(); var data = TestDirs.New();
         File.WriteAllText(Path.Combine(dir, marker == "capture-failed" ? "fail-peer-capture" : "fail-peer-evidence"), "");
-        var serviceExe = Environment.GetEnvironmentVariable("GORYNYCH_TEST_SERVICE") ?? throw new AssertInconclusiveException("GORYNYCH_TEST_SERVICE is required");
+        var serviceExe = PeerServiceExecutable();
         var pipe = "peer-unknown-" + Guid.NewGuid().ToString("N");
         await using var launcher = new CompletionProcessHost(dir, data, FakeClaude(), peer: true);
         var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true));
@@ -439,21 +459,21 @@ public sealed partial class ClaudeHeadlessTests
     [DataRow("before-retained")]
     [DataRow("before-ack")]
     [Timeout(120000, CooperativeCancellation = true)]
-    public Task PeerRetentionRecoversAfterSeparateHostRestart(string phase) => RunPeerRetentionRestart(phase, false);
+    public Task PeerRetentionRecoversAfterSeparateHostRestart(string phase) => RunPeerRetentionRestart(phase, false, PeerServiceExecutable());
 
     [TestMethod]
     [Timeout(120000, CooperativeCancellation = true)]
     public async Task PeerRetentionSetupFailurePreservesOriginalAndStopsOwnedHost()
     {
-        var failure = await Assert.ThrowsExactlyAsync<AssertFailedException>(() => RunPeerRetentionRestart("before-ack", true));
+        var serviceExe = PeerServiceExecutable(); // Inconclusive must not be caught as the expected fixture failure.
+        var failure = await Assert.ThrowsExactlyAsync<AssertFailedException>(() => RunPeerRetentionRestart("before-ack", true, serviceExe));
         StringAssert.Contains(failure.Message, "fixture setup sentinel");
         Assert.IsFalse(failure.Data.Contains("peer fixture cleanup failure"), "cleanup succeeded without masking the setup failure");
     }
 
-    async Task RunPeerRetentionRestart(string phase, bool failSetup)
+    async Task RunPeerRetentionRestart(string phase, bool failSetup, string serviceExe)
     {
         var dir = TestDirs.New(); var data = TestDirs.New();
-        var serviceExe = Environment.GetEnvironmentVariable("GORYNYCH_TEST_SERVICE") ?? throw new AssertInconclusiveException("GORYNYCH_TEST_SERVICE is required");
         var pipe = "peer-restart-" + Guid.NewGuid().ToString("N");
         var launcher = new CompletionProcessHost(dir, data, FakeClaude(), peer: true);
         var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true));
@@ -553,7 +573,7 @@ public sealed partial class ClaudeHeadlessTests
         var admissions = 0; var admissionOpen = 0;
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var dir = TestDirs.New(); var data = TestDirs.New();
-        var serviceExe = Environment.GetEnvironmentVariable("GORYNYCH_TEST_SERVICE") ?? throw new AssertInconclusiveException("GORYNYCH_TEST_SERVICE is required");
+        var serviceExe = PeerServiceExecutable();
         var pipe = "peer-route-" + Guid.NewGuid().ToString("N");
         await using var launcher = new CompletionProcessHost(dir, data, FakeClaude(), peer: true);
         var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true));
@@ -650,16 +670,7 @@ public sealed partial class ClaudeHeadlessTests
     public async Task SeparateHostPersistsActualManagedMcpReplyMarker(bool reply)
     {
         var dir = TestDirs.New(); var data = TestDirs.New();
-        var serviceExe = Environment.GetEnvironmentVariable("GORYNYCH_TEST_SERVICE");
-        if (string.IsNullOrWhiteSpace(serviceExe))
-        {
-            var root = new DirectoryInfo(AppContext.BaseDirectory);
-            while (root is not null && !File.Exists(Path.Combine(root.FullName, "Gorynych.slnx"))) root = root.Parent;
-            Assert.IsNotNull(root);
-            var staged = Path.Combine(root.FullName, ".artifacts", "bin", "Gorynych.Service", "release", TestDirs.Exe("Gorynych.Service"));
-            serviceExe = File.Exists(staged) ? staged : Directory.EnumerateFiles(Path.Combine(root.FullName, "src", "Gorynych.Service", "bin"),
-                TestDirs.Exe("Gorynych.Service"), SearchOption.AllDirectories).First();
-        }
+        var serviceExe = PeerServiceExecutable();
         var pipe = "peer-real-mcp-" + Guid.NewGuid().ToString("N");
         await using var launcher = new CompletionProcessHost(dir, data, FakeClaude(), peer: true);
         var adapter = new ClaudeAdapter(Options(dir, fetchCatalog: false, liveNotes: true));
