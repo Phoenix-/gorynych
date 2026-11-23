@@ -211,6 +211,8 @@ public sealed partial class Conductor
     IReadOnlyList<JsonObject> ReadManagedQueue(string recipient, int limit) =>
         mailbox.ReadManagedQueue(recipient, limit, includeNotices: store.Get(recipient)?.Archived != true);
 
+    sealed class PeerAdmissionDeferredException : Exception;
+
     async Task PumpMailboxAsync(string recipient)
     {
         try
@@ -226,10 +228,22 @@ public sealed partial class Conductor
                     await DeliverMailboxTurnAsync(item, cleanupStop.Token);
                 }
                 catch (OperationCanceledException) when (cleanupStop.IsCancellationRequested) { break; }
+                catch (PeerAdmissionDeferredException)
+                {
+                    // Keep the accepted head intact and avoid a retry spin on a stale route.
+                    await Task.Delay(TimeSpan.FromSeconds(1), cleanupStop.Token);
+                }
                 catch (Exception e)
                 {
                     if (Draining || cleanupStop.IsCancellationRequested) break;
-                    FailMailbox(item, e.Message, uncertain: e is not JsonRpcException);
+                    // A started peer capture may still be recovered after producer exit. Do not
+                    // wake its sender with a separate failure while its exact terminal is unknown.
+                    var peerRow = e is ReportPersistenceException ? mailbox.Find((string)item["id"]!) : null;
+                    var peerStarted = peerRow is not null && (string?)peerRow["recipient"] == recipient &&
+                        (long?)peerRow["sequence"] == (long?)item["sequence"] && peerRow["peerTurn"] is JsonObject;
+                    if (peerStarted)
+                        mailbox.MarkFailed((string)item["id"]!, recipient, e.Message, null, true, (long)item["sequence"]!);
+                    else FailMailbox(item, e.Message, uncertain: e is not JsonRpcException);
                 }
             }
         }
@@ -332,7 +346,16 @@ public sealed partial class Conductor
             // ordinary/legacy mailbox ID from spelling a generated delegation key.
             var messageId = batchCommit ? "inbox-" + (long)item["sequence"]! :
                 assignmentGeneration is null ? "mailbox-" + id : "delegation-" + assignmentGeneration + "-" + id;
-            promptId = ServicePromptId(messageId);
+            var sequence = (long)item["sequence"]!;
+            var peerEligible = (options.PeerTurnReplies || options.TestPeerTurnRouting) && !suppliedGates && !batchCommit && assignmentGeneration is null &&
+                (bool?)item["expectReply"] != true && item["replyTo"] is null && (bool?)item["peerAutoReply"] != true &&
+                sender != recipient && sender != "service" && !sender.StartsWith("outside:", StringComparison.Ordinal) &&
+                !recipient.StartsWith("outside:", StringComparison.Ordinal) && use.Record.Agent == "claude" && ManagedPeerRoute(recipient, rpc) &&
+                HostOf(use.Record).RouteOf(recipient) is { } peerLink && peerLink.Rpc == rpc && !rpc.IsClosed &&
+                peerLink.Info.Meta?[GorynychProtocol.CapHostPeerTerminal] is JsonValue peerCap &&
+                peerCap.TryGetValue<bool>(out var peerSupported) && peerSupported;
+            promptId = peerEligible ? $"service-peer-{sequence}-{id}" : ServicePromptId(messageId);
+            var peerRoute = peerEligible ? new PeerTurnIdentity(id, sequence, sender, recipient, promptId) : null;
             var isDelegation = (bool?)item["delegation"] == true;
             if (!isDelegation && !batchCommit) key = feed.BeginPrompt(promptId);
             var shownSender = batch.Count > 1 ? "service" : sender.StartsWith("outside:", StringComparison.Ordinal) ? "outside_agent" : sender;
@@ -346,7 +369,7 @@ public sealed partial class Conductor
                 meta[GorynychProtocol.MetaFromSessionId] = sender;
             async Task PublishMessageAsync() => await feed.PublishAsync(AcpJson.ToNode<SessionUpdate>(new SessionUpdateUserMessageChunk
             { Content = block, MessageId = messageId, Meta = meta.DeepClone().AsObject() })!.AsObject(), except: null, () => store.Touch(recipient));
-            if (!isDelegation && !batchCommit) await PublishMessageAsync();
+            if (!isDelegation && !batchCommit && peerRoute is null) await PublishMessageAsync();
             if (use.Record.ParentSessionId is not null) feed.BeginTurnText(ReportLimit + 1);
             Task<JsonNode?> response;
             var startAttempted = false;
@@ -363,11 +386,14 @@ public sealed partial class Conductor
                 if (feed.Retired || store.Get(recipient) is not { Deleted: false }) throw NotFound(recipient);
                 var cause = (bool?)item["delegation"] == true ? ReportCause.Delegation :
                     item["replyTo"] is not null ? ReportCause.Reply : ReportCause.Peer;
-                var turnKey = batchCommit ? "mailbox-batch:" + (long)item["sequence"]! :
+                var turnKey = peerRoute is not null ? $"peer:{sequence}:{id}" : batchCommit ? "mailbox-batch:" + (long)item["sequence"]! :
                     assignmentGeneration is null ? "mailbox:" + id : "delegation:" + assignmentGeneration + ":" + id;
+                if (peerRoute is not null && options.DeferPeerAdmissionForTests?.Invoke() == true) throw new PeerAdmissionDeferredException();
                 report = AdmitReport(use.Record, rpc, promptId, turnKey, cause,
                     cause == ReportCause.Delegation ? (string?)item["assignmentId"] : resume?.AssignmentId, id,
-                    cause == ReportCause.Delegation ? assignmentGeneration : resume?.Generation, resume);
+                    cause == ReportCause.Delegation ? assignmentGeneration : resume?.Generation, resume, peerRoute);
+                if (peerRoute is not null && report is null) throw new PeerAdmissionDeferredException();
+                if (peerRoute is not null) await PublishMessageAsync();
                 BeforeMailboxMarkStarted?.Invoke();
                 if (suppliedGates && ((string?)item["reminderSource"] is not { } authoritySource ||
                     Draining || IsStopping(use.Record.Agent) || feed.ReadOnly is not null || feed.OpenedReadOnly ||
@@ -379,7 +405,7 @@ public sealed partial class Conductor
                 if (isDelegation && assignmentGeneration is not null)
                     assignmentRouteEpoch = HostOf(use.Record).OnCurrentRoute<long?>(recipient, rpc,
                         link => link.HostId is not null ? feed.AssignmentEvidenceEpoch : null, null);
-                if (!(batchCommit ? mailbox.TryStartCoordinatorBatch(batch, resume, use.Record.ParentSessionId) : mailbox.TryMarkStarted(id, recipient, (long)item["sequence"]!))) return;
+                if (!(batchCommit ? mailbox.TryStartCoordinatorBatch(batch, resume, use.Record.ParentSessionId) : mailbox.TryMarkStarted(id, recipient, (long)item["sequence"]!, peerRoute))) return;
                 if (isDelegation || batchCommit)
                 {
                     key = feed.BeginPrompt(promptId);
@@ -452,6 +478,7 @@ public sealed partial class Conductor
             }
             ReportTurnEnd(recipient, Outcome(result), feed.EndTurnText());
         }
+        catch (PeerAdmissionDeferredException) { throw; }
         catch (Exception e)
         {
             if (!Draining && !cleanupStop.IsCancellationRequested)

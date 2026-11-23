@@ -79,6 +79,10 @@ public sealed class ClaudeAdapterOptions
     /// <summary>Allow the enclosing host to negotiate private read-only prompt observations.</summary>
     public bool HostedPromptObservation { get; init; }
     public bool HostedCompletionGuarded { get; init; }
+    public bool HostedPeerTerminal { get; init; }
+    internal Func<JsonObject, JsonObject>? PeerTerminalWireOverrideForTests { get; init; }
+    internal Action<ClaudePeerReplyWitness>? PeerReplyWitnessForTests { get; init; }
+    internal Action<ClaudePeerTerminalEvidence>? PeerTerminalForTests { get; init; }
     internal bool DisableForceKillForTests { get; init; }
     internal Action<ClaudeProcess>? NativeProcessStartedForTests { get; init; }
 
@@ -276,6 +280,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
 
     bool Headless => options.Transport == ClaudeTransport.Headless;
     bool negotiatedPromptObservation;
+    bool negotiatedPeerTerminal;
     bool negotiatedCompletionGuarded;
     readonly Lock guardedReceiptGate = new();
     readonly Dictionary<string, string> guardedReceiptOwners = new(StringComparer.Ordinal);
@@ -329,6 +334,8 @@ internal sealed class ClaudeAgent : IAsyncDisposable
         {
             case AcpMethods.Agent.Initialize:
             {
+                negotiatedPeerTerminal = Headless && options.HostedPeerTerminal &&
+                    request.Params?["_meta"]?[GorynychProtocol.CapPeerTerminalReceiver] is JsonValue peer && peer.TryGetValue<bool>(out var enabledPeer) && enabledPeer;
                 negotiatedPromptObservation = Headless && options.HostedPromptObservation &&
                     request.Params?["_meta"]?[GorynychProtocol.CapClaudeObservationReceiver] is JsonValue observation && observation.TryGetValue<bool>(out var accepted) && accepted;
                 negotiatedCompletionGuarded = Headless && options.HostedCompletionGuarded &&
@@ -376,6 +383,7 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                         [GorynychProtocol.CapReportNote] = Headless && Channel is not null,
                         [GorynychProtocol.CapReportNoteAck] = Headless && Channel is not null,
                         [GorynychProtocol.CapClaudePromptObservation] = negotiatedPromptObservation,
+                        [GorynychProtocol.CapPeerTerminalAdapter] = negotiatedPeerTerminal,
                     },
                 })!;
                 if (negotiatedCompletionGuarded) initialization["_meta"]![GorynychProtocol.CapCompletionGuardedAdapter] = true;
@@ -520,13 +528,33 @@ internal sealed class ClaudeAgent : IAsyncDisposable
                 Func<bool> cancelled = () => cancelledAt.TryGetValue(session.Id, out var at) && at > sequence;
                 var observedPromptId = p.Meta?[GorynychProtocol.MetaPromptId] is JsonValue promptValue && promptValue.TryGetValue<string>(out var promptText)
                     ? promptText : null;
+                ClaudePeerTerminalEvidence? peerTerminal = null;
+                var source = negotiatedPeerTerminal && reminder is null && observedPromptId is not null &&
+                    p.Meta?[GorynychProtocol.MetaPeerTerminal] is JsonObject requested && requested.Count == 1 &&
+                    requested["sourceMessageId"] is JsonValue sourceValue && sourceValue.TryGetValue<string>(out var sourceText) &&
+                    sourceText is { Length: > 0 and <= 256 } ? sourceText : null;
                 var stop = reminder is not null
                     ? await ((HeadlessSession)session).ReminderPromptAsync(p.Prompt, cancelled, ct, request.Sequence, stream!)
                     : session is HeadlessSession observed
-                        ? await observed.ObservedPromptAsync(p.Prompt, cancelled, ct, request.Sequence, observedPromptId)
+                        ? await observed.ObservedPromptAsync(p.Prompt, cancelled, ct, request.Sequence, observedPromptId,
+                            source is null ? null : e => peerTerminal = e)
                         : await session.PromptAsync(p.Prompt, cancelled, ct, request.Sequence);
                 state.Update(session.Id, session.Cwd, r => r.UpdatedAt = DateTimeOffset.UtcNow);
-                return AcpJson.ToNode(new PromptResponse { StopReason = stop, Meta = await MarkMetaAsync(session) });
+                var resultMeta = await MarkMetaAsync(session);
+                if (source is not null && peerTerminal is { } terminal && terminal.SessionId == session.Id && terminal.PromptId == observedPromptId)
+                {
+                    var accepted = terminal.Replies.Where(r => r.TriggerMessageId == source).Select(r => r.AcceptedMessageId).Distinct(StringComparer.Ordinal).ToArray();
+                    if (accepted.Length <= 1) (resultMeta ??= new JsonObject())[GorynychProtocol.MetaPeerTerminal] = new JsonObject { ["sessionId"] = terminal.SessionId,
+                        ["promptId"] = terminal.PromptId, ["sourceMessageId"] = source, ["nativeUuid"] = terminal.NativeUuid,
+                        ["stream"] = terminal.Stream, ["acceptedMessageId"] = accepted.SingleOrDefault() };
+                }
+                if (options.PeerTerminalWireOverrideForTests is { } mutate)
+                {
+                    resultMeta ??= new JsonObject();
+                    var proof = resultMeta[GorynychProtocol.MetaPeerTerminal] as JsonObject ?? new JsonObject();
+                    resultMeta[GorynychProtocol.MetaPeerTerminal] = mutate(proof.DeepClone().AsObject());
+                }
+                return AcpJson.ToNode(new PromptResponse { StopReason = stop, Meta = resultMeta });
             }
             case GorynychProtocol.MethodRefreshSubagentStates:
             {

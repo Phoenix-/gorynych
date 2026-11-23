@@ -59,6 +59,7 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
     public CompletionHostLedger? HostCompletionLedger { get; set; }
     public Action<ReportCapture>? CaptureOpened { get; set; }
     public Action? BeforeProducerEvidence { get; set; }
+    public bool PeerTerminalForTests { get; set; }
     public bool FilterCodexIdleForTests { get; set; }
     public Action? IdleFrameProcessedForTests { get; set; }
     public List<string> Said { get; } = [];
@@ -107,7 +108,7 @@ sealed class InProcessHosts(Func<string, IAgentAdapter> adapters) : IHostLaunche
             Generation = new HostGeneration(Build, Options(adapter)),
             OrphanIdle = OrphanIdle, OrphanBusy = OrphanBusy, CancelGrace = CancelGrace, BufferBytes = BufferBytes,
             ReportStore = CaptureReports ? HostReportStore ?? Service?.ReportStorage : null, CompletionHostLedger = HostCompletionLedger, CaptureOpened = CaptureOpened,
-            BeforeProducerEvidence = BeforeProducerEvidence,
+            BeforeProducerEvidence = BeforeProducerEvidence, PeerTerminal = PeerTerminalForTests,
             FilterCodexIdleForTests = FilterCodexIdleForTests, IdleFrameProcessedForTests = IdleFrameProcessedForTests,
             Log = m => { lock (Said) Said.Add(m); },
         });

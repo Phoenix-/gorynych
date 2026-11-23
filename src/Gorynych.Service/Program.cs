@@ -24,7 +24,7 @@ switch (line.Command)
 {
     // The gorynych MCP server agents start over stdio: peer tools, reply, and Claude's channel (TUI) or reply route (headless).
     case "peers":
-        return await PeersServer.RunAsync(line.Value("--pipe"), line.Value("--token"), line.Value("--channel-url"), line.Value("--reply-url"));
+        return await PeersServer.RunAsync(line.Value("--pipe"), line.Value("--token"), line.Value("--channel-url"), line.Value("--reply-url"), line.Flag("--peer-turn-replies"));
     // Asks the running service to exit and waits for it; exit code 1 when none runs on the pipe.
     case "shutdown":
         return await AcpBridge.ShutdownAsync(line.Value("--pipe") ?? GorynychProtocol.DefaultPipeName);
@@ -153,12 +153,14 @@ await using var conductor = new Conductor(new ConductorOptions
         line.Value("--completion-observe-group") is { } observeGroup && line.Value("--completion-observe-instance") is { } observeInstance
         ? (observeProject, observeGroup, observeInstance) : null,
     CompletionAuto = line.Flag("--completion-auto"),
+    PeerTurnReplies = line.Flag("--peer-turn-replies"),
     CompletionConfiguration = line.Value("--completion-project") is { } completionProject &&
         line.Value("--completion-group") is { } completionGroup && line.Value("--completion-instance") is { } completionInstance
         ? (completionProject, completionGroup, completionInstance) : null,
     SessionDefaults = sessionDefaults,
     UnloadAfter = UnloadAfter(line.Value("--unload-after")),
-    PeerServerCommand = line.Flag("--no-peers") ? null : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
+    PeerServerCommand = line.Flag("--no-peers") ? null : line.Flag("--peer-turn-replies")
+        ? [Environment.ProcessPath!, "peers", "--pipe", pipeName, "--peer-turn-replies"] : [Environment.ProcessPath!, "peers", "--pipe", pipeName],
     Hosts = hosts,
     HostToken = hostToken,
     // A host of another build, or with other options for its adapter, is stale: its sessions move once idle.
@@ -238,6 +240,7 @@ static List<IAgentAdapter> Adapters(CommandLine line, string dataDirectory, bool
         AutoTitle = true,
         HostedPromptObservation = hosted,
         HostedCompletionGuarded = hosted,
+        HostedPeerTerminal = hosted && line.Flag("--peer-turn-replies"),
         Log = ServiceLog.Info,
     }),
     new KimiAdapter(new KimiAdapterOptions { Log = ServiceLog.Info }),
@@ -258,7 +261,7 @@ static List<string> AdapterArguments(CommandLine line, string adapter)
     var args = new List<string>();
     (string[] Values, string[] Flags) mine = adapter switch
     {
-        "claude" => (["--claude-model", "--claude-transport", "--claude-channels"], ["--no-channel"]),
+        "claude" => (["--claude-model", "--claude-transport", "--claude-channels"], ["--no-channel", "--peer-turn-replies"]),
         "dsh" => ([], ["--no-peers"]),
         _ => ([], []),
     };
@@ -319,6 +322,7 @@ static async Task<int> HostCommand(CommandLine line)
         return (stream, stream);
     }, new Gorynych.Service.Hosts.AdapterHostOptions { Adapter = adapterName, Token = token, Slot = slot, Generation = generation, Log = ServiceLog.Info,
         ReportStore = new ReportStore(Path.Combine(data, "reports")),
+        PeerTerminal = line.Flag("--peer-turn-replies"),
         CompletionHostLedger = adapterName == "claude" ? new Gorynych.Service.Hosts.CompletionHostLedger(Path.Combine(data, "completion-host-ledger.json")) : null });
     ServiceLog.Info($"host {adapterName} {host.HostId} starting, pid {Environment.ProcessId}, pipe {pipe}, data {data}, slot {(slot.Length == 0 ? "(none)" : slot)}, " +
         $"build {build} (read in {buildTook.TotalMilliseconds:0} ms)");

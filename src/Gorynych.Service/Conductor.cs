@@ -18,6 +18,9 @@ public sealed class ConductorOptions
     public string? DefaultAgent { get; init; }
     internal (string Project, string Group, string Instance)? CompletionConfiguration { get; init; }
     internal bool CompletionAuto { get; init; }
+    internal bool TestPeerTurnRouting { get; init; }
+    internal bool PeerTurnReplies { get; init; }
+    internal Func<bool>? DeferPeerAdmissionForTests { get; init; }
     internal TimeSpan CompletionAutoSweepInterval { get; init; } = TimeSpan.FromSeconds(15);
     internal (string Project, string Group, string Instance)? CompletionObservationConfiguration { get; init; }
     internal string? TestCompletionLedgerPath { get; init; }
@@ -2232,7 +2235,8 @@ public sealed partial class Conductor : IAsyncDisposable
             throw Unavailable(host.Name);
         }
         var token = NewToken();
-        request.McpServers = WithPeers(request.McpServers, token);
+        var managedPeer = options.PeerServerCommand is { Count: > 0 } && !HasClientPeerServer(request.McpServers) && PeerProofSupported(host, rpc);
+        request.McpServers = WithPeers(request.McpServers, token, managedPeer);
         request.SystemPrompt = SystemPromptFor(host);
         NewSessionResponse response;
         try
@@ -2275,6 +2279,7 @@ public sealed partial class Conductor : IAsyncDisposable
         // The URI an AHP client chose for the session it creates, kept so that every list names it so.
         var ahpUri = AhpUriOf(request.Meta);
         store.Update(response.SessionId, host.Name, r => { r.Cwd = FolderPath.Normalize(request.Cwd); r.Draft = true; r.PeerToken = token; r.AhpUri = ahpUri; });
+        if (managedPeer) managedPeerRoutes[response.SessionId] = rpc;
         var feed = Feed(response.SessionId);
         feed.CaptureState(AcpJson.ToNode(response));
         // Attached now, for the agent's requests; its list of commands only once it has the answer.
@@ -2948,7 +2953,7 @@ public sealed partial class Conductor : IAsyncDisposable
         // Client metadata cannot claim service provenance, report identity or assignment ownership.
         if (request.Params is JsonObject raw && raw["_meta"] is JsonObject untrusted)
         {
-            foreach (var name in new[] { GorynychProtocol.MetaReportId, GorynychProtocol.MetaReportCapture, GorynychProtocol.MetaReportDelivery,
+            foreach (var name in new[] { GorynychProtocol.MetaReportId, GorynychProtocol.MetaReportCapture, GorynychProtocol.MetaReportDelivery, GorynychProtocol.MetaPeerTerminal,
                 GorynychProtocol.MetaAssignmentId, GorynychProtocol.MetaOrigin, GorynychProtocol.MetaMailboxMessage, GorynychProtocol.MetaExpectsReply, GorynychProtocol.MetaReplyReminder, GorynychProtocol.MetaHostBackgroundEvidence, GorynychProtocol.MetaBackgroundCompleteStream,
                 GorynychProtocol.MetaSender, GorynychProtocol.MetaParentSessionId, GorynychProtocol.MetaFromSessionId,
                 GorynychProtocol.MetaCodexLoadedIdle }) untrusted.Remove(name);
@@ -4408,7 +4413,7 @@ public sealed partial class Conductor : IAsyncDisposable
         // Not cancelled with the spawn: the agent may create the session anyway, and only its answer names it.
         // Session setup uses the agent's defaults. Config options and an explicit mode are applied
         // and checked before publishing or prompting it.
-        var newSession = new NewSessionRequest { Cwd = cwd, McpServers = WithPeers([], token), SystemPrompt = SystemPromptFor(host) };
+        var newSession = new NewSessionRequest { Cwd = cwd, McpServers = WithPeers([], token, PeerProofSupported(host, rpc)), SystemPrompt = SystemPromptFor(host) };
         RequireConfigOptions(newSession, configChoices);
         var creating = await rpc.StartRequestAsync(AcpMethods.Agent.SessionNew, AcpJson.ToNode(newSession),
             CancellationToken.None);
@@ -4444,6 +4449,7 @@ public sealed partial class Conductor : IAsyncDisposable
         try
         {
             BindToken(token, id);
+            if (options.PeerServerCommand is { Count: > 0 } && PeerProofSupported(host, rpc)) managedPeerRoutes[id] = rpc;
             host.MarkLive(id, rpc);
             host.DoneOpening(rpc);
             feed.CaptureState(created);
@@ -5969,14 +5975,41 @@ public sealed partial class Conductor : IAsyncDisposable
     /// The peers server for a session being opened, with its token, which the overlay keeps: the
     /// agent may hold it longer than this service runs (in a host, across a restart).
     /// </summary>
+    // A live binding is intentionally not reconstructed from the host's session list. The
+    // native process may still hold a client-supplied server after reconnect or resume.
+    readonly ConcurrentDictionary<string, JsonRpcConnection> managedPeerRoutes = new(StringComparer.Ordinal);
+
+    static bool HasClientPeerServer(IEnumerable<McpServer>? servers) => servers?.Any(server => server switch
+    {
+        McpServerStdio stdio => stdio.Name == PeersServer.ServerName,
+        McpServerHttp http => http.Name == PeersServer.ServerName,
+        McpServerSse sse => sse.Name == PeersServer.ServerName,
+        McpServer.Unknown => true, // an unknown server form cannot establish exclusive ownership
+        _ => true,
+    }) == true;
+
+    bool ManagedPeerRoute(string sessionId, JsonRpcConnection rpc) =>
+        options.PeerServerCommand is { Count: > 0 } && managedPeerRoutes.TryGetValue(sessionId, out var bound) &&
+        ReferenceEquals(bound, rpc) && !rpc.IsClosed;
+
     List<McpServer> PeersFor(string sessionId)
     {
+        managedPeerRoutes.TryRemove(sessionId, out _); // load/resume may reuse an existing native process
+
         var token = sessionTokens.GetOrAdd(sessionId, _ => NewToken());
         peerTokens[token] = sessionId;
         if (store.Get(sessionId) is { } record && record.PeerToken != token)
             store.Update(sessionId, record.Agent, r => r.PeerToken = token);
-        return WithPeers([], token);
+        var recordForPeer = store.Get(sessionId);
+        var host = recordForPeer is null ? null : HostOf(recordForPeer);
+        var rpc = host?.RouteOf(sessionId)?.Rpc;
+        return WithPeers([], token, host is not null && rpc is not null && PeerProofSupported(host, rpc));
     }
+
+    bool PeerProofSupported(AgentHost host, JsonRpcConnection rpc) =>
+        (options.PeerTurnReplies || options.TestPeerTurnRouting) && host.Name == "claude" && !rpc.IsClosed &&
+        host.Links.Any(link => link.Rpc == rpc && link.Info.Meta?[GorynychProtocol.CapHostPeerTerminal] is JsonValue cap &&
+            cap.TryGetValue<bool>(out var supported) && supported);
 
     /// <summary>
     /// The service's instructions for the peer tools as an ACP <c>systemPrompt</c> in append mode,
@@ -6002,7 +6035,7 @@ public sealed partial class Conductor : IAsyncDisposable
     }
 
     /// <summary>Adds the peers MCP server, unless the client already brought one with that name.</summary>
-    List<McpServer> WithPeers(List<McpServer>? servers, string token)
+    List<McpServer> WithPeers(List<McpServer>? servers, string token, bool peerProof)
     {
         var list = servers is null ? [] : new List<McpServer>(servers);
         if (options.PeerServerCommand is not { Count: > 0 } command) return list;
@@ -6011,7 +6044,7 @@ public sealed partial class Conductor : IAsyncDisposable
         {
             Name = PeersServer.ServerName,
             Command = command[0],
-            Args = [.. command.Skip(1), "--token", token],
+            Args = [.. command.Skip(1).Where(arg => arg != "--peer-turn-replies" || peerProof), "--token", token],
             Env = [],
         });
         return list;

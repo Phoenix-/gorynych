@@ -57,6 +57,7 @@ public sealed class AdapterHostOptions
     internal Action? BeforeCompletionRetireRecordForTests { get; init; }
     internal Action<ReportCapture>? CaptureOpened { get; init; }
     internal Action? BeforeProducerEvidence { get; init; }
+    internal bool PeerTerminal { get; init; }
     // Isolated protocol tests only. Production remains disabled until conductor integration.
     internal bool FilterCodexIdleForTests { get; init; }
     internal Action? IdleFrameProcessedForTests { get; init; }
@@ -136,6 +137,9 @@ public sealed class AdapterHost
     /// Runs until the agent exits or a conductor stops the host (0), or no conductor comes for too
     /// long (2).
     /// </summary>
+    // Fixture-only graceful stop for a detached host; never exposed on ACP.
+    internal void StopForTests() => ended.TrySetResult(0);
+
     public async Task<int> RunAsync()
     {
         var reading = Task.Run(AgentLoopAsync);
@@ -270,6 +274,7 @@ public sealed class AdapterHost
                         report["_meta"] = new JsonObject { [GorynychProtocol.MetaReportId] = reportId,
                             [GorynychProtocol.MetaReportCapture] = new JsonObject { ["failure"] = request.CaptureFailure } };
                     }
+                    (message["result"]?["_meta"] as JsonObject)?.Remove(GorynychProtocol.MetaPeerTerminal);
                     if (request.Delivery is { } delivery)
                     {
                         if (report["_meta"] is not JsonObject deliveryMeta) report["_meta"] = deliveryMeta = new JsonObject();
@@ -1383,6 +1388,9 @@ public sealed class AdapterHost
             {
                 if (message["params"] is not JsonObject initParams) message["params"] = initParams = new JsonObject();
                 if (initParams["_meta"] is not JsonObject initMeta) initParams["_meta"] = initMeta = new JsonObject();
+                initMeta.Remove(GorynychProtocol.CapPeerTerminalReceiver);
+                if (options.PeerTerminal && options.ReportStore is not null && options.Adapter == "claude")
+                    initMeta[GorynychProtocol.CapPeerTerminalReceiver] = true;
                 var acceptsCompletionGuarded = options.CompletionHostLedger is not null && initMeta[GorynychProtocol.CapHostCompletionGuarded] is JsonValue testValue && testValue.TryGetValue<bool>(out var testAccepted) && testAccepted;
                 initMeta.Remove(GorynychProtocol.CapHostCompletionGuarded);
                 initMeta.Remove(GorynychProtocol.CapCompletionGuardedReceiver);
@@ -1463,6 +1471,9 @@ public sealed class AdapterHost
         var sessionId = observationSession ?? Text(@params?["sessionId"]);
         var reportId = method == AcpMethods.Agent.SessionPrompt ? Text(@params?["_meta"]?[GorynychProtocol.MetaReportId]) : null;
         ReportCapture? capture = null;
+        PeerTurnIdentity? peerRoute = null;
+        if (method == AcpMethods.Agent.SessionPrompt && @params?["_meta"] is JsonObject callerMeta)
+            callerMeta.Remove(GorynychProtocol.MetaPeerTerminal);
         var provenUnstarted = reportId is not null;
         Exception? refusal = null;
         JsonObject? admissionRevocation = null;
@@ -1509,6 +1520,19 @@ public sealed class AdapterHost
                     // not proof that this reservation was never handed off.
                     provenUnstarted = false;
                     capture = options.ReportStore.OpenReservedCapture(reportId, session, prompt);
+                    if (options.PeerTerminal && options.Adapter == "claude" &&
+                        initialize?["_meta"]?[GorynychProtocol.CapPeerTerminalAdapter] is JsonValue capability &&
+                        capability.TryGetValue<bool>(out var supported) && supported)
+                    {
+                        var reserved = options.ReportStore.GetReport(reportId);
+                        if (reserved.Identity.PeerRoute is { } exact && reserved.Identity.HostId == options.HostId &&
+                            reserved.Identity.HostGeneration == options.Generation?.Key && exact.Recipient == session && exact.PromptId == prompt)
+                        {
+                            peerRoute = exact;
+                            if (@params!["_meta"] is not JsonObject peerMeta) @params["_meta"] = peerMeta = new JsonObject();
+                            peerMeta[GorynychProtocol.MetaPeerTerminal] = new JsonObject { ["sourceMessageId"] = exact.MessageId };
+                        }
+                    }
                     provenUnstarted = true;
                     options.CaptureOpened?.Invoke(capture);
                     (@params?["_meta"] as JsonObject)?.Remove(GorynychProtocol.MetaReportId);
@@ -1519,7 +1543,7 @@ public sealed class AdapterHost
                 Connection = connection, ConductorId = id.DeepClone(), Method = method, SessionId = sessionId, IdleAdmission = idleAdmission,
                 GuardedAttempt = guardedAttempt, GuardedIdentity = guardedIdentity, GuardedEpoch = guardedEpoch, GuardedWriteAdmission = guardedWriteAdmission, GuardedAckRevision = guardedAckRevision, GuardedRetireRevision = guardedRetireRevision, GuardedIsAbort = guardedIsAbort,
                 ClaudeObservationAdmission = observationAdmission,
-                ClaudeObservationEpoch = observationCapabilityEpoch ?? connection.ClaudeObservationEpoch, PromptId = observationPrompt ?? Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]), ReportId = reportId, Capture = capture,
+                ClaudeObservationEpoch = observationCapabilityEpoch ?? connection.ClaudeObservationEpoch, PeerRoute = peerRoute, PromptId = observationPrompt ?? Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]), ReportId = reportId, Capture = capture,
                 NoteStatusReport = noteStatusReport, NoteAttempt = noteAttempt, NoteDigest = noteDigest,
                 NoteAckUuid = noteAckUuid, NoteAckRevision = noteAckRevision,
                 Delivery = method == AcpMethods.Agent.SessionPrompt && Text(@params?["_meta"]?[GorynychProtocol.MetaOrigin]) == "report"
@@ -1630,6 +1654,20 @@ public sealed class AdapterHost
         if (request.Capture is not { } capture) return;
         var error = response["error"] is { } nativeError ? BoundError(nativeError.ToJsonString()) : null;
         var outcome = ReportTerminalOutcome.From(response["result"], error is not null);
+        PeerProducerEvidence? peerEvidence = null;
+        var meta = response["result"]?["_meta"] as JsonObject;
+        var peer = meta?[GorynychProtocol.MetaPeerTerminal] as JsonObject;
+        // This is meaningful only for the exact host-opened reservation and negotiated adapter.
+        if (request.PeerRoute is { } route && peer is { Count: 6 } && outcome == "ended" && error is null &&
+            Text(peer["sessionId"]) == route.Recipient && Text(peer["promptId"]) == route.PromptId &&
+            Text(peer["sourceMessageId"]) == route.MessageId && Text(peer["nativeUuid"]) is { } uuid &&
+            Text(peer["stream"]) is { } stream && peer.ContainsKey("acceptedMessageId") &&
+            (peer["acceptedMessageId"] is null || Text(peer["acceptedMessageId"]) is not null))
+        {
+            var candidate = new PeerProducerEvidence(route.PromptId, uuid, stream, Text(peer["acceptedMessageId"]));
+            if (ReportStore.IsValidPeerEvidence(candidate)) peerEvidence = candidate;
+        }
+        meta?.Remove(GorynychProtocol.MetaPeerTerminal);
         try
         {
             if (request.CaptureFailure is { } failure) capture.SealIncomplete(failure, outcome, error);
@@ -1649,7 +1687,7 @@ public sealed class AdapterHost
             try
             {
                 options.BeforeProducerEvidence?.Invoke();
-                reports.RecordProducerEvidence(id, options.HostId, outcome, error, request.CaptureFailure);
+                reports.RecordProducerEvidence(id, options.HostId, outcome, error, request.CaptureFailure, request.CaptureFailure is null ? peerEvidence : null);
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
             { request.CaptureFailure = BoundError("Producer evidence could not be saved: " + e.Message); }
@@ -1761,6 +1799,12 @@ public sealed class AdapterHost
     {
         var meta = result["_meta"] as JsonObject ?? [];
         // Capability belongs to the host implementation, not the wrapped adapter.
+        var peerAdapter = meta[GorynychProtocol.CapPeerTerminalAdapter] is JsonValue pv && pv.TryGetValue<bool>(out var ps) && ps;
+        meta.Remove(GorynychProtocol.CapPeerTerminalAdapter);
+        meta.Remove(GorynychProtocol.CapPeerTerminalReceiver);
+        meta.Remove(GorynychProtocol.CapHostPeerTerminal);
+        if (options.PeerTerminal && options.Adapter == "claude" && options.ReportStore is not null && peerAdapter)
+            meta[GorynychProtocol.CapHostPeerTerminal] = true;
         meta.Remove(GorynychProtocol.CapHostCompletionGuarded);
         var guardedAdapter = meta[GorynychProtocol.CapCompletionGuardedAdapter] is JsonValue tv && tv.TryGetValue<bool>(out var ts) && ts;
         meta.Remove(GorynychProtocol.CapCompletionGuardedAdapter);
@@ -1953,6 +1997,7 @@ public sealed class AdapterHost
         public long? ClaudeObservationAdmission { get; init; }
         public long ClaudeObservationEpoch { get; init; }
         public string? ReportId { get; init; }
+        public PeerTurnIdentity? PeerRoute { get; init; }
         public string? NoteStatusReport { get; init; }
         public string? NoteAttempt { get; init; }
         public string? NoteDigest { get; init; }

@@ -46,6 +46,7 @@ static partial class FakeHeadless
     static int tools;
     static int asks;
     static int taskIds;
+    static JsonObject? peerConfig;
 
     public static async Task<int> RunAsync(string[] args)
     {
@@ -75,7 +76,9 @@ static partial class FakeHeadless
                     if (permissions[kind] is JsonArray rules) list.AddRange(rules.Select(r => (string?)r).OfType<string>());
         canBypass = mode == "bypassPermissions" || args.Contains("--allow-dangerously-skip-permissions") || args.Contains("--dangerously-skip-permissions");
         model = Arg("--model") ?? model;
-        var replyUrl = ReplyUrl(Arg("--mcp-config"));
+        var mcpConfigPath = Arg("--mcp-config");
+        peerConfig = mcpConfigPath is not null && File.Exists(mcpConfigPath) ? JsonNode.Parse(File.ReadAllText(mcpConfigPath))?["mcpServers"]?["gorynych"] as JsonObject : null;
+        var replyUrl = ReplyUrl(mcpConfigPath);
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
 
         Console.OutputEncoding = new UTF8Encoding(false);
@@ -283,6 +286,43 @@ static partial class FakeHeadless
         var apiKey = File.Exists(Path.Combine(Environment.CurrentDirectory, "api-key-init")) ? "ANTHROPIC_API_KEY" : "none";
         await WriteAsync(new JsonObject { ["type"] = "system", ["subtype"] = "init", ["session_id"] = sessionId, ["model"] = model, ["permissionMode"] = mode, ["apiKeySource"] = apiKey });
         await ReplayAsync(first, sessionId);
+        if (prompt.Contains("peer-real-reply-probe", StringComparison.Ordinal) || prompt.Contains("peer-real-refusal-probe", StringComparison.Ordinal))
+        {
+            var refusal = prompt.Contains("peer-real-refusal-probe", StringComparison.Ordinal);
+            var match = Regex.Match(prompt, "To answer, use reply_message with message_id \"([^\"]+)\"");
+            var args = new JsonObject { ["message_id"] = match.Success ? match.Groups[1].Value : "request", ["text"] = refusal ? "" : "fixture reply" };
+            var call = await ToolUseAsync(sessionId, "mcp__gorynych__reply_message", args);
+            var result = await CallRealPeerAsync(args);
+            if ((bool?)result["isError"] != refusal) throw new InvalidOperationException("Unexpected fixture MCP result");
+            var text = (string?)result["content"]?[0]?["text"] ?? throw new InvalidOperationException("Missing fixture MCP text");
+            if (refusal && !JsonNode.DeepEquals(JsonNode.Parse(text), result["structuredContent"]))
+                throw new InvalidOperationException("MCP structured refusal and text differ");
+            await ToolResultAsync(sessionId, call, text, refusal, null);
+        }
+        if (prompt.Contains("peer-native-receipt-probe", StringComparison.Ordinal))
+        {
+            // Synthetic native frames model the MCP result; no MCP request is made here.
+            var sub = await ToolUseAsync(sessionId, "mcp__gorynych__reply_message", new JsonObject { ["message_id"] = "request" }, "child");
+            await ToolResultAsync(sessionId, sub, "{\"messageId\":\"0123456789abcdef0123456789abcdef\",\"status\":\"accepted\"}", false, null, "child");
+            await WriteAsync(new JsonObject { ["type"] = "assistant", ["session_id"] = sessionId, ["isReplay"] = true,
+                ["message"] = new JsonObject { ["role"] = "assistant", ["content"] = new JsonArray(new JsonObject {
+                    ["type"] = "tool_use", ["id"] = "replayed-call", ["name"] = "mcp__gorynych__reply_message",
+                    ["input"] = new JsonObject { ["message_id"] = "request" } }) } });
+            await ToolResultAsync(sessionId, "replayed-call", "{\"messageId\":\"0123456789abcdef0123456789abcdef\",\"status\":\"accepted\"}", false, null);
+            var wrong = await ToolUseAsync(sessionId, "mcp__other__reply_message", new JsonObject { ["message_id"] = "request" });
+            await ToolResultAsync(sessionId, wrong, "{\"messageId\":\"0123456789abcdef0123456789abcdef\",\"status\":\"accepted\"}", false, null);
+            var firstReply = await ToolUseAsync(sessionId, "mcp__gorynych__reply_message", new JsonObject { ["message_id"] = "request" });
+            var olderReply = await ToolUseAsync(sessionId, "mcp__gorynych__reply_message", new JsonObject { ["message_id"] = "older" });
+            await WriteAsync(new JsonObject { ["type"] = "user", ["session_id"] = sessionId, ["parent_tool_use_id"] = null,
+                ["message"] = new JsonObject { ["role"] = "user", ["content"] = new JsonArray(
+                    new JsonObject { ["type"] = "tool_result", ["tool_use_id"] = firstReply, ["content"] = "{\"messageId\":\"0123456789abcdef0123456789abcdef\",\"status\":\"accepted\"}" },
+                    new JsonObject { ["type"] = "tool_result", ["tool_use_id"] = olderReply, ["content"] = "{\"messageId\":\"fedcba9876543210fedcba9876543210\",\"status\":\"accepted\"}" }) } });
+        }
+        if (prompt.Contains("peer-native-malformed-probe", StringComparison.Ordinal))
+        {
+            var call = await ToolUseAsync(sessionId, "mcp__gorynych__reply_message", new JsonObject { ["message_id"] = "request" });
+            await ToolResultAsync(sessionId, call, "{not-a-receipt}", false, null);
+        }
         if (prompt.Contains("receipt-exit-after-echo", StringComparison.Ordinal)) Environment.Exit(42);
         if (prompt.Contains("receipt-hold-after-echo", StringComparison.Ordinal))
             while (!File.Exists(Path.Combine(Environment.CurrentDirectory, "release-report-result"))) await Task.Delay(20);
@@ -589,6 +629,43 @@ static partial class FakeHeadless
         replay["isReplay"] = true;
         replay["session_id"] = sessionId;
         return WriteAsync(replay);
+    }
+
+    // Fixture-only MCP client: start the session's configured, token-bound peers server and
+    // relay its actual tools/call result. Never print the command, arguments or token.
+    static async Task<JsonObject> CallRealPeerAsync(JsonObject arguments)
+    {
+        var config = peerConfig ?? throw new InvalidOperationException("Fixture peer server is unavailable");
+        var command = (string?)config["command"] ?? throw new InvalidOperationException("Missing fixture peer command");
+        var start = new System.Diagnostics.ProcessStartInfo(command) { UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
+        foreach (var arg in config["args"]?.AsArray() ?? []) start.ArgumentList.Add((string)arg!);
+        if (config["env"] is JsonObject env) foreach (var pair in env) start.Environment[pair.Key] = (string?)pair.Value;
+        using var process = System.Diagnostics.Process.Start(start) ?? throw new InvalidOperationException("Fixture peers failed to start");
+        var stderr = process.StandardError.ReadToEndAsync();
+        async Task<JsonObject> Request(int id, string method, JsonObject parameters)
+        {
+            await process.StandardInput.WriteLineAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["method"] = method, ["params"] = parameters }.ToJsonString());
+            await process.StandardInput.FlushAsync();
+            while (await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(15)) is { } line)
+                if (JsonNode.Parse(line) is JsonObject response && (int?)response["id"] == id) return response;
+            throw new IOException("Fixture peer server closed before response");
+        }
+        try
+        {
+            var init = await Request(1, "initialize", new JsonObject { ["protocolVersion"] = "2025-06-18", ["capabilities"] = new JsonObject() });
+            if (init["error"] is not null) throw new InvalidOperationException("Fixture MCP initialize failed");
+            var call = await Request(2, "tools/call", new JsonObject { ["name"] = "reply_message", ["arguments"] = arguments.DeepClone() });
+            if (call["error"] is not null || call["result"] is not JsonObject result)
+                throw new InvalidOperationException("Fixture MCP reply returned no tool result");
+            return result;
+        }
+        finally
+        {
+            process.StandardInput.Close();
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15));
+            await stderr;
+        }
     }
 
     static async Task<string> ToolUseAsync(string sessionId, string tool, JsonObject input, string? parentToolUseId = null)

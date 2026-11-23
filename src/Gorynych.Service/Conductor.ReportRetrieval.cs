@@ -105,7 +105,7 @@ public sealed partial class Conductor
                     if (report.Status is "pending" or "claimed" or "accepted")
                     {
                         pending++;
-                        var recipient = store.Get(report.Identity.Parent);
+                        var recipient = report.Identity.Parent is { } parentId ? store.Get(parentId) : null;
                         if (recipient is null || recipient.Deleted) { blocked++; unavailable++; }
                         else if (recipient.Archived) { blocked++; archived++; }
                     }
