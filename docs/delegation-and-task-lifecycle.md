@@ -31,6 +31,7 @@ that an agent's solution is correct or force an agent to complete arbitrary work
 - [Obligations and dependency edges](#obligations-and-dependency-edges)
 - [Events, guards, and transitions](#events-guards-and-transitions)
 - [Automatic results and explicit outcomes](#automatic-results-and-explicit-outcomes)
+- [Planned routing for peer turn results](#planned-routing-for-peer-turn-results)
 - [Waiting, wake-ups, and escalation](#waiting-wake-ups-and-escalation)
 - [Cancellation, restart, and recovery](#cancellation-restart-and-recovery)
 - [Safety and liveness properties](#safety-and-liveness-properties)
@@ -42,9 +43,9 @@ that an agent's solution is correct or force an agent to complete arbitrary work
 
 The following are the agreed direction:
 
-1. **Keep automatic child reports.** Prefer an extra report to losing a needed
-   result and leaving the team asleep. A peer- or user-initiated turn is not, by
-   itself, a reason to suppress a report that would otherwise be generated.
+1. **Keep turn reports available for inspection.** Capture eligible reports and
+   apply the [planned routing for peer turn results](#planned-routing-for-peer-turn-results)
+   when delivering an answer to an ordinary direct message.
 2. **Distinguish delegation from conversation.** Add explicit delegation to an
    immediate child, checked against the service's stored relationship. An ordinary
    `send_message` is not delegation and does not grant user authority.
@@ -66,12 +67,10 @@ does not expand an opt-out into a report, nor does it authorize reports to be
 discarded silently. Archived or unavailable recipients need the failure policy
 described below.
 
-An initially attractive alternative was to suppress peer-only turn reports and
-require the child to publish important revisions explicitly. Two reviewers expose
-its weakness: both send an initial review, wake on each other's replies, agree on a
-changed conclusion, and forget to publish it to the coordinator. Origin alone does
-not establish that the revised result is irrelevant. **That filtering proposal,
-including blanket exclusion of user-initiated child turns, was superseded.**
+The initial design used broad parent delivery to surface revised conclusions.
+The later peer-routing decision gives the sender an addressed answer and keeps
+the retained report available for the parent to inspect. An announced revision
+can reach the parent through a direct reply or an explicit assignment outcome.
 
 ## Standards and existing mechanisms
 
@@ -220,11 +219,10 @@ An automatic report means "this turn ended with this outcome". It is distinct fr
 the explicit claim "assignment X is complete". Both error/cancellation reports and
 turns with no final text matter to the parent.
 
-Keep report delivery independent of whether the turn began with delegation, peer
-conversation, a direct user prompt or a later reminder, subject to existing report
-opt-outs and recursion safeguards. Mark the cause and assignment correlation;
-uncertain relevance favors delivery. There is no mandatory duplicate `send_message`
-for an ordinary child result.
+The current child-report contract can deliver reports from delegation, peer
+conversation, a direct user prompt or a later reminder. It records the cause and
+any assignment correlation and honors the existing opt-outs and recursion safeguards.
+The planned routing below changes delivery for ordinary direct messages.
 
 Preserve the full result before acknowledging its publication. A preview must say
 that it is truncated and link to that exact immutable result, not "the child's
@@ -242,6 +240,35 @@ Completion is the agent's explicit claim. It is not proof of correctness, parent
 acceptance, successful tests, or absence of intentionally running dev servers.
 Exact tool names, parameters, completion-result capture, and parent acceptance or
 reopening semantics need a separate wire proposal.
+
+## Planned routing for peer turn results
+
+This decision describes a follow-up to the deployed
+[message delivery contract](messaging.md#delivery-and-authority).
+
+- Use `send_message` to start an exchange or send an independent update. Use
+  `reply_message` to answer a particular incoming message by ID.
+- A turn started by an ordinary direct `send_message` returns its final answer to
+  the sender by default. This rule applies to any relationship between the two
+  sessions. A `reply_message` from that turn to the exact triggering message
+  supplies the answer and suppresses the automatic one. A plain `send_message`
+  leaves the automatic answer eligible, even when it goes to the same sender.
+- The recipient's parent can use `list_reports` and `read_report` to inspect the
+  retained report. When another agent starts the turn, the report is available
+  for inspection without waking the parent. A reply explicitly addressed to the
+  parent follows its own delivery path.
+- A reply to an earlier message answers that message. For example, a reviewer
+  can respond to an earlier request from the coordinator after another reviewer
+  has started the current turn. The explicit reply carries the verdict to the
+  coordinator. The peer's triggering message still determines where this turn's
+  default answer goes and which explicit reply can suppress it.
+- Track reply acceptance and delivery separately. Report failure and cancellation
+  as turn outcomes independently of successful-answer suppression. An automatic
+  answer closes the automatic response path so delivering it cannot start a
+  chain of automatic answers.
+
+Explicit reply waits and assignment outcomes follow their respective lifecycle
+rules. An ordinary turn result carries no assignment completion claim.
 
 ## Waiting, wake-ups, and escalation
 
@@ -354,8 +381,9 @@ this discussion. Let `pending(w)` mean an unresolved registered wait and
   a lost response is not proof that no dispatch occurred.
 - A terminal assignment cannot be reopened by a stale event. Results and notices
   remain available under their explicit retention policy.
-- Every eligible automatic report is delivered or has a visible pending/failure
-  disposition; initiator-based relevance guesses do not discard it.
+- Every eligible report has a recorded disposition. Planned peer routing can
+  retain it for inspection. Attempted deliveries expose their outcome, including
+  uncertainty.
 
 **Liveness and visibility, assuming a running service, fair event/timer processing
 and usable persistence:**
@@ -385,7 +413,7 @@ host and restart boundaries; reducer tests alone do not prove native recovery.
 | --- | --- |
 | Parent delegates; child ends a turn without an explicit outcome | Automatic report arrives; assignment stays open; a continuation check remains |
 | Non-parent attempts delegation | Refused before delivery with an actionable error; ordinary peer messaging remains available |
-| Two reviewers exchange questions after initial reports | Later eligible reports still reach the coordinator; initial final text did not close their assignments |
+| Two reviewers exchange ordinary messages after initial reports | The planned routing returns answers to their initiating senders. The coordinator can inspect retained reports without an additional turn. Assignment completion is explicit |
 | Explicit wait for M; recipient goes idle unanswered | Recipient gets one correlated reminder; its resulting response reaches the waiter |
 | Both reviewers await each other | Incoming questions still arrive; dependency facts become visible and bounded escalation prevents silent indefinite waiting |
 | Reply commits while a deadline fires | One consistent resolution; stale wake is cancelled or harmless; reply is still delivered |
@@ -445,9 +473,9 @@ properties and remain separately reviewable.
 - [ACP v1 extensibility](https://agentclientprotocol.com/protocol/v1/extensibility).
 - [Official MCP Tasks extension and schema status](https://github.com/modelcontextprotocol/ext-tasks/blob/main/README.md),
   [2026-07-28 task lifecycle](https://github.com/modelcontextprotocol/ext-tasks/blob/main/specification/2026-07-28/tasks.md).
-- [OMP result routing at 6f03614](https://github.com/can1357/oh-my-pi/blob/6f03614d761366972e80e84e25d1418ed678d2c7/packages/coding-agent/src/task/executor.ts#L3697-L3789):
-  useful provenance tracking, but peer-only suppression and reliance on explicit
-  publication are not adopted as Gorynych's default reliability policy.
+- [OMP result routing at 6f03614](https://github.com/can1357/oh-my-pi/blob/6f03614d761366972e80e84e25d1418ed678d2c7/packages/coding-agent/src/task/executor.ts#L3697-L3789)
+  provides a comparison for tracking which message started a turn. The planned
+  Gorynych rule uses an explicit `reply_message` to suppress the automatic answer.
 - [Codex completion routing at 05ae1b0f](https://github.com/openai/codex/blob/05ae1b0fdd5ab412d24248acc76c5d9f6f275440/codex-rs/core/src/agent/control/completion.rs#L33-L150):
   delivery/wake modes and parent result routing are separate concerns.
 - [Claude Agent Teams](https://code.claude.com/docs/en/agent-teams) and
@@ -455,8 +483,9 @@ properties and remain separately reviewable.
   comparisons, not evidence of Gorynych runtime guarantees.
 
 The earlier deferred note in local commit `f37c50a` proposed initiator-based report
-exclusions. The decisions above supersede those exclusions; the note was not
-integrated into `main`. No runtime capability is introduced by this documentation.
+exclusions. The initial implementation chose broad parent delivery. The later
+decision for ordinary messages is in the
+[planned routing](#planned-routing-for-peer-turn-results) section.
 
 ### Passive reply and child continuations (5b first slice)
 

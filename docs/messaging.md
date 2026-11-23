@@ -130,6 +130,10 @@ An agent with no independent work ends its turn; later messages resume it. Turn 
 does not declare task completion. Child reports still describe completed turns, which may
 say that the child is awaiting replies. An acknowledgement need not be acknowledged again.
 
+The [planned routing for peer turn results](delegation-and-task-lifecycle.md#planned-routing-for-peer-turn-results)
+describes how a future version will route the final answer to the sender and use an exact
+`reply_message` to suppress the automatic answer.
+
 ## Outside agents
 
 Outside discovery retains `list_sessions` and `read_session` and exposes `send_message`,
