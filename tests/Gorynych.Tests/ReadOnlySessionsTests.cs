@@ -141,6 +141,149 @@ public sealed class ReadOnlySessionsTests
     }
 
     [TestMethod]
+    public async Task OldReattachCompletionCannotClearNewRouteCheck()
+    {
+        var feed = new SessionFeed("s", new SessionJournal(Path.Combine(TestDirs.New(), "journal"), 100));
+        var oldWire = new DuplexLink(); var newWire = new DuplexLink();
+        await using var oldRoute = new JsonRpcConnection(oldWire.ClientEnd.Input, oldWire.ClientEnd.Output, "old-route");
+        await using var newRoute = new JsonRpcConnection(newWire.ClientEnd.Input, newWire.ClientEnd.Output, "new-route");
+        feed.RequireReattachedOpen(oldRoute);
+        using var staleReady = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        var stale = Task.Run(() =>
+        {
+            staleReady.Set(); if (!release.Wait(Wait)) throw new TimeoutException("stale completion barrier");
+            return feed.ApplyNativeOpen(oldRoute, false, () => throw new AssertFailedException("stale result was applied"));
+        });
+        Assert.IsTrue(await Task.Run(() => staleReady.Wait(Wait)));
+        feed.RequireReattachedOpen(newRoute);
+        release.Set(); Assert.IsFalse(await stale.WaitAsync(Wait), "old native open is rejected");
+        feed.ClearReattachedOpenRoute(oldRoute);
+        Assert.AreSame(newRoute, feed.ReattachedOpenRoute, "old completion cannot clear a replacement route");
+        Assert.IsTrue(feed.NeedsRetakeFor(newRoute), "pre-handoff decision keeps new route fenced");
+        Assert.IsFalse(feed.TrySetReadOnlyFromOpen(oldRoute, null, out _), "stale UI state is rejected");
+        feed.ClearReattachedOpenRoute(newRoute);
+        Assert.IsNull(feed.ReattachedOpenRoute);
+    }
+
+    [TestMethod]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task ReattachedRunningCodexTurnSurvivesExplicitResume()
+    {
+        var data = TestDirs.New(); var fake = new FakeAppServer();
+        var adapter = new CodexAdapter(new CodexAdapterOptions { Launch = fake.StartAsync, ClientVersion = "test",
+            FindHolders = _ => new Dictionary<string, string>(), LocksDirectory = TestDirs.New() });
+        var hosts = new InProcessHosts(_ => adapter);
+        var first = hosts.Conductor(data, adapter); hosts.Service = first;
+        await using var client = await TestClient.ConnectAsync(first, agent: "codex");
+        var id = await HostTests.NewSession(client);
+        var originalTurn = PromptAsync(client, "wait", id);
+        _ = originalTurn.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+        await Until(() => fake.All("turn/start").Length == 1, "native turn started");
+        var beforeResumes = fake.All("thread/resume").Length;
+        await HostTests.RestartAsync(first); await HostTests.GoneAsync(first, null, hosts);
+        await using var reopened = hosts.Conductor(data, adapter); hosts.Service = reopened;
+        await Until(() => reopened.Agents["codex"].RouteOf(id) is not null && reopened.Feed(id).Adopted is not null, "running turn adopted");
+        await using var resumed = await TestClient.ConnectAsync(reopened, agent: "codex");
+        await resumed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume(id)).WaitAsync(Wait);
+        Assert.IsNotNull(reopened.Feed(id).Adopted, "resume leaves the original turn running");
+        Assert.AreEqual(beforeResumes, fake.All("thread/resume").Length, "no native retake while a turn runs");
+        Assert.AreEqual(1, fake.All("turn/start").Length, "no replayed input");
+        Assert.AreEqual(0, fake.All("turn/interrupt").Length, "resume did not cancel the native turn");
+        Assert.IsNotNull(reopened.Feed(id).ReattachedOpenRoute, "idle handoff remains fenced");
+        await resumed.Rpc.SendNotificationAsync(AcpMethods.Agent.SessionCancel, new JsonObject { ["sessionId"] = id });
+        await Until(() => reopened.Feed(id).Adopted is null && !reopened.Feed(id).TurnRunning, "fixture turn ended by normal cancel");
+        Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(resumed, "hello", id).WaitAsync(Wait)).StopReason);
+        Assert.AreEqual(2, fake.All("turn/start").Length, "only the deliberate next input starts");
+        Assert.IsNull(reopened.Feed(id).ReattachedOpenRoute, "idle handoff checked its exact route");
+    }
+
+    [TestMethod]
+    [DataRow("prompt")]
+    [DataRow("direct")]
+    [DataRow("mailbox")]
+    [DataRow("held")]
+    [DataRow("already-full")]
+    [DataRow("usage")]
+    [Timeout(60000, CooperativeCancellation = true)]
+    public async Task HostedReadOnlyOpenIsRetakenAfterConductorReattach(string scenario)
+    {
+        var data = TestDirs.New(); var locks = TestDirs.New(); var fake = new FakeAppServer();
+        fake.Existing(Thread, Cwd, name: "Open in Codex Desktop", openElsewhere: scenario != "already-full");
+        var held = scenario == "already-full" ? 0 : 1;
+        if (held == 1) File.WriteAllText(Path.Combine(locks, Thread + ".lock"), "");
+        var adapter = new CodexAdapter(new CodexAdapterOptions { Launch = fake.StartAsync, ClientVersion = "test",
+            TurnEndWait = TimeSpan.FromMilliseconds(200), LocksDirectory = locks, LockSettle = TimeSpan.FromMilliseconds(50),
+            LockRecheck = TimeSpan.FromMilliseconds(200),
+            FindHolders = ids => Volatile.Read(ref held) == 1 ? ids.ToDictionary(id => id, _ => "Codex Desktop") : new Dictionary<string, string>() });
+        var hosts = new InProcessHosts(_ => adapter);
+        Conductor NewService() => new(new ConductorOptions { DataDirectory = data, ServiceId = "retake-host",
+            Hosts = hosts, HostToken = InProcessHosts.Token, PeerServerCommand = ["svc.exe", "peers", "--pipe", "p"] }, [adapter]);
+        var first = NewService(); hosts.Service = first;
+        await using (var client = await TestClient.ConnectAsync(first, agent: "codex"))
+        {
+            var meta = await MetaOfAsync(client, AcpMethods.Agent.SessionResume);
+            Assert.AreEqual(scenario == "already-full" ? GorynychProtocol.InteractivityFull : GorynychProtocol.InteractivityReadOnly, Interactivity(meta));
+            Assert.AreEqual(scenario != "already-full", first.Feed(Thread).OpenedReadOnly);
+            if (scenario is not ("held" or "already-full"))
+            {
+                fake.Threads[Thread].OpenElsewhere = false; Interlocked.Exchange(ref held, 0);
+                File.Delete(Path.Combine(locks, Thread + ".lock"));
+                await Until(() => first.Feed(Thread).ReadOnly is null && first.Feed(Thread).OpenedReadOnly, "holder released but native open remains read-only");
+            }
+            Assert.AreEqual(scenario == "already-full" ? 1 : 0, fake.All("thread/resume").Length);
+        }
+        var initialResumes = fake.All("thread/resume").Length;
+        var initialUsageReads = fake.All("account/rateLimits/read").Length;
+        var original = hosts["codex"]; await HostTests.RestartAsync(first);
+        await HostTests.GoneAsync(first, null, hosts);
+        await using var reopened = NewService(); hosts.Service = reopened;
+        await Until(() => reopened.Agents["codex"].RouteOf(Thread) is not null, "original host reattached");
+        Assert.AreSame(original.Host, hosts["codex"].Host);
+        await using var resumed = await TestClient.ConnectAsync(reopened, agent: "codex");
+        Assert.IsTrue(reopened.Feed(Thread).OpenedReadOnly, "reattached native open must be checked before a handoff");
+        if (scenario is not ("mailbox" or "direct"))
+        {
+            var resumedMeta = (await resumed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionResume, Resume()).WaitAsync(Wait))?["_meta"];
+            Assert.AreEqual(scenario == "held", reopened.Feed(Thread).OpenedReadOnly, "resume checks the exact native open");
+            Assert.AreEqual(scenario == "held" ? GorynychProtocol.InteractivityReadOnly : GorynychProtocol.InteractivityFull,
+                Interactivity(resumedMeta), "the UI reflects the current holder separately from native authority");
+        }
+        if (scenario == "held")
+        {
+            await Assert.ThrowsExactlyAsync<JsonRpcException>(() => PromptAsync(resumed, "held").WaitAsync(Wait));
+            Assert.AreEqual(0, fake.All("turn/start").Length, "external holder was not bypassed");
+            fake.Threads[Thread].OpenElsewhere = false; Interlocked.Exchange(ref held, 0);
+            File.Delete(Path.Combine(locks, Thread + ".lock"));
+            await Until(() => reopened.Feed(Thread).ReadOnly is null, "holder released after reattach");
+        }
+        if (scenario == "mailbox")
+        {
+            var sender = (string)(await resumed.Rpc.SendRequestAsync(AcpMethods.Agent.SessionNew,
+                new JsonObject { ["cwd"] = Cwd, ["mcpServers"] = new JsonArray() }).WaitAsync(Wait))!["sessionId"]!;
+            var token = reopened.Store.Get(sender)!.PeerToken!; const string id = "reattach-mailbox";
+            await resumed.Rpc.SendRequestAsync(GorynychProtocol.MethodSendMessage, new JsonObject { ["sessionId"] = Thread,
+                ["text"] = "mailbox after reattach", ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = token,
+                    [GorynychProtocol.MetaMessageRequestId] = id } }).WaitAsync(Wait);
+            try { await Until(() => (bool?)reopened.ReplyMailbox.Find(id)?["delivered"] == true, "mailbox handoff completed"); }
+            catch (AssertFailedException e) { throw new AssertFailedException(e.Message + " row=" + reopened.ReplyMailbox.Find(id)?.ToJsonString() +
+                " starts=" + fake.All("turn/start").Length + " resumes=" + fake.All("thread/resume").Length + " host=" + hosts.Log()); }
+            Assert.IsNull(reopened.ReplyMailbox.Find(id)?["error"]);
+        }
+        else Assert.AreEqual(StopReason.EndTurn, (await PromptAsync(resumed, scenario == "usage" ? "/usage" : "hello").WaitAsync(Wait)).StopReason);
+        Assert.AreEqual(initialResumes + (scenario == "already-full" ? 0 : 1), fake.All("thread/resume").Length,
+            "the adapter retakes a read-only thread and keeps an already-owned thread");
+        Assert.AreEqual(scenario == "usage" ? 0 : 1, fake.All("turn/start").Length, "one native turn or local usage only");
+        if (scenario == "usage") Assert.AreEqual(initialUsageReads + 1, fake.All("account/rateLimits/read").Length);
+        else
+        {
+            Assert.AreEqual("workspaceWrite", (string?)fake.Threads[Thread].Settings["sandbox"]?["type"], "native mode remains unchanged");
+            Assert.IsNull(fake.Last("turn/start")["sandboxPolicy"], "retake did not override native mode");
+        }
+        Assert.AreEqual("svc.exe", (string?)fake.Last("thread/resume")["config"]?["mcp_servers"]?["gorynych"]?["command"], "managed MCP survives retake");
+        Assert.AreEqual(1, HostTests.JournalText(reopened, Thread).Split("Fixed it.").Length - 1, "original native history remains once");
+    }
+
+    [TestMethod]
     [Timeout(60_000, CooperativeCancellation = true)]
     public async Task AHeldThreadTheJournalNeverSaw_OpensReadOnly_WithItsHistoryReadWithoutTakingIt()
     {

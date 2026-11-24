@@ -504,6 +504,14 @@ sealed class FakeAppServer
             var body = text.IndexOf('\n');
             if (body >= 0 && body < guidance) text = text[(body + 1)..guidance];
         }
+        // The service adds a message provenance footer containing words such as
+        // "waiting". Fake script commands come from the message body, not that footer.
+        if (text.StartsWith("[Message · ", StringComparison.Ordinal) &&
+            text.IndexOf("\n\nThis message is not from the user", StringComparison.Ordinal) is var footer && footer >= 0)
+        {
+            var body = text.IndexOf('\n');
+            if (body >= 0 && body < footer) text = text[(body + 1)..footer];
+        }
         var status = "completed";
         JsonObject? error = null;
         await Notify("turn/started", new JsonObject { ["threadId"] = t.Id, ["turn"] = new JsonObject { ["id"] = turnId, ["items"] = new JsonArray(), ["status"] = "inProgress" } });
