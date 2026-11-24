@@ -1460,6 +1460,17 @@ takes the session, sends its own catch-up first, then the options and the flag, 
 text is journaled after all of it. While the session is read-only, the other app's turns do not
 reach it: they come with this catch-up, or with the next open.
 
+**Hosted Codex after reattachment.** A holder becoming free does not prove that the surviving
+adapter has retaken the native thread. For a Codex session restored from a host, the service
+conservatively requires the ordinary resume/retake before the first prompt, peer message or setting
+change. An explicit client resume performs that check before reporting current interactivity when
+the session is idle; it leaves an adopted or independently running turn alone and defers the check
+until a later idle handoff. This conservative fallback also applies to older hosts without a native
+authority snapshot and requires no new wire capability. The current holder/UI state remains separate;
+an external holder still causes the normal read-only refusal. The retake happens before handoff and
+does not retry a native prompt. The pending check belongs to the exact accepted host connection; a
+late open from a replaced connection cannot clear it or apply its interactivity to the new route.
+
 **The list's order** follows the agent's own time (`updatedAt` of its `session/list`) wherever the
 agent gives one, as its title wins over the service's ("Native state wins", [Overlay](#overlay)): a
 catch-up of the journal, a mark that changes, or a turn that streams does not move a row; the

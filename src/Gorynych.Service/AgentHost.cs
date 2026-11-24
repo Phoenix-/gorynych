@@ -548,6 +548,10 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
         // alone) never ended anywhere: they end here, cancelled.
         await conductor.SettleAsync(this, link, reattached ? report : null);
         if (conductor.TakingHost is { } taking) await taking(hello.HostId);
+        // A reattached Codex host can still have opened a thread for reading even
+        // after its watcher reported the holder gone. A legacy host cannot prove
+        // which native opens took the writer, so require a pre-handoff retake.
+        var retake = reattached && Name == "codex" ? conductor.PrepareReattachedCodexRetake(sessions) : null;
         TaskCompletionSource<HostLink>? arrival = null;
         bool late;
         lock (linksGate)
@@ -559,7 +563,12 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
             {
                 links.Add(link);
                 foreach (var s in sessions)
-                    if (route.TryAdd(s, link)) link.Sessions.Add(s);
+                    if (route.TryAdd(s, link))
+                    {
+                        link.Sessions.Add(s);
+                        if (retake is not null && retake.TryGetValue(s, out var feed))
+                        feed.RequireReattachedOpen(link.Rpc);
+                    }
                     else ServiceLog.Warn($"{Name}: host {hello.HostId} has {s} open, which host {route[s].HostId} has too; it goes on there");
                 // Started for an open: it is not stopped as empty before the session is opened in it.
                 if (link.ForSession && claimed.Remove(link.Slot)) link.Opening++;
@@ -677,7 +686,32 @@ public sealed class AgentHost(IAgentAdapter adapter, Conductor conductor) : IAsy
     /// <summary>The session is open in a host of an earlier generation: it moves once it is idle.</summary>
     internal bool IsStale(string sessionId) => RouteOf(sessionId) is { Current: false };
 
+    // Serialize the open response with route replacement and link removal.
+    internal bool ApplyOpenState(string sessionId, JsonRpcConnection rpc, Func<bool> apply)
+    {
+        lock (linksGate)
+        {
+            if (links.FirstOrDefault(l => l.Rpc == rpc) is not { } link || rpc.IsClosed ||
+                route.TryGetValue(sessionId, out var current) && current != link) return false;
+            return apply();
+        }
+    }
+
     /// <summary>The session is open now in the instance of <paramref name="rpc"/>.</summary>
+    // An old open response must not replace a route published while it waited.
+    internal bool MarkLiveFromOpen(string sessionId, JsonRpcConnection rpc)
+    {
+        lock (linksGate)
+        {
+            if (links.FirstOrDefault(l => l.Rpc == rpc) is not { } link || rpc.IsClosed ||
+                route.TryGetValue(sessionId, out var current) && current != link) return false;
+            route[sessionId] = link;
+            link.Sessions.Add(sessionId);
+            pinned.Remove(sessionId);
+            return true;
+        }
+    }
+
     public void MarkLive(string sessionId, JsonRpcConnection rpc)
     {
         lock (linksGate)

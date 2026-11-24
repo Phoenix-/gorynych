@@ -438,6 +438,12 @@ public sealed partial class Conductor : IAsyncDisposable
     /// A host that came back is taken: its sessions are routed to it now, so their records no longer
     /// name it (SettleAsync kept it named until now). The exit names again where each one is open.
     /// </summary>
+    // Build feeds outside the host route lock. Only a route successfully published for
+    // this reattaching host may apply the conservative native-open authority below.
+    internal Dictionary<string, SessionFeed> PrepareReattachedCodexRetake(IEnumerable<string> sessions) =>
+        sessions.Where(id => !removed.ContainsKey(id) && store.Get(id) is { Deleted: false, Agent: "codex" })
+            .Distinct(StringComparer.Ordinal).ToDictionary(id => id, Feed, StringComparer.Ordinal);
+
     internal void HostTaken(AgentHost host, HostLink link)
     {
         if (link.HostId is not { } hostId) return;
@@ -714,9 +720,9 @@ public sealed partial class Conductor : IAsyncDisposable
     {
         var host = HostOf(record);
         var feed = Feed(record.SessionId);
-        if (host.RouteOf(record.SessionId) is { Current: true } on && on.Rpc == rpc && !feed.OpenedReadOnly) return rpc;
+        if (host.RouteOf(record.SessionId) is { Current: true } on && on.Rpc == rpc && !feed.NeedsRetakeFor(rpc)) return rpc;
         var live = (await EnsureLiveAsync(record, ct, holdingTurn: true)).Rpc;
-        return feed.OpenedReadOnly ? await RetakeAsync(host, record, live, forAgent ? ReadOnlyUse.Message : ReadOnlyUse.Prompt, ct) : live;
+        return feed.NeedsRetakeFor(live) ? await RetakeAsync(host, record, live, forAgent ? ReadOnlyUse.Message : ReadOnlyUse.Prompt, ct) : live;
     }
 
     /// <summary>What a read-only session was refused for, which its refusal's words follow.</summary>
@@ -744,9 +750,10 @@ public sealed partial class Conductor : IAsyncDisposable
         await feed.OpenGate.WaitAsync(ct);
         try
         {
-            if (feed.OpenedReadOnly && host.RouteOf(record.SessionId) is { } on)
+            if (host.RouteOf(record.SessionId) is { } on && feed.NeedsRetakeFor(on.Rpc))
             {
                 await OpenAsync(host, on.Rpc, store.Get(record.SessionId) ?? record, ct);
+                feed.ClearReattachedOpenRoute(on.Rpc);
                 rpc = on.Rpc;
             }
         }
@@ -798,9 +805,10 @@ public sealed partial class Conductor : IAsyncDisposable
     /// clients are told: a <c>session_info_update</c> with the value in full, and a notice to those
     /// that show notices; neither is journaled, since it is the session's state, not its history.
     /// </summary>
-    async Task SetInteractivityAsync(SessionFeed feed, SessionFeed.ReadOnlyState? state)
+    async Task SetInteractivityAsync(SessionFeed feed, SessionFeed.ReadOnlyState? state, JsonRpcConnection? openSource = null)
     {
-        if (!feed.SetReadOnly(state)) return;
+        if (openSource is null) { if (!feed.SetReadOnly(state)) return; }
+        else if (!feed.TrySetReadOnlyFromOpen(openSource, state, out var changed) || !changed) return;
         ServiceLog.Info($"{feed.SessionId}: {(state is null ? "can be written to again" : $"read-only: {state.Reason}")}");
         var update = new JsonObject { ["sessionUpdate"] = "session_info_update", ["_meta"] = PutInteractivity(new JsonObject(), state) };
         await feed.PublishAsync(update, except: null, () => { }, journal: false);
@@ -1635,7 +1643,7 @@ public sealed partial class Conductor : IAsyncDisposable
     // observation itself is never authority to select or reopen a session/host.
     internal void InvalidateBackgroundEvidence(string sessionId, JsonRpcConnection source)
     {
-        if (feeds.TryGetValue(sessionId, out var feed)) { feed.InvalidateBackgroundEvidence(source); feed.InvalidateAssignmentEvidence(source); }
+        if (feeds.TryGetValue(sessionId, out var feed)) { feed.InvalidateBackgroundEvidence(source); feed.InvalidateAssignmentEvidence(source); feed.ClearReattachedOpenRoute(source); }
     }
 
     internal BackgroundEvidence? CurrentBackgroundEvidence(string sessionId)
@@ -2692,12 +2700,16 @@ public sealed partial class Conductor : IAsyncDisposable
         {
             throw new JsonRpcException(JsonRpcException.ResourceNotFound, $"{host.Name} cannot reopen session {record.SessionId}");
         }
-        feed.CaptureState(opened);
-        // An agent that can show the session but not take it now says so (gorynych/interactivity): read-only until it can.
+        // A replacement reattach and an older open completion serialize here. An old
+        // response cannot overwrite the new route's native-open authority or state.
         var readOnly = ReadOnlyOf((opened as JsonObject)?["_meta"]);
-        var taken = feed.OpenedReadOnly && readOnly is null;
-        feed.OpenedReadOnly = readOnly is not null;
-        feed.ReportedReadOnly = readOnly;
+        var taken = false;
+        if (!host.ApplyOpenState(record.SessionId, rpc, () => feed.ApplyNativeOpen(rpc, readOnly is not null, () =>
+        {
+            taken = feed.NeedsRetakeFor(rpc) && readOnly is null;
+            feed.CaptureState(opened);
+            feed.ReportedReadOnly = readOnly;
+        }))) throw new IOException("The session's host route changed while it was opening.");
         try
         {
             if (replayed is { } how && collect) await CatchUpAsync(host, feed, history.Updates, history.Dropped, how, newMark);
@@ -2705,7 +2717,8 @@ public sealed partial class Conductor : IAsyncDisposable
         }
         finally
         {
-            host.MarkLive(record.SessionId, rpc);
+            if (!host.MarkLiveFromOpen(record.SessionId, rpc))
+                throw new IOException("The session's host route changed while it was opening.");
         }
         // What the other app made meanwhile is in the journal and with the clients first; then, taken
         // after it was open for reading only, the options its agent could not say then (Codex reports
@@ -2713,7 +2726,7 @@ public sealed partial class Conductor : IAsyncDisposable
         if (taken && (opened as JsonObject)?["configOptions"] is JsonArray { Count: > 0 } options)
             await feed.PublishAsync(new JsonObject { ["sessionUpdate"] = "config_option_update", ["configOptions"] = options.DeepClone() },
                 except: null, () => { }, journal: false);
-        await SetInteractivityAsync(feed, readOnly);
+        await SetInteractivityAsync(feed, readOnly, rpc);
         return opened as JsonObject;
     }
 
@@ -2868,6 +2881,28 @@ public sealed partial class Conductor : IAsyncDisposable
         var host = HostOf(use.Record);
         if (IsStopping(host.Name)) throw Unavailable(host.Name);
         var (rpc, opened) = await EnsureLiveAsync(use.Record, ct);
+        // On reattach the watcher state and the native open authority are independent.
+        // An explicit resume refreshes both before reporting interactivity to this client.
+        if (ReferenceEquals(use.Feed.ReattachedOpenRoute, rpc) && use.Feed.TurnGate.Wait(0))
+        {
+            try
+            {
+                if (!use.Feed.AgentTurnRunning)
+                {
+                    await use.Feed.OpenGate.WaitAsync(ct);
+                    try
+                    {
+                        if (ReferenceEquals(use.Feed.ReattachedOpenRoute, rpc) && host.RouteOf(request.SessionId) is { } current && current.Rpc == rpc)
+                        {
+                            opened = await OpenAsync(host, rpc, store.Get(request.SessionId) ?? use.Record, ct);
+                            use.Feed.ClearReattachedOpenRoute(rpc);
+                        }
+                    }
+                    finally { use.Feed.OpenGate.Release(); }
+                }
+            }
+            finally { use.Feed.TurnGate.Release(); }
+        }
         var position = await use.Feed.ResumeAndAttachAsync(client, after, codex: host.Name == "codex");
         if (client.TakesSubagents && host.Name is "codex" or "claude")
             afterAnswer(() => RefreshSubagentStatesAsync(host, rpc, client, request.SessionId));
@@ -3541,7 +3576,7 @@ public sealed partial class Conductor : IAsyncDisposable
             if (pilot.Fenced) ConfirmCompletionMembershipMutation(pilot.Saved, pilot.Verdict);
             // A change of a session its agent opened for reading only: opened again first, which takes it
             // if it is free now, and refused in the same words as a prompt while it is still read-only.
-            if (use.Feed.OpenedReadOnly && request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode or "session/set_model")
+            if (use.Feed.NeedsRetakeFor(rpc) && request.Method is AcpMethods.Agent.SessionSetConfigOption or AcpMethods.Agent.SessionSetMode or "session/set_model")
                 rpc = await RetakeAsync(HostOf(use.Record), use.Record, rpc, ReadOnlyUse.Setting, ct);
             JsonNode? response;
             if (modeChange)

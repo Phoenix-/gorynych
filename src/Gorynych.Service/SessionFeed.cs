@@ -628,17 +628,58 @@ internal sealed class SessionFeed(string sessionId, SessionJournal journal)
         set => Volatile.Write(ref reportedReadOnly, value);
     }
 
+    readonly Lock nativeOpenGate = new();
+    JsonRpcConnection? reattachedOpenRoute;
+
+    /// <summary>The exact host connection whose native open has not been rechecked.</summary>
+    public JsonRpcConnection? ReattachedOpenRoute
+    {
+        get => Volatile.Read(ref reattachedOpenRoute);
+    }
+
+    public void RequireReattachedOpen(JsonRpcConnection source)
+    {
+        lock (nativeOpenGate) { Volatile.Write(ref openedReadOnly, 1); Volatile.Write(ref reattachedOpenRoute, source); }
+    }
+
+    public bool NeedsRetakeFor(JsonRpcConnection source) => OpenedReadOnly || ReferenceEquals(ReattachedOpenRoute, source);
+
+    public bool ApplyNativeOpen(JsonRpcConnection source, bool readOnly, Action apply)
+    {
+        lock (nativeOpenGate)
+        {
+            if (reattachedOpenRoute is { } route && !ReferenceEquals(route, source)) return false;
+            apply();
+            Volatile.Write(ref openedReadOnly, readOnly ? 1 : 0);
+            return true;
+        }
+    }
+
+    public bool TrySetReadOnlyFromOpen(JsonRpcConnection source, ReadOnlyState? state, out bool changed)
+    {
+        lock (nativeOpenGate)
+        {
+            if (reattachedOpenRoute is { } route && !ReferenceEquals(route, source)) { changed = false; return false; }
+            changed = SetReadOnly(state);
+            return true;
+        }
+    }
+
+    public void ClearReattachedOpenRoute(JsonRpcConnection source)
+    {
+        lock (nativeOpenGate) if (ReferenceEquals(reattachedOpenRoute, source)) Volatile.Write(ref reattachedOpenRoute, null);
+    }
+
     int openedReadOnly;
 
     /// <summary>
-    /// Its agent opened it for reading only, and has not opened it in full since: also once it is
-    /// writable again, the agent has not taken it yet (Codex takes the thread at its next resume),
+    /// Its agent opened it for reading only, or a reattached Codex host has not proved its native
+    /// open was writable. Even once it is writable again, the agent has not taken it yet (Codex takes the thread at its next resume),
     /// so a turn opens it again first, which also catches its journal up with what was made meanwhile.
     /// </summary>
     public bool OpenedReadOnly
     {
         get => Volatile.Read(ref openedReadOnly) != 0;
-        set => Volatile.Write(ref openedReadOnly, value ? 1 : 0);
     }
 
     int asking;
