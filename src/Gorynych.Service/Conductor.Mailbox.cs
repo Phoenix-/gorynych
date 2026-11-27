@@ -530,6 +530,8 @@ public sealed partial class Conductor
         {
             "outcome" => $"Session {source} recorded outcome {item["status"]}." +
                 (InFullAccess(recipient) ? " Read the summary with read_assignment." : $"\nSummary from assignee: {item["text"]}"),
+            "blocked" => $"Session {source} reported a blocked assignment." +
+                (InFullAccess(recipient) ? " Read the reason with read_assignment." : $"\nReason from assignee: {item["text"]}"),
             "reminder_ended" => $"The completion reminder turn for {source} ended. The assignment is still open with no recorded continuation.",
             "reminder_unavailable" => $"The completion reminder for {source} could not be confirmed. The assignment is still open with no recorded continuation.",
             "report_only" => $"A turn report from {source} was retained, but a successful initial turn and continued supervision were not confirmed. The assignment remains open with no recorded continuation.",
