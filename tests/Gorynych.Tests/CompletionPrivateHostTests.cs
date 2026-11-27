@@ -707,15 +707,38 @@ public sealed partial class ClaudeHeadlessTests
                     await Assert.ThrowsExactlyAsync<JsonRpcException>(() => route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedAck,
                         new JsonObject { ["_meta"] = ackFields.DeepClone() }));
                     Assert.IsNull(ledger.ReadAttempt(attempt)?["ackRevision"]);
+                    File.WriteAllText(Path.Combine(dir, "hold-status-handler"), "");
                     var retainedStatus = await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedStatus,
                         new JsonObject { ["_meta"] = identity.DeepClone() });
                     Assert.AreEqual(true, (bool?)retainedStatus?["_meta"]?["receipt"]?["committed"]);
                     Assert.AreEqual(false, (bool?)retainedStatus?["_meta"]?["receipt"]?["noInput"]);
+                    await LinkHarness.Until(() => File.Exists(Path.Combine(dir, "status-handler-entered")), "status handler held after forward").WaitAsync(TimeSpan.FromSeconds(15));
                 }
                 // Also discard a successful response and verify durable retry.
-                await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedAck, new JsonObject { ["_meta"] = ackFields.DeepClone() });
+                if (n == 0)
+                {
+                    File.WriteAllText(Path.Combine(dir, "hold-ack-before-handler"), "");
+                    var nextAck = route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedAck, new JsonObject { ["_meta"] = ackFields.DeepClone() });
+                    await LinkHarness.Until(() => File.Exists(Path.Combine(dir, "ack-before-handler-entered")), "new ack lease held").WaitAsync(TimeSpan.FromSeconds(15));
+                    File.WriteAllText(Path.Combine(dir, "release-status-handler"), "");
+                    await LinkHarness.Until(() => File.Exists(Path.Combine(dir, "status-handler-finished")), "old status handler finished").WaitAsync(TimeSpan.FromSeconds(15));
+                    var busy = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => route.Rpc.SendRequestAsync(
+                        GorynychProtocol.MethodHostCompletionGuardedStatus, new JsonObject { ["_meta"] = identity.DeepClone() }));
+                    Assert.AreEqual("Guarded bridge busy", busy.Message, "the old handler cannot release the new lease");
+                    File.WriteAllText(Path.Combine(dir, "release-ack-before-handler"), "");
+                    await nextAck;
+                }
+                else await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedAck, new JsonObject { ["_meta"] = ackFields.DeepClone() });
+                if (n == 0) File.WriteAllText(Path.Combine(dir, "hold-ack-handler"), "");
                 var ack = await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedAck, new JsonObject { ["_meta"] = ackFields.DeepClone() });
                 Assert.AreEqual((long?)ackFields["receiptRevision"], (long?)ack?["_meta"]?["ackRevision"], $"iteration {n}");
+                if (n == 0)
+                {
+                    await LinkHarness.Until(() => File.Exists(Path.Combine(dir, "ack-handler-entered")), "direct ack handler held").WaitAsync(TimeSpan.FromSeconds(15));
+                    var retry = await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedAck, new JsonObject { ["_meta"] = ackFields.DeepClone() });
+                    Assert.AreEqual((long?)ackFields["receiptRevision"], (long?)retry?["_meta"]?["ackRevision"]);
+                    File.WriteAllText(Path.Combine(dir, "release-ack-handler"), "");
+                }
                 Assert.IsFalse(ledger.CompactWithDurableConsumer(record.Stream!, record.Number, attempt, identity, _ => true));
                 if (n == 0)
                 {
@@ -741,7 +764,7 @@ public sealed partial class ClaudeHeadlessTests
             Assert.AreEqual(1, InputCount(child, Guid.ParseExact(firstAttempt!, "N").ToString("D")));
             Assert.AreEqual(132, File.ReadAllLines(Path.Combine(FakeRoot, child + ".inputs.jsonl")).Length);
         }
-        finally { await launcher.CloseNativeGracefully(); }
+        finally { File.WriteAllText(Path.Combine(dir, "release-status-handler"), ""); File.WriteAllText(Path.Combine(dir, "release-ack-before-handler"), ""); File.WriteAllText(Path.Combine(dir, "release-ack-handler"), ""); await launcher.CloseNativeGracefully(); }
     }
 
     [TestMethod]
@@ -906,6 +929,9 @@ public sealed partial class ClaudeHeadlessTests
                 try
                 {
                     await LinkHarness.Until(() => File.Exists(enteredPath), "adapter submit held before writer").WaitAsync(TimeSpan.FromSeconds(15));
+                    var busy = await Assert.ThrowsExactlyAsync<JsonRpcException>(() => route.Rpc.SendRequestAsync(
+                        GorynychProtocol.MethodHostCompletionGuardedStatus, new JsonObject { ["_meta"] = identity.DeepClone() }));
+                    Assert.AreEqual("Guarded bridge busy", busy.Message, "a genuinely forwarded submit retains its lane");
                     var abort = await route.Rpc.SendRequestAsync(GorynychProtocol.MethodHostCompletionGuardedAbort,
                         new JsonObject { ["_meta"] = identity.DeepClone() });
                     Assert.AreEqual("confirmed_precommit", (string?)abort?["_meta"]?["abortVerdict"], abort?.ToJsonString());

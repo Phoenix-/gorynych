@@ -55,6 +55,9 @@ public sealed class AdapterHostOptions
     internal CompletionHostLedger? CompletionHostLedger { get; init; }
     internal Action? BeforeCompletionAckRecordForTests { get; init; }
     internal Action? BeforeCompletionRetireRecordForTests { get; init; }
+    internal Func<string, Task>? BeforeCompletionHandlerForTests { get; init; }
+    internal Func<string, Task>? AfterCompletionHandlerForTests { get; init; }
+    internal Action<string>? AfterCompletionHandlerFinallyForTests { get; init; }
     internal Action<ReportCapture>? CaptureOpened { get; init; }
     internal Action? BeforeProducerEvidence { get; init; }
     internal bool PeerTerminal { get; init; }
@@ -262,7 +265,9 @@ public sealed class AdapterHost
                 if (!released && forwarded.TryGetValue(key, out var pending)
                     && pending.Method == AcpMethods.Agent.SessionPrompt && pending.SessionId is { } pendingSession
                     && DeferTerminal(message, key, pendingSession)) return;
-                if (!forwarded.Remove(key, out request)) return;
+                if (!forwarded.TryGetValue(key, out request)) return;
+                // Keep a guarded request reserved through durable receipt processing.
+                if (request.GuardedAttempt is null) forwarded.Remove(key);
                 Track(request, message);
                 if (request.Method == AcpMethods.Agent.SessionPrompt && request.SessionId is { } sessionId)
                 {
@@ -367,6 +372,7 @@ public sealed class AdapterHost
         }
         if (request.GuardedAttempt is not null)
         {
+            lock (state) forwarded.Remove(key);
             await sendGate.WaitAsync();
             try
             {
@@ -1023,14 +1029,22 @@ public sealed class AdapterHost
                 {
                     // Abort and retire must remain available while a submit waits at its writer.
                     var abort = method is GorynychProtocol.MethodHostCompletionGuardedAbort or GorynychProtocol.MethodHostCompletionGuardedRetire;
-                    bool alreadyForwarded;
-                    lock (state) alreadyForwarded = forwarded.Values.Any(f => f.Connection == connection && f.GuardedAttempt is not null &&
-                        (f.GuardedIsAbort || f.GuardedRetireRevision is not null) == abort);
-                    ref var slot = ref (abort ? ref connection.GuardedAbortInFlight : ref connection.CompletionGuardedInFlight);
-                    if (alreadyForwarded || Interlocked.CompareExchange(ref slot, 1, 0) != 0)
+                    GuardedLease? lease = null;
+                    lock (state)
+                    {
+                        var alreadyForwarded = forwarded.Values.Any(f => f.Connection == connection && f.GuardedAttempt is not null &&
+                            (f.GuardedIsAbort || f.GuardedRetireRevision is not null) == abort);
+                        var occupied = abort ? connection.GuardedAbortLease : connection.CompletionGuardedLease;
+                        if (!alreadyForwarded && occupied is null)
+                        {
+                            lease = new GuardedLease(this, connection, abort);
+                            if (abort) connection.GuardedAbortLease = lease; else connection.CompletionGuardedLease = lease;
+                        }
+                    }
+                    if (lease is null)
                         await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
                             ["error"] = new JsonObject { ["code"] = JsonRpcException.InvalidRequest, ["message"] = "Guarded bridge busy" } });
-                    else _ = HandleCompletionGuardedRequestAsync(connection, id.DeepClone(), method, message, abort);
+                    else _ = HandleCompletionGuardedRequestAsync(connection, id.DeepClone(), method, message, lease);
                 }
                 else await ConductorAsksAsync(connection, id, method, message);
             }
@@ -1045,15 +1059,21 @@ public sealed class AdapterHost
 
     // A bounded detached operation keeps the private host reader responsive. Keeping the reader live lets it
     // observe disconnect and capability changes while a guarded write is waiting for a gate.
-    async Task HandleCompletionGuardedRequestAsync(Connection connection, JsonNode id, string method, JsonObject message, bool abort)
+    async Task HandleCompletionGuardedRequestAsync(Connection connection, JsonNode id, string method, JsonObject message, GuardedLease lease)
     {
-        try { await ConductorAsksAsync(connection, id, method, message); }
+        try
+        {
+            if (options.BeforeCompletionHandlerForTests is { } before) await before(method);
+            await ConductorAsksAsync(connection, id, method, message, lease);
+            if (options.AfterCompletionHandlerForTests is { } barrier) await barrier(method);
+        }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or OperationCanceledException)
         {
+            lease.Release();
             await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
                 ["error"] = new JsonObject { ["code"] = JsonRpcException.InternalError, ["message"] = "Guarded bridge unresolved" } });
         }
-        finally { if (abort) Interlocked.Exchange(ref connection.GuardedAbortInFlight, 0); else Interlocked.Exchange(ref connection.CompletionGuardedInFlight, 0); }
+        finally { lease.Release(); options.AfterCompletionHandlerFinallyForTests?.Invoke(method); }
     }
 
     async Task ConductorAnsweredAsync(Connection connection, JsonNode? id, JsonObject message)
@@ -1096,8 +1116,9 @@ public sealed class AdapterHost
         await WriteToAgentAsync(message);
     }
 
-    async Task ConductorAsksAsync(Connection connection, JsonNode id, string method, JsonObject message)
+    async Task ConductorAsksAsync(Connection connection, JsonNode id, string method, JsonObject message, GuardedLease? lease = null)
     {
+        Task<bool> RespondAsync(JsonObject response) { lease?.Release(); return TryWriteAsync(connection, response); }
         JsonObject? guardedIdentity = null;
         long? guardedAdmissionNumber = null, guardedEpoch = null, guardedWriteAdmission = null, guardedAckRevision = null, guardedRetireRevision = null;
         string? guardedAttempt = null;
@@ -1105,7 +1126,7 @@ public sealed class AdapterHost
         var guardedIsRetire = method == GorynychProtocol.MethodHostCompletionGuardedRetire;
         if (method is GorynychProtocol.MethodCompletionGuardedSubmit or GorynychProtocol.MethodCompletionGuardedStatus or GorynychProtocol.MethodCompletionGuardedAck or GorynychProtocol.MethodCompletionGuardedRetire or GorynychProtocol.MethodCompletionGuardedAbort)
         {
-            await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+            await RespondAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
                 ["error"] = new JsonObject { ["code"] = JsonRpcException.MethodNotFound, ["message"] = "Private adapter method" } });
             return;
         }
@@ -1178,7 +1199,7 @@ public sealed class AdapterHost
                             if (Text(guardedIdentity["hostId"]) != options.HostId || Text(guardedIdentity["hostGeneration"]) != options.Generation?.Key)
                             {
                                 row["abortState"] = "unresolved";
-                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
+                                await RespondAsync(Response(id, new JsonObject { ["_meta"] = row })); return;
                             }
                             // A matching name and generation do not identify a restarted OS
                             // producer. Only the original instance can fence its live adapter.
@@ -1188,18 +1209,18 @@ public sealed class AdapterHost
                                 producerStart != ProcessIncarnation.Read(Environment.ProcessId))
                             {
                                 row["abortState"] = "unresolved";
-                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
+                                await RespondAsync(Response(id, new JsonObject { ["_meta"] = row })); return;
                             }
                             if ((string?)row["abortVerdict"] is "confirmed_precommit" or "already_committed")
                             {
                                 row["attemptId"] = guardedAttempt;
-                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
+                                await RespondAsync(Response(id, new JsonObject { ["_meta"] = row })); return;
                             }
                             var verdict = store.AbortBeforeForward(guardedAttempt, guardedIdentity);
                             if (verdict != "needs_adapter")
                             {
                                 row = store.ReadAttempt(guardedAttempt)!; row["attemptId"] = guardedAttempt;
-                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
+                                await RespondAsync(Response(id, new JsonObject { ["_meta"] = row })); return;
                             }
                         }
                         if (method == GorynychProtocol.MethodHostCompletionGuardedAck)
@@ -1210,7 +1231,7 @@ public sealed class AdapterHost
                             row = store.PrepareAck(guardedAttempt, guardedIdentity, requestedRevision);
                             if ((long?)row["ackRevision"] == requestedRevision)
                             {
-                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row }));
+                                await RespondAsync(Response(id, new JsonObject { ["_meta"] = row }));
                                 return;
                             }
                         }
@@ -1223,7 +1244,7 @@ public sealed class AdapterHost
                             if ((long?)row["retiredRevision"] == requestedRevision)
                             {
                                 row["adapterState"] = "retired";
-                                await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row })); return;
+                                await RespondAsync(Response(id, new JsonObject { ["_meta"] = row })); return;
                             }
                         }
                         var originalStart = Text(guardedIdentity["producerStart"]);
@@ -1232,7 +1253,7 @@ public sealed class AdapterHost
                             !CompletionReminderBinding.CanonicalProducerStart(originalStart) || originalStart != ProcessIncarnation.Read(Environment.ProcessId))
                         {
                             row["adapterState"] = "unknown";
-                            await TryWriteAsync(connection, Response(id, new JsonObject { ["_meta"] = row }));
+                            await RespondAsync(Response(id, new JsonObject { ["_meta"] = row }));
                             return;
                         }
                         guardedIdentity = (JsonObject)guardedIdentity.DeepClone();
@@ -1247,7 +1268,7 @@ public sealed class AdapterHost
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or System.Text.Json.JsonException)
             {
-                await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                await RespondAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
                     ["error"] = new JsonObject { ["code"] = JsonRpcException.InvalidRequest, ["message"] = "Guarded bridge unresolved: " + e.Message } });
                 return;
             }
@@ -1558,6 +1579,8 @@ public sealed class AdapterHost
                 SteerOrigin = method == GorynychProtocol.MethodSteering ? Text(@params?["_meta"]?[GorynychProtocol.MetaSteerOrigin]) : null,
                 Prompt = method == GorynychProtocol.MethodSteering ? @params?["prompt"]?.DeepClone() as JsonArray : null,
                 };
+                // Transfer to forwarded while holding the same lock used by admission.
+                lease?.Release();
               }
               catch
               {
@@ -1582,7 +1605,7 @@ public sealed class AdapterHost
         }
         if (refusal is not null)
         {
-            await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+            await RespondAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
                 ["error"] = new JsonObject { ["code"] = JsonRpcException.InvalidRequest, ["message"] = "Host request refused: " + refusal.Message,
                     ["data"] = !provenUnstarted ? null : new JsonObject { [GorynychProtocol.MetaReportRefused] = new JsonObject
                     { ["reportId"] = reportId, ["sessionId"] = sessionId, ["promptId"] = Text(@params?["_meta"]?[GorynychProtocol.MetaPromptId]) } } } });
@@ -1592,7 +1615,7 @@ public sealed class AdapterHost
         if (guardedAttempt is not null)
         {
             if (!await WriteCompletionGuardedToAgentAsync(message, connection, key, guardedEpoch, guardedIsAbort))
-                await TryWriteAsync(connection, new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
+                await RespondAsync(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(),
                     ["error"] = new JsonObject { ["code"] = JsonRpcException.InvalidRequest, ["message"] = "Guarded admission unresolved" } });
         }
         else await WriteToAgentAsync(message);
@@ -2038,6 +2061,22 @@ public sealed class AdapterHost
         public long? ConductorId { get; set; }
     }
 
+    // A release belongs to one admission, never to a subsequent use of the lane.
+    sealed class GuardedLease(AdapterHost owner, Connection connection, bool abort)
+    {
+        public void Release()
+        {
+            lock (owner.state)
+            {
+                if (abort)
+                {
+                    if (ReferenceEquals(connection.GuardedAbortLease, this)) connection.GuardedAbortLease = null;
+                }
+                else if (ReferenceEquals(connection.CompletionGuardedLease, this)) connection.CompletionGuardedLease = null;
+            }
+        }
+    }
+
     sealed class Connection(long number, Stream input, Stream output)
     {
         public long Number { get; } = number;
@@ -2049,7 +2088,7 @@ public sealed class AdapterHost
         public TaskCompletionSource Gone { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public long NextAsk;
         public bool AcceptsIdle;
-        public int CompletionGuardedInFlight, GuardedAbortInFlight;
+        public GuardedLease? CompletionGuardedLease, GuardedAbortLease;
         public bool AcceptsCompletionGuarded;
         public long CompletionGuardedEpoch;
         public bool AcceptsClaudeObservation;

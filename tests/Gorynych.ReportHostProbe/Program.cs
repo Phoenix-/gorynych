@@ -63,6 +63,28 @@ if (args is [var hostMode, var pipe, var cwd, var executable, var ledgerPath, va
         } : null,
         BeforeCompletionAckRecordForTests = () => FailOnce("fail-completion-ack-record"),
         BeforeCompletionRetireRecordForTests = () => FailOnce("fail-completion-retire-record"),
+        BeforeCompletionHandlerForTests = async method =>
+        {
+            if (method != GorynychProtocol.MethodHostCompletionGuardedAck || !File.Exists(Path.Combine(cwd, "hold-ack-before-handler"))) return;
+            File.WriteAllText(Path.Combine(cwd, "ack-before-handler-entered"), "");
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            while (!File.Exists(Path.Combine(cwd, "release-ack-before-handler"))) await Task.Delay(20, timeout.Token);
+        },
+        AfterCompletionHandlerForTests = async method =>
+        {
+            var kind = method == GorynychProtocol.MethodHostCompletionGuardedStatus ? "status" :
+                method == GorynychProtocol.MethodHostCompletionGuardedAck ? "ack" : null;
+            if (kind is null || !File.Exists(Path.Combine(cwd, $"hold-{kind}-handler")) ||
+                File.Exists(Path.Combine(cwd, $"{kind}-handler-entered"))) return;
+            File.WriteAllText(Path.Combine(cwd, $"{kind}-handler-entered"), "");
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            while (!File.Exists(Path.Combine(cwd, $"release-{kind}-handler"))) await Task.Delay(20, timeout.Token);
+        },
+        AfterCompletionHandlerFinallyForTests = method =>
+        {
+            if (method == GorynychProtocol.MethodHostCompletionGuardedStatus && File.Exists(Path.Combine(cwd, "status-handler-entered")))
+                File.WriteAllText(Path.Combine(cwd, "status-handler-finished"), "");
+        },
         RetryDelays = [TimeSpan.FromMilliseconds(50)],
     });
     Console.WriteLine("HOST_STARTED");
