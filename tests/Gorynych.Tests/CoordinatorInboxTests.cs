@@ -13,6 +13,88 @@ public sealed class CoordinatorInboxTests
     static readonly TimeSpan Wait = TimeSpan.FromSeconds(20);
 
     [TestMethod]
+    public void BlockedNoticeIsDeduplicatedAndReopenSupersedesOnlyUnstarted()
+    {
+        var path = Path.Combine(TestDirs.New(), "mailbox.json");
+        var box = new MailboxStore(path);
+        box.Accept("task", "owner", "child", "work", delegation: true, coordinatorLifecycle: true);
+        var generation = (string)box.FindAssignment("task", "owner")!["generation"]!;
+        JsonObject Change(long revision, string operation, string state, string text) =>
+            box.TransitionAssignment("task", "child", revision, operation, state, text, generation: generation);
+        Change(1, "block", "blocked", "need input");
+        var original = box.ReadManagedQueue("owner", 8).Single();
+        Assert.AreEqual("blocked", (string?)original["kind"]);
+        Assert.AreEqual("need input", (string?)original["text"]);
+        Change(1, "block", "blocked", "need input");
+        Change(2, "again", "blocked", "still waiting");
+        Assert.AreEqual((long?)original["sequence"], (long?)box.ReadManagedQueue("owner", 8).Single()["sequence"]);
+        Change(3, "reopen", "open", "");
+        Assert.AreEqual(0, new MailboxStore(path).ReadManagedQueue("owner", 8).Count);
+        Change(4, "block2", "blocked", "another obstacle");
+        var second = box.ReadManagedQueue("owner", 8).Single();
+        Assert.IsTrue((long)second["sequence"]! > (long)original["sequence"]!);
+        Assert.IsTrue(box.TryStartCoordinatorBatch([second]));
+        Change(5, "reopen2", "open", "");
+        box = new MailboxStore(path);
+        Assert.IsFalse(box.TryStartCoordinatorBatch(box.ReadManagedQueue("owner", 8)));
+        box.FailCoordinatorNotice(second, "lost", true);
+        Assert.AreEqual("uncertain", (string?)box.FindAssignment("task", "owner")!["coordinatorNotice"]!["delivery"]);
+        Change(6, "block3", "blocked", "new obstacle");
+        Assert.AreEqual("new obstacle", (string?)box.ReadManagedQueue("owner", 8).Single()["text"]);
+    }
+
+    [TestMethod]
+    [DataRow(true)]
+    [DataRow(false)]
+    public void BlockedResumeReportRequiresNoticeAfterExactDurableClaim(bool blockedBeforeClaim)
+    {
+        var path = Path.Combine(TestDirs.New(), "mailbox.json");
+        var box = new MailboxStore(path);
+        box.Accept("task", "owner", "child", "work", delegation: true, coordinatorLifecycle: true);
+        box.MarkStarted("task", "child"); box.MarkDelivered("task", "child");
+        var generation = (string)box.FindAssignment("task", "owner")!["generation"]!;
+        box.Accept("wait", "child", "peer", "question", expectReply: true);
+        var target = box.ContinuationWait("wait", "child")!; target["kind"] = "reply_wait";
+        target.Remove("state"); target.Remove("requestDelivery"); target.Remove("replyDelivery");
+        box.UpdateContinuation("task", "child", generation, 1, "register", "register", target);
+        box.Accept("reply", "peer", "child", "answer", replyTo: "wait");
+        var reply = box.ReadManagedQueue("child", 8).Single(x => (string?)x["id"] == "reply");
+        var exact = box.ResolveCoordinatorReply([reply], "owner"); Assert.IsNotNull(exact);
+        if (blockedBeforeClaim)
+        {
+            box.TransitionAssignment("task", "child", 2, "block", "blocked", "obstacle", generation: generation);
+            Assert.IsFalse(box.RecordCoordinatorReport("task", generation, "child", "owner", "unclaimed", resume: true,
+                replySequence: exact.ReplySequence, waitId: exact.WaitId, waitSequence: exact.WaitSequence));
+        }
+        Assert.IsTrue(box.TryStartCoordinatorBatch([reply], exact, "owner"));
+        box = new MailboxStore(path);
+        if (!blockedBeforeClaim) box.TransitionAssignment("task", "child", 2, "block", "blocked", "obstacle", generation: generation);
+        box = new MailboxStore(path);
+        Assert.IsFalse(box.RecordCoordinatorReport("task", generation, "child", "owner", "foreign", resume: true,
+            replySequence: exact.ReplySequence, waitId: "wrong", waitSequence: exact.WaitSequence));
+        var retained = box.RecordCoordinatorReport("task", generation, "child", "owner", "report", resume: true,
+            replySequence: exact.ReplySequence, waitId: exact.WaitId, waitSequence: exact.WaitSequence);
+        Assert.AreEqual(!blockedBeforeClaim, retained, "only a post-claim notice replaces legacy report delivery");
+        if (retained) Assert.AreEqual("report", (string?)box.ReadManagedQueue("owner", 8).Single()["reportId"]);
+    }
+
+    [TestMethod]
+    [DataRow("cancelled")]
+    [DataRow("completed")]
+    public void TerminalTransitionSupersedesUnstartedBlockedNotice(string outcome)
+    {
+        var box = new MailboxStore(Path.Combine(TestDirs.New(), "mailbox.json"));
+        box.Accept("task", "owner", "child", "work", delegation: true, coordinatorLifecycle: true);
+        var generation = (string)box.FindAssignment("task", "owner")!["generation"]!;
+        box.TransitionAssignment("task", "child", 1, "block", "blocked", "obstacle", generation: generation);
+        box.TransitionAssignment("task", outcome == "cancelled" ? "owner" : "child", 2, "finish", outcome, "finished", generation: generation);
+        var notices = box.ReadManagedQueue("owner", 8);
+        Assert.IsFalse(notices.Any(item => (string?)item["kind"] == "blocked"));
+        Assert.AreEqual(outcome == "completed" ? 1 : 0, notices.Count);
+        if (outcome == "completed") Assert.AreEqual("outcome", (string?)notices.Single()["kind"]);
+    }
+
+    [TestMethod]
     public void BatchClaimSurvivesRestartWithoutReplay()
     {
         var path = Path.Combine(TestDirs.New(), "mailbox.json");
@@ -477,10 +559,12 @@ public sealed class CoordinatorInboxTests
     }
 
     [TestMethod]
-    [DataRow(false)]
-    [DataRow(true)]
+    [DataRow(false, false, false)]
+    [DataRow(true, false, false)]
+    [DataRow(false, true, false)]
+    [DataRow(false, true, true)]
     [Timeout(60000, CooperativeCancellation = true)]
-    public async Task ExactReplyResumesAssignmentAndRetainsReportWithoutSecondWake(bool ambiguous)
+    public async Task ExactReplyResumesAssignmentAndRetainsReportWithoutSecondWake(bool ambiguous, bool blocked, bool blockedBeforeClaim)
     {
         var agent = new LifecycleAgent("kimi", canDelete: true) { Answer = "full resumed report" };
         var hosts = new InProcessHosts(_ => agent.Adapter);
@@ -505,9 +589,9 @@ public sealed class CoordinatorInboxTests
                     ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = agent.Tokens[child] } });
                 registered.TrySetResult();
             }
-            else if (text.Contains("reply-exact", StringComparison.Ordinal))
+            else if (text.Contains("reply-exact", StringComparison.Ordinal) && !blockedBeforeClaim)
                 await client.Rpc.SendRequestAsync(GorynychProtocol.MethodUpdateAssignment, new JsonObject { ["source"] = "delegation", ["assignmentId"] = "task-resume",
-                    ["generation"] = generation, ["expectedRevision"] = 2, ["operationId"] = "complete", ["outcome"] = "completed", ["summary"] = "finished after reply",
+                    ["generation"] = generation, ["expectedRevision"] = 2, ["operationId"] = "complete", ["outcome"] = blocked ? "blocked" : "completed", ["summary"] = "finished after reply",
                     ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = agent.Tokens[child] } });
         };
         await client.Rpc.SendRequestAsync(GorynychProtocol.MethodDelegateTask, new JsonObject { ["sessionId"] = child, ["text"] = "initial-delegation",
@@ -525,10 +609,24 @@ public sealed class CoordinatorInboxTests
             target.Remove("state"); target.Remove("requestDelivery"); target.Remove("replyDelivery");
             box.UpdateContinuation("second-task", child, second, 1, "second-register", "register", target);
         }
+        var beforeClaim = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseClaim = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (blockedBeforeClaim) service.BeforeCoordinatorModeWaitForTests = async () => { beforeClaim.TrySetResult(); await releaseClaim.Task; };
         await client.Rpc.SendRequestAsync(GorynychProtocol.MethodReplyMessage, new JsonObject { ["messageId"] = "wait-exact", ["text"] = "answer",
             ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = agent.Tokens[peer], [GorynychProtocol.MetaMessageRequestId] = "reply-exact" } });
+        if (blockedBeforeClaim)
+        {
+            try
+            {
+                await beforeClaim.Task.WaitAsync(Wait);
+                await client.Rpc.SendRequestAsync(GorynychProtocol.MethodUpdateAssignment, new JsonObject { ["source"] = "delegation", ["assignmentId"] = "task-resume",
+                    ["generation"] = generation, ["expectedRevision"] = 2, ["operationId"] = "block-before-claim", ["outcome"] = "blocked", ["summary"] = "finished after reply",
+                    ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = agent.Tokens[child] } });
+            }
+            finally { service.BeforeCoordinatorModeWaitForTests = null; releaseClaim.TrySetResult(); }
+        }
         await LinkHarness.Until(() => service.ReportStorage.List(child).Items.Any(r => r.Identity.Cause == ReportCause.Reply &&
-            (ambiguous ? r.Status == "pending" : r.Status == "retained")), "reply report recorded").WaitAsync(Wait);
+            (ambiguous || blockedBeforeClaim ? r.Status == "pending" : r.Status == "retained")), "reply report recorded").WaitAsync(Wait);
         var report = service.ReportStorage.List(child).Items.Single(r => r.Identity.Cause == ReportCause.Reply);
         if (ambiguous)
         {
@@ -543,15 +641,15 @@ public sealed class CoordinatorInboxTests
         StringAssert.Contains(service.ReportStorage.Read(report.ReportId, parent).Text, "full resumed report");
         var view = await client.Rpc.SendRequestAsync(GorynychProtocol.MethodReadAssignment, new JsonObject { ["source"] = "delegation", ["assignmentId"] = "task-resume",
             ["_meta"] = new JsonObject { [GorynychProtocol.MetaPeerToken] = agent.Tokens[parent] } });
-        Assert.AreEqual("completed", (string?)view!["status"]);
-        if (!ambiguous) Assert.AreEqual(report.ReportId, (string?)view["latestReportId"]);
+        Assert.AreEqual(blocked ? "blocked" : "completed", (string?)view!["status"]);
+        if (!ambiguous && !blockedBeforeClaim) Assert.AreEqual(report.ReportId, (string?)view["latestReportId"]);
         await client.Rpc.SendRequestAsync(GorynychProtocol.MethodArchive, new JsonObject { ["sessionId"] = parent, ["archived"] = false });
         await LinkHarness.Until(() => service.ReplyMailbox.ReadManagedQueue(parent, 8).Count == 0, "one owner outcome").WaitAsync(Wait);
-        if (ambiguous) await LinkHarness.Until(() => service.ReportStorage.GetReport(report.ReportId).Status == "completed", "legacy report delivered").WaitAsync(Wait);
+        if (ambiguous || blockedBeforeClaim) await LinkHarness.Until(() => service.ReportStorage.GetReport(report.ReportId).Status == "completed", "legacy report delivered").WaitAsync(Wait);
         string[] prompts; lock (agent.Prompts) prompts = agent.Prompts.Where(p => p.SessionId == parent).Select(p => p.Text).ToArray();
-        Assert.AreEqual(ambiguous ? 2 : 1, prompts.Length);
+        Assert.AreEqual(ambiguous || blockedBeforeClaim ? 2 : 1, prompts.Length);
         Assert.AreEqual(1, prompts.Count(text => text.Contains("finished after reply", StringComparison.Ordinal)));
-        Assert.AreEqual(ambiguous ? 1 : 0, prompts.Count(text => text.StartsWith("[Report", StringComparison.Ordinal)));
+        Assert.AreEqual(ambiguous || blockedBeforeClaim ? 1 : 0, prompts.Count(text => text.StartsWith("[Report", StringComparison.Ordinal)));
     }
 
     [TestMethod]

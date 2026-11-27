@@ -44,7 +44,7 @@ internal sealed partial class MailboxStore
             ["assignmentId"] = assignmentId, ["assignmentGeneration"] = generation,
             ["assignmentRevision"] = (long?)assignment["revision"], ["assignee"] = (string?)assignment["child"],
             ["coordinatorNotice"] = true, ["kind"] = kind, ["status"] = (string?)assignment["status"],
-            ["text"] = kind == "outcome" ? (string?)assignment["summary"] : null,
+            ["text"] = kind is "outcome" or "blocked" ? (string?)assignment["summary"] : null,
             ["reportId"] = (string?)assignment["outcomeReportId"] ?? (string?)assignment["latestReportId"],
             ["delivered"] = false, ["delivery"] = "queued",
         };
@@ -53,13 +53,22 @@ internal sealed partial class MailboxStore
     // Producer acknowledgement proves only the retained report, not the hosted
     // prompt boundary or the current route. The normal terminal path records those.
     internal bool RecordCoordinatorReport(string id, string generation, string child, string parent, string reportId,
-        bool terminalNotEnded = false, bool resume = false)
+        bool terminalNotEnded = false, bool resume = false, long? replySequence = null, string? waitId = null, long? waitSequence = null)
     {
         lock (gate)
         {
             if (assignments[id] is not JsonObject current || (bool?)current["coordinatorLifecycle"] != true ||
                 (string?)current["generation"] != generation || (string?)current["child"] != child ||
-                (string?)current["parent"] != parent || resume && (string?)current["status"] is not ("completed" or "failed")) return false;
+                (string?)current["parent"] != parent || resume && (string?)current["status"] is not ("completed" or "failed" or "blocked")) return false;
+            // Acceptance is earlier than the handoff: only a notice published after
+            // the exact durable claim can be attributed to this resumed episode.
+            if (resume && (string?)current["status"] == "blocked" &&
+                (replySequence is not > 0 || waitSequence is not > 0 || string.IsNullOrEmpty(waitId) ||
+                 current["coordinatorReplyClaim"] is not JsonObject claim ||
+                 (string?)claim["waitId"] != waitId || (long?)claim["waitSequence"] != waitSequence ||
+                 (long?)claim["replySequence"] != replySequence || (long?)claim["cutoff"] is not { } cutoff ||
+                 current["coordinatorNotice"] is not JsonObject blocked ||
+                 (string?)blocked["kind"] != "blocked" || (long?)blocked["sequence"] is not { } noticeSequence || noticeSequence <= cutoff)) return false;
             if ((string?)current["latestReportId"] == reportId && (bool?)current["coordinatorReportObserved"] == true &&
                 (!terminalNotEnded || (bool?)current["coordinatorFallbackIssued"] == true || !StillNeedsOutcome(current))) return true;
             var copy = assignments.DeepClone().AsObject(); var item = copy[id]!.AsObject();
@@ -144,7 +153,7 @@ internal sealed partial class MailboxStore
 
     static void RemoveUnstartedCoordinatorEscalation(JsonObject item)
     {
-        if (item["coordinatorNotice"] is JsonObject notice && (string?)notice["kind"] != "outcome" &&
+        if (item["coordinatorNotice"] is JsonObject notice && (string?)notice["kind"] is not ("outcome" or "blocked") &&
             IsPending(notice) && (bool?)notice["started"] != true)
             item.Remove("coordinatorNotice");
     }
@@ -208,6 +217,10 @@ internal sealed partial class MailboxStore
                 ApplyWaitDelivery(waitCopy, item, disposition);
                 changed = true;
             }
+            if (changed && starting && resume is not null)
+                assignmentCopy[resume.AssignmentId]!["coordinatorReplyClaim"] = new JsonObject {
+                    ["waitId"] = resume.WaitId, ["waitSequence"] = resume.WaitSequence,
+                    ["replySequence"] = resume.ReplySequence, ["cutoff"] = next };
             if (changed) Save(entryCopy, next, waits: waitCopy, assigned: assignmentCopy);
             return changed;
         }

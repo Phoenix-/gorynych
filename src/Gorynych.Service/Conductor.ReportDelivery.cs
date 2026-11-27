@@ -334,7 +334,8 @@ public sealed partial class Conductor
             identity.AssignmentId is not { } id || identity.AssignmentGeneration is not { } generation)
             return false;
         var notEnded = info.Outcome is "failed" or "cancelled" or "not_started" || info.Outcome?.StartsWith("stopped:", StringComparison.Ordinal) == true;
-        if (!mailbox.RecordCoordinatorReport(id, generation, identity.Child, identity.Parent, info.ReportId, terminalNotEnded: notEnded, resume: resume)) return false;
+        if (!mailbox.RecordCoordinatorReport(id, generation, identity.Child, identity.Parent, info.ReportId, terminalNotEnded: notEnded, resume: resume,
+            replySequence: identity.ReplyMessageSequence, waitId: identity.ReplyWaitId, waitSequence: identity.ReplyWaitSequence)) return false;
         reports.SetDisposition(info.ReportId, "retained", "Available through assignment history; lifecycle notice handles owner wake");
         ReevaluateCoordinatorSupervision();
         QueueMailbox(identity.Parent);

@@ -53,7 +53,7 @@ internal sealed partial class MailboxStore
     static JsonObject AssignmentView(string id, JsonObject item)
     {
         var view = item.DeepClone().AsObject();
-        view.Remove("fingerprint"); view.Remove("operations"); view.Remove("completionReminder"); view["assignmentId"] = id;
+        view.Remove("fingerprint"); view.Remove("operations"); view.Remove("completionReminder"); view.Remove("coordinatorReplyClaim"); view["assignmentId"] = id;
         return view;
     }
 
@@ -95,6 +95,11 @@ internal sealed partial class MailboxStore
             var sequence = next;
             if ((bool?)item["coordinatorLifecycle"] == true && outcome is ("completed" or "failed"))
                 SetCoordinatorNotice(id, item, ++sequence, "outcome");
+            else if ((bool?)item["coordinatorLifecycle"] == true && outcome == "blocked" && status != "blocked")
+                SetCoordinatorNotice(id, item, ++sequence, "blocked");
+            else if (outcome is ("open" or "cancelled") && item["coordinatorNotice"] is JsonObject blockedNotice &&
+                (string?)blockedNotice["kind"] == "blocked" && IsPending(blockedNotice) && (bool?)blockedNotice["started"] != true)
+                item.Remove("coordinatorNotice");
             else
                 RemoveUnstartedCoordinatorEscalation(item);
             var entriesCopy = entries.DeepClone().AsArray();
